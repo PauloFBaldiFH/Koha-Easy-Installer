@@ -28,7 +28,7 @@ on_exit() {
 trap on_exit EXIT INT TERM HUP
 
 PANEL_VERSION=" β-0.9.2"
-UPDATE_URL="https://raw.githubusercontent.com/BibliotecaPalotina/koha-easy-install/refs/heads/main/installer"
+UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
 # 2. LANGUAGE / IDIOMA
@@ -38,7 +38,7 @@ LANGUAGES_KOHA="en-GB:English (UK);en-NZ:English (NZ);pt-BR:Português (Brasil);
 
 TRANSLATION_CONFIG="/etc/koha-easy-install/translation.conf"
 CONFIG_DIR="/etc/koha-easy-install"
-LANG_REPO_URL="https://raw.githubusercontent.com/BibliotecaPalotina/koha-easy-install/refs/heads/main/lang"
+LANG_REPO_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/lang"
 
 if [ -f "$TRANSLATION_CONFIG" ]; then
     source "$TRANSLATION_CONFIG" 2>/dev/null || true
