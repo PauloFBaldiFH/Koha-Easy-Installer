@@ -40,16 +40,6 @@ TRANSLATION_CONFIG="/etc/koha-easy-install/translation.conf"
 CONFIG_DIR="/etc/koha-easy-install"
 LANG_REPO_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/lang"
 
-if [ -f "$TRANSLATION_CONFIG" ]; then
-    source "$TRANSLATION_CONFIG" 2>/dev/null || true
-fi
-
-[ -z "${KOHA_PANEL_LANG_FULL:-}" ] && KOHA_PANEL_LANG_FULL="en-GB"
-[ -z "${KOHA_PANEL_LANG:-}" ] && KOHA_PANEL_LANG="en"
-
-export KOHA_PANEL_LANG_FULL
-export KOHA_PANEL_LANG
-
 normalize_panel_language() {
     case "$1" in
         pt-*|pt_BR|pt_PT|por) printf '%s' "pt" ;;
@@ -78,6 +68,19 @@ normalize_panel_language() {
     esac
 }
 
+# ======================================================================
+# LEITURA DA CONFIGURAÇÃO DE IDIOMA
+# ======================================================================
+if [ -f "$TRANSLATION_CONFIG" ]; then
+    source "$TRANSLATION_CONFIG" 2>/dev/null || true
+fi
+
+[ -z "${KOHA_PANEL_LANG_FULL:-}" ] && KOHA_PANEL_LANG_FULL="pt-BR"
+[ -z "${KOHA_PANEL_LANG:-}" ] && KOHA_PANEL_LANG="pt"
+
+export KOHA_PANEL_LANG_FULL
+export KOHA_PANEL_LANG
+
 SYS_LANG="$(normalize_panel_language "$KOHA_PANEL_LANG")"
 export SYS_LANG
 
@@ -96,33 +99,74 @@ if [ ! -f "$CACHE_FILE" ] && [ "${SYS_LANG:-en}" != "en" ]; then
     fi
 fi
 
-# Carrega o cache persistente (HD) para a memória
+# Carrega o cache persistente (HD) para a memória tratando Base64 com segurança
 if [ -f "$CACHE_FILE" ]; then
-    while IFS='=' read -r k_b64 v_b64; do
-        [ -n "$k_b64" ] && [ -n "$v_b64" ] && \
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        k_b64="${line%%=*}"
+        v_b64="${line#*=}"
+        if [ -n "$k_b64" ] && [ -n "$v_b64" ]; then
             _TRANS_CACHE["$(printf '%s' "$k_b64" | base64 -d 2>/dev/null)"]="$(printf '%s' "$v_b64" | base64 -d 2>/dev/null)"
+        fi
     done < "$CACHE_FILE"
 fi
+
+declare -A _MENU_PT=(
+    ["Control Dashboard"]="Painel de Controle"
+    ["Exit"]="Sair"
+    ["Back"]="Voltar"
+    ["Select an option:"]="Selecione uma opção:"
+    ["Select your language / Selecione o idioma:"]="Selecione o idioma:"
+    ["⚙  Install Koha server"]="⚙  Instalar servidor Koha"
+    ["ℹ  View first-access credentials"]="ℹ  Visualizar credenciais de primeiro acesso"
+    ["↻  Restore database"]="↻  Restaurar base de dados"
+    ["▣  Backup center"]="▣  Central de cópias de segurança"
+    ["⌁  Search engine & indexing"]="⌁  Motor de busca e indexação"
+    ["☁  Publish system to internet"]="☁  Publicar sistema na Internet"
+    ["◈  Diagnostics & maintenance center"]="◈  Diagnóstico e manutenção"
+    ["⚠  Security center"]="⚠  Central de segurança"
+    ["⚙  Koha settings & parameters"]="⚙  Configurações e parâmetros do Koha"
+    ["▤  General tools"]="▤  Ferramentas gerais"
+    ["⏱  Schedules & cron tasks"]="⏱  Tarefas agendadas e automações"
+    ["✦  Koha languages"]="✦  Idiomas do Koha e do Painel"
+    ["⟳  Update center"]="⟳  Central de atualizações"
+    ["ℹ  About the program & support"]="ℹ  Sobre o programa e suporte"
+    ["↻  Reboot server"]="↻  Reiniciar servidor"
+    ["✖  Exit"]="✖  Sair"
+)
 
 t() {
     local source_text="${1:-}"
     [ -z "$source_text" ] && return 0
-    
-    local target_lang="$(normalize_panel_language "${KOHA_PANEL_LANG:-en}")"
 
+    # 1. Se a variável estiver vazia, tenta ler do arquivo de configuração
+    if [ -z "${KOHA_PANEL_LANG:-}" ] && [ -f "$TRANSLATION_CONFIG" ]; then
+        source "$TRANSLATION_CONFIG" 2>/dev/null || true
+    fi
+
+    local target_lang
+    target_lang="$(normalize_panel_language "${KOHA_PANEL_LANG:-pt}")"
+
+    # 2. Se for inglês, devolve o texto original
     if [ "$target_lang" = "en" ]; then
-        printf '%b' "$source_text"
+        printf '%s' "$source_text"
         return 0
     fi
 
-    # Busca na memória
+    # 3. Verifica no dicionário nativo em português (_MENU_PT)
+    if [ "$target_lang" = "pt" ] && [[ -n "${_MENU_PT["$source_text"]+x}" ]]; then
+        printf '%s' "${_MENU_PT["$source_text"]}"
+        return 0
+    fi
+
+    # 4. Busca no cache da memória (baixado do GitHub)
     if [[ -n "${_TRANS_CACHE["$source_text"]+x}" ]]; then
-        printf '%b' "${_TRANS_CACHE["$source_text"]}"
+        printf '%s' "${_TRANS_CACHE["$source_text"]}"
         return 0
     fi
 
-    # Fallback silencioso: se não achar a tradução, exibe o original em inglês
-    printf '%b' "$source_text"
+    # 5. Fallback final: original em inglês
+    printf '%s' "$source_text"
     return 0
 }
 
@@ -403,13 +447,23 @@ v_fail() { V_FAIL=$((V_FAIL+1)); printf '[%s] %s\n' "$(t "FAIL")" "$1" | tee -a 
 v_info() { printf '[INFO] %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
 
 validate_command() {
-    if command -v "$1" >/dev/null 2>&1; then v_ok "$2: '$1' $(t "available")."; return 0; fi
-    v_fail "$2: '$1' $(t "not found")."; return 1
+    local msg
+    if command -v "$1" >/dev/null 2>&1; then
+        msg=$(t 'available')
+        v_ok "$2: '$1' $msg."
+        return 0
+    fi
+    msg=$(t 'not found')
+    v_fail "$2: '$1' $msg."
+    return 1
 }
 
 validate_file() {
+    local msg
     if [ -f "$1" ]; then v_ok "$2: $1"; return 0; fi
-    v_fail "$2: $(t "missing"): $1"; return 1
+    msg=$(t 'missing')
+    v_fail "$2: $msg: $1"
+    return 1
 }
 
 validate_service() {
@@ -3885,36 +3939,62 @@ actlistbox=white,blue
 while true; do
     restore_apt_timers
 
-    MAIN_OPT=$(whiptail --title "Koha Easy Installer & Manager v${PANEL_VERSION} - $(t "Control Dashboard")" \
-        --cancel-button "$(t "Exit")" \
-        --menu "$(t "Select an option:")" 25 80 16 \
-        "1"  "$(t "⚙  Install Koha server")" \
-        "2"  "$(t "ℹ  View first-access credentials")" \
-        "3"  "$(t "↻  Restore database")" \
-        "4"  "$(t "▣  Backup center")" \
-        "5"  "$(t "⌁  Search engine & indexing")" \
-        "6"  "$(t "☁  Publish system to internet")" \
-        "7"  "$(t "◈  Diagnostics & maintenance center")" \
-        "8"  "$(t "⚠  Security center")" \
-        "9"  "$(t "⚙  Koha settings & parameters")" \
-        "10" "$(t "▤  General tools")" \
-        "11" "$(t "⏱  Schedules & cron tasks")" \
-        "12" "$(t "✦  Koha languages")" \
-        "13" "$(t "⟳  Update center")" \
-        "14" "$(t "ℹ  About the program & support")" \
-        "15" "$(t "↻  Reboot server")" \
-        "16" "$(t "✖  Exit")" 3>&1 1>&2 2>&3) || { clear; rm -f "$PANEL_LOCK_FILE"; exit 0; }
+    title_dash=$(t 'Control Dashboard')
+    [ -z "$title_dash" ] && title_dash="Control Dashboard"
+
+    exit_btn=$(t 'Exit')
+    [ -z "$exit_btn" ] && exit_btn="Exit"
+
+    menu_prompt=$(t 'Select an option:')
+    [ -z "$menu_prompt" ] && menu_prompt="Select an option:"
+
+    m1=$(t '⚙  Install Koha server')
+    m2=$(t 'ℹ  View first-access credentials')
+    m3=$(t '↻  Restore database')
+    m4=$(t '▣  Backup center')
+    m5=$(t '⌁  Search engine & indexing')
+    m6=$(t '☁  Publish system to internet')
+    m7=$(t '◈  Diagnostics & maintenance center')
+    m8=$(t '⚠  Security center')
+    m9=$(t '⚙  Koha settings & parameters')
+    m10=$(t '▤  General tools')
+    m11=$(t '⏱  Schedules & cron tasks')
+    m12=$(t '✦  Koha languages')
+    m13=$(t '⟳  Update center')
+    m14=$(t 'ℹ  About the program & support')
+    m15=$(t '↻  Reboot server')
+    m16=$(t '✖  Exit')
+
+    MAIN_OPT=$(whiptail --title "Koha Easy Installer & Manager v${PANEL_VERSION} - ${title_dash}" \
+        --cancel-button "${exit_btn}" \
+        --menu "${menu_prompt}" 25 80 16 \
+        "1"  "$m1" \
+        "2"  "$m2" \
+        "3"  "$m3" \
+        "4"  "$m4" \
+        "5"  "$m5" \
+        "6"  "$m6" \
+        "7"  "$m7" \
+        "8"  "$m8" \
+        "9"  "$m9" \
+        "10" "$m10" \
+        "11" "$m11" \
+        "12" "$m12" \
+        "13" "$m13" \
+        "14" "$m14" \
+        "15" "$m15" \
+        "16" "$m16" 3>&1 1>&2 2>&3) || { clear; rm -f "$PANEL_LOCK_FILE"; exit 0; }
 
     case "$MAIN_OPT" in
         1) function_install_koha ;;
         2) function_view_credentials ;;
         3) function_restore_database ;;
         4)
-            SUB_OPT=$(whiptail --title "$(t "▣ Backup Center")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a backup routine:")" 17 76 3 \
-                "1" "$(t "▣  Generate manual backup and download to PC")" \
-                "2" "$(t "☁  Configure cloud backup (Google Drive)")" \
-                "3" "$(t "✓  Test integrity of latest backup")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '▣ Backup Center')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a backup routine:')" 17 76 3 \
+                "1" "$(t '▣  Generate manual backup and download to PC')" \
+                "2" "$(t '☁  Configure cloud backup (Google Drive)')" \
+                "3" "$(t '✓  Test integrity of latest backup')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_manual_backup ;;
                 2) function_configure_rclone ;;
@@ -3922,21 +4002,21 @@ while true; do
             esac
             ;;
         5)
-            SUB_OPT=$(whiptail --title "$(t "⌁ Search Engine & Indexing")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose an action:")" 16 76 2 \
-                "1" "$(t "↔  Toggle search engine (Zebra ⇄ Elasticsearch)")" \
-                "2" "$(t "⟳  Repair / rebuild indexing")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '⌁ Search Engine & Indexing')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose an action:')" 16 76 2 \
+                "1" "$(t '↔  Toggle search engine (Zebra ⇄ Elasticsearch)')" \
+                "2" "$(t '⟳  Repair / rebuild indexing')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_toggle_search_engine ;;
                 2) function_repair_indexing ;;
             esac
             ;;
         6)
-            SUB_OPT=$(whiptail --title "$(t "☁ Publish System to Internet")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a publishing method:")" 17 76 3 \
-                "1" "$(t "☁  Cloudflare Tunnel Manager (Recommended)")" \
-                "2" "$(t "⌁  Free SSL certificate (Certbot / Apache)")" \
-                "3" "$(t "⌕  Google Search Console Assistant")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '☁ Publish System to Internet')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a publishing method:')" 17 76 3 \
+                "1" "$(t '☁  Cloudflare Tunnel Manager (Recommended)')" \
+                "2" "$(t '⌁  Free SSL certificate (Certbot / Apache)')" \
+                "3" "$(t '⌕  Google Search Console Assistant')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_configure_cloudflare ;;
                 2) function_configure_ssl ;;
@@ -3944,13 +4024,13 @@ while true; do
             esac
             ;;
         7)
-            SUB_OPT=$(whiptail --title "$(t "◈ Diagnostics & Maintenance Center")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a tool:")" 19 76 5 \
-                "1" "$(t "◈  Detailed server & Koha status")" \
-                "2" "$(t "✓  Full system health check")" \
-                "3" "$(t "▤  View latest validation report")" \
-                "4" "$(t "⌁  Real-time Apache log auditing")" \
-                "5" "$(t "⚙  Deep database optimization & log cleanup")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '◈ Diagnostics & Maintenance Center')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a tool:')" 19 76 5 \
+                "1" "$(t '◈  Detailed server & Koha status')" \
+                "2" "$(t '✓  Full system health check')" \
+                "3" "$(t '▤  View latest validation report')" \
+                "4" "$(t '⌁  Real-time Apache log auditing')" \
+                "5" "$(t '⚙  Deep database optimization & log cleanup')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_detailed_status ;;
                 2) function_validate_system ;;
@@ -3960,45 +4040,45 @@ while true; do
             esac
             ;;
         8)
-            SUB_OPT=$(whiptail --title "$(t "⚠ Security Center")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a security routine:")" 18 76 4 \
-                "1" "$(t "⚠  Fail2ban status (intrusion attempts)")" \
-                "2" "$(t "▣  Staff firewall (restrict port 8080)")" \
-                "3" "$(t "↻  Rotate database password")" \
-                "4" "$(t "☑  Show active UFW rules")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '⚠ Security Center')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a security routine:')" 18 76 4 \
+                "1" "$(t '⚠  Fail2ban status (intrusion attempts)')" \
+                "2" "$(t '▣  Staff firewall (restrict port 8080)')" \
+                "3" "$(t '↻  Rotate database password')" \
+                "4" "$(t '☑  Show active UFW rules')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1)
                     local info=""
                     for jail in sshd apache-auth apache-badbots; do
-                        info="${info}=== ${jail} ===\n$(fail2ban-client status "$jail" 2>/dev/null || echo "$(t "jail inactive")")\n\n"
+                        info="${info}=== ${jail} ===\n$(fail2ban-client status "$jail" 2>/dev/null || echo "$(t 'jail inactive')")\n\n"
                     done
-                    whiptail --title "$(t "⚠ Fail2ban")" --scrolltext --msgbox "$(printf '%b' "$info")" 24 78 2>/dev/null || true
+                    whiptail --title "$(t '⚠ Fail2ban')" --scrolltext --msgbox "$(printf '%b' "$info")" 24 78 2>/dev/null || true
                     ;;
                 2)
-                    if prompt_yes_no "$(t "Staff firewall")" \
-"$(t "Port 80 (OPAC) must stay open to the public.\nPort 8080 (staff) can be closed to the internet if you use\nCloudflare Tunnel or only access it from the local network.\n\nBLOCK direct external access to 8080?")" 14 78; then
+                    if prompt_yes_no "$(t 'Staff firewall')" \
+"$(t 'Port 80 (OPAC) must stay open to the public.\nPort 8080 (staff) can be closed to the internet if you use\nCloudflare Tunnel or only access it from the local network.\n\nBLOCK direct external access to 8080?')" 14 78; then
                         ufw delete allow 8080/tcp >/dev/null 2>&1
                         ufw allow from 127.0.0.1 to any port 8080 >/dev/null 2>&1
                         ufw allow from 192.168.0.0/16 to any port 8080 >/dev/null 2>&1
                         ufw allow from 10.0.0.0/8 to any port 8080 >/dev/null 2>&1
                         ufw deny 8080/tcp >/dev/null 2>&1
-                        msg_ok "$(t "Port 8080 now allowed only from 127.0.0.1 and the local network.")" 9 72
+                        msg_ok "$(t 'Port 8080 now allowed only from 127.0.0.1 and the local network.')" 9 72
                     else
                         ufw delete deny 8080/tcp >/dev/null 2>&1
                         ufw allow 8080/tcp >/dev/null 2>&1
-                        msg_ok "$(t "Port 8080 is open.")" 8 60
+                        msg_ok "$(t 'Port 8080 is open.')" 8 60
                     fi
                     ;;
                 3)
                     require_koha || continue
-                    prompt_yes_no "$(t "Rotate Password")" \
-"$(t "A new strong password will be generated for the database user,\nkoha-conf.xml updated and services restarted.\n\nContinue?")" 12 74 || continue
+                    prompt_yes_no "$(t 'Rotate Password')" \
+"$(t 'A new strong password will be generated for the database user,\nkoha-conf.xml updated and services restarted.\n\nContinue?')" 12 74 || continue
                     clear
                     local new_pass
                     new_pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
                     local xml_bak="${KOHA_CONF}.bak-$(date +%s)"
                     cp -f "$KOHA_CONF" "$xml_bak" || {
-                        msg_error "" "$(t "Could not back up koha-conf.xml. Password was not changed.")" 9 74
+                        msg_error "" "$(t 'Could not back up koha-conf.xml. Password was not changed.')" 9 74
                         continue
                     }
                     if mysql -e "ALTER USER '${DB_NAME}'@'localhost' IDENTIFIED BY '${new_pass}'; FLUSH PRIVILEGES;"; then
@@ -4006,7 +4086,7 @@ while true; do
                         if ! xmllint --noout "$KOHA_CONF" >/dev/null 2>&1; then
                             cp -f "$xml_bak" "$KOHA_CONF"
                             mysql -e "ALTER USER '${DB_NAME}'@'localhost' IDENTIFIED BY '$(get_database_password)'; FLUSH PRIVILEGES;" >/dev/null 2>&1 || true
-                            msg_error "" "$(t "The new password was rolled back because koha-conf.xml became invalid.\nNothing was restarted.")" 11 76
+                            msg_error "" "$(t 'The new password was rolled back because koha-conf.xml became invalid.\nNothing was restarted.')" 11 76
                             continue
                         fi
                         sed -i -E "s|^([[:space:]]*Senha[[:space:]]*:[[:space:]]*).*|\1${new_pass}|; s|^([[:space:]]*Password[[:space:]]*:[[:space:]]*).*|\1${new_pass}|" /root/credenciais_koha.txt 2>/dev/null
@@ -4015,25 +4095,25 @@ while true; do
                         sleep 2
                         if validate_http "http://127.0.0.1:8080/" "Staff" >/dev/null 2>&1; then
                             log "database password rotated"
-                            msg_ok "$(t "Password rotated and Koha still responds.\n\nNew password: ${new_pass}\n(saved in /root/credenciais_koha.txt)")" 12 74
+                            msg_ok "$(t 'Password rotated and Koha still responds.\n\nNew password: ')${new_pass}\n(saved in /root/credenciais_koha.txt)" 12 74
                         else
-                            msg_error "" "$(t "Password changed but Koha did not answer the test.\nPrevious XML copy at ${KOHA_CONF}.bak-*")" 11 76
+                            msg_error "" "$(t 'Password changed but Koha did not answer the test.\nPrevious XML copy at ')${KOHA_CONF}.bak-*" 11 76
                         fi
                     else
-                        msg_error "" "$(t "Failed to change the password in MariaDB. Nothing was changed.")" 9 72
+                        msg_error "" "$(t 'Failed to change the password in MariaDB. Nothing was changed.')" 9 72
                     fi
                     ;;
-                4) whiptail --title "$(t "☑ UFW")" --scrolltext --msgbox "$(ufw status verbose 2>/dev/null || echo 'ufw?')" 24 78 2>/dev/null || true ;;
+                4) whiptail --title "$(t '☑ UFW')" --scrolltext --msgbox "$(ufw status verbose 2>/dev/null || echo 'ufw?')" 24 78 2>/dev/null || true ;;
             esac
             ;;
         9)
-            SUB_OPT=$(whiptail --title "$(t "⚙ Koha Settings & Parameters")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a parameter:")" 19 76 5 \
-                "1" "$(t "⚙  Server sizing (memory / workers)")" \
-                "2" "$(t "✉  Configure email and circulation notices")" \
-                "3" "$(t "★  Create super librarian")" \
-                "4" "$(t "↔  Enable interoperability (SIP2 and Z39.50)")" \
-                "5" "$(t "⏱  Clock and timezone (NTP)")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '⚙ Koha Settings & Parameters')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a parameter:')" 19 76 5 \
+                "1" "$(t '⚙  Server sizing (memory / workers)')" \
+                "2" "$(t '✉  Configure email and circulation notices')" \
+                "3" "$(t '★  Create super librarian')" \
+                "4" "$(t '↔  Enable interoperability (SIP2 and Z39.50)')" \
+                "5" "$(t '⏱  Clock and timezone (NTP)')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_size_server ;;
                 2) function_configure_emails ;;
@@ -4043,11 +4123,11 @@ while true; do
             esac
             ;;
         10)
-            SUB_OPT=$(whiptail --title "$(t "▤ General Tools")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose a tool:")" 17 76 3 \
-                "1" "$(t "▤  Resource monitoring (Htop / Nethogs)")" \
-                "2" "$(t "⌁  Terminal web browser (Links)")" \
-                "3" "$(t "▣  File explorer (Midnight Commander)")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '▤ General Tools')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose a tool:')" 17 76 3 \
+                "1" "$(t '▤  Resource monitoring (Htop / Nethogs)')" \
+                "2" "$(t '⌁  Terminal web browser (Links)')" \
+                "3" "$(t '▣  File explorer (Midnight Commander)')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_run_monitor ;;
                 2) function_run_links ;;
@@ -4057,10 +4137,10 @@ while true; do
         11) function_manage_crons ;;
         12) function_install_languages ;;
         13)
-            SUB_OPT=$(whiptail --title "$(t "⟳ Update Center")" --cancel-button "$(t "Back")" \
-                --menu "$(t "Choose what to update:")" 16 76 2 \
-                "1" "$(t "⟳  Update OS packages & Koha schemas")" \
-                "2" "$(t "↻  Update this panel via GitHub")" 3>&1 1>&2 2>&3) || continue
+            SUB_OPT=$(whiptail --title "$(t '⟳ Update Center')" --cancel-button "$(t 'Back')" \
+                --menu "$(t 'Choose what to update:')" 16 76 2 \
+                "1" "$(t '⟳  Update OS packages & Koha schemas')" \
+                "2" "$(t '↻  Update this panel via GitHub')" 3>&1 1>&2 2>&3) || continue
             case "$SUB_OPT" in
                 1) function_update_system ;;
                 2) function_autoupdate ;;
