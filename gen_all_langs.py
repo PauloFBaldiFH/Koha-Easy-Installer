@@ -15,11 +15,13 @@ INSTALLER_FILE = "installer"
 LANG_DIR = "lang"
 os.makedirs(LANG_DIR, exist_ok=True)
 
-# 15 idiomas principais
+# 22 idiomas (Europa, Ásia, Oriente Médio e Américas)
 TARGET_LANGS = [
     "pt", "es", "fr", "de", "it",
     "nl", "ru", "pl", "uk", "cs",
-    "sv", "tr", "ar", "ja", "zh"
+    "sv", "tr", "ar", "ja", "zh",
+    "hi", "bn", "id", "tl", "fa", 
+    "vi", "ko"
 ]
 
 PROTECTED_TERMS = [
@@ -124,8 +126,8 @@ def process_language(strings, lang_code):
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             for line in f:
-                if "=" in line:
-                    k, v = line.strip().split("=", 1)
+                if "|" in line:
+                    k, v = line.strip().split("|", 1)
                     try:
                         k_dec = base64.b64decode(k).decode("utf-8")
                         v_dec = base64.b64decode(v).decode("utf-8")
@@ -166,7 +168,7 @@ def process_language(strings, lang_code):
                     if orig in existing:
                         k_b64 = base64.b64encode(orig.encode("utf-8")).decode("utf-8")
                         v_b64 = base64.b64encode(existing[orig].encode("utf-8")).decode("utf-8")
-                        out.write(f"{k_b64}={v_b64}\n")
+                        out.write(f"{k_b64}|{v_b64}\n")
             print(f"    Progresso: {idx}/{len(pending)} frases concluídas...")
 
     print(f"[OK] Idioma {lang_code.upper()} concluído!")
