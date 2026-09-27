@@ -14,7 +14,7 @@ It was born from real-life experience facing technical barriers in collection ma
 
 - **One-step installation** of Koha, MariaDB, Apache, Memcached and Plack, with pre-validation of the server (OS, disk, network, busy ports), 4 GB SWAP, NTP and timezone selection.
 - **Backup center**: daily compressed SQL backups, weekly MARC21 export, manual backup with download instructions, restore test in a temporary database and cloud copies to Google Drive (rclone).
-- **Safe restore** of `.sql` / `.sql.gz` backups, with a safety copy of the current database taken first, schema upgrade and reindexing.
+- **Safe restore** of `.sql` / `.sql.gz` backups: the file is checked (gzip test, complete mysqldump, Koha tables) and imported into a temporary database first; the current catalog is only replaced after a verified safety copy exists, is put back automatically if anything fails, and a restore cannot be left half-done by CTRL+C or a lost SSH connection.
 - **Search engine**: switch between Zebra and Elasticsearch 7, indexer watchdog and repair/rebuild tools.
 - **Publishing to the internet**: Cloudflare Tunnel (no open ports), free SSL certificate (Certbot) and a Google Search Console assistant.
 - **Diagnostics**: full health check with a detailed report, server status, real-time Apache log viewer and deep database maintenance.
@@ -27,7 +27,7 @@ It was born from real-life experience facing technical barriers in collection ma
 
 | Item | Minimum |
 |------|---------|
-| Operating system | Debian 11/12 or Ubuntu 22.04/24.04 (64-bit) |
+| Operating system | Debian 11/12/13 or Ubuntu 22.04/24.04, 64-bit (amd64 or arm64, e.g. Oracle Ampere, AWS Graviton, Raspberry Pi 4/5) |
 | RAM | 2 GB (4 GB+ recommended; Elasticsearch needs ~1.5 GB more) |
 | Free disk | 5 GB (10 GB+ recommended) |
 | Access | `root` or a user with `sudo` |
@@ -96,7 +96,8 @@ Installed in `/etc/cron.d/koha_tasks`:
 | Daily 01:30 | Session and database cleanup |
 | Daily 05:00 | Plack restart (keeps memory low) |
 | Daily 08:00 / 08:05 | Overdue notices and e-mail queue |
-| Every 2 min | Zebra incremental indexing |
+| Every 2 min | Zebra indexing watchdog: keeps Koha's indexer daemon (`koha-indexer`) running and restarts it if records wait more than 10 min |
+| Every 5 min (Elasticsearch only) | Elasticsearch indexer watchdog |
 
 ## Important files
 
@@ -121,9 +122,20 @@ sudo bash uninstall.sh --yes    # no questions (automation)
 
 Copy your backups somewhere else before running it.
 
+## Tests (for contributors)
+
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64.
+
+```bash
+sudo apt-get install bats mariadb-server memcached whiptail
+sudo KEI_TEST_SANDBOX=1 tests/run.sh
+```
+
+**Only on a disposable container or VM:** the tests replace the `koha_library` database and install test doubles for the `koha-*` tools and `systemctl`. `tests/run.sh` refuses to run next to a real Koha.
+
 ## Translations (for contributors)
 
-The panel texts are in English inside `installer`; each language has a dictionary in `lang/<code>.cache` (`base64(English)|base64(translation)`).
+The panel texts are in English inside `installer`; each language has a dictionary in `lang/<code>.cache` (`base64(English)|base64(translation)`). The panel itself is pure Bash; the Python scripts below are optional contributor tools.
 
 - Wrap every user-visible text in `$(t "...")`. Variables must be escaped so the English text reaches `t()` unchanged: `$(t "Backup saved in \${file}")`.
 - Check coverage and repair dictionaries: `python3 i18n_common.py` / `python3 i18n_common.py --fix`

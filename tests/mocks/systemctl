@@ -1,0 +1,39 @@
+#!/bin/bash
+# Test double for systemctl (tests/ only). The test containers have no
+# systemd; units are "active" when /run/kei-mock/svc/<unit> exists.
+#   svc-fail/<unit>   make start/restart of that unit fail
+S=/run/kei-mock
+mkdir -p "$S/svc" "$S/svc-fail"
+printf 'systemctl %s\n' "$*" >> "$S/calls.log"
+now="no" quiet="no" args=()
+for a in "$@"; do
+    case "$a" in
+        --now) now="yes" ;;
+        --quiet|-q) quiet="yes" ;;
+        -*) ;;
+        *) args+=("${a%.service}") ;;
+    esac
+done
+verb="${args[0]:-}"
+units=("${args[@]:1}")
+rc=0
+case "$verb" in
+    is-active)
+        for u in "${units[@]}"; do [ -e "$S/svc/$u" ] || rc=3; done
+        if [ "$quiet" = "no" ]; then [ "$rc" -eq 0 ] && echo active || echo inactive; fi
+        ;;
+    is-enabled) rc=0 ;;
+    start|restart|reload)
+        for u in "${units[@]}"; do
+            if [ -e "$S/svc-fail/$u" ]; then rc=1; else touch "$S/svc/$u"; fi
+        done
+        ;;
+    stop)
+        for u in "${units[@]}"; do rm -f "$S/svc/$u"; done
+        ;;
+    enable)  [ "$now" = "yes" ] && for u in "${units[@]}"; do touch "$S/svc/$u"; done ;;
+    disable) [ "$now" = "yes" ] && for u in "${units[@]}"; do rm -f "$S/svc/$u"; done ;;
+    cat)     for u in "${units[@]}"; do [ -e "$S/svc/$u" ] || [ -e "$S/units/$u" ] || rc=1; done ;;
+    *) ;;
+esac
+exit "$rc"

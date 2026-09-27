@@ -115,9 +115,9 @@ step "[1/9] Parando serviços do Koha, indexadores e túnel..."
 systemctl stop 'koha-*' 'koha-es-indexer@*' 'koha-zebra-daemon@*' cloudflared 2>/dev/null || true
 systemctl disable 'koha-es-indexer@*' 'koha-zebra-daemon@*' cloudflared 2>/dev/null || true
 command -v cloudflared >/dev/null 2>&1 && cloudflared service uninstall >/dev/null 2>&1
-pkill -f 'zebrasrv|zebraqueue_daemon|es_indexer_daemon|koha-worker|background_jobs_worker|starman.*koha|z3950_responder|SIPServer' 2>/dev/null
+pkill -f 'zebrasrv|rebuild_zebra|es_indexer_daemon|koha-worker|background_jobs_worker|starman.*koha|z3950_responder|SIPServer' 2>/dev/null
 sleep 2
-pkill -9 -f 'zebrasrv|zebraqueue_daemon|es_indexer_daemon|koha-worker|background_jobs_worker|starman.*koha|z3950_responder|SIPServer' 2>/dev/null
+pkill -9 -f 'zebrasrv|rebuild_zebra|es_indexer_daemon|koha-worker|background_jobs_worker|starman.*koha|z3950_responder|SIPServer' 2>/dev/null
 pkill -f 'cloudflared tunnel' 2>/dev/null
 
 # ----------------------------------------------------------------------
@@ -176,10 +176,13 @@ fi
 step "[6/9] Removendo tarefas agendadas, scripts, unidades e repositórios..."
 rm -f /etc/cron.d/koha_* /etc/cron.d/koha-common
 rm -f /root/backup_sql.sh /root/backup_marc.sh /usr/local/bin/koha-es-watchdog.sh
+rm -f /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh
 rm -f /usr/local/bin/config.sh /usr/local/bin/config.sh.bak-* /usr/local/bin/.config.sh.*
 rm -f /usr/local/bin/koha-foreach /tmp/koha-foreach
 rm -f /etc/systemd/system/koha-es-indexer@.service
 rm -rf /etc/systemd/system/multi-user.target.wants/koha-* /etc/systemd/system/koha-*.service.d
+rm -f /etc/systemd/system/apache2.service.d/koha-easy-install.conf
+rmdir /etc/systemd/system/apache2.service.d 2>/dev/null
 rm -f /etc/apt/sources.list.d/koha.list /etc/apt/sources.list.d/elastic*.list /etc/apt/sources.list.d/cloudflared.list
 rm -f /usr/share/keyrings/koha-keyring.gpg /usr/share/keyrings/elasticsearch-keyring.gpg /etc/apt/keyrings/cloudflare-main.gpg
 rm -f /etc/fail2ban/jail.d/koha-easy-install.local
@@ -211,7 +214,7 @@ rm -rf /var/backups/koha_sql /var/backups/koha_marc
 rm -rf /etc/cloudflared /root/.cloudflared /home/*/.cloudflared
 rm -f /root/koha_credentials.txt /root/credenciais_koha.txt
 rm -f /var/run/koha_panel.lock /var/run/koha_backup.pid /var/run/koha_es_watchdog.pid \
-      /var/lock/koha_backup.lock /var/lock/koha_es_rebuild.lock
+      /var/lock/koha_backup.lock /var/lock/koha_es_rebuild.lock /run/lock/koha_zebra_watchdog.lock
 rm -rf /tmp/koha_* /tmp/koha-* /tmp/drop_koha_dbs.sql /tmp/99-koha-tuning.bak
 if [ "$FULL" = "yes" ]; then
     rm -rf /etc/elasticsearch /var/lib/elasticsearch /var/log/elasticsearch /usr/share/elasticsearch
