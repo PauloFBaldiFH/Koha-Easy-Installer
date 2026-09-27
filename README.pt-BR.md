@@ -150,6 +150,10 @@ Depois de alterar o `installer`, gere de novo o checksum usado pela autoatualiza
 sha256sum installer > installer.sha256
 ```
 
+## Licença
+
+O Koha Easy Installer & Manager é software livre sob a [Licença Pública Geral GNU v3.0 ou posterior](LICENSE) (GPL-3.0-or-later), a mesma licença do Koha. Você pode usar, estudar, compartilhar e modificar; se distribuir versões modificadas, elas devem continuar sob a GPL e com o código-fonte disponível. É fornecido **sem garantia**.
+
 ## Apoie o projeto
 
 - Pix: `076.650.449.21`
