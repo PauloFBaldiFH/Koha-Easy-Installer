@@ -60,7 +60,7 @@ sudo config.sh
 ### Depois de instalar
 
 1. Abra a interface do Staff em `http://IP-DO-SERVIDOR:8080`.
-2. Entre com o usuário e a senha do banco de dados mostrados no fim da instalação (também salvos em `/root/credenciais_koha.txt`) e conclua o **Web Installer** do Koha.
+2. Entre com o usuário e a senha do banco de dados mostrados no fim da instalação (também salvos em `/root/koha_credentials.txt`) e conclua o **Web Installer** do Koha.
 3. De volta ao painel, crie seu próprio superbibliotecário (**9 – Configurações do Koha > Criar superbibliotecário**).
 4. O catálogo público (OPAC) fica em `http://IP-DO-SERVIDOR:80`.
 
@@ -102,7 +102,7 @@ Instaladas em `/etc/cron.d/koha_tasks`:
 
 | Caminho | Conteúdo |
 |---------|----------|
-| `/root/credenciais_koha.txt` | Credenciais de primeiro acesso |
+| `/root/koha_credentials.txt` | Credenciais de primeiro acesso |
 | `/etc/koha/sites/library/koha-conf.xml` | Configuração da instância do Koha |
 | `/var/backups/koha_sql`, `/var/backups/koha_marc` | Backups locais |
 | `/etc/koha-easy-install/` | Configurações do painel (idioma, backup) |
