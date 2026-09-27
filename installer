@@ -92,19 +92,24 @@ declare -A _TRANS_CACHE
 mkdir -p "$CONFIG_DIR" 2>/dev/null
 CACHE_FILE="${CONFIG_DIR}/translations_${SYS_LANG:-en}.cache"
 
-# Baixa o arquivo do GitHub se não for inglês e não existir no HD
+# 1. Puxa primeiro do cache local da pasta lang/ se existir
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_CACHE="${_SCRIPT_DIR}/lang/${SYS_LANG:-pt}.cache"
+if [ -f "$LOCAL_CACHE" ]; then
+    cp -f "$LOCAL_CACHE" "$CACHE_FILE" 2>/dev/null || true
+fi
+
+# 2. Baixa do GitHub apenas se ainda não existir localmente
 if [ ! -f "$CACHE_FILE" ] && [ "${SYS_LANG:-en}" != "en" ]; then
     if command -v curl >/dev/null 2>&1; then
         curl -4fsS --connect-timeout 3 --max-time 10 "${LANG_REPO_URL}/${SYS_LANG}.cache" -o "$CACHE_FILE" 2>/dev/null || true
     fi
 fi
 
-# Carrega o cache persistente (HD) para a memória tratando Base64 com segurança
+# 3. Carrega o cache para a memória tratando Base64 com segurança
 if [ -f "$CACHE_FILE" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-        k_b64="${line%%=*}"
-        v_b64="${line#*=}"
+    while IFS='|' read -r k_b64 v_b64 || [ -n "$k_b64" ]; do
+        [[ "$k_b64" =~ ^#.*$ || -z "$k_b64" ]] && continue
         if [ -n "$k_b64" ] && [ -n "$v_b64" ]; then
             _TRANS_CACHE["$(printf '%s' "$k_b64" | base64 -d 2>/dev/null)"]="$(printf '%s' "$v_b64" | base64 -d 2>/dev/null)"
         fi
@@ -335,13 +340,78 @@ if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
         exit 1
     }
 fi
+
 # ======================================================================
 # GUI & HELPER FUNCTIONS
 # ======================================================================
-msg_info() { whiptail --title "$1" --msgbox "$2" ${3:-12} ${4:-74} 3>&1 1>&2 2>&3; }
-msg_ok() { whiptail --title "OK" --msgbox "$1" ${2:-10} ${3:-70} 3>&1 1>&2 2>&3; }
-msg_error() { whiptail --title "${1:-Error}" --msgbox "$2" ${3:-10} ${4:-74} 3>&1 1>&2 2>&3; }
-prompt_yes_no() { whiptail --title "$1" --yesno "$2" ${3:-12} ${4:-74} 3>&1 1>&2 2>&3; }
+run_sql() {
+    mysql --default-character-set=utf8mb4 -Nse "$1" 2>/dev/null
+}
+
+is_database_ready() {
+    mysql -e "SELECT 1 FROM ${DB_NAME}.systempreferences LIMIT 1;" >/dev/null 2>&1
+}
+
+require_koha() {
+    if ! is_koha_installed; then
+        msg_error "" "$(t "Koha is not installed yet. Please run option 1 first.")" 9 70
+        return 1
+    fi
+    return 0
+}
+
+require_database() {
+    if ! is_koha_installed || ! mysql -e "USE ${DB_NAME};" >/dev/null 2>&1; then
+        msg_error "" "$(t "Koha database not found. Please install Koha first.")" 9 70
+        return 1
+    fi
+    return 0
+}
+
+get_ssh_ports() {
+    local ports
+    ports=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo "${ports:-22}"
+}
+
+adjust_elasticsearch_heap() {
+    local jvm_dir="/etc/elasticsearch/jvm.options.d"
+    mkdir -p "$jvm_dir" 2>/dev/null || return 1
+    local ram_gb
+    ram_gb=$(awk '/MemTotal:/ {printf "%d", ($2/1024/1024)/2}' /proc/meminfo)
+    [ "${ram_gb:-0}" -lt 1 ] && ram_gb=1
+    [ "${ram_gb:-0}" -gt 4 ] && ram_gb=4
+    cat > "${jvm_dir}/koha_heap.options" << EOF
+-Xms${ram_gb}g
+-Xmx${ram_gb}g
+EOF
+    return 0
+}
+
+msg_info() { whiptail --title "$1" --msgbox "$2" ${3:-12} ${4:-74}; }
+msg_ok() { whiptail --title "OK" --msgbox "$1" ${2:-10} ${3:-70}; }
+msg_error() { whiptail --title "${1:-Error}" --msgbox "$2" ${3:-10} ${4:-74}; }
+
+prompt_yes_no() {
+    local title="${1:-Aviso}"
+    local message="${2:-Deseja continuar?}"
+    local h="${3:-12}"
+    local w="${4:-74}"
+
+    if command -v whiptail >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
+        whiptail --title "$title" --yesno "$message" "$h" "$w"
+        return $?
+    fi
+
+    printf '\n[%s]\n%s\n' "$title" "$message"
+    local ans
+    read -r -p "[S/n]: " ans
+    case "$ans" in
+        n|N|nao|NAO|não|NÃO|no|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 display_explanation() { echo -e "\e[1;36m>>> $1\e[0m"; }
 pause_terminal() { read -r -p "$(t "Press [ENTER] to return to menu...")"; }
 
@@ -725,9 +795,14 @@ show_validation_report() {
 }
 
 validate_pre_installation() {
-    msg_info "$(t "Welcome to Koha Easy Installer!")" \
-        "$(t "This project democratizes collection management, automating the setup of a robust, fast and free infrastructure for libraries.\n\nThe wizard will install and tune MariaDB, Apache, Memcached and Koha.\n\nEstimated time: 10 to 30 minutes.\nPlease do not close the terminal during installation.")" 16 78
-        
+    local welcome_body
+    welcome_body="$(t "This project democratizes collection management, automating the setup of a robust, fast and free infrastructure for libraries.")\n\n"
+    welcome_body+="$(t "The wizard will install and tune MariaDB, Apache, Memcached and Koha.")\n\n"
+    welcome_body+="$(t "Estimated time: 10 to 30 minutes.")\n"
+    welcome_body+="$(t "Please do not close the terminal during installation.")"
+
+    msg_info "$(t "Welcome to Koha Easy Installer!")" "$welcome_body" 16 78
+    
     clear
     local free_disk p
     v_reset "pre-installation"
@@ -758,28 +833,59 @@ validate_pre_installation() {
     elif [ "${free_disk:-0}" -ge 5120 ] 2>/dev/null; then v_warn "Disk: ${free_disk} MB ($(t "tight for Elasticsearch"))."
     else v_fail "Disk: ${free_disk:-0} MB ($(t "recommended minimum: 5 GB"))."; fi
 
+    local busy_ports=() proc_info=""
     for p in 80 8080; do
         if ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "([.:]$p)\$"; then
-            v_warn "TCP $p $(t "already in use (another web server?)")."
+            local p_owner
+            p_owner=$(ss -lntp 2>/dev/null | grep -E "([.:]$p)[[:space:]]" | grep -oP 'users:\(\("\K[^"]+' | head -n1)
+            busy_ports+=("$p")
+            proc_info+="- $(t "Port") $p: ${p_owner:-$(t "unknown process")}\n"
+            v_warn "TCP $p $(t "already in use by") '${p_owner:-$(t "unknown")}'."
         else
             v_ok "TCP $p $(t "free")."
         fi
     done
 
+    if [ ${#busy_ports[@]} -gt 0 ]; then
+        local release_msg
+        release_msg="$(printf "%s\n\n%b\n%s" \
+            "$(t "The following ports required by Koha are currently in use:")" \
+            "$proc_info" \
+            "$(t "Do you want to stop the occupying services to free the ports automatically?")")"
+
+        if prompt_yes_no "$(t "Occupied Ports Detected")" "$release_msg" 15 76; then
+            display_explanation "Stopping web services to free ports 80 and 8080..."
+            systemctl stop apache2 nginx 2>/dev/null || true
+            for p in "${busy_ports[@]}"; do
+                fuser -k "${p}/tcp" >/dev/null 2>&1 || true
+            done
+            sleep 1
+            v_ok "$(t "Ports 80 and 8080 freed successfully.")"
+        fi
+    fi
+
     if [ "$V_FAIL" -ne 0 ]; then
         local err_list
         err_list=$(grep -E '\[FAIL\]' "$VALIDATION_LOG" | sed -E 's/\[FAIL\] //' | head -n 4)
         
-        if prompt_yes_no "$(t "Pre-validation Failed")" \
-            "$(t "System does not meet minimum requirements ($V_FAIL critical error).\n\nReason(s):\n${err_list}\n\nDo you want to open the full report for more details?")" 16 78; then
+        local fail_msg
+        fail_msg=$(printf "$(t "System does not meet minimum requirements (%s critical error).\n\nReason(s):\n%s\n\nDo you want to open the full report for more details?")" "$V_FAIL" "$err_list")
+        
+        if prompt_yes_no "$(t "Pre-validation Failed")" "$fail_msg" 16 78; then
             show_validation_report
         fi
         return 1
     fi
-    prompt_yes_no "$(t "Pre-validation OK")" \
-        "$(t "No critical errors.\n\nOK: $V_OK   Warnings: $V_WARN\n\nStart the installation now?")" 12 70
-}
+    
+    local ok_msg
+    ok_msg=$(printf "%s\n\n%s: %s   %s: %s\n\n%s" \
+        "$(t "No critical errors.")" \
+        "$(t "OK")" "$V_OK" \
+        "$(t "Warnings")" "$V_WARN" \
+        "$(t "Start the installation now?")")
 
+    prompt_yes_no "$(t "Pre-validation OK")" "$ok_msg" 12 70
+}
 # ======================================================================
 # SEARCH ENGINE: XML, INDEXER & BROKER
 # ======================================================================
@@ -1783,12 +1889,18 @@ EOF
         result_msg="$(t "INSTALLATION COMPLETE, BUT WITH FAILURES ($V_FAIL).\nThe system may have issues.\n\n")"
     fi
 
-    local report_text="${result_msg}"
-    report_text+="$(t "ACCESS:\n  Staff: http://${ip}:8080\n  OPAC:  http://${ip}:80\n\nCREDENTIALS (saved in /root/credenciais_koha.txt):\n  User: ${DB_NAME}\n  Pass: ${db_pass}\n\nNEXT STEP: open Staff in browser for the Web Installer (or use option 3 with a backup).\n\nValidation: OK=$V_OK  Warnings=$V_WARN  Failures=$V_FAIL")"
+local report_text="${result_msg}\n\n"
+    report_text+="$(t "ACCESS:")\n"
+    report_text+="  Staff: http://${ip}:8080\n"
+    report_text+="  OPAC:  http://${ip}:80\n\n"
+    report_text+="$(t "CREDENTIALS (saved in /root/credenciais_koha.txt):")\n"
+    report_text+="  $(t "User:") ${DB_NAME}\n"
+    report_text+="  $(t "Pass:") ${db_pass}\n\n"
+    report_text+="$(t "NEXT STEP: open Staff in browser for the Web Installer (or use option 3 with a backup).")\n\n"
+    report_text+="$(t "Validation:") OK=$V_OK  $(t "Warnings:") $V_WARN  $(t "Failures:") $V_FAIL"
 
     whiptail --title "$(t "Installation Complete")" \
         --scrolltext --msgbox "$report_text" 22 78 2>/dev/null || true
-
     if [ "$V_FAIL" -gt 0 ] || [ "$V_WARN" -gt 0 ]; then
         local diag_msg
         if [ "$V_FAIL" -gt 0 ]; then
@@ -2117,8 +2229,18 @@ function_test_backup() {
         msg_error "" "$(t "The latest backup failed gzip validation and will not be tested.")" 9 74
         return 1
     fi
-    prompt_yes_no "$(t "Test Backup")" \
-"$(t "A backup is only worth it if it restores. This test imports the newest\nfile into a temporary database and checks it.\nProduction data is NOT touched.\n\nFile: $(basename "$newest")\nDate: $(date -r "$newest" '+%Y-%m-%d %H:%M')\n\nRun the test now?")" 17 76 || return 0
+
+    local b_name b_date p_msg
+    b_name="$(basename "$newest")"
+    b_date="$(date -r "$newest" '+%Y-%m-%d %H:%M')"
+    p_msg="$(printf "%s\n\n%s: %s\n%s: %s\n\n%s" \
+        "$(t "A backup is only worth it if it restores. This test imports the newest file into a temporary database and checks it. Production data is NOT touched.")" \
+        "$(t "File")" "$b_name" \
+        "$(t "Date")" "$b_date" \
+        "$(t "Run the test now?")")"
+
+    prompt_yes_no "$(t "Test Backup")" "$p_msg" 15 76 || return 0
+
     clear
     local test_db="koha_teste_restauracao"
     display_explanation "Importing into a temporary database..."
@@ -2131,16 +2253,28 @@ function_test_backup() {
         msg_error "" "$(t "The backup DID NOT restore. Check the file urgently.")" 9 72
         return 1
     fi
+
     local tab bib usu
     tab=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${test_db}';")
     bib=$(run_sql "SELECT COUNT(*) FROM ${test_db}.biblio;")
     usu=$(run_sql "SELECT COUNT(*) FROM ${test_db}.borrowers;")
     mysql -e "DROP DATABASE IF EXISTS ${test_db};" >/dev/null 2>&1 || true
     log "backup test: $newest tables=$tab biblios=$bib"
+
     if [ "${tab:-0}" -gt 50 ] 2>/dev/null && [ "${bib:-0}" -ge 0 ] 2>/dev/null; then
-        msg_ok "$(t "BACKUP IS INTACT AND RESTORABLE.\n\nFile: $(basename "$newest")\nTables: ${tab}\nBibliographic records: ${bib}\nPatrons: ${usu}")" 13 74
+        local ok_test_msg
+        ok_test_msg="$(printf "%s\n\n%s: %s\n%s: %s\n%s: %s\n%s: %s" \
+            "$(t "BACKUP IS INTACT AND RESTORABLE.")" \
+            "$(t "File")" "$b_name" \
+            "$(t "Tables")" "${tab}" \
+            "$(t "Bibliographic records")" "${bib}" \
+            "$(t "Patrons")" "${usu}")"
+
+        msg_ok "$ok_test_msg" 13 74
     else
-        msg_error "" "$(t "The backup imported but has only ${tab} tables. Suspicious.")" 9 72
+        local err_tab_msg
+        err_tab_msg="$(printf "$(t "The backup imported but has only %s tables. Suspicious.")" "${tab}")"
+        msg_error "" "$err_tab_msg" 9 72
         return 1
     fi
     return 0
@@ -2170,23 +2304,33 @@ function_install_languages() {
         created_mock=1
     fi
 
+# ==================================================================
+    # LANGUAGE SELECTOR (Endônimos Nativos)
     # ==================================================================
-    # LANGUAGE SELECTOR
-    # ==================================================================
-    local items=()
-    local pairs=()
-    local pair
-    local code
-    local name
     local choice
-
-    IFS=';' read -ra pairs <<< "$LANGUAGES_KOHA"
-
-    for pair in "${pairs[@]}"; do
-        code="${pair%%:*}"
-        name="${pair#*:}"
-        items+=("$code" "$name")
-    done
+    local items=(
+        "en-GB" "English"
+        "pt-BR" "Português (Brasil)"
+        "es-ES" "Español"
+        "fr-FR" "Français"
+        "it-IT" "Italiano"
+        "de-DE" "Deutsch"
+        "nl-NL" "Nederlands"
+        "sv-SE" "Svenska"
+        "pl-PL" "Polski"
+        "cs-CZ" "Čeština"
+        "ru-RU" "Русский"
+        "uk-UA" "Українська"
+        "tr-TR" "Türkçe"
+        "tl-PH" "Tagalog (Filipino)"
+        "ar-Arab" "العربية"
+        "fa-Arab" "فارسی"
+        "hi" "हिन्दी"
+        "bn-IN" "বাংলা"
+        "vi-VN" "Tiếng Việt"
+        "zh-Hans-CN" "中文 (简体)"
+        "ja-Jpan-JP" "日本語"
+    )
 
     choice=$(
         whiptail \
@@ -3534,6 +3678,70 @@ function_interoperability() {
 # ======================================================================
 # 18. CLOCK AND TIMEZONE
 # ======================================================================
+choose_timezone() {
+    local detected_tz=""
+
+    # 1. Automatic system detection
+    if command -v timedatectl >/dev/null 2>&1; then
+        detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    fi
+    if [ -z "$detected_tz" ] && [ -f /etc/timezone ]; then
+        detected_tz=$(tr -d '[:space:]' < /etc/timezone)
+    fi
+    if [ -z "$detected_tz" ] && [ -L /etc/localtime ]; then
+        detected_tz=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+    fi
+    [ -z "$detected_tz" ] && detected_tz="UTC"
+
+    # 2. Confirmation prompt for detected timezone
+    if whiptail --title "$(t "Timezone Configuration")" --yesno \
+        "$(printf "$(t "Detected system timezone: %s\n\nDo you want to use this timezone?")" "$detected_tz")" \
+        10 65; then
+        printf '%s' "$detected_tz"
+        return 0
+    fi
+
+    # 3. Global selection by Region -> City
+    local regions
+    mapfile -t regions < <(timedatectl list-timezones 2>/dev/null | cut -d/ -f1 | sort -u | grep -Ev '^(posix|right|SystemV)$')
+    if [ ${#regions[@]} -eq 0 ]; then
+        regions=("Africa" "America" "Antarctica" "Arctic" "Asia" "Atlantic" "Australia" "Europe" "Indian" "Pacific" "UTC")
+    fi
+
+    local region_menu=()
+    for reg in "${regions[@]}"; do
+        region_menu+=("$reg" "")
+    done
+
+    local chosen_region
+    chosen_region=$(whiptail --title "$(t "Global Timezone Selection")" \
+        --menu "$(t "Select your region/continent:")" 18 60 10 \
+        "${region_menu[@]}" 3>&1 1>&2 2>&3) || return 1
+
+    if [ "$chosen_region" = "UTC" ]; then
+        printf '%s' "UTC"
+        return 0
+    fi
+
+    local cities
+    mapfile -t cities < <(timedatectl list-timezones 2>/dev/null | grep "^${chosen_region}/" | sed "s|^${chosen_region}/||" | sort)
+    local city_menu=()
+    for city in "${cities[@]}"; do
+        city_menu+=("$city" "")
+    done
+
+    local chosen_city
+    chosen_city=$(whiptail --title "$(t "Global Timezone Selection")" \
+        --menu "$(t "Select the closest city/timezone:")" 20 65 12 \
+        "${city_menu[@]}" 3>&1 1>&2 2>&3) || return 1
+
+    if [ -n "$chosen_city" ]; then
+        printf '%s' "${chosen_region}/${chosen_city}"
+    else
+        printf '%s' "$detected_tz"
+    fi
+}
+
 function_configure_clock() {
     local tz
     tz=$(choose_timezone) || { systemctl restart cron >/dev/null 2>&1; return 0; }
@@ -3878,27 +4086,25 @@ function_about() {
     local tmp_about
     tmp_about=$(mktemp /tmp/koha_about.XXXXXX) || return 1
 
-    cat > "$tmp_about" << 'EOF'
-Koha Easy Installer & Manager
+    local txt_about
+    txt_about="Koha Easy Installer & Manager\n\n"
+    txt_about+="$(t "Born from real-life experience facing technical barriers in collection management, designed for libraries without budget for expensive commercial systems or dedicated technical support.")\n\n"
+    txt_about+="$(t "Support this open-source initiative:")\n"
+    txt_about+="  * Pix (Brazil)  : 076.650.449.21\n"
+    txt_about+="  * Bitcoin (BTC) : bc1qw0kvacdkzul0panuppxcv90y08ah443m2z89tx\n\n"
+    txt_about+="$(t "If this project helped you:")\n"
+    txt_about+="  ★ $(t "Star the repository on GitHub!")\n"
+    txt_about+="  ★ $(t "Share it with colleagues and other institutions.")\n\n"
+    txt_about+="$(t "Official Repository:")\n"
+    txt_about+="  https://github.com/BibliotecaPalotina/koha-easy-install\n\n"
+    txt_about+="----------------------------------------------------------------------\n"
+    txt_about+="$(t "Created with dedication by Paulo F. Baldi FH.")\n"
+    txt_about+="$(t "Library Assistant - Castro Alves Public Library")\n"
+    txt_about+="Palotina, Paraná, Brazil"
 
-Born from real-life experience facing technical barriers in collection
-management, designed for libraries without budget for expensive commercial
-systems or dedicated technical support.
+    printf '%b\n' "$txt_about" > "$tmp_about"
 
-If this project helped you:
-  ★ Star the repository on GitHub!
-  ★ Share it with colleagues and other institutions.
-
-Official Repository:
-  https://github.com/BibliotecaPalotina/koha-easy-install
-
-----------------------------------------------------------------------
-Created with dedication by Paulo F. Baldi FH.
-Library Assistant - Castro Alves Public Library
-Palotina, Paraná, Brazil
-EOF
-
-    whiptail --title "$(t "About")" --textbox "$tmp_about" 22 78 2>/dev/null || true
+    whiptail --title "$(t "About")" --textbox "$tmp_about" 25 78 2>/dev/null || true
     rm -f "$tmp_about"
 }
 
@@ -3908,12 +4114,28 @@ EOF
 if [ ! -f "$TRANSLATION_CONFIG" ]; then
     _init_choice=$(whiptail --title "Language / Idioma" \
         --nocancel \
-        --menu "Select your language / Selecione o idioma:" 16 70 5 \
+        --menu "Select your language / Selecione o idioma:" 22 72 14 \
+        "en-GB" "English" \
         "pt-BR" "Português (Brasil)" \
         "es-ES" "Español" \
-        "en-GB" "English (UK)" \
-        "pt-PT" "Português (Portugal)" \
         "fr-FR" "Français" \
+        "it-IT" "Italiano" \
+        "de-DE" "Deutsch" \
+        "nl-NL" "Nederlands" \
+        "sv-SE" "Svenska" \
+        "pl-PL" "Polski" \
+        "cs-CZ" "Čeština" \
+        "ru-RU" "Русский" \
+        "uk-UA" "Українська" \
+        "tr-TR" "Türkçe" \
+        "tl-PH" "Tagalog (Filipino)" \
+        "ar-Arab" "العربية" \
+        "fa-Arab" "فارسی" \
+        "hi" "हिन्दी" \
+        "bn-IN" "বাংলা" \
+        "vi-VN" "Tiếng Việt" \
+        "zh-Hans-CN" "中文 (简体)" \
+        "ja-Jpan-JP" "日本語" \
         3>&1 1>&2 2>&3)
 
     if [ -n "$_init_choice" ]; then
