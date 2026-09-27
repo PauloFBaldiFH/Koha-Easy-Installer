@@ -6,6 +6,8 @@
 # Single, self-sufficient file. Updates via "Update this panel" option.
 # ======================================================================
 
+# Errors are handled explicitly (no "set -e"): whiptail returns non-zero
+# for "Cancel"/"No", and every one of those would otherwise end the panel.
 set -o pipefail
 umask 022
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -19,8 +21,17 @@ restore_apt_timers() {
     systemctl start apt-daily.timer apt-daily-upgrade.timer unattended-upgrades >/dev/null 2>&1
     APT_TIMERS_STOPPED="no"
 }
+# Leftovers of a restore or backup test interrupted before it touched the
+# catalog: the temporary database, a partial file and the maintenance
+# marker that keeps the indexing watchdogs away.
+RESTORE_TRIAL_DB=""
+CLEANUP_FILE=""
+MAINT_MARKER_OWNED=""
 on_exit() {
     restore_apt_timers
+    [ -n "$RESTORE_TRIAL_DB" ] && mysql -e "DROP DATABASE IF EXISTS \`${RESTORE_TRIAL_DB}\`;" >/dev/null 2>&1
+    [ -n "$CLEANUP_FILE" ] && rm -f "$CLEANUP_FILE"
+    [ -n "$MAINT_MARKER_OWNED" ] && rm -f "$MAINT_MARKER_OWNED"
     rm -f /tmp/koha_tmp_* 2>/dev/null || true
 }
 # CTRL+C only returns to the menu inside screens that explicitly allow it
@@ -32,12 +43,22 @@ on_interrupt() {
     echo ""
     exit 130
 }
+SIGNALS_SHIELDED=0
+unshield_signals() {
+    trap on_interrupt INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    SIGNALS_SHIELDED=0
+}
+# While the live catalog is being replaced, an interruption (CTRL+C, lost
+# SSH connection, kill) would leave Koha without a database. The signals are
+# ignored until the restore reaches a consistent state; the commands started
+# meanwhile inherit the ignored signals (mysql also gets --sigint-ignore).
+shield_signals() { trap '' INT TERM HUP; SIGNALS_SHIELDED=1; }
 trap on_exit EXIT
-trap on_interrupt INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+unshield_signals
 
-PANEL_VERSION=" 1.0.1"
+PANEL_VERSION=" 1.1.0"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -298,35 +319,17 @@ load_panel_translations() {
     [ "${SYS_LANG:-en}" = "en" ] && return 0
     local cache k v
     cache="$(_find_translation_cache "$SYS_LANG")" || return 0
-    if command -v python3 >/dev/null 2>&1; then
-        while IFS= read -r -d '' k && IFS= read -r -d '' v; do
-            _TRANS_CACHE["$k"]="$v"
-        done < <(python3 - "$cache" 2>/dev/null << 'PYEOF'
-import sys, base64
-out = sys.stdout.buffer
-with open(sys.argv[1], "rb") as fh:
-    for line in fh:
-        line = line.strip()
-        if not line or line.startswith(b"#") or b"|" not in line:
-            continue
-        k, v = line.split(b"|", 1)
-        try:
-            k = base64.b64decode(k, validate=True)
-            v = base64.b64decode(v, validate=True)
-        except Exception:
-            continue
-        if k and v and b"\0" not in k and b"\0" not in v:
-            out.write(k + b"\0" + v + b"\0")
-PYEOF
-)
-    else
-        while IFS='|' read -r k v || [ -n "$k" ]; do
-            [ -z "$k" ] || [ -z "$v" ] && continue
-            k="$(printf '%s' "$k" | base64 -d 2>/dev/null)" || continue
-            v="$(printf '%s' "$v" | base64 -d 2>/dev/null)" || continue
-            [ -n "$k" ] && [ -n "$v" ] && _TRANS_CACHE["$k"]="$v"
-        done < "$cache"
-    fi
+    # The whole dictionary is decoded by a single base64 run (one process per
+    # line took seconds): each "key|value" line becomes key, NUL, value, NUL,
+    # "AA==" being a NUL byte. Lines that are not valid base64 are skipped so
+    # they cannot shift the pairs.
+    while IFS= read -r -d '' k && IFS= read -r -d '' v; do
+        [ -n "$k" ] && [ -n "$v" ] && _TRANS_CACHE["$k"]="$v"
+    done < <(awk -F'|' '
+        NF == 2 && length($1) % 4 == 0 && length($2) % 4 == 0 &&
+        $1 ~ /^[A-Za-z0-9+\/]+(==|=)?$/ && $2 ~ /^[A-Za-z0-9+\/]+(==|=)?$/ {
+            print $1; print "AA=="; print $2; print "AA=="
+        }' "$cache" | base64 -d 2>/dev/null)
     return 0
 }
 
@@ -441,6 +444,15 @@ apt_log_tail() {
     tail -n "${1:-8}" "$APT_LOG" 2>/dev/null | cut -c1-76
 }
 
+# One APT source line, pinned to the architecture dpkg reports (amd64,
+# arm64...): nothing assumes x86_64, and foreign architectures enabled on
+# the machine (e.g. i386 for Wine) do not query repositories without them.
+apt_source_line() {
+    local keyring="$1" url="$2" suite="$3" comp="$4" arch
+    arch=$(dpkg --print-architecture 2>/dev/null)
+    printf 'deb [%ssigned-by=%s] %s %s %s\n' "${arch:+arch=$arch }" "$keyring" "$url" "$suite" "$comp"
+}
+
 # ======================================================================
 # 4. PRIVILEGE ESCALATION
 # ======================================================================
@@ -479,22 +491,43 @@ if ! flock -n 9; then
 fi
 
 # ======================================================================
-# 5. EXECUTION LOCKS (PID BASED) - BACKUP ONLY
+# 5. BACKUP / RESTORE LOCK
 # ======================================================================
-BACKUP_LOCK_FILE="/var/run/koha_backup.pid"
+# The same lock as the cron backups (/root/backup_sql.sh, backup_marc.sh):
+# a nightly backup never dumps a catalog that is being restored, and a
+# restore never starts while a backup is being written. The kernel releases
+# it if the panel dies.
+BACKUP_LOCK_FILE="/var/lock/koha_backup.lock"
 backup_lock_acquire() {
-    if [ -f "$BACKUP_LOCK_FILE" ]; then
-        local b_pid
-        b_pid=$(cat "$BACKUP_LOCK_FILE" 2>/dev/null | tr -dc '0-9')
-        if [ -n "$b_pid" ] && kill -0 "$b_pid" 2>/dev/null; then
-            return 1
-        fi
-    fi
-    echo $$ > "$BACKUP_LOCK_FILE"
-    return 0
+    { exec 8>>"$BACKUP_LOCK_FILE"; } 2>/dev/null || return 1
+    flock -n 8 && return 0
+    exec 8>&-
+    return 1
 }
 backup_lock_release() {
-    rm -f "$BACKUP_LOCK_FILE" 2>/dev/null || true
+    exec 8>&-
+    return 0
+}
+
+# Starts or restarts Koha daemons (Plack, Zebra, workers, indexers) without
+# the panel's lock descriptors (7 to 9): a daemon inheriting them would keep
+# the locks after the panel exits, so "sudo config.sh" would say it is
+# already running and every nightly backup would be skipped.
+koha_ctl() { "$@" 7>&- 8>&- 9>&-; }
+plack_restart() { koha_ctl /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1; }
+
+# Maintenance marker: while it names a live panel process, the indexing
+# watchdogs leave Koha alone (restore, full reindex, engine switch).
+MARKER_DIR="/run/koha-easy-install"
+maintenance_begin() {
+    mkdir -p "$MARKER_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$$" > "${MARKER_DIR}/maintenance.in-progress" && MAINT_MARKER_OWNED="${MARKER_DIR}/maintenance.in-progress"
+    return 0
+}
+maintenance_end() {
+    [ -n "$MAINT_MARKER_OWNED" ] && rm -f "$MAINT_MARKER_OWNED"
+    MAINT_MARKER_OWNED=""
+    return 0
 }
 
 # ======================================================================
@@ -532,7 +565,7 @@ log "===== panel started (v$PANEL_VERSION, user=$REAL_USER) ====="
 timedatectl set-ntp true >/dev/null 2>&1 || true
 
 MISSING_DEPS=()
-for dep in whiptail:whiptail curl:curl python3:python3 unzip:unzip gpg:gpg wget:wget fuser:psmisc ss:iproute2 flock:util-linux; do
+for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg wget:wget fuser:psmisc ss:iproute2 flock:util-linux; do
     if ! command -v "${dep%%:*}" >/dev/null 2>&1; then
         MISSING_DEPS+=("${dep#*:}")
     fi
@@ -573,6 +606,50 @@ require_database() {
         return 1
     fi
     return 0
+}
+
+# Checks the administrator connection (root through the local socket) used
+# for every DDL/DML of the panel. A server that is down is started once and
+# given DB_WAIT_SECONDS to answer.
+# Returns 0 = OK, 1 = MariaDB down, 2 = login refused.
+DB_WAIT_SECONDS=30
+db_admin_check() {
+    local err i
+    for ((i = 0; i <= DB_WAIT_SECONDS; i++)); do
+        err=$(mysql -e 'SELECT 1;' 2>&1 >/dev/null) && return 0
+        case "$err" in *"Access denied"*|*1045*|*1698*) return 2 ;; esac
+        if [ "$i" -eq 0 ]; then
+            systemctl start mariadb >/dev/null 2>&1 || koha_ctl service mariadb start >/dev/null 2>&1
+        fi
+        [ "$i" -lt "$DB_WAIT_SECONDS" ] && sleep 1
+    done
+    return 1
+}
+
+require_db_admin() {
+    local rc=0
+    db_admin_check || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) msg_error "" "$(t "MariaDB refused the administrator login (root through the local socket).\nNothing was changed.\n\nCheck the root account or /root/.my.cnf.")" 12 76 ;;
+        *) msg_error "" "$(t "MariaDB is not accepting connections and could not be started.\nNothing was changed.\n\nCheck: systemctl status mariadb")" 12 76 ;;
+    esac
+    return 1
+}
+
+# Logs in as the Koha database user exactly like Koha does (koha-conf.xml
+# <hostname>/<port>): "localhost" goes through the socket, an IP address
+# through TCP, and MariaDB treats user@localhost and user@127.0.0.1 as two
+# different accounts.
+db_app_login_ok() {
+    local host port user pass db args
+    host=$(koha_conf_value hostname); port=$(koha_conf_value port)
+    user=$(koha_conf_value user); db=$(koha_conf_value database)
+    pass=$(get_database_password)
+    [ -n "$user" ] && [ -n "$pass" ] || return 1
+    args=(--no-defaults -u "$user" -D "${db:-$DB_NAME}")
+    [ "${host:-localhost}" != "localhost" ] && args+=(-h "$host" -P "${port:-3306}" --protocol=TCP)
+    MYSQL_PWD="$pass" mysql "${args[@]}" -e 'SELECT 1;' >/dev/null 2>&1
 }
 
 get_ssh_ports() {
@@ -663,11 +740,13 @@ get_database_password() {
 
 is_koha_installed() { [ -f "$KOHA_CONF" ] && return 0 || return 1; }
 
-# Number of tables of the Koha database (0 when it does not exist).
+# Number of tables of the Koha database (0 when it does not exist). Fails
+# when MariaDB cannot be asked: "unknown" must never be taken for "empty".
 koha_table_count() {
     local n
-    n=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
-    printf '%s' "${n:-0}"
+    n=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';") || return 1
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$n"
 }
 
 # Value of a simple tag of koha-conf.xml (<user>, <database>, <pass>...).
@@ -683,22 +762,33 @@ koha_conf_value() {
         | sed -n "s:.*<$1>\\([^<]*\\)</$1>.*:\\1:p" | head -n1
 }
 
-# Makes sure the Koha database user exists and has every privilege on the
-# database, whatever host it was created with ('localhost', '%', ...).
-# A GRANT to a host that does not exist used to abort the restore halfway.
+# Makes sure the Koha database user exists, with the password of
+# koha-conf.xml and every privilege on the database, for each host it was
+# created with ('localhost', '%', ...) plus the one Koha really connects
+# from: <hostname>127.0.0.1</hostname> means TCP, i.e. user@127.0.0.1, not
+# user@localhost. A GRANT to a host that does not exist used to abort the
+# restore halfway.
 ensure_db_grants() {
-    local user pass hosts h
+    local user pass hosts h conn_host sql_pass
     user=$(koha_conf_value user); [ -z "$user" ] && user="$DB_NAME"
     pass=$(get_database_password)
     [[ "$user" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-    hosts=$(run_sql "SELECT Host FROM mysql.user WHERE User='${user}';")
-    if [ -z "$hosts" ]; then
-        mysql -e "CREATE USER '${user}'@'localhost' IDENTIFIED BY '${pass//\'/\'\'}';" 2>>"${LOG_DIR}/mysql.log" || return 1
-        hosts="localhost"
-    fi
+    [ -n "$pass" ] || return 1
+    sql_pass="${pass//\'/\'\'}"
+    hosts=" $(run_sql "SELECT Host FROM mysql.user WHERE User='${user}';" | tr '\n' ' ') "
+    [ -z "${hosts// /}" ] && hosts=" localhost "
+    conn_host=$(koha_conf_value hostname)
+    case "$conn_host" in
+        127.0.0.1|::1) [[ "$hosts" == *" $conn_host "* ]] || hosts+="$conn_host " ;;
+    esac
     for h in $hosts; do
         [[ "$h" =~ ^[A-Za-z0-9_.%:-]+$ ]] || continue
-        mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${user}'@'${h}';" 2>>"${LOG_DIR}/mysql.log"
+        # Through stdin: a password on the command line shows up in "ps".
+        mysql 2>>"${LOG_DIR}/mysql.log" <<SQLEOF || return 1
+CREATE USER IF NOT EXISTS '${user}'@'${h}' IDENTIFIED BY '${sql_pass}';
+ALTER USER '${user}'@'${h}' IDENTIFIED BY '${sql_pass}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${user}'@'${h}';
+SQLEOF
     done
     mysql -e "FLUSH PRIVILEGES;" 2>/dev/null
     return 0
@@ -717,13 +807,63 @@ plack_running() {
     [ -S "/var/run/koha/${INSTANCE}/plack.sock" ] && pgrep -f "starman.*${INSTANCE}" >/dev/null 2>&1
 }
 
+# Boot order: MariaDB and Memcached -> koha-common (Zebra, Plack, workers,
+# indexers) -> Apache, which proxies to Plack. systemd's "active" does not
+# mean "answering", so koha-common also waits (max. 60 s) until both really
+# respond before starting Plack.
+KOHA_WAIT_SCRIPT="/usr/local/bin/koha-wait-services.sh"
+install_boot_ordering() {
+    cat > "$KOHA_WAIT_SCRIPT" << 'EOF'
+#!/bin/bash
+# Koha Easy Installer: waits until MariaDB and Memcached answer (default 60 s)
+# so that Plack never starts before them. ExecStartPre of koha-common.
+set -euo pipefail
+max="${1:-60}"
+db_ok() { mysqladmin --connect-timeout=2 ping >/dev/null 2>&1; }
+mc_ok() {
+    timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/11211 && printf "version\r\n" >&3 &&
+        IFS= read -r -t 2 l <&3 && [[ "$l" == VERSION* ]]' 2>/dev/null
+}
+for ((i = 0; i < max; i++)); do
+    if db_ok && mc_ok; then exit 0; fi
+    sleep 1
+done
+db_ok || echo "koha-wait-services: MariaDB did not answer within ${max}s" >&2
+mc_ok || echo "koha-wait-services: Memcached did not answer within ${max}s" >&2
+exit 1
+EOF
+    chmod 755 "$KOHA_WAIT_SCRIPT"
+    chown root:root "$KOHA_WAIT_SCRIPT" 2>/dev/null
+    mkdir -p /etc/systemd/system/koha-common.service.d /etc/systemd/system/apache2.service.d
+    cat > /etc/systemd/system/koha-common.service.d/koha-easy-install.conf << EOF
+# Koha Easy Installer: Plack must start after Memcached and MariaDB.
+[Unit]
+Wants=memcached.service mariadb.service
+After=memcached.service mariadb.service network-online.target
+
+[Service]
+# "active" is not "answering": wait until both respond. The "-" lets Koha
+# start anyway (degraded) if one of them never comes up.
+ExecStartPre=-${KOHA_WAIT_SCRIPT}
+EOF
+    cat > /etc/systemd/system/apache2.service.d/koha-easy-install.conf << 'EOF'
+# Koha Easy Installer: Apache proxies to Plack, so it starts after koha-common.
+[Unit]
+After=koha-common.service
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+    return 0
+}
+
 # Koha only uses Memcached if it answers when Plack starts: a Plack started
 # first (e.g. after a reboot) runs without cache until it is restarted
 # ("Memcached: not running" in About Koha). This makes Memcached answer,
 # makes koha-conf.xml point to it, orders the services at boot and then
-# restarts Plack and Apache. Returns 1 if Memcached or Plack are not up.
+# restarts Plack and Apache. MariaDB is a hard dependency: without it Plack
+# is not started at all. Memcached is waited for, but Koha still starts
+# (without cache) if it never answers. Returns 1 if anything is not up.
 ensure_koha_services() {
-    local i servers
+    local i servers db_rc=0
     if ! command -v memcached >/dev/null 2>&1; then
         apt_install memcached libcache-memcached-fast-perl >/dev/null 2>&1
     fi
@@ -731,7 +871,7 @@ ensure_koha_services() {
         echo '-l 127.0.0.1' >> /etc/memcached.conf
     fi
     systemctl enable memcached >/dev/null 2>&1
-    systemctl restart memcached >/dev/null 2>&1 || service memcached restart >/dev/null 2>&1
+    systemctl restart memcached >/dev/null 2>&1 || koha_ctl service memcached restart >/dev/null 2>&1
     for i in 1 2 3 4 5 6 7 8 9 10; do
         memcached_alive && break
         sleep 1
@@ -744,25 +884,24 @@ ensure_koha_services() {
         fi
     fi
 
-    mkdir -p /etc/systemd/system/koha-common.service.d
-    cat > /etc/systemd/system/koha-common.service.d/koha-easy-install.conf << 'EOF'
-# Koha Easy Installer: Plack must start after Memcached and MariaDB.
-[Unit]
-Wants=memcached.service mariadb.service
-After=memcached.service mariadb.service network-online.target
-EOF
-    systemctl daemon-reload >/dev/null 2>&1
+    install_boot_ordering
 
-    /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
-    /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
-    sleep 1
-    /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+    db_admin_check || db_rc=$?
+    if [ "$db_rc" -ne 1 ]; then
+        koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
+        koha_ctl /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
+        sleep 1
+        koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+    else
+        log "MariaDB is down: Plack not started"
+    fi
     systemctl restart apache2 >/dev/null 2>&1
     for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ "$db_rc" -eq 1 ] && break
         plack_running && break
         sleep 1
     done
-    memcached_alive && plack_running
+    [ "$db_rc" -ne 1 ] && memcached_alive && plack_running
 }
 
 # Zebra is run by koha-zebra (koha-common has no systemd unit for it).
@@ -773,7 +912,7 @@ zebra_stop() {
     return 0
 }
 zebra_start() {
-    /usr/sbin/koha-zebra --start "$INSTANCE" >/dev/null 2>&1 \
+    koha_ctl /usr/sbin/koha-zebra --start "$INSTANCE" >/dev/null 2>&1 \
         || systemctl start "koha-zebra-daemon@${INSTANCE}" >/dev/null 2>&1
     sleep 1
     is_koha_zebra_running
@@ -782,6 +921,7 @@ zebra_start() {
 # Stops everything that keeps the database open (restore, reinstall).
 stop_koha_db_clients() {
     manage_koha_indexers stop
+    /usr/sbin/koha-indexer --stop --quiet "$INSTANCE" >/dev/null 2>&1
     /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
     /usr/sbin/koha-worker --stop "$INSTANCE" >/dev/null 2>&1
     /usr/sbin/koha-worker --stop --queue long_tasks "$INSTANCE" >/dev/null 2>&1
@@ -789,9 +929,19 @@ stop_koha_db_clients() {
 }
 
 start_koha_workers() {
-    /usr/sbin/koha-worker --start "$INSTANCE" >/dev/null 2>&1
-    /usr/sbin/koha-worker --start --queue long_tasks "$INSTANCE" >/dev/null 2>&1
+    koha_ctl /usr/sbin/koha-worker --start "$INSTANCE" >/dev/null 2>&1
+    koha_ctl /usr/sbin/koha-worker --start --queue long_tasks "$INSTANCE" >/dev/null 2>&1
     return 0
+}
+
+# Brings every Koha service back after a restore, successful or not:
+# workers, the Zebra server, the indexing of the active search engine,
+# Memcached, Plack and Apache. The catalog is never left without indexer.
+resume_koha_services() {
+    start_koha_workers
+    zebra_start >/dev/null 2>&1
+    ensure_search_indexing >/dev/null 2>&1
+    ensure_koha_services >/dev/null 2>&1
 }
 
 # Streams a .sql/.sql.gz backup into a database. Statements that would
@@ -799,7 +949,10 @@ start_koha_workers() {
 # dumps made with --databases), DEFINERs of users that do not exist here and
 # MySQL 8 collations unknown to MariaDB are neutralised.
 import_sql_file() {
-    local file="$1" db="$2" errlog="$3"
+    local file="$1" db="$2" errlog="$3" sig_opt=()
+    # Shielded (live catalog being replaced): CTRL+C must not stop mysql,
+    # which installs its own handler. Otherwise (trial import) it may.
+    [ "$SIGNALS_SHIELDED" = "1" ] && sig_opt=(--sigint-ignore)
     {
         echo "SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0;"
         if [[ "$file" == *.gz ]]; then zcat -- "$file"; else cat -- "$file"; fi
@@ -808,7 +961,90 @@ import_sql_file() {
     } | sed -E -e '/^[[:space:]]*(CREATE DATABASE|USE[[:space:]])/Id' \
                -e 's/DEFINER=`[^`]*`@`[^`]*`//g' \
                -e 's/utf8mb4_0900_ai_ci/utf8mb4_unicode_ci/g' \
-      | mysql --default-character-set=utf8mb4 "$db" 2>>"$errlog"
+      | mysql "${sig_opt[@]}" --default-character-set=utf8mb4 "$db" 2>>"$errlog"
+}
+
+# ======================================================================
+# BACKUP FILE CHECKS
+# ======================================================================
+# The last line of a complete mysqldump/mariadb-dump: a file without it was
+# cut short (or made with --skip-comments / by another tool).
+dump_is_complete() {
+    local n
+    if [[ "$1" == *.gz ]]; then
+        n=$(zcat -- "$1" 2>/dev/null | tail -c 512 | grep -c '^-- Dump completed')
+    else
+        n=$(tail -c 512 -- "$1" 2>/dev/null | grep -c '^-- Dump completed')
+    fi
+    [ "${n:-0}" -gt 0 ]
+}
+
+# Validates a .sql/.sql.gz backup before anything is touched. On failure
+# DUMP_ERROR holds the (translated) reason. On success DUMP_MB is the
+# uncompressed size, DUMP_HAS_SQL says whether SQL statements were found at
+# the start and DUMP_COMPLETE whether the file ends like a full mysqldump.
+check_dump_file() {
+    local file="$1" n
+    DUMP_ERROR=""; DUMP_MB=0; DUMP_HAS_SQL="no"; DUMP_COMPLETE="no"
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+        DUMP_ERROR="$(t "The file does not exist or cannot be read.\nNothing was changed.")"
+        return 1
+    fi
+    if [ ! -s "$file" ]; then
+        DUMP_ERROR="$(t "The file is empty (0 bytes).\nNothing was changed.")"
+        return 1
+    fi
+    if [[ "$file" == *.gz ]]; then
+        if ! gzip -t -- "$file" 2>/dev/null; then
+            DUMP_ERROR="$(t "The file is corrupt (failed the gzip test).\nNothing was changed.")"
+            return 1
+        fi
+        n=$(zcat -- "$file" 2>/dev/null | wc -c)
+        # grep -c reads everything: "grep -q" would exit early, head would
+        # get SIGPIPE and pipefail would report a valid file as suspicious.
+        [ "$(zcat -- "$file" 2>/dev/null | head -c 200000 | grep -aic 'CREATE TABLE')" -gt 0 ] && DUMP_HAS_SQL="yes"
+    else
+        n=$(stat -c %s -- "$file" 2>/dev/null)
+        [ "$(head -c 200000 -- "$file" | grep -aic 'CREATE TABLE')" -gt 0 ] && DUMP_HAS_SQL="yes"
+    fi
+    DUMP_MB=$(( ${n:-0} / 1048576 ))
+    dump_is_complete "$file" && DUMP_COMPLETE="yes"
+    return 0
+}
+
+# Tables a database needs to be accepted as a Koha catalog.
+KOHA_CORE_TABLES="systempreferences biblio biblio_metadata items borrowers branches categories"
+
+# Prints what is missing from database $1 to be a complete Koha catalog
+# (core tables, the Version preference). Nothing printed = complete. An
+# unreachable database is reported as missing everything.
+koha_schema_missing() {
+    local db="$1" tbl found missing=""
+    found=" $(run_sql "SELECT table_name FROM information_schema.tables WHERE table_schema='${db}';" | tr '\n' ' ') "
+    for tbl in $KOHA_CORE_TABLES; do
+        [[ "$found" == *" $tbl "* ]] || missing+="$tbl "
+    done
+    if [[ "$found" == *" systempreferences "* ]] \
+       && [ -z "$(run_sql "SELECT value FROM \`${db}\`.systempreferences WHERE variable='Version';")" ]; then
+        missing+="systempreferences.Version "
+    fi
+    printf '%s' "${missing% }"
+}
+
+# Dumps the Koha database to $1 and checks the result (gzip test, complete
+# mysqldump, minimum size). Removes the file and returns 1 on any failure.
+create_safety_backup() {
+    local out="$1" errlog="${2:-${LOG_DIR}/mysql.log}"
+    mkdir -p "$(dirname "$out")" 2>/dev/null
+    if mysqldump --single-transaction --quick --routines --triggers \
+            --default-character-set=utf8mb4 "$DB_NAME" 2>>"$errlog" | gzip 2>/dev/null > "$out" \
+       && gzip -t "$out" 2>/dev/null \
+       && [ "$(stat -c %s "$out" 2>/dev/null || echo 0)" -ge 10240 ] \
+       && dump_is_complete "$out"; then
+        return 0
+    fi
+    rm -f "$out"
+    return 1
 }
 
 # ======================================================================
@@ -948,6 +1184,13 @@ validate_mariadb() {
         v_fail "MariaDB: $(t "local connection failed")."; return 1
     fi
     v_ok "MariaDB: $(t "local connection OK")."
+    if is_koha_installed; then
+        if db_app_login_ok; then
+            v_ok "MariaDB: $(t "Koha user login OK") ($(koha_conf_value user)@$(koha_conf_value hostname))."
+        else
+            v_fail "MariaDB: $(t "Koha user login FAILED") ($(koha_conf_value user)@$(koha_conf_value hostname))."
+        fi
+    fi
     c=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
     c="${c:-0}"
     if [ "$c" -gt 50 ] 2>/dev/null; then
@@ -1004,15 +1247,31 @@ validate_koha_instance() {
 
 validate_zebra() {
     [ "$1" != "Zebra" ] && return 0
+    local stuck
     if is_koha_zebra_running; then
         v_ok "Zebra: $(t "daemon active")."
     else
         v_fail "Zebra: $(t "daemon INACTIVE")."
     fi
-    if [ -f "$CRON_ZEBRA" ]; then
+    # New records are indexed by the koha-indexer daemon; the cron job only
+    # keeps it alive. A cron file alone proves nothing.
+    if ! zebra_indexer_daemon_enabled; then
+        v_info "Zebra: USE_INDEXER_DAEMON=no (/etc/default/koha-common)."
+    elif is_zebra_indexer_running; then
+        v_ok "$(t "Indexer"): koha-indexer $(t "running")."
+    else
+        v_fail "$(t "Indexer"): koha-indexer $(t "STOPPED - new records will not reach search")."
+    fi
+    if [ -f "$CRON_ZEBRA" ] && grep -qF "$ZEBRA_WATCHDOG" "$CRON_ZEBRA" && [ -x "$ZEBRA_WATCHDOG" ]; then
         v_ok "Zebra: $(t "incremental indexing scheduled")."
     else
         v_warn "Zebra: $(t "no incremental indexing cron (new records may lag)")."
+    fi
+    stuck=$(zebra_stuck_records)
+    if [ "${stuck:-0}" -gt 0 ] 2>/dev/null; then
+        v_fail "$(t "Queue"): $stuck $(t "pending jobs - the indexer is not consuming")."
+    else
+        v_ok "$(t "Queue"): $(t "no pending indexing jobs")."
     fi
 }
 
@@ -1179,6 +1438,46 @@ show_validation_report() {
         }
 }
 
+# Releases the installer is tested on (other Debian/Ubuntu based systems
+# get a warning, not a refusal).
+SUPPORTED_RELEASES="debian:11 debian:12 debian:13 ubuntu:22.04 ubuntu:24.04"
+
+# Adds the OS release ($1, default /etc/os-release) and the CPU architecture
+# to the validation report. The architecture comes from dpkg (the one APT
+# installs for) and uname -m (the kernel's view, e.g. aarch64 = arm64).
+# shellcheck disable=SC1090  # os-release is shell syntax by design
+platform_check() {
+    local osr="${1:-/etc/os-release}" id="" like="" ver="" name arch machine
+    if [ -r "$osr" ]; then
+        id=$(. "$osr" 2>/dev/null; printf '%s' "${ID:-}")
+        like=$(. "$osr" 2>/dev/null; printf '%s' "${ID_LIKE:-}")
+        ver=$(. "$osr" 2>/dev/null; printf '%s' "${VERSION_ID:-}")
+    fi
+    name=$(. "$osr" 2>/dev/null; printf '%s' "${PRETTY_NAME:-$id $ver}")
+    case " $id $like " in
+        *" debian "*|*" ubuntu "*)
+            if [[ " $SUPPORTED_RELEASES " == *" ${id}:${ver} "* ]]; then
+                v_ok "OS: $(t "Debian/Ubuntu based") (${name})."
+            else
+                v_warn "OS: $(t "release not tested by this installer") (${name})."
+            fi
+            ;;
+        *) v_fail "OS: $(t "this installer only supports Debian/Ubuntu")." ;;
+    esac
+    arch=$(dpkg --print-architecture 2>/dev/null)
+    machine=$(uname -m 2>/dev/null)
+    case "$arch" in
+        amd64|arm64) v_ok "$(t "Architecture"): ${arch} (${machine})." ;;
+        *) v_warn "$(t "Architecture"): ${arch:-?} (${machine:-?}) - $(t "only amd64 and arm64 are tested")." ;;
+    esac
+}
+
+# Elasticsearch 7 is only packaged for amd64 and arm64.
+es_arch_supported() {
+    case "$(dpkg --print-architecture 2>/dev/null)" in amd64|arm64) return 0 ;; esac
+    return 1
+}
+
 validate_pre_installation() {
     local welcome_body
     welcome_body="$(t "This project democratizes collection management, automating the setup of a robust, fast and free infrastructure for libraries.")\n\n"
@@ -1193,11 +1492,7 @@ validate_pre_installation() {
     v_reset "pre-installation"
     [ "$EUID" -eq 0 ] && v_ok "Root OK." || v_fail "Root: $(t "insufficient privileges")."
 
-    if [ -r /etc/os-release ] && grep -qiE '^(ID|ID_LIKE)=.*(debian|ubuntu)' /etc/os-release; then
-        v_ok "OS: $(t "Debian/Ubuntu based") ($(. /etc/os-release; echo "$PRETTY_NAME"))."
-    else
-        v_fail "OS: $(t "this installer only supports Debian/Ubuntu")."
-    fi
+    platform_check /etc/os-release
 
     validate_command apt-get   "APT"
     validate_command dpkg      "DPKG"
@@ -1287,45 +1582,64 @@ validate_pre_installation() {
 # ======================================================================
 # SEARCH ENGINE: XML, INDEXER & BROKER
 # ======================================================================
-edit_xml() {
-    python3 - "$1" "$2" "$KOHA_CONF" "${3:-}" << 'PYEOF'
-import re, sys, os, tempfile
-
-action, tag, path, body = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-
-with open(path, "r", encoding="utf-8") as f:
-    text = f.read()
-
-parts = re.split(r"(<!--.*?-->)", text, flags=re.DOTALL)
-pattern = re.compile(r"[ \t]*<%s>.*?</%s>[ \t]*\n?" % (tag, tag), re.DOTALL)
-for i, p in enumerate(parts):
-    if not p.startswith("<!--"):
-        parts[i] = pattern.sub("", p)
-text = "".join(parts)
-
-if action == "inserir":
-    if "</config>" not in text:
-        sys.exit("ERROR: </config> not found in koha-conf.xml")
-    text = text.replace("</config>", body + "</config>", 1)
-
-st = os.stat(path)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
-with os.fdopen(fd, "w", encoding="utf-8") as f:
-    f.write(text)
-os.chown(tmp, st.st_uid, st.st_gid)
-os.chmod(tmp, st.st_mode)
-os.replace(tmp, path)
-PYEOF
+# Replaces koha-conf.xml with the file $1 if it is well-formed XML, keeping
+# owner and permissions. $1 is removed in any case.
+_replace_koha_conf() {
+    local tmp="$1"
+    if ! xmllint --noout "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chown --reference="$KOHA_CONF" "$tmp" 2>/dev/null
+    chmod --reference="$KOHA_CONF" "$tmp" 2>/dev/null
+    mv -f "$tmp" "$KOHA_CONF"
 }
 
+# Older panel versions inserted the <elasticsearch> block before the FIRST
+# </config> of koha-conf.xml, which belongs to Zebra's <server> section
+# (<config>.../zebra-biblios-dom.cfg</config>): Zebra's configuration path
+# was broken and Zebra would not start again. This puts the path back.
+repair_koha_conf_xml() {
+    [ -f "$KOHA_CONF" ] || return 0
+    grep -q '\.cfg  <elasticsearch>$' "$KOHA_CONF" || return 0
+    local tmp
+    tmp=$(mktemp "${KOHA_CONF}.XXXXXX") || return 1
+    awk '
+        skip && /<\/elasticsearch><\/config>/ { sub(/.*<\/elasticsearch>/, ""); print keep $0; skip = 0; next }
+        skip { next }
+        /<config>[^<]*\.cfg  <elasticsearch>$/ { keep = $0; sub(/  <elasticsearch>$/, "", keep); skip = 1; next }
+        { print }' "$KOHA_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+    _replace_koha_conf "$tmp" || return 1
+    log "koha-conf.xml: Zebra <config> path repaired (damage left by an older panel version)"
+}
+
+# "inserir": makes sure the main <config> section has an <elasticsearch>
+# block. Debian's koha-conf.xml already ships one (even on Zebra): nothing
+# is added then. The main section is closed by the LAST </config> of the
+# file; the Zebra <server> sections before it have <config> elements too.
+# "remover": nothing to do. The engine is chosen by the SearchEngine system
+# preference; a stock <elasticsearch> block is harmless on Zebra.
 set_xml_elasticsearch() {
-    local body=""
     [ -f "$KOHA_CONF" ] || return 1
-    if [ "$1" = "inserir" ]; then
-        body=$(printf '  <elasticsearch>\n    <server>127.0.0.1:9200</server>\n    <index_name>%s</index_name>\n  </elasticsearch>\n' "${DB_NAME}")
-    fi
-    edit_xml "$1" "elasticsearch" "$body" || return 1
-    if command -v xmllint >/dev/null 2>&1 && ! xmllint --noout "$KOHA_CONF" >/dev/null 2>&1; then
+    repair_koha_conf_xml
+    [ "$1" = "inserir" ] || return 0
+    is_koha_es_active_in_xml && return 0
+    local tmp
+    tmp=$(mktemp "${KOHA_CONF}.XXXXXX") || return 1
+    ES_BLOCK="$(printf '  <elasticsearch>\n    <server>127.0.0.1:9200</server>\n    <index_name>%s</index_name>\n  </elasticsearch>' "$DB_NAME")" \
+    awk '
+        { line[NR] = $0; if (index($0, "</config>")) last = NR }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (i == last) {
+                    p = index(line[i], "</config>")
+                    if (p > 1) print substr(line[i], 1, p - 1)
+                    print ENVIRON["ES_BLOCK"]
+                    print substr(line[i], p)
+                } else print line[i]
+            }
+        }' "$KOHA_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! _replace_koha_conf "$tmp" || ! is_koha_es_active_in_xml; then
         msg_error "" "$(t "Editing koha-conf.xml produced invalid XML. Restore from Koha's own backup.")" 10 74
         return 1
     fi
@@ -1334,20 +1648,9 @@ set_xml_elasticsearch() {
 
 is_koha_es_active_in_xml() {
     [ -f "$KOHA_CONF" ] || return 1
-    if command -v xmllint >/dev/null 2>&1; then
-        local n
-        n=$(xmllint --xpath 'count(/yazgfs/config/elasticsearch)' "$KOHA_CONF" 2>/dev/null || echo 0)
-        [ "$n" -gt 0 ] && return 0
-    fi
-    python3 - "$KOHA_CONF" << 'PYEOF'
-import sys, re
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    txt = f.read()
-clean = re.sub(r'<!--.*?-->', '', txt, flags=re.DOTALL)
-if '<elasticsearch>' in clean:
-    sys.exit(0)
-sys.exit(1)
-PYEOF
+    local n
+    n=$(xmllint --xpath 'count(/yazgfs/config/elasticsearch)' "$KOHA_CONF" 2>/dev/null)
+    [ "${n:-0}" -gt 0 ] 2>/dev/null
 }
 
 prepare_koha_broker() {
@@ -1394,7 +1697,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'set -u; inst="$1"; /usr/sbin/koha-es-indexer --start --quiet "$inst" || exit 1; if [ -r /usr/share/koha/bin/koha-functions.sh ]; then . /usr/share/koha/bin/koha-functions.sh; else exit 1; fi; while is_es_indexer_running "$inst"; do sleep 5; done; exit 1' _ %i
+ExecStart=/bin/bash -c 'set -u; inst="$1"; . /usr/share/koha/bin/koha-functions.sh || exit 1; is_es_indexer_running "$inst" || /usr/sbin/koha-es-indexer --start --quiet "$inst" || exit 1; while is_es_indexer_running "$inst"; do sleep 5; done; exit 1' _ %i
 ExecStop=/usr/sbin/koha-es-indexer --stop --quiet %i
 Restart=always
 RestartSec=10
@@ -1430,19 +1733,23 @@ fi
 echo \$$ > "\$LOCK_FILE"
 trap 'rm -f "\$LOCK_FILE"' EXIT
 
-if [ -e "\$MARKER" ]; then
-    REBUILD_PID=""
-    read -r REBUILD_PID < "\$MARKER" 2>/dev/null || true
-    if [[ "\$REBUILD_PID" =~ ^[0-9]+$ ]] && kill -0 "\$REBUILD_PID" 2>/dev/null; then
+# Rebuild, restore or engine switch in progress (marker naming a live
+# process): stay away. A marker left by a process that died is removed.
+for M in "\$(dirname "\$MARKER")"/*.in-progress; do
+    [ -e "\$M" ] || continue
+    M_PID=""
+    read -r M_PID < "\$M" 2>/dev/null || true
+    if [[ "\$M_PID" =~ ^[0-9]+$ ]] && kill -0 "\$M_PID" 2>/dev/null; then
         exit 0
     fi
-    rm -f "\$MARKER"
-fi
+    rm -f "\$M"
+done
 
-if [ ! -r "/etc/koha/sites/\${INST}/koha-conf.xml" ] || \
-   ! xmllint --xpath 'count(/yazgfs/config/elasticsearch)' "/etc/koha/sites/\${INST}/koha-conf.xml" 2>/dev/null | grep -qx '1'; then
-    exit 0
-fi
+# The engine is the SearchEngine preference (koha-conf.xml has an
+# <elasticsearch> block even on Zebra). Database unreachable: nothing to do.
+[ -r "/etc/koha/sites/\${INST}/koha-conf.xml" ] || exit 0
+ENGINE=\$(mysql -Nse "SELECT value FROM \${DB}.systempreferences WHERE variable='SearchEngine'" 2>/dev/null) || exit 0
+[ "\$ENGINE" = "Elasticsearch" ] || exit 0
 
 if ! curl -sS --max-time 5 http://127.0.0.1:9200/ >/dev/null 2>&1; then
     logger -t koha-es-watchdog "Elasticsearch API unavailable; indexer will not restart this round"
@@ -1506,12 +1813,13 @@ EOF
 
 manage_koha_indexers() {
     if [ "$1" = "start" ]; then
-        koha-worker --start "$INSTANCE" >/dev/null 2>&1 || true
-        koha-worker --start --queue long_tasks "$INSTANCE" >/dev/null 2>&1 || true
-        if is_koha_es_active_in_xml; then
+        start_koha_workers
+        # The engine is the SearchEngine preference: Debian's koha-conf.xml
+        # has an <elasticsearch> block even when Koha runs on Zebra.
+        if [ "$(get_search_engine)" = "Elasticsearch" ]; then
             install_koha_indexer_service || return 1
             if ! systemctl restart "koha-es-indexer@${INSTANCE}" >/dev/null 2>&1; then
-                /usr/sbin/koha-es-indexer --start --quiet "$INSTANCE" >/dev/null 2>&1 || true
+                koha_ctl /usr/sbin/koha-es-indexer --start --quiet "$INSTANCE" >/dev/null 2>&1 || true
             fi
             local i
             for i in $(seq 1 30); do
@@ -1613,15 +1921,123 @@ rebuild_koha_elasticsearch() {
     return "$rc"
 }
 
+# ----------------------------------------------------------------------
+# Zebra incremental indexing. New and changed records are queued in the
+# zebraqueue table and indexed within seconds by Koha's indexer daemon
+# (koha-indexer, i.e. rebuild_zebra.pl -daemon). If that daemon is down,
+# nothing new reaches the OPAC search. The watchdog below, run every
+# 2 minutes from cron, keeps the Zebra server and the daemon alive and
+# restarts the daemon when records wait for more than 10 minutes.
+# (Older panel versions scheduled "zebraqueue_daemon.pl", which does not
+# exist in Koha: that cron line never indexed anything.)
+# ----------------------------------------------------------------------
+ZEBRA_WATCHDOG="/usr/local/bin/koha-zebra-watchdog.sh"
+
+zebra_indexer_daemon_enabled() {
+    ! grep -qE '^[[:space:]]*USE_INDEXER_DAEMON="?no' /etc/default/koha-common 2>/dev/null
+}
+is_zebra_indexer_running() {
+    [ -r /usr/share/koha/bin/koha-functions.sh ] || return 1
+    /bin/bash -c '. /usr/share/koha/bin/koha-functions.sh; is_indexer_running "$1"' _ "$INSTANCE" >/dev/null 2>&1
+}
+zebra_indexer_start() {
+    zebra_indexer_daemon_enabled || return 0
+    is_zebra_indexer_running && return 0
+    koha_ctl /usr/sbin/koha-indexer --start --quiet "$INSTANCE" >/dev/null 2>&1
+    sleep 1
+    is_zebra_indexer_running
+}
+# Records queued for Zebra and still not indexed after 10 minutes.
+zebra_stuck_records() {
+    local n
+    n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.zebraqueue WHERE done=0 AND time < NOW() - INTERVAL 10 MINUTE;")
+    printf '%s' "${n:-0}"
+}
+
 write_cron_zebra() {
+    cat > "$ZEBRA_WATCHDOG" << EOF
+#!/bin/bash
+# Koha Easy Installer: keeps Zebra incremental indexing alive (run from
+# ${CRON_ZEBRA}). New records are queued in zebraqueue and indexed by the
+# koha-indexer daemon; if it is down, they never reach the OPAC search.
+set -euo pipefail
+INST="${INSTANCE}"
+DB="${DB_NAME}"
+MARKER_DIR="${MARKER_DIR}"
+
+exec 9>"/run/lock/koha_zebra_watchdog.lock"
+flock -n 9 || exit 0
+say() { logger -t koha-zebra-watchdog "\$*" 2>/dev/null || true; }
+# Daemons started from here must not inherit the lock descriptor.
+run() { "\$@" 9>&- >/dev/null 2>&1 || say "failed: \$*"; }
+kf()  { /bin/bash -c '. /usr/share/koha/bin/koha-functions.sh; "\$@"' _ "\$@" >/dev/null 2>&1; }
+
+# Restore, full reindex or engine switch in progress (marker naming a live
+# process): stay away. A marker left by a process that died is removed.
+for m in "\$MARKER_DIR"/*.in-progress; do
+    [ -e "\$m" ] || continue
+    pid=""
+    read -r pid < "\$m" 2>/dev/null || true
+    if [[ "\$pid" =~ ^[0-9]+\$ ]] && kill -0 "\$pid" 2>/dev/null; then exit 0; fi
+    rm -f "\$m"
+done
+
+[ -r "/etc/koha/sites/\${INST}/koha-conf.xml" ] || exit 0
+[ -r /usr/share/koha/bin/koha-functions.sh ] || exit 0
+# Database down or Web Installer not finished: nothing to index yet.
+ENGINE=\$(mysql -Nse "SELECT value FROM \${DB}.systempreferences WHERE variable='SearchEngine'" 2>/dev/null) || exit 0
+[ "\$ENGINE" = "Elasticsearch" ] && exit 0
+
+if ! kf is_zebra_running "\$INST"; then
+    say "Zebra server down; starting it"
+    run /usr/sbin/koha-zebra --start "\$INST"
+fi
+
+if grep -qE '^[[:space:]]*USE_INDEXER_DAEMON="?no' /etc/default/koha-common 2>/dev/null; then
+    # No indexer daemon configured: process the queue here.
+    run /usr/sbin/koha-rebuild-zebra -q "\$INST"
+    exit 0
+fi
+
+if ! kf is_indexer_running "\$INST"; then
+    say "indexer daemon down; starting it"
+    run /usr/sbin/koha-indexer --start --quiet "\$INST"
+    exit 0
+fi
+
+STUCK=\$(mysql -Nse "SELECT COUNT(*) FROM \${DB}.zebraqueue WHERE done=0 AND time < NOW() - INTERVAL 10 MINUTE" 2>/dev/null || echo 0)
+if [ "\${STUCK:-0}" -gt 0 ] 2>/dev/null; then
+    say "\$STUCK record(s) waiting for more than 10 minutes; restarting the indexer daemon"
+    run /usr/sbin/koha-indexer --restart --quiet "\$INST"
+fi
+exit 0
+EOF
+    chmod 755 "$ZEBRA_WATCHDOG"
+    chown root:root "$ZEBRA_WATCHDOG" 2>/dev/null
     cat > "$CRON_ZEBRA" << EOF
 $CRON_PATH
-# Zebra incremental indexing every 2 minutes
-*/2 * * * * root /usr/sbin/koha-shell $INSTANCE -c "/usr/share/koha/bin/cronjobs/zebraqueue_daemon.pl -m z3950" >/dev/null 2>&1
+# Zebra incremental indexing watchdog (keeps koha-indexer running) - every 2 minutes
+*/2 * * * * root ${ZEBRA_WATCHDOG} >/dev/null 2>&1
 EOF
     chmod 644 "$CRON_ZEBRA"
     chown root:root "$CRON_ZEBRA"
     systemctl restart cron >/dev/null 2>&1 || true
+}
+
+# Makes sure new and changed records reach the search index of the active
+# engine: its indexing daemon is running and its watchdog is scheduled (and
+# the other engine's watchdog is gone). Returns 1 if the indexer is not up.
+ensure_search_indexing() {
+    if [ "$(get_search_engine)" = "Elasticsearch" ]; then
+        rm -f "$CRON_ZEBRA"
+        manage_koha_indexers start
+        return
+    fi
+    rm -f "$CRON_ES"
+    systemctl disable --now "koha-es-indexer@${INSTANCE}" >/dev/null 2>&1 || true
+    write_cron_zebra
+    is_koha_zebra_running || zebra_start >/dev/null 2>&1
+    zebra_indexer_start
 }
 
 validate_elasticsearch() {
@@ -1712,7 +2128,7 @@ write_backup_scripts() {
     cat > /root/backup_sql.sh << EOF
 #!/bin/bash
 # Koha database backup. Generated by Koha Easy Install & Tools.
-set -o pipefail
+set -euo pipefail
 umask 077
 CONF="${BACKUP_CONF}"
 DB="${DB_NAME}"
@@ -1723,18 +2139,21 @@ RCLONE_REMOTE=""; RCLONE_SQL_FOLDER="Backup_SQL_Koha"; KEEP_DAYS=7
 [ -f "\$CONF" ] && . "\$CONF"
 case "\${KEEP_DAYS}" in ''|*[!0-9]*) KEEP_DAYS=7;; esac
 
-log_backup() { mkdir -p "\$(dirname "\$LOG")" "\$DIR"; printf '%s | %s\n' "\$(date '+%F %T')" "\$*" >> "\$LOG"; }
+log_backup() { mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true; printf '%s | %s\n' "\$(date '+%F %T')" "\$*" >> "\$LOG"; }
 exec 9>"\$LOCK_FILE"
 if ! flock -n 9; then
     log_backup "INFO: SQL backup skipped because another backup/restore is running"
     exit 0
 fi
-mkdir -p "\$DIR"
+if ! mkdir -p "\$DIR" 2>/dev/null; then
+    log_backup "FAILED: cannot create \$DIR"
+    exit 1
+fi
 
 FILE="\$DIR/\${DB}_\$(date +%Y-%m-%d_%Hh%M).sql.gz"
 
 if ! mysqldump --single-transaction --quick --routines --triggers \
-        --default-character-set=utf8mb4 "\$DB" 2>>"\$LOG" | gzip > "\$FILE"; then
+        --default-character-set=utf8mb4 "\$DB" 2>>"\$LOG" | gzip 2>>"\$LOG" > "\$FILE"; then
     log_backup "FAILED to generate \$FILE"
     rm -f "\$FILE"
     exit 1
@@ -1742,6 +2161,13 @@ fi
 
 if ! gzip -t "\$FILE" 2>/dev/null; then
     log_backup "FAILED: corrupt file removed: \$FILE"
+    rm -f "\$FILE"
+    exit 1
+fi
+
+# A complete dump ends with mysqldump's "-- Dump completed" line.
+if [ "\$(zcat "\$FILE" | tail -c 512 | grep -c '^-- Dump completed')" -eq 0 ]; then
+    log_backup "FAILED: incomplete dump (no completion line) removed: \$FILE"
     rm -f "\$FILE"
     exit 1
 fi
@@ -1765,14 +2191,14 @@ if [ -n "\$RCLONE_REMOTE" ] && [ -f /root/.config/rclone/rclone.conf ]; then
     fi
 fi
 
-find "\$DIR" -name '*.sql.gz' -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null
+find "\$DIR" -name '*.sql.gz' -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null || true
 exit 0
 EOF
 
     cat > /root/backup_marc.sh << EOF
 #!/bin/bash
 # Koha MARC21 records backup (bibliographic and authority).
-set -o pipefail
+set -euo pipefail
 umask 077
 CONF="${BACKUP_CONF}"
 INST="${INSTANCE}"
@@ -1783,13 +2209,16 @@ RCLONE_REMOTE=""; RCLONE_MARC_FOLDER="Backup_MARC_Koha"; KEEP_DAYS=7
 [ -f "\$CONF" ] && . "\$CONF"
 case "\${KEEP_DAYS}" in ''|*[!0-9]*) KEEP_DAYS=7;; esac
 
-log_backup() { mkdir -p "\$(dirname "\$LOG")" "\$DIR"; printf '%s | %s\n' "\$(date '+%F %T')" "\$*" >> "\$LOG"; }
+log_backup() { mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true; printf '%s | %s\n' "\$(date '+%F %T')" "\$*" >> "\$LOG"; }
 exec 9>"\$LOCK_FILE"
 if ! flock -n 9; then
     log_backup "INFO: MARC backup skipped because another backup/restore is running"
     exit 0
 fi
-mkdir -p "\$DIR"
+if ! mkdir -p "\$DIR" 2>/dev/null; then
+    log_backup "FAILED: cannot create \$DIR"
+    exit 1
+fi
 
 EXPORT_CMD="/usr/share/koha/bin/export_records.pl"
 [ -f "\$EXPORT_CMD" ] || EXPORT_CMD="\$(find /usr/share/koha -name export_records.pl 2>/dev/null | head -n1)"
@@ -1840,7 +2269,7 @@ if [ -n "\$RCLONE_REMOTE" ] && [ -f /root/.config/rclone/rclone.conf ]; then
     fi
 fi
 
-find "\$DIR" -name 'koha_marc_*.tar.gz' -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null
+find "\$DIR" -name 'koha_marc_*.tar.gz' -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null || true
 exit 0
 EOF
 
@@ -2073,7 +2502,7 @@ ensure_elastic_repo() {
     mkdir -p /usr/share/keyrings
     if curl -fsSL --retry 3 --max-time 60 https://artifacts.elastic.co/GPG-KEY-elasticsearch \
         | gpg --dearmor --yes -o /usr/share/keyrings/elasticsearch-keyring.gpg 2>/dev/null; then
-        echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/7.x/apt stable main" > "$list"
+        apt_source_line /usr/share/keyrings/elasticsearch-keyring.gpg https://artifacts.elastic.co/packages/7.x/apt stable main > "$list"
         if apt_update_indices; then
             return 0
         fi
@@ -2196,7 +2625,7 @@ function_install_koha() {
     display_explanation "Installing essential dependencies..."
     apt_install nano curl wget gpg ca-certificates ufw apt-transport-https \
                 fail2ban libsasl2-modules rclone avahi-daemon memcached libcache-memcached-fast-perl \
-                python3 libxml2-utils unzip pv psmisc || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
+                libxml2-utils unzip pv psmisc || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
 
     # Labels utility installed separately to prevent batch failure if missing from repository
     apt_install glabels >/dev/null 2>&1 || true
@@ -2212,7 +2641,7 @@ function_install_koha() {
         msg_error "" "$(t "Could not download the Koha repository key. Check your internet connection.")" 9 74
         return 1
     fi
-    echo "deb [signed-by=/usr/share/keyrings/koha-keyring.gpg] https://debian.koha-community.org/koha stable main" > /etc/apt/sources.list.d/koha.list
+    apt_source_line /usr/share/keyrings/koha-keyring.gpg https://debian.koha-community.org/koha stable main > /etc/apt/sources.list.d/koha.list
 
     if ! ensure_elastic_repo; then
         echo "$(t "[WARN] Elasticsearch repository unavailable; continuing with Zebra only.")"
@@ -2224,7 +2653,7 @@ function_install_koha() {
     ensure_koha_conffiles || { install_step_failed "$(t "Restoring missing Koha configuration files...")"; return 1; }
     systemctl enable --now mariadb >/dev/null 2>&1
     if ! mysql -e "SELECT 1;" >/dev/null 2>&1; then
-        systemctl restart mariadb >/dev/null 2>&1 || service mariadb start >/dev/null 2>&1 || true
+        systemctl restart mariadb >/dev/null 2>&1 || koha_ctl service mariadb start >/dev/null 2>&1 || true
         sleep 2
     fi
     if ! mysql -e "SELECT 1;" >/dev/null 2>&1; then
@@ -2265,14 +2694,12 @@ function_install_koha() {
             msg_error "" "$(t "Another backup or restore is already running. Reinstallation was cancelled.")" 9 74
             return 1
         fi
-        mkdir -p "$DIR_SQL"
-        local rescue
-        rescue="${DIR_SQL}/PRE-REINSTALLATION_$(date +%Y-%m-%d_%Hh%M).sql.gz"
-        local db_has_tables
-        db_has_tables=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
-        if [ "${db_has_tables:-0}" -gt 0 ] 2>/dev/null; then
-            if ! mysqldump --single-transaction --quick --routines --triggers "$DB_NAME" 2>/dev/null | gzip > "$rescue" || ! gzip -t "$rescue" 2>/dev/null || [ "$(stat -c %s "$rescue" 2>/dev/null || echo 0)" -lt 10240 ]; then
-                rm -f "$rescue"
+        local rescue db_has_tables
+        rescue="${DIR_SQL}/PRE-REINSTALLATION_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+        # "Could not count" is not "empty": no DROP without a verified copy.
+        db_has_tables=$(koha_table_count) || db_has_tables="unknown"
+        if [ "$db_has_tables" != "0" ]; then
+            if ! create_safety_backup "$rescue"; then
                 backup_lock_release
                 restore_apt_timers
                 msg_error "$(t "Safety backup failed")" \
@@ -2307,7 +2734,7 @@ function_install_koha() {
     # C.UTF-8 keeps the tools' messages readable in the error box (some of
     # them print badly encoded accents in other locales).
     mkdir -p /var/lib/koha
-    if ! LC_ALL=C.UTF-8 LANGUAGE=en /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1; then
+    if ! LC_ALL=C.UTF-8 LANGUAGE=en koha_ctl /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1; then
         local err_msg
         err_msg=$(tail -n 15 "${LOG_DIR}/koha-create.log" 2>/dev/null)
         [ -z "$err_msg" ] && err_msg="$(t "Empty log.")"
@@ -2336,16 +2763,15 @@ function_install_koha() {
         /usr/sbin/koha-translate --install "$auto_lang" >>"${LOG_DIR}/koha-translate.log" 2>&1 || true
     fi
 
-    /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
-    /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+    koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
+    koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
     systemctl restart apache2 >/dev/null 2>&1
 
     display_explanation "Enabling Zebra and incremental indexing..."
-    /usr/sbin/koha-zebra --start "$INSTANCE" >/dev/null 2>&1
     zebra_start >/dev/null 2>&1
     write_cron_zebra
-    /usr/sbin/koha-worker --start "$INSTANCE" >/dev/null 2>&1
-    /usr/sbin/koha-worker --start --queue long_tasks "$INSTANCE" >/dev/null 2>&1
+    zebra_indexer_start >/dev/null 2>&1
+    start_koha_workers
 
     display_explanation "Creating automatic backups and credentials..."
     local db_pass ip
@@ -2556,8 +2982,83 @@ show_restore_transfer_help() {
 # ======================================================================
 # 3. RESTORE DATABASE
 # ======================================================================
+drop_trial_db() {
+    [ -n "$RESTORE_TRIAL_DB" ] && mysql -e "DROP DATABASE IF EXISTS \`${RESTORE_TRIAL_DB}\`;" >/dev/null 2>&1
+    RESTORE_TRIAL_DB=""
+}
+
+# Ends a restore that did not touch the live catalog.
+restore_release() {
+    drop_trial_db
+    maintenance_end
+    backup_lock_release
+}
+
+# Puts the previous catalog back from the safety copy after a failed restore.
+# Succeeds only when the previous catalog is complete again.
+restore_rollback() {
+    local rescue="$1" errlog="$2"
+    [ -n "$rescue" ] && [ -f "$rescue" ] || return 1
+    display_explanation "Restoring the previous catalog from the safety backup..."
+    mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>>"$errlog" \
+        && import_sql_file "$rescue" "$DB_NAME" "$errlog" \
+        && [ -z "$(koha_schema_missing "$DB_NAME")" ] \
+        && ensure_db_grants
+}
+
+# A restore failed after the live catalog was touched ($1 = stage: recreate,
+# import or schema): puts the previous catalog back when possible, restarts
+# every service (indexer included) and only then explains what happened.
+restore_failed() {
+    local stage="$1" rescue="$2" errlog="$3" details outcome
+    details=$(grep -v "^=====" "$errlog" 2>/dev/null | tail -n 6 | cut -c1-76)
+    [ "$stage" = "schema" ] && details=$(tail -n 6 "${LOG_DIR}/schema-upgrade.log" 2>/dev/null | cut -c1-76)
+    if [ "$stage" = "recreate" ] && [ -z "$(koha_schema_missing "$DB_NAME")" ]; then
+        outcome="intact"            # DROP failed: the previous catalog is still there
+    elif [ -z "$rescue" ] && [ "$stage" = "schema" ]; then
+        outcome="kept"              # nothing to go back to: keep it for diagnosis
+    elif [ -z "$rescue" ]; then
+        outcome="empty"             # the database was empty before the restore
+    elif restore_rollback "$rescue" "$errlog"; then
+        outcome="rolled-back"
+    else
+        outcome="lost"
+    fi
+    log "restore failed at '${stage}': ${outcome} (safety copy: ${rescue:-none})"
+    resume_koha_services
+    unshield_signals
+    maintenance_end
+    backup_lock_release
+    case "$outcome" in
+        intact)      msg_error "" "$(t 'Could not recreate the database.\n\n${details}')" 14 80 ;;
+        kept)        msg_error "" "$(t "Schema migration failed. The imported database was preserved for diagnosis.")" 11 78 ;;
+        empty)       msg_error "" "$(t 'The backup could not be imported. Nothing was changed in the current catalog.\n\nLast error lines:\n${details}')" 18 80 ;;
+        rolled-back) msg_error "" "$(t 'The import failed. The previous catalog was restored from the safety backup.\n\nLast error lines:\n${details}')" 18 80 ;;
+        *)           msg_error "" "$(t 'The import failed and the safety backup could not be restored automatically.\nRestore it with option 3: ${rescue}\n\nLast error lines:\n${details}')" 18 80 ;;
+    esac
+}
+
+# Search engine for a restored catalog: the one this server was running
+# ($1; its services are installed and tuned), else the one in the backup.
+# An Elasticsearch that does not answer here falls back to Zebra, which
+# every Koha installation has.
+restored_search_engine() {
+    local engine="$1" i
+    [ -z "$engine" ] && engine=$(get_search_engine)
+    if [ "$engine" = "Elasticsearch" ] && dpkg -s elasticsearch >/dev/null 2>&1; then
+        systemctl start elasticsearch >/dev/null 2>&1
+        for i in $(seq 1 60); do
+            curl -sS --max-time 2 http://127.0.0.1:9200/ >/dev/null 2>&1 && { printf 'Elasticsearch'; return 0; }
+            sleep 1
+        done
+    fi
+    [ "$engine" = "Elasticsearch" ] && log "restore: Elasticsearch does not answer on this server; using Zebra"
+    printf 'Zebra'
+}
+
 function_restore_database() {
     require_koha || return 0
+    require_db_admin || return 0
 
     show_restore_transfer_help
 
@@ -2565,19 +3066,34 @@ function_restore_database() {
     file=$(select_file "$REAL_HOME") || return 0
     [ -z "$file" ] && return 0
 
+    # 1) The file itself: readable, not empty, intact gzip, SQL inside,
+    #    and ending like a complete mysqldump.
     display_explanation "Checking the backup file..."
-    if [[ "$file" == *.gz ]]; then
-        if ! gzip -t "$file" 2>/dev/null; then
-            msg_error "" "$(t "The file is corrupt (failed the gzip test).\nNothing was changed.")" 9 70
-            return 0
-        fi
-        if ! zcat "$file" 2>/dev/null | head -c 200000 | grep -qi 'CREATE TABLE'; then
+    if ! check_dump_file "$file"; then
+        msg_error "" "$DUMP_ERROR" 10 72
+        return 0
+    fi
+    if [ "$DUMP_HAS_SQL" != "yes" ]; then
+        if [[ "$file" == *.gz ]]; then
             prompt_yes_no "$(t "Suspicious file")" "$(t "No SQL statements found at the start of the file.\nIt may not be a Koha backup.\n\nContinue anyway?")" 11 72 || return 0
-        fi
-    else
-        if ! head -c 200000 "$file" | grep -qi 'CREATE TABLE'; then
+        else
             prompt_yes_no "$(t "Suspicious file")" "$(t "No SQL statements found at the start of the file.\n\nContinue anyway?")" 10 72 || return 0
         fi
+    fi
+    if [ "$DUMP_COMPLETE" != "yes" ]; then
+        prompt_yes_no "$(t "Suspicious file")" "$(t "The file does not end with the mysqldump completion line (-- Dump completed): it may be truncated.\n\nContinue anyway? It will still be tested in a temporary database first.")" 12 76 || return 0
+    fi
+
+    # 2) Room for the trial import and then the new catalog (InnoDB takes
+    #    about 1.5 times the size of the SQL text).
+    local datadir free_mb need_mb
+    datadir=$(run_sql "SELECT @@datadir;")
+    datadir="${datadir:-/var/lib/mysql}"
+    free_mb=$(get_free_space_mb "$datadir")
+    need_mb=$(( DUMP_MB + DUMP_MB / 2 + 256 ))
+    if [ "${free_mb:-0}" -lt "$need_mb" ] 2>/dev/null; then
+        msg_error "" "$(t 'Not enough free disk space for a safe restore.\n\nNeeded: ~${need_mb} MB\nFree  : ${free_mb} MB (${datadir})\n\nNothing was changed.')" 13 76
+        return 0
     fi
 
     prompt_yes_no "$(t "Confirm Restore")" \
@@ -2588,135 +3104,124 @@ function_restore_database() {
         msg_error "" "$(t "Another backup or restore is already running.\nNothing was changed.")" 10 72
         return 0
     fi
+    maintenance_begin
 
-    local import_log="${LOG_DIR}/restore-import.log" details tables
+    local import_log="${LOG_DIR}/restore-import.log" details tables missing
     printf '===== %s | restore from %s =====\n' "$(date '+%F %T')" "$file" >> "$import_log"
 
-    # 1) Test the file in a temporary database: the current catalog is only
+    # 3) Import into a temporary database: the current catalog is only
     #    touched after the backup has proven to be a complete Koha database.
     display_explanation "Checking the backup in a temporary database..."
-    local check_db="koha_restore_check"
-    if ! mysql -e "DROP DATABASE IF EXISTS \`${check_db}\`; CREATE DATABASE \`${check_db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>>"$import_log" \
-       || ! import_sql_file "$file" "$check_db" "$import_log"; then
-        mysql -e "DROP DATABASE IF EXISTS \`${check_db}\`;" >/dev/null 2>&1
-        backup_lock_release
+    RESTORE_TRIAL_DB="koha_restore_check"
+    if ! mysql -e "DROP DATABASE IF EXISTS \`${RESTORE_TRIAL_DB}\`; CREATE DATABASE \`${RESTORE_TRIAL_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>>"$import_log" \
+       || ! import_sql_file "$file" "$RESTORE_TRIAL_DB" "$import_log"; then
+        restore_release
         details=$(grep -v "^=====" "$import_log" | tail -n 6 | cut -c1-76)
         msg_error "" "$(t 'The backup could not be imported. Nothing was changed in the current catalog.\n\nLast error lines:\n${details}')" 18 80
         return 1
     fi
-    tables=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${check_db}';")
-    mysql -e "DROP DATABASE IF EXISTS \`${check_db}\`;" >/dev/null 2>&1
+    tables=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${RESTORE_TRIAL_DB}';")
+    missing=$(koha_schema_missing "$RESTORE_TRIAL_DB")
+    drop_trial_db
     if [ "${tables:-0}" -lt 50 ] 2>/dev/null; then
-        backup_lock_release
+        restore_release
         msg_error "" "$(t 'The backup has only ${tables} tables; it is not a complete Koha database. Nothing was changed.')" 10 76
         return 1
     fi
-
-    # 2) Safety copy of the current catalog.
-    local rescue="" cur_tables
-    cur_tables=$(koha_table_count)
-    if [ "${cur_tables:-0}" -gt 0 ] 2>/dev/null; then
-        display_explanation "Saving a safety backup before deleting..."
-        mkdir -p "$DIR_SQL"
-        rescue="${DIR_SQL}/PRE-RESTORE_$(date +%Y-%m-%d_%Hh%M).sql.gz"
-        if mysqldump --single-transaction --quick --routines --triggers --default-character-set=utf8mb4 "$DB_NAME" 2>>"$import_log" | gzip > "$rescue" \
-                && gzip -t "$rescue" 2>/dev/null; then
-            echo "$(t "Safety backup:") $rescue"
-            log "pre-restore safety backup: $rescue"
-        else
-            rm -f "$rescue"; rescue=""
-            if ! prompt_yes_no "$(t "Safety backup failed")" \
-                "$(t "The current database could not be backed up before the restore.\n\nContinue anyway? The current catalog will be lost if the import fails.")" 12 76; then
-                backup_lock_release
-                return 0
-            fi
-        fi
+    if [ -n "$missing" ]; then
+        restore_release
+        msg_error "" "$(t 'The backup is not a complete Koha database (missing: ${missing}).\nNothing was changed.')" 11 76
+        return 1
     fi
 
-    # 3) Replace the catalog.
+    # 4) Verified safety copy of the current catalog: without it, the
+    #    current catalog is never dropped.
+    local rescue="" cur_tables pre_engine
+    if ! cur_tables=$(koha_table_count); then
+        restore_release
+        msg_error "" "$(t "MariaDB is not accepting connections and could not be started.\nNothing was changed.\n\nCheck: systemctl status mariadb")" 12 76
+        return 1
+    fi
+    pre_engine=$(get_search_engine)
+    if [ "$cur_tables" -gt 0 ]; then
+        display_explanation "Saving a safety backup before deleting..."
+        rescue="${DIR_SQL}/PRE-RESTORE_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+        CLEANUP_FILE="$rescue"
+        if ! create_safety_backup "$rescue" "$import_log"; then
+            CLEANUP_FILE=""
+            restore_release
+            msg_error "$(t "Safety backup failed")" "$(t 'The safety backup of the current database could not be created or validated (check the free space and ${DIR_SQL}).\n\nNothing was changed.')" 12 76
+            return 1
+        fi
+        CLEANUP_FILE=""
+        echo "$(t "Safety backup:") $rescue"
+        log "pre-restore safety backup: $rescue"
+    fi
+
+    # 5) Replace the catalog. From here on the restore can only end with the
+    #    backup fully imported or with the previous catalog back in place.
+    shield_signals
+    display_explanation "Do not interrupt: CTRL+C is disabled until the restore finishes."
     display_explanation "Stopping Koha services..."
     stop_koha_db_clients
 
+    local stage="done"
     display_explanation "Recreating the database with utf8mb4 charset..."
     if ! mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>>"$import_log"; then
-        backup_lock_release
-        details=$(grep -v "^=====" "$import_log" | tail -n 6 | cut -c1-76)
-        ensure_koha_services >/dev/null 2>&1
-        msg_error "" "$(t 'Could not recreate the database.\n\n${details}')" 14 80
+        stage="recreate"
+    else
+        ensure_db_grants
+        display_explanation "Importing the catalog (may take several minutes)..."
+        if ! import_sql_file "$file" "$DB_NAME" "$import_log" || [ -n "$(koha_schema_missing "$DB_NAME")" ]; then
+            stage="import"
+        else
+            display_explanation "Upgrading the schema to the installed Koha version..."
+            systemctl restart memcached >/dev/null 2>&1 || true
+            if ! koha_ctl /usr/sbin/koha-upgrade-schema "$INSTANCE" > "${LOG_DIR}/schema-upgrade.log" 2>&1 \
+               || [ -n "$(koha_schema_missing "$DB_NAME")" ]; then
+                stage="schema"
+            fi
+        fi
+    fi
+    if [ "$stage" != "done" ]; then
+        restore_failed "$stage" "$rescue" "$import_log"
         return 1
     fi
     ensure_db_grants
 
-    display_explanation "Importing the catalog (may take several minutes)..."
-    local ok="yes"
-    import_sql_file "$file" "$DB_NAME" "$import_log" || ok="no"
-    tables=$(koha_table_count)
-    if [ "$ok" = "no" ] || [ "${tables:-0}" -lt 50 ] 2>/dev/null; then
-        details=$(grep -v "^=====" "$import_log" | tail -n 6 | cut -c1-76)
-        # Put the previous catalog back.
-        if [ -n "$rescue" ] && mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>>"$import_log" \
-           && import_sql_file "$rescue" "$DB_NAME" "$import_log"; then
-            ensure_db_grants
-            zebra_start >/dev/null 2>&1; start_koha_workers; ensure_koha_services >/dev/null 2>&1
-            backup_lock_release
-            log "restore failed; previous catalog restored from $rescue"
-            msg_error "" "$(t 'The import failed. The previous catalog was restored from the safety backup.\n\nLast error lines:\n${details}')" 18 80
-        else
-            zebra_start >/dev/null 2>&1; start_koha_workers; ensure_koha_services >/dev/null 2>&1
-            backup_lock_release
-            log "restore failed; automatic rollback not possible (rescue=$rescue)"
-            msg_error "" "$(t 'The import failed and the safety backup could not be restored automatically.\nRestore it with option 3: ${rescue}\n\nLast error lines:\n${details}')" 18 80
-        fi
-        return 1
-    fi
-
-    display_explanation "Upgrading the schema to the installed Koha version..."
-    systemctl restart memcached >/dev/null 2>&1 || true
-    /usr/sbin/koha-upgrade-schema "$INSTANCE" > "${LOG_DIR}/schema-upgrade.log" 2>&1 || true
-
-    if ! mysql -e "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable='Version';" >/dev/null 2>&1; then
-        start_koha_workers; ensure_koha_services >/dev/null 2>&1
-        backup_lock_release
-        msg_error "" "$(t "Schema migration failed. The imported database was preserved for diagnosis.")" 11 78
-        return 1
-    fi
-
+    # 6) Search engine and full reindex, then every service back.
     display_explanation "Synchronizing the search engine..."
-    local engine="Zebra"
-    if dpkg -s koha-elasticsearch >/dev/null 2>&1 && is_koha_es_active_in_xml; then engine="Elasticsearch"; fi
-    if ! mysql -e "UPDATE ${DB_NAME}.systempreferences SET value='${engine}' WHERE variable='SearchEngine';" >/dev/null 2>&1; then
-        backup_lock_release
-        msg_error "" "$(t "Could not set the search engine after restore.")" 9 72
-        return 1
-    fi
+    local engine engine_ok="yes" rebuild_ok="yes" cut_time
+    engine=$(restored_search_engine "$pre_engine")
+    mysql -e "UPDATE ${DB_NAME}.systempreferences SET value='${engine}' WHERE variable='SearchEngine';" >/dev/null 2>&1 || engine_ok="no"
     systemctl restart memcached >/dev/null 2>&1 || true
-
-    local rebuild_ok="yes"
-    local cut_time
     cut_time=$(date '+%Y-%m-%d %H:%M:%S')
+    display_explanation "Rebuilding the indices..."
     if [ "$engine" = "Elasticsearch" ]; then
+        set_xml_elasticsearch inserir >/dev/null 2>&1
         prepare_koha_broker || true
         ensure_koha_services >/dev/null 2>&1
-        if ! manage_koha_indexers start; then rebuild_ok="no"; fi
-        if [ "$rebuild_ok" = "yes" ] && ! rebuild_koha_elasticsearch "$cut_time"; then rebuild_ok="no"; fi
+        if ! manage_koha_indexers start || ! rebuild_koha_elasticsearch "$cut_time"; then rebuild_ok="no"; fi
     else
         zebra_stop
         zebra_start >/dev/null 2>&1 || true
-        write_cron_zebra
-        display_explanation "Rebuilding the indices..."
-        /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" > "${LOG_DIR}/zebra-rebuild.log" 2>&1 || rebuild_ok="no"
-        zebra_stop
-        zebra_start >/dev/null 2>&1 || true
+        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" > "${LOG_DIR}/zebra-rebuild.log" 2>&1 || rebuild_ok="no"
     fi
 
-    backup_lock_release
-    start_koha_workers
     display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
-    ensure_koha_services >/dev/null 2>&1
+    resume_koha_services
+    unshield_signals
+    maintenance_end
+    backup_lock_release
+    db_app_login_ok || log "restore: the Koha database user cannot log in (check <hostname> in koha-conf.xml)"
 
     validate_complete_system "$(t "database restore")"
     log "restore completed from $file (engine=$engine rebuild=$rebuild_ok)"
 
+    if [ "$engine_ok" = "no" ]; then
+        msg_error "" "$(t "Could not set the search engine after restore.")" 9 72
+        return 1
+    fi
     if [ "$rebuild_ok" = "no" ]; then
         msg_error "" "$(t "The database was restored, but index rebuilding failed.\nCheck /var/log/koha-easy-install/zebra-rebuild.log")" 11 78
         if prompt_yes_no "$(t "View Report")" \
@@ -2749,25 +3254,25 @@ function_manual_backup() {
     srv_ip=$(get_server_ip)
     msg_info "$(t "Backup Destination")" \
 "$(t "Choose where to save the file.\n\n  USB drive: usually under /media or /mnt\n  To download later: scp root@\${srv_ip}:PATH Downloads/")" 12 76
-    
-    local target_dir
+
+    local target_dir target_file
     target_dir=$(select_directory "$REAL_HOME") || { backup_lock_release; return 0; }
     [ -z "$target_dir" ] && { backup_lock_release; return 0; }
-    local target_file="${target_dir%/}/${DB_NAME}_manual_$(date +%Y-%m-%d_%Hh%M).sql.gz"
-    
+    target_file="${target_dir%/}/${DB_NAME}_manual_$(date +%Y-%m-%d_%Hh%M).sql.gz"
+
     clear
     display_explanation "Generating the backup..."
-    
-    if mysqldump --single-transaction --quick --routines --triggers \
-         --default-character-set=utf8mb4 "$DB_NAME" | gzip > "$target_file" && gzip -t "$target_file" 2>/dev/null; then
-        
+
+    # Same checks as the safety copies: gzip test, complete mysqldump, size.
+    if create_safety_backup "$target_file"; then
+
         log "manual backup generated: $target_file"
         backup_lock_release
-        
+
         local size ip_addr
         size=$(du -h "$target_file" | cut -f1)
         ip_addr=$(get_server_ip)
-        
+
         echo "======================================================================"
         echo -e "\e[1;32m$(t "BACKUP GENERATED AND VERIFIED SUCCESSFULLY!")\e[0m"
         echo "======================================================================"
@@ -2788,7 +3293,6 @@ function_manual_backup() {
         echo "======================================================================"
         pause_terminal
     else
-        rm -f "$target_file"
         backup_lock_release
         msg_error "" "$(t "Failed to generate the backup. Check the free disk space.")" 9 70
     fi
@@ -2799,14 +3303,15 @@ function_manual_backup() {
 # ======================================================================
 function_test_backup() {
     require_koha || return 0
+    require_db_admin || return 0
     local newest
     newest=$(find "$DIR_SQL" -name '*.sql.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
     if [ -z "$newest" ]; then
         msg_error "" "$(t "No automatic backup found in \${DIR_SQL}.")" 9 70
         return 0
     fi
-    if ! gzip -t "$newest" 2>/dev/null; then
-        msg_error "" "$(t "The latest backup failed gzip validation and will not be tested.")" 9 74
+    if ! check_dump_file "$newest"; then
+        msg_error "" "$DUMP_ERROR" 9 74
         return 1
     fi
 
@@ -2822,26 +3327,35 @@ function_test_backup() {
     prompt_yes_no "$(t "Test Backup")" "$p_msg" 15 76 || return 0
 
     clear
-    local test_db="koha_teste_restauracao"
+    if ! backup_lock_acquire; then
+        msg_info "$(t "Backup in progress")" "$(t "Another backup or restore is already running. Try again later.")" 9 72
+        return 0
+    fi
     display_explanation "Importing into a temporary database..."
-    if ! mysql -e "DROP DATABASE IF EXISTS ${test_db}; CREATE DATABASE ${test_db} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null 2>&1; then
+    RESTORE_TRIAL_DB="koha_teste_restauracao"
+    if ! mysql -e "DROP DATABASE IF EXISTS \`${RESTORE_TRIAL_DB}\`; CREATE DATABASE \`${RESTORE_TRIAL_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null 2>&1; then
+        RESTORE_TRIAL_DB=""
+        backup_lock_release
         msg_error "" "$(t "Could not create the temporary test database.")" 9 72
         return 1
     fi
-    if ! zcat "$newest" | mysql --default-character-set=utf8mb4 "$test_db"; then
-        mysql -e "DROP DATABASE IF EXISTS ${test_db};" >/dev/null 2>&1 || true
+    # import_sql_file drops the CREATE DATABASE/USE lines: a dump made with
+    # --databases would otherwise be imported into the production database.
+    local ok="yes" tab bib usu missing
+    import_sql_file "$newest" "$RESTORE_TRIAL_DB" "${LOG_DIR}/restore-import.log" || ok="no"
+    tab=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${RESTORE_TRIAL_DB}';")
+    bib=$(run_sql "SELECT COUNT(*) FROM ${RESTORE_TRIAL_DB}.biblio;")
+    usu=$(run_sql "SELECT COUNT(*) FROM ${RESTORE_TRIAL_DB}.borrowers;")
+    missing=$(koha_schema_missing "$RESTORE_TRIAL_DB")
+    drop_trial_db
+    backup_lock_release
+    log "backup test: $newest import=$ok tables=$tab biblios=$bib missing=${missing:-none}"
+
+    if [ "$ok" = "no" ]; then
         msg_error "" "$(t "The backup DID NOT restore. Check the file urgently.")" 9 72
         return 1
     fi
-
-    local tab bib usu
-    tab=$(run_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${test_db}';")
-    bib=$(run_sql "SELECT COUNT(*) FROM ${test_db}.biblio;")
-    usu=$(run_sql "SELECT COUNT(*) FROM ${test_db}.borrowers;")
-    mysql -e "DROP DATABASE IF EXISTS ${test_db};" >/dev/null 2>&1 || true
-    log "backup test: $newest tables=$tab biblios=$bib"
-
-    if [ "${tab:-0}" -gt 50 ] 2>/dev/null && [ "${bib:-0}" -ge 0 ] 2>/dev/null; then
+    if [ "${tab:-0}" -gt 50 ] 2>/dev/null && [ -z "$missing" ]; then
         local ok_test_msg
         ok_test_msg="$(printf "%s\n\n%s: %s\n%s: %s\n%s: %s\n%s: %s" \
             "$(t "BACKUP IS INTACT AND RESTORABLE.")" \
@@ -2851,6 +3365,9 @@ function_test_backup() {
             "$(t "Patrons")" "${usu}")"
 
         msg_ok "$ok_test_msg" 13 74
+    elif [ -n "$missing" ] && [ "${tab:-0}" -gt 50 ] 2>/dev/null; then
+        msg_error "" "$(t 'The backup is not a complete Koha database (missing: ${missing}).\nNothing was changed.')" 11 76
+        return 1
     else
         local err_tab_msg
         err_tab_msg="$(printf "$(t "The backup imported but has only %s tables. Suspicious.")" "${tab}")"
@@ -2974,7 +3491,7 @@ function_install_languages() {
     # ==================================================================
     if $sudo_cmd "$koha_trans_cmd" --list 2>/dev/null | grep -Fq "$choice"; then
         $sudo_cmd systemctl restart memcached >/dev/null 2>&1 || true
-        $sudo_cmd /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+        plack_restart || true
 
         # ==============================================================
         # ENABLE LANGUAGE IN KOHA
@@ -3025,7 +3542,7 @@ function_install_languages() {
             $mysql_runner -e "DELETE FROM ${DB_NAME}.sessions;" >/dev/null 2>&1 || true
 
             $sudo_cmd systemctl restart memcached >/dev/null 2>&1 || true
-            $sudo_cmd /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+            plack_restart || true
             $sudo_cmd systemctl reload apache2 >/dev/null 2>&1 || true
         fi
 
@@ -3054,21 +3571,17 @@ function_toggle_search_engine() {
             msg_error "" "$(t "Another backup/restore is running. Engine switch cancelled.")" 9 72
             return 1
         fi
+        maintenance_begin
         display_explanation "Stopping the Elasticsearch indexer..."
         manage_koha_indexers stop
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-        display_explanation "Removing the <elasticsearch> block..."
-        if ! set_xml_elasticsearch remover; then
-            manage_koha_indexers start >/dev/null 2>&1 || true
-            systemctl enable --now elasticsearch >/dev/null 2>&1 || true
-            backup_lock_release
-            return 1
-        fi
+        # The <elasticsearch> block stays (Debian ships it even for Zebra);
+        # only the damage left there by older panel versions is repaired.
+        repair_koha_conf_xml
         if ! mysql -e "UPDATE ${DB_NAME}.systempreferences SET value='Zebra' WHERE variable='SearchEngine';" >/dev/null 2>&1; then
-            set_xml_elasticsearch inserir >/dev/null 2>&1 || true
             manage_koha_indexers start >/dev/null 2>&1 || true
             systemctl enable --now elasticsearch >/dev/null 2>&1 || true
-            backup_lock_release
+            maintenance_end; backup_lock_release
             msg_error "" "$(t "Could not set SearchEngine to Zebra. Elasticsearch configuration was restored.")" 10 74
             return 1
         fi
@@ -3084,15 +3597,17 @@ function_toggle_search_engine() {
             "/var/lock/koha/${INSTANCE}" 2>/dev/null || true
         zebra_start >/dev/null 2>&1
         if ! is_koha_zebra_running; then
-            backup_lock_release
+            ensure_search_indexing >/dev/null 2>&1
+            maintenance_end; backup_lock_release
             msg_error "" "$(t "Zebra daemon could not be started. Engine switch was interrupted.")" 10 74
             return 1
         fi
         write_cron_zebra
         systemctl restart koha-common >/dev/null 2>&1 || true
         display_explanation "Reindexing the catalog into Zebra..."
-        if ! /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log"; then
-            backup_lock_release
+        if ! koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log"; then
+            ensure_search_indexing >/dev/null 2>&1
+            maintenance_end; backup_lock_release
             msg_error "" "$(t "Zebra rebuild failed. The system will remain on Zebra; use the repair option.")" 11 76
             if prompt_yes_no "$(t "View Report")" \
                 "$(t "Do you want to see the validation report to investigate the issues now?")" 10 72; then
@@ -3100,8 +3615,9 @@ function_toggle_search_engine() {
             fi
             return 1
         fi
-        backup_lock_release
-        /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+        ensure_search_indexing >/dev/null 2>&1
+        maintenance_end; backup_lock_release
+        plack_restart
         validate_complete_system "$(t "switch to Zebra")"
         msg_ok "$(t "System now running on ZEBRA.\nIncremental indexing runs every 2 minutes.")" 10 70
 
@@ -3119,11 +3635,19 @@ function_toggle_search_engine() {
         prompt_yes_no "$(t "Low disk space")" "$(t "Less than 4 GB free. Elasticsearch may fail to start.\n\nContinue anyway?")" 10 70 || return 0
     fi
 
+    local es_arch
+    es_arch=$(dpkg --print-architecture 2>/dev/null)
+    if ! es_arch_supported; then
+        msg_error "" "$(t 'Elasticsearch 7 has no packages for this architecture (${es_arch}). Zebra was kept.')" 9 76
+        return 1
+    fi
+
     clear
     if ! backup_lock_acquire; then
         msg_error "" "$(t "Another backup/restore is running. Engine switch cancelled.")" 9 72
         return 1
     fi
+    maintenance_begin
 
     display_explanation "Disabling Zebra and its queue..."
     rm -f "$CRON_ZEBRA"; systemctl restart cron >/dev/null 2>&1 || true
@@ -3137,7 +3661,7 @@ function_toggle_search_engine() {
             restore_apt_timers
             write_cron_zebra
             zebra_start >/dev/null 2>&1 || true
-            backup_lock_release
+            maintenance_end; backup_lock_release
             msg_error "" "$(t "Elasticsearch installation failed. Zebra was restored.")" 10 72
             return 1
         fi
@@ -3147,12 +3671,12 @@ function_toggle_search_engine() {
     if ! adjust_elasticsearch_heap; then
         write_cron_zebra
         zebra_start >/dev/null 2>&1 || true
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Could not write Elasticsearch memory configuration. Zebra was restored.")" 11 78
         return 1
     fi
     if [ ! -f /etc/elasticsearch/elasticsearch.yml ]; then
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Elasticsearch configuration file is missing.")" 9 70
         write_cron_zebra; zebra_start >/dev/null 2>&1 || true
         return 1
@@ -3165,7 +3689,7 @@ function_toggle_search_engine() {
             systemctl disable --now elasticsearch >/dev/null 2>&1 || true
             write_cron_zebra
             zebra_start >/dev/null 2>&1 || true
-            backup_lock_release
+            maintenance_end; backup_lock_release
             msg_error "" "$(t "Could not install the Elasticsearch analysis-icu plugin. Zebra was restored.")" 11 78
             return 1
         fi
@@ -3177,7 +3701,7 @@ function_toggle_search_engine() {
     if ! systemctl restart elasticsearch; then
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
         write_cron_zebra; zebra_start >/dev/null 2>&1 || true
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Elasticsearch failed to start. Zebra was restored.")" 12 76
         return 1
     fi
@@ -3190,7 +3714,7 @@ function_toggle_search_engine() {
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
         write_cron_zebra
         zebra_start >/dev/null 2>&1 || true
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Elasticsearch did not start on port 9200. Zebra was kept.")" 12 76
         return 1
     fi
@@ -3200,7 +3724,7 @@ function_toggle_search_engine() {
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
         write_cron_zebra
         zebra_start >/dev/null 2>&1 || true
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Could not enable the Elasticsearch block in koha-conf.xml. Zebra was restored.")" 11 78
         return 1
     fi
@@ -3208,7 +3732,7 @@ function_toggle_search_engine() {
         set_xml_elasticsearch remover >/dev/null 2>&1 || true
         write_cron_zebra; zebra_start >/dev/null 2>&1 || true
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-        backup_lock_release
+        maintenance_end; backup_lock_release
         msg_error "" "$(t "Could not set SearchEngine to Elasticsearch. Zebra was restored.")" 10 76
         return 1
     fi
@@ -3226,8 +3750,8 @@ function_toggle_search_engine() {
     local rebuild_ok="yes"
     display_explanation "Reindexing the catalog into Elasticsearch..."
     if [ "$indexer_ok" = "yes" ] && ! rebuild_koha_elasticsearch "$cut_time"; then rebuild_ok="no"; fi
-    backup_lock_release
-    /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+    maintenance_end; backup_lock_release
+    plack_restart
     validate_complete_system "$(t "Elasticsearch activation")"
     if [ "$indexer_ok" = "yes" ] && [ "$rebuild_ok" = "yes" ] && is_koha_indexer_running; then
         msg_ok "$(t "System now running on ELASTICSEARCH.\n\nThe indexer has automatic recovery and the watchdog checks the queue every 5 minutes.")" 12 78
@@ -3298,7 +3822,7 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
         prepare_koha_broker
         systemctl restart memcached koha-common >/dev/null 2>&1
         manage_koha_indexers start
-        /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1
+        plack_restart
         local rebuild_ok="yes"
         if prompt_yes_no "$(t "Reindex")" "$(t "Rebuild the whole index from scratch?\nOn large catalogs this can take several minutes.")" 10 74; then
             clear
@@ -3328,6 +3852,8 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
 
     prompt_yes_no "$(t "Repair Zebra")" "$(t "Unlock Zebra and rebuild the indices from scratch?")" 10 70 || return 0
     clear
+    maintenance_begin
+    repair_koha_conf_xml
     display_explanation "Unlocking Zebra..."
     zebra_stop
     force_stop_koha_zebra
@@ -3340,9 +3866,11 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
     write_cron_zebra
     display_explanation "Rebuilding the indices..."
     local zebra_ok="yes"
-    /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || zebra_ok="no"
+    koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || zebra_ok="no"
     zebra_stop
     zebra_start >/dev/null 2>&1 || zebra_ok="no"
+    maintenance_end
+    ensure_search_indexing >/dev/null 2>&1 || zebra_ok="no"
     display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
     ensure_koha_services >/dev/null 2>&1
 
@@ -3432,7 +3960,7 @@ function_size_server() {
         return 1
     fi
     systemctl restart koha-common >/dev/null 2>&1
-    /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1
+    plack_restart
     if [ "$(get_search_engine)" = "Elasticsearch" ]; then
         if ! adjust_elasticsearch_heap || ! systemctl restart elasticsearch >/dev/null 2>&1; then
             msg_error "" "$(t "Elasticsearch memory tuning failed or the service did not restart.")" 9 74
@@ -3480,6 +4008,14 @@ validate_and_register_rclone() {
         msg_info "$(t "Cloud configured")" "$(t "Configuration saved, but I could not find the test file at \${name}:Backup_SQL_Koha.\n\nCheck the log: \${LOG_DIR}/backup_sql.log")" 11 76
     fi
     return 0
+}
+
+# A complete rclone OAuth token as printed by "rclone authorize": one JSON
+# object with the access and refresh tokens and the expiry (a copy cut
+# short loses the end). rclone itself checks it with a real write test.
+is_rclone_token() {
+    [[ "$1" =~ ^\{.*\}$ ]] && [[ "$1" == *'"access_token"'* ]] \
+        && [[ "$1" == *'"refresh_token"'* ]] && [[ "$1" == *'"expiry"'* ]]
 }
 
 function_configure_rclone() {
@@ -3540,7 +4076,7 @@ function_configure_rclone() {
                 echo -e "\n\e[1;31m$(t "[ERROR] Invalid format! Token must start with '{' and end with '}'. Try again:")\e[0m\n"
                 continue
             fi
-            if ! python3 -c 'import sys, json; json.loads(sys.argv[1])' "$token_input" 2>/dev/null; then
+            if ! is_rclone_token "$token_input"; then
                 echo -e "\n\e[1;31m$(t "[ERROR] Provided JSON is corrupt or was truncated when copying. Try again:")\e[0m\n"
                 continue
             fi
@@ -3584,7 +4120,7 @@ function_configure_rclone() {
         local extracted_token
         extracted_token=$(echo "$token_output" | grep -o '{.*}' | head -n 1)
 
-        if [ -n "$extracted_token" ] && python3 -c 'import sys, json; json.loads(sys.argv[1])' "$extracted_token" 2>/dev/null; then
+        if [ -n "$extracted_token" ] && is_rclone_token "$extracted_token"; then
             echo ""
             echo -e "\e[1;32m[OK] $(t "Token captured automatically!")\e[0m"
             rclone config delete gdrive >/dev/null 2>&1 || true
@@ -3835,7 +4371,7 @@ function_cloudflare_setup() {
             msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
             return 1
         fi
-        echo "deb [signed-by=/etc/apt/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
+        apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
         if ! apt_update_indices; then
             rm -f /etc/apt/sources.list.d/cloudflared.list
             restore_apt_timers
@@ -3954,7 +4490,7 @@ EOF
             fi
 
             systemctl restart memcached >/dev/null 2>&1 || true
-            /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+            plack_restart || true
         fi
 
         function_cloudflare_status
@@ -3965,7 +4501,8 @@ EOF
 
 function_configure_cloudflare() {
     while true; do
-        local tunnel_active="$(t "INACTIVE")"
+        local tunnel_active
+        tunnel_active="$(t "INACTIVE")"
         systemctl is-active --quiet cloudflared && tunnel_active="$(t "ACTIVE")"
 
         local choice
@@ -4188,7 +4725,7 @@ function_configure_ssl() {
         return 1
     fi
     restore_apt_timers
-    if ! certbot --apache; then
+    if ! koha_ctl certbot --apache; then
         msg_error "" "$(t "Certbot could not complete certificate issuance/configuration. Apache will not be reloaded automatically.")" 10 78
         return 1
     fi
@@ -4219,12 +4756,12 @@ function_interoperability() {
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     local z39_ok="no" sip_ok="no"
-    if /usr/sbin/koha-z3950-responder --start "$INSTANCE" >/dev/null 2>&1 \
+    if koha_ctl /usr/sbin/koha-z3950-responder --start "$INSTANCE" >/dev/null 2>&1 \
        || systemctl enable --now "koha-z3950-responder@${INSTANCE}" >/dev/null 2>&1 \
        || pgrep -f "z3950_responder.*${INSTANCE}" >/dev/null 2>&1; then
         z39_ok="yes"
     fi
-    if /usr/sbin/koha-sip --start "$INSTANCE" >/dev/null 2>&1 \
+    if koha_ctl /usr/sbin/koha-sip --start "$INSTANCE" >/dev/null 2>&1 \
        || systemctl enable --now "koha-sip-daemon@${INSTANCE}" >/dev/null 2>&1 \
        || pgrep -f "SIPServer.*${INSTANCE}" >/dev/null 2>&1; then
         sip_ok="yes"
@@ -4359,6 +4896,28 @@ function_update_system() {
     prompt_yes_no "$(t "Update")" \
 "$(t "System and Koha packages will be updated and database\nmigrations applied.\n\nRecommended: make a backup first.\n\nContinue?")" 13 74 || return 0
     clear
+    # koha-common's own postinst migrates the database during "apt-get
+    # upgrade": the verified safety copy must exist before the packages move.
+    local cur_tables pre_update
+    if is_koha_installed && cur_tables=$(koha_table_count) && [ "$cur_tables" -gt 0 ]; then
+        if ! backup_lock_acquire; then
+            msg_error "" "$(t "Another backup or restore is already running.\nNothing was changed.")" 10 72
+            return 1
+        fi
+        display_explanation "Generating the backup..."
+        pre_update="${DIR_SQL}/PRE-UPDATE_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+        CLEANUP_FILE="$pre_update"
+        if ! create_safety_backup "$pre_update"; then
+            CLEANUP_FILE=""
+            backup_lock_release
+            msg_error "$(t "Safety backup failed")" "$(t 'The safety backup of the current database could not be created or validated (check the free space and ${DIR_SQL}).\n\nNothing was changed.')" 12 76
+            return 1
+        fi
+        CLEANUP_FILE=""
+        backup_lock_release
+        echo "$(t "Safety backup:") $pre_update"
+        log "pre-update safety backup: $pre_update"
+    fi
     if ! wait_for_apt_locks; then return 1; fi
     apt_update_indices
     if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade "${APT_OPTS[@]}"; then
@@ -4396,6 +4955,7 @@ function_update_system() {
                 msg_error "" "$(t "Zebra could not be started after the update.")" 9 72
                 return 1
             fi
+            ensure_search_indexing >/dev/null 2>&1
         fi
     fi
     display_explanation "Cleaning orphan packages..."
@@ -4436,6 +4996,7 @@ function_repair_services() {
     systemctl start mariadb >/dev/null 2>&1
     start_koha_workers
     is_koha_zebra_running || zebra_start >/dev/null 2>&1
+    ensure_search_indexing >/dev/null 2>&1
     ensure_koha_services >/dev/null 2>&1
     local mc_state plack_state details=""
     memcached_alive && mc_state="$(t "active")" || mc_state="$(t "inactive")"
@@ -4473,7 +5034,7 @@ function_deep_maintenance() {
 
     display_explanation "Restarting core services to free memory..."
     systemctl restart memcached >/dev/null 2>&1 || true
-    /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1 || true
+    plack_restart || true
     systemctl restart apache2 >/dev/null 2>&1 || true
 
     msg_ok "$(t "Maintenance completed successfully!\n\n• MariaDB tables optimized\n• System logs vacuumed\n• Services restarted and memory flushed")" 12 74
@@ -4675,7 +5236,8 @@ function_autoupdate() {
     fi
 
     chmod 755 "$tmp"
-    local backup="${target}.bak-$(date +%Y%m%d-%H%M%S)"
+    local backup
+    backup="${target}.bak-$(date +%Y%m%d-%H%M%S)"
     if [ -f "$target" ]; then
         if ! cp -p "$target" "$backup"; then
             rm -f "$tmp" "$tmp_sha"
@@ -4771,18 +5333,12 @@ function_rotate_db_password() {
     # The credentials file is translated, so replace the old value itself
     # instead of looking for a "Password:" label.
     if [ -f "$CREDENTIALS_FILE" ] && [ -n "$old_pass" ]; then
-        OLD_PASS="$old_pass" NEW_PASS="$new_pass" python3 - "$CREDENTIALS_FILE" << 'PYEOF' 2>/dev/null || true
-import os, sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as fh:
-    text = fh.read()
-text = text.replace(os.environ["OLD_PASS"], os.environ["NEW_PASS"])
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write(text)
-PYEOF
+        local cred
+        cred=$(<"$CREDENTIALS_FILE")
+        printf '%s\n' "${cred//"$old_pass"/"$new_pass"}" > "$CREDENTIALS_FILE"
     fi
     systemctl restart memcached koha-common >/dev/null 2>&1
-    /usr/sbin/koha-plack --restart "$INSTANCE" >/dev/null 2>&1
+    plack_restart
     sleep 2
     if curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "http://127.0.0.1:8080/" 2>/dev/null | grep -Eq '^[23]'; then
         log "database password rotated"
@@ -4853,6 +5409,9 @@ function_about() {
     whiptail --title "$(t "About")" --textbox "$tmp_about" 25 78 2>/dev/null || true
     rm -f "$tmp_about"
 }
+
+# Loaded with "source installer" (tests/): functions only, no menu.
+(return 0 2>/dev/null) && return 0
 
 # ======================================================================
 # KEEP THE INSTALLED PANEL UP TO DATE

@@ -14,7 +14,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 
 - **Instalação em um passo** do Koha, MariaDB, Apache, Memcached e Plack, com pré-validação do servidor (sistema, disco, rede, portas ocupadas), SWAP de 4 GB, NTP e escolha do fuso horário.
 - **Central de backup**: backup SQL compactado diário, exportação MARC21 semanal, backup manual com instruções de download, teste de restauração em banco temporário e cópia na nuvem para o Google Drive (rclone).
-- **Restauração segura** de backups `.sql` / `.sql.gz`, com cópia de segurança do banco atual antes, atualização do esquema e reindexação.
+- **Restauração segura** de backups `.sql` / `.sql.gz`: o arquivo é verificado (teste do gzip, mysqldump completo, tabelas do Koha) e importado antes em um banco temporário; o catálogo atual só é substituído depois de existir uma cópia de segurança verificada, volta automaticamente se algo falhar, e a restauração não fica pela metade por causa de um CTRL+C ou de uma queda da conexão SSH.
 - **Motor de busca**: troca entre Zebra e Elasticsearch 7, vigia (watchdog) do indexador e ferramentas de reparo/reconstrução.
 - **Publicação na internet**: Túnel Cloudflare (sem abrir portas), certificado SSL gratuito (Certbot) e assistente do Google Search Console.
 - **Diagnóstico**: verificação completa com relatório detalhado, status do servidor, logs do Apache em tempo real e manutenção profunda do banco.
@@ -27,7 +27,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 
 | Item | Mínimo |
 |------|--------|
-| Sistema operacional | Debian 11/12 ou Ubuntu 22.04/24.04 (64 bits) |
+| Sistema operacional | Debian 11/12/13 ou Ubuntu 22.04/24.04, 64 bits (amd64 ou arm64, ex.: Oracle Ampere, AWS Graviton, Raspberry Pi 4/5) |
 | RAM | 2 GB (recomendado 4 GB ou mais; o Elasticsearch precisa de ~1,5 GB a mais) |
 | Disco livre | 5 GB (recomendado 10 GB ou mais) |
 | Acesso | `root` ou usuário com `sudo` |
@@ -96,7 +96,8 @@ Instaladas em `/etc/cron.d/koha_tasks`:
 | Diariamente 01:30 | Limpeza de sessões e do banco |
 | Diariamente 05:00 | Reinício do Plack (mantém a memória baixa) |
 | Diariamente 08:00 / 08:05 | Avisos de atraso e fila de e-mails |
-| A cada 2 min | Indexação incremental do Zebra |
+| A cada 2 min | Vigia da indexação do Zebra: mantém o daemon indexador do Koha (`koha-indexer`) no ar e o reinicia se registros esperarem mais de 10 min |
+| A cada 5 min (só Elasticsearch) | Vigia do indexador do Elasticsearch |
 
 ## Arquivos importantes
 
@@ -121,9 +122,20 @@ sudo bash uninstall.sh --yes    # sem perguntas (automação)
 
 Copie seus backups para outro lugar antes de executá-lo.
 
+## Testes (para quem contribui)
+
+A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64.
+
+```bash
+sudo apt-get install bats mariadb-server memcached whiptail
+sudo KEI_TEST_SANDBOX=1 tests/run.sh
+```
+
+**Somente em um contêiner ou VM descartável:** os testes substituem o banco `koha_library` e instalam dublês de teste para as ferramentas `koha-*` e o `systemctl`. O `tests/run.sh` se recusa a rodar ao lado de um Koha real.
+
 ## Traduções (para quem contribui)
 
-Os textos do painel ficam em inglês dentro do `installer`; cada idioma tem um dicionário em `lang/<código>.cache` (`base64(inglês)|base64(tradução)`).
+Os textos do painel ficam em inglês dentro do `installer`; cada idioma tem um dicionário em `lang/<código>.cache` (`base64(inglês)|base64(tradução)`). O painel em si é Bash puro; os scripts Python abaixo são ferramentas opcionais para quem contribui.
 
 - Envolva todo texto visível em `$(t "...")`. As variáveis devem ser escapadas para que o texto em inglês chegue intacto ao `t()`: `$(t "Backup saved in \${file}")`.
 - Verificar a cobertura e reparar os dicionários: `python3 i18n_common.py` / `python3 i18n_common.py --fix`

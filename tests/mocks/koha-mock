@@ -1,0 +1,55 @@
+#!/bin/bash
+# Test double for Koha's command-line tools (koha-plack, koha-zebra, ...).
+# Installed by tests/run.sh as symlinks in /usr/sbin, on disposable test
+# machines only. State lives in /run/kei-mock:
+#   calls.log      every invocation ("koha-plack --start library")
+#   run/<svc>      the service is "running"
+#   fail/<tool>    make that tool fail (exit 1)
+#   daemons.pids   detached processes started by "--start", like the real
+#                  daemons (they inherit the caller's open descriptors)
+S=/run/kei-mock
+name=$(basename "$0")
+mkdir -p "$S/run" "$S/fail"
+printf '%s %s\n' "$name" "$*" >> "$S/calls.log"
+[ -e "$S/fail/$name" ] && { echo "$name: simulated failure" >&2; exit 1; }
+
+action=""
+for a in "$@"; do
+    case "$a" in --start|--stop|--restart|--status|--enable|--disable|--rebuild) action="$a" ;; esac
+done
+
+svc=""
+case "$name" in
+    koha-plack)            svc=plack ;;
+    koha-zebra)            svc=zebra ;;
+    koha-indexer)          svc=indexer ;;
+    koha-es-indexer)       svc=es-indexer ;;
+    koha-worker)           svc=worker ;;
+    koha-sip)              svc=sip ;;
+    koha-z3950-responder)  svc=z3950 ;;
+esac
+
+if [ -n "$svc" ]; then
+    case "$action" in
+        --start|--restart)
+            touch "$S/run/$svc"
+            # Like Starman/daemon(1): detach but keep inherited descriptors.
+            # (fd 3 is the test runner's own pipe, not part of the simulation)
+            setsid sleep 600 </dev/null >/dev/null 2>&1 3>&- &
+            echo $! >> "$S/daemons.pids"
+            ;;
+        --stop)   rm -f "$S/run/$svc" ;;
+        --status) if [ -e "$S/run/$svc" ]; then echo "$svc running"; else echo "$svc not running"; exit 1; fi ;;
+    esac
+    exit 0
+fi
+
+case "$name" in
+    koha-list) echo library ;;
+    koha-shell)
+        # koha-shell INSTANCE -c "command": run it (as root, tests only).
+        shift
+        [ "${1:-}" = "-c" ] && { shift; bash -c "$*"; exit $?; }
+        ;;
+esac
+exit 0
