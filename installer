@@ -37,7 +37,7 @@ trap on_interrupt INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-PANEL_VERSION=" β-0.9.4"
+PANEL_VERSION=" β-0.9.5"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -249,33 +249,47 @@ t() {
     fi
 }
 
-# Locates the dictionary of a language. Order: lang/ folder next to the
-# script, copy installed with the panel, copy downloaded from GitHub (refreshed
-# whenever the panel itself is newer than it).
-_find_translation_cache() {
-    local lang="$1"
-    local near="${_SCRIPT_DIR}/lang/${lang}.cache"
-    local bundled="${CONFIG_DIR}/lang/${lang}.cache"
-    local dl="${CONFIG_DIR}/translations_${lang}.cache"
+# Every dictionary starts with a header naming the panel version it was
+# generated for. A dictionary from another version (e.g. the lang/ folder of
+# an old git clone) is only used as a last resort: it lacks the new texts and
+# may still carry old, bad translations.
+LANG_CACHE_HEADER="# koha-easy-installer lang ${PANEL_VERSION# }"
+_cache_is_current() {
+    [ -s "$1" ] && [ "$(head -n1 "$1" 2>/dev/null)" = "$LANG_CACHE_HEADER" ]
+}
 
-    [ -n "$_SCRIPT_DIR" ] && [ -s "$near" ] && { printf '%s' "$near"; return 0; }
-    if [ -s "$bundled" ] && ! [ "$bundled" -ot "$_SCRIPT_PATH" ]; then
-        printf '%s' "$bundled"; return 0
-    fi
+# Locates the dictionary of a language. Order: a copy made for this panel
+# version (lang/ folder next to the script, copy installed with the panel,
+# copy downloaded from GitHub); otherwise download it again; otherwise any
+# copy available.
+_find_translation_cache() {
+    local lang="$1" f
+    local near="" bundled="${CONFIG_DIR}/lang/${lang}.cache"
+    local dl="${CONFIG_DIR}/translations_${lang}.cache"
+    [ -n "$_SCRIPT_DIR" ] && near="${_SCRIPT_DIR}/lang/${lang}.cache"
+
+    for f in "$near" "$bundled" "$dl"; do
+        [ -n "$f" ] && _cache_is_current "$f" && { printf '%s' "$f"; return 0; }
+    done
+
+    # Download again when missing, older than the panel or more than a day old
+    # (so an offline server does not wait for the network on every start).
     if [ "$(id -u)" -eq 0 ] && command -v curl >/dev/null 2>&1 && \
-       { [ ! -s "$dl" ] || [ "$dl" -ot "$_SCRIPT_PATH" ]; }; then
+       { [ ! -s "$dl" ] || [ "$dl" -ot "$_SCRIPT_PATH" ] || [ -n "$(find "$dl" -mmin +1440 2>/dev/null)" ]; }; then
         mkdir -p "$CONFIG_DIR" 2>/dev/null
         if curl -4fsSL --connect-timeout 3 --max-time 15 "${LANG_REPO_URL}/${lang}.cache" -o "${dl}.part" 2>/dev/null \
            && grep -q '|' "${dl}.part" 2>/dev/null; then
             mv -f "${dl}.part" "$dl"
         else
             rm -f "${dl}.part"
-            # Offline: keep the old copy and do not retry on every start.
             [ -s "$dl" ] && touch "$dl" 2>/dev/null
         fi
     fi
-    [ -s "$dl" ] && { printf '%s' "$dl"; return 0; }
-    [ -s "$bundled" ] && { printf '%s' "$bundled"; return 0; }
+    _cache_is_current "$dl" && { printf '%s' "$dl"; return 0; }
+
+    for f in "$dl" "$bundled" "$near"; do
+        [ -n "$f" ] && [ -s "$f" ] && { printf '%s' "$f"; return 0; }
+    done
     return 1
 }
 
@@ -2252,7 +2266,7 @@ EOF
         echo "$(t "Rebooting in 5 seconds to consolidate services...")"
         log "post-install automatic reboot requested by user"
         sleep 5
-        reboot
+        reboot_now
     else
         msg_info "$(t "Pending Reboot")" \
 "$(t "All set! You chose to reboot later.\n\nRemember: if the catalog feels sluggish, restart the server via option 15 in the panel before heavy indexing.")" 11 74
@@ -4530,17 +4544,27 @@ function_ufw_rules() {
 # ======================================================================
 # 27. REBOOT SERVER
 # ======================================================================
+# Reboots even when a desktop session is open: on machines with a graphical
+# login, GNOME/KDE "inhibit" a plain "reboot" while a user is logged in.
+reboot_now() {
+    sync
+    systemctl reboot -i >/dev/null 2>&1 \
+        || systemctl reboot --check-inhibitors=no >/dev/null 2>&1 \
+        || shutdown -r now >/dev/null 2>&1 \
+        || /sbin/reboot >/dev/null 2>&1
+    # The reboot was accepted: wait here instead of going back to the menu.
+    sleep 60
+    msg_error "" "$(t "The server did not reboot. Restart it manually with: sudo systemctl reboot -i")" 9 76
+    return 1
+}
+
 function_reboot_server() {
     prompt_yes_no "$(t "Reboot")" "$(t "Reboot the server now?\nEveryone using the catalog will be disconnected.")" 10 74 || return 0
     clear
     echo "$(t "Rebooting in 5 seconds...")"
     log "reboot requested by panel"
     sleep 5
-    if [ "$EUID" -ne 0 ]; then
-        sudo /sbin/reboot || sudo /bin/systemctl reboot || sudo shutdown -r now
-    else
-        /sbin/reboot || /bin/systemctl reboot || shutdown -r now
-    fi
+    reboot_now
 }
 
 # ======================================================================

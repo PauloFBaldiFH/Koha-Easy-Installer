@@ -14,6 +14,8 @@ shows the English text.
 Run directly to check or repair the dictionaries without any translation engine:
     python3 i18n_common.py            # coverage report
     python3 i18n_common.py --fix      # repair variables/icons, drop broken and stale entries
+                                      # (run it after every PANEL_VERSION change: the
+                                      # panel prefers dictionaries of its own version)
 """
 import base64
 import html
@@ -218,11 +220,30 @@ def read_cache(path):
     return entries
 
 
+def panel_version(installer_file=INSTALLER_FILE):
+    """PANEL_VERSION of the installer, without the leading space."""
+    try:
+        with open(installer_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'^PANEL_VERSION="\s*([^"]*)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+def cache_header():
+    """First line of every dictionary; the panel checks it (LANG_CACHE_HEADER)."""
+    return f"# koha-easy-installer lang {panel_version()}"
+
+
 def write_cache(path, entries, order=None):
     keys = [k for k in (order or sorted(entries)) if k in entries]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as out:
+        out.write(cache_header() + "\n")
         for k in keys:
             kb = base64.b64encode(k.encode("utf-8")).decode("ascii")
             vb = base64.b64encode(entries[k].encode("utf-8")).decode("ascii")

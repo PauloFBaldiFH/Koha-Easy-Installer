@@ -130,6 +130,8 @@ The panel texts are in English inside `installer`; each language has a dictionar
 - Translate only what is missing: `python3 gen_all_langs.py` (offline, Argos Translate) or `python3 gen_lang.py` (online).
 - Translations that lose a variable or `%s` are rejected automatically and English is shown instead.
 
+After changing `PANEL_VERSION`, run `python3 i18n_common.py --fix` (each dictionary is stamped with the panel version, and outdated dictionaries are only used as a last resort).
+
 After changing `installer`, regenerate the checksum used by the self-update:
 
 ```bash
