@@ -34,5 +34,5 @@
 
 Execute the one-line installer directly in your terminal. Root privileges are required to provision system packages, Apache modules, and database daemons.
 
-```bash
+```text
 curl -fsSL [https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer](https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer) | sudo bash
