@@ -397,19 +397,32 @@ prompt_yes_no() {
     local message="${2:-Deseja continuar?}"
     local h="${3:-12}"
     local w="${4:-74}"
+    local rc
 
-    if command -v whiptail >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
-        whiptail --title "$title" --yesno "$message" "$h" "$w"
-        return $?
+    if command -v whiptail >/dev/null 2>&1; then
+        whiptail --title "$title" --yesno "$message" "$h" "$w" </dev/tty >/dev/tty 2>/dev/tty
+        rc=$?
+        case "$rc" in
+            0) return 0 ;;
+            1|255) return 1 ;;
+            *) return 1 ;;
+        esac
     fi
 
-    printf '\n[%s]\n%s\n' "$title" "$message"
-    local ans
-    read -r -p "[S/n]: " ans
-    case "$ans" in
-        n|N|nao|NAO|não|NÃO|no|NO) return 1 ;;
-        *) return 0 ;;
-    esac
+    printf '\n[%s]\n%s\n' "$title" "$message" >&2
+
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        local ans
+        printf '[S/n] ' > /dev/tty
+        IFS= read -r ans < /dev/tty || return 1
+        case "$ans" in
+            n|N|nao|NAO|não|NÃO|no|NO) return 1 ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    printf '%s\n' "$(t "No interactive terminal is available. Installation cancelled.")" >&2
+    return 1
 }
 
 display_explanation() { echo -e "\e[1;36m>>> $1\e[0m"; }
