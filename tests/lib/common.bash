@@ -164,9 +164,9 @@ kei_reset_env() {
     rm -f /etc/systemd/system/koha-common.service.d/koha-easy-install.conf /etc/systemd/system/apache2.service.d/koha-easy-install.conf
     cp -f "$KEI_REPO/tests/mocks/koha-conf.xml" /etc/koha/sites/library/koha-conf.xml
     printf 'USE_INDEXER_DAEMON="yes"\n' > /etc/default/koha-common
-    mysql -e "DROP DATABASE IF EXISTS koha_restore_check; DROP DATABASE IF EXISTS koha_teste_restauracao;" 2>/dev/null
     kei_start_mariadb
     kei_start_memcached
+    mysql -e "DROP DATABASE IF EXISTS koha_restore_check; DROP DATABASE IF EXISTS koha_teste_restauracao;" 2>/dev/null || true
 }
 
 # Runs one installer function through the driver (bats "run" semantics).
