@@ -73,11 +73,14 @@ wait_for_apt() {
 }
 
 # Remove pacotes com purge (apaga também os arquivos de configuração do
-# dpkg). Se o script de remoção de algum pacote falhar, força a remoção:
-# um pacote "meio removido" deixa o dpkg achando que os arquivos de
-# /etc/koha existem e a próxima instalação falha (apache-site.conf.in).
+# dpkg). Com "force" (só para os pacotes do Koha), se o apt falhar a remoção
+# é forçada pelo dpkg: um pacote "meio removido" deixa o dpkg achando que os
+# arquivos de /etc/koha existem e a próxima instalação falha
+# (apache-site.conf.in). Pacotes gerais (Apache, MariaDB...) nunca são
+# forçados: em máquinas com desktop outros programas dependem deles.
 purge_packages() {
-    local installed=() p
+    local force="no" installed=() leftover=() p
+    [ "$1" = "force" ] && { force="yes"; shift; }
     for p in "$@"; do
         dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qE 'install|config-files|half' && installed+=("$p")
     done
@@ -85,11 +88,20 @@ purge_packages() {
     echo "    Removendo: ${installed[*]}"
     apt-get purge -y "${installed[@]}" >/dev/null 2>&1 || true
     for p in "${installed[@]}"; do
-        if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qE 'install|config-files|half'; then
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qE 'install|config-files|half' || continue
+        if [ "$force" = "yes" ]; then
             echo "    [!] $p não saiu com apt; forçando com dpkg"
             dpkg --purge --force-remove-reinstreq --force-depends "$p" >/dev/null 2>&1 || true
+        else
+            leftover+=("$p")
         fi
     done
+    if [ ${#leftover[@]} -gt 0 ]; then
+        echo "    [i] Mantidos porque outros programas desta máquina dependem deles:"
+        echo "        ${leftover[*]}"
+        echo "        (não atrapalha uma nova instalação do Koha)"
+    fi
+    return 0
 }
 
 KOHA_PACKAGES=(koha-common koha-elasticsearch koha-perldeps koha-l10n)
@@ -140,7 +152,7 @@ step "[4/9] Removendo pacotes..."
 wait_for_apt
 dpkg --configure -a >/dev/null 2>&1 || true
 apt-get install -f -y >/dev/null 2>&1 || true
-purge_packages "${KOHA_PACKAGES[@]}"
+purge_packages force "${KOHA_PACKAGES[@]}"
 if [ "$FULL" = "yes" ]; then
     systemctl stop mariadb apache2 memcached elasticsearch rabbitmq-server 2>/dev/null || true
     purge_packages "${FULL_PACKAGES[@]}"
@@ -244,9 +256,10 @@ check "bancos koha_* removidos"              "mysql -Nse \"SELECT 1 FROM informa
 check "porta 8080 livre"                     "ss -lnt | awk '{print \$4}' | grep -Eq '[.:]8080\$'"
 if [ "$FULL" = "yes" ]; then
     check "MariaDB removido"                 "dpkg-query -W -f='\${Status}' mariadb-server | grep -q 'ok installed'"
-    check "Apache removido"                  "dpkg-query -W -f='\${Status}' apache2 | grep -q 'ok installed'"
     check "porta 80 livre"                   "ss -lnt | awk '{print \$4}' | grep -Eq '[.:]80\$'"
 fi
+
+check "sistema de pacotes consistente"      "! apt-get check"
 
 echo "----------------------------------------------------------------------"
 if [ "$problems" -eq 0 ]; then

@@ -130,6 +130,8 @@ Os textos do painel ficam em inglês dentro do `installer`; cada idioma tem um d
 - Traduzir só o que falta: `python3 gen_all_langs.py` (offline, Argos Translate) ou `python3 gen_lang.py` (online).
 - Traduções que perdem uma variável ou `%s` são rejeitadas automaticamente e o texto em inglês é exibido.
 
+Depois de mudar o `PANEL_VERSION`, rode `python3 i18n_common.py --fix` (cada dicionário leva a versão do painel, e dicionários desatualizados só são usados em último caso).
+
 Depois de alterar o `installer`, gere de novo o checksum usado pela autoatualização:
 
 ```bash
