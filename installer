@@ -37,7 +37,7 @@ trap on_interrupt INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-PANEL_VERSION=" β-0.9.3"
+PANEL_VERSION=" β-0.9.4"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -716,8 +716,8 @@ v_reset() {
     {
         echo "======================================================================"
         echo "KOHA EASY INSTALLER & MANAGER - VALIDATION REPORT"
-        echo "Context: ${1:-general}"
-        echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "$(t "Context"): ${1:-general}"
+        echo "$(t "Date"): $(date '+%Y-%m-%d %H:%M:%S %Z')"
         echo "Host: $(hostname)    Panel: v${PANEL_VERSION}"
         echo "======================================================================"
     } > "$VALIDATION_LOG"
@@ -891,9 +891,9 @@ validate_backups() {
         fi
     fi
     if [ -f "$BACKUP_CONF" ] && grep -q '^RCLONE_REMOTE="[^"]\+"' "$BACKUP_CONF" 2>/dev/null; then
-        v_ok "Cloud: $(t "rclone remote configured")."
+        v_ok "$(t "Cloud"): $(t "rclone remote configured")."
     else
-        v_warn "Cloud: $(t "remote backup not configured (Backup Center)")."
+        v_warn "$(t "Cloud"): $(t "remote backup not configured (Backup Center)")."
     fi
 }
 
@@ -918,9 +918,9 @@ validate_network_and_system() {
     v_info "RAM: ${ram:-?} GB."
     
     free_disk=$(get_free_space_mb /)
-    if [ "${free_disk:-0}" -ge 5120 ] 2>/dev/null; then v_ok "Disk: ${free_disk} MB $(t "free")."
-    elif [ "${free_disk:-0}" -ge 2048 ] 2>/dev/null; then v_warn "Disk: ${free_disk} MB $(t "free")."
-    else v_fail "Disk: ${free_disk:-0} MB $(t "free (under 2 GB)")."; fi
+    if [ "${free_disk:-0}" -ge 5120 ] 2>/dev/null; then v_ok "$(t "Disk"): ${free_disk} MB $(t "free")."
+    elif [ "${free_disk:-0}" -ge 2048 ] 2>/dev/null; then v_warn "$(t "Disk"): ${free_disk} MB $(t "free")."
+    else v_fail "$(t "Disk"): ${free_disk:-0} MB $(t "free (under 2 GB)")."; fi
     
     swapon --show 2>/dev/null | grep -q '/' && v_ok "SWAP: $(t "active")." || v_warn "SWAP: $(t "none")."
     timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$' \
@@ -1052,9 +1052,9 @@ validate_pre_installation() {
     fi
 
     free_disk=$(get_free_space_mb /)
-    if [ "${free_disk:-0}" -ge 10240 ] 2>/dev/null; then v_ok "Disk: ${free_disk} MB $(t "free")."
-    elif [ "${free_disk:-0}" -ge 5120 ] 2>/dev/null; then v_warn "Disk: ${free_disk} MB ($(t "tight for Elasticsearch"))."
-    else v_fail "Disk: ${free_disk:-0} MB ($(t "recommended minimum: 5 GB"))."; fi
+    if [ "${free_disk:-0}" -ge 10240 ] 2>/dev/null; then v_ok "$(t "Disk"): ${free_disk} MB $(t "free")."
+    elif [ "${free_disk:-0}" -ge 5120 ] 2>/dev/null; then v_warn "$(t "Disk"): ${free_disk} MB ($(t "tight for Elasticsearch"))."
+    else v_fail "$(t "Disk"): ${free_disk:-0} MB ($(t "recommended minimum: 5 GB"))."; fi
 
     local busy_ports=() proc_info=""
     for p in 80 8080; do
@@ -1485,14 +1485,14 @@ validate_elasticsearch() {
         || v_warn "Elasticsearch: $(t "Koha indices unconfirmed")."
 
     if is_koha_indexer_running; then
-        v_ok "Indexer: koha-es-indexer $(t "running")."
+        v_ok "$(t "Indexer"): koha-es-indexer $(t "running")."
     else
-        v_fail "Indexer: koha-es-indexer $(t "STOPPED - new records will not reach search")."
+        v_fail "$(t "Indexer"): koha-es-indexer $(t "STOPPED - new records will not reach search")."
     fi
 
     [ -f /etc/systemd/system/koha-es-indexer@.service ] \
-        && v_ok "Indexer: $(t "systemd unit installed (auto-restart)")." \
-        || v_warn "Indexer: $(t "no dedicated systemd unit")."
+        && v_ok "$(t "Indexer"): $(t "systemd unit installed (auto-restart)")." \
+        || v_warn "$(t "Indexer"): $(t "no dedicated systemd unit")."
 
     ss -lnt 2>/dev/null | grep -q ':61613' \
         && v_ok "Broker: RabbitMQ/STOMP (61613) OK." \
@@ -1500,19 +1500,19 @@ validate_elasticsearch() {
 
     pend=$(get_pending_es_jobs)
     if [ "${pend:-0}" -eq 0 ] 2>/dev/null; then
-        v_ok "Queue: $(t "no pending indexing jobs")."
+        v_ok "$(t "Queue"): $(t "no pending indexing jobs")."
     elif [ "${pend:-0}" -le 20 ] 2>/dev/null; then
-        v_warn "Queue: $pend $(t "pending job(s)")."
+        v_warn "$(t "Queue"): $pend $(t "pending job(s)")."
     else
-        v_fail "Queue: $pend $(t "pending jobs - the indexer is not consuming")."
+        v_fail "$(t "Queue"): $pend $(t "pending jobs - the indexer is not consuming")."
     fi
 
     bibs=$(get_total_biblios); docs=$(get_total_es_documents)
     if [[ "$bibs" =~ ^[0-9]+$ ]] && [[ "$docs" =~ ^[0-9]+$ ]]; then
         if [ "$docs" -ge "$bibs" ]; then
-            v_ok "Coverage: $docs $(t "documents for") $bibs $(t "records")."
+            v_ok "$(t "Coverage"): $docs $(t "documents for") $bibs $(t "records")."
         else
-            v_warn "Coverage: $docs/$bibs ($(t "missing") $((bibs-docs)))."
+            v_warn "$(t "Coverage"): $docs/$bibs ($(t "missing") $((bibs-docs)))."
         fi
     fi
 }
@@ -1924,6 +1924,27 @@ EOF
     systemctl restart fail2ban >/dev/null 2>&1 || true
 }
 
+# koha-create needs the templates shipped in /etc/koha (apache-site.conf.in,
+# koha-conf-site.xml.in...). They are dpkg "conffiles": if /etc/koha was
+# deleted by hand or by an old uninstall while koha-common stayed installed,
+# a plain reinstall does NOT bring them back. --force-confmiss does.
+ensure_koha_conffiles() {
+    local f missing=0
+    while read -r f _; do
+        [ -n "$f" ] && [ ! -e "$f" ] && missing=$((missing + 1))
+    done < <(dpkg-query -W -f='${Conffiles}\n' koha-common 2>/dev/null)
+    [ -f /etc/koha/apache-site.conf.in ] || missing=$((missing + 1))
+    [ -f /etc/koha/koha-conf-site.xml.in ] || missing=$((missing + 1))
+    [ "$missing" -eq 0 ] && return 0
+
+    display_explanation "Restoring missing Koha configuration files..."
+    log "koha-common: $missing configuration file(s) missing; reinstalling with --force-confmiss"
+    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y \
+        -o Dpkg::Options::=--force-confmiss -o Dpkg::Options::=--force-confold \
+        -o Acquire::ForceIPv4=true koha-common 2>&1 | tee -a "$APT_LOG"
+    [ -f /etc/koha/apache-site.conf.in ] && [ -f /etc/koha/koha-conf-site.xml.in ]
+}
+
 # Copies the panel (and its dictionaries) to /usr/local/bin/config.sh.
 install_panel_copy() {
     local src="$_SCRIPT_PATH"
@@ -2024,6 +2045,7 @@ function_install_koha() {
     apt_update_indices || { install_step_failed "apt-get update (Koha)"; return 1; }
     display_explanation "Installing MariaDB and Koha (longest step)..."
     apt_install mariadb-server koha-common || { install_step_failed "mariadb-server koha-common"; return 1; }
+    ensure_koha_conffiles || { install_step_failed "$(t "Restoring missing Koha configuration files...")"; return 1; }
     systemctl enable --now mariadb >/dev/null 2>&1
     if ! mysql -e "SELECT 1;" >/dev/null 2>&1; then
         systemctl restart mariadb >/dev/null 2>&1 || service mariadb start >/dev/null 2>&1 || true
@@ -2106,7 +2128,10 @@ function_install_koha() {
 
     display_explanation "Creating the '\${INSTANCE}' Koha instance..."
 
-    if ! /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1; then
+    # C.UTF-8 keeps the tools' messages readable in the error box (some of
+    # them print badly encoded accents in other locales).
+    mkdir -p /var/lib/koha
+    if ! LC_ALL=C.UTF-8 LANGUAGE=en /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1; then
         local err_msg
         err_msg=$(tail -n 15 "${LOG_DIR}/koha-create.log" 2>/dev/null)
         [ -z "$err_msg" ] && err_msg="$(t "Empty log.")"
@@ -4546,6 +4571,20 @@ function_about() {
     whiptail --title "$(t "About")" --textbox "$tmp_about" 25 78 2>/dev/null || true
     rm -f "$tmp_about"
 }
+
+# ======================================================================
+# KEEP THE INSTALLED PANEL UP TO DATE
+# ----------------------------------------------------------------------
+# After an installation the panel is also copied to /usr/local/bin/config.sh.
+# If a newer copy of the installer is run, refresh that copy too, so that
+# "sudo config.sh" never keeps running an old version.
+# ======================================================================
+if [ -f /usr/local/bin/config.sh ] && [ -f "$_SCRIPT_PATH" ] \
+   && [ "$(readlink -f "$_SCRIPT_PATH")" != "$(readlink -f /usr/local/bin/config.sh)" ] \
+   && ! cmp -s "$_SCRIPT_PATH" /usr/local/bin/config.sh; then
+    install_panel_copy
+    log "config.sh refreshed from $_SCRIPT_PATH"
+fi
 
 # ======================================================================
 # PRIMEIRA EXECUÇÃO: IDIOMA OBRIGATÓRIO SE NÃO ESTIVER CONFIGURADO
