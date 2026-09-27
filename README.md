@@ -1,3 +1,7 @@
+<div align="right">
+  <strong><a href="#-versão-em-português">🇧🇷 Português</a></strong>
+</div>
+
 <div align="center">
 
 # Koha-Easy-Installer
@@ -13,8 +17,7 @@
   <a href="#quick-start">Quick Start</a> •
   <a href="#system-requirements">Requirements</a> •
   <a href="#architecture--features">Architecture</a> •
-  <a href="#maintenance--security">Maintenance</a> •
-  <a href="#-versão-em-português">Versão em Português</a>
+  <a href="#maintenance--security">Maintenance</a>
 </p>
 
 </div>
