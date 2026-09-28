@@ -1,0 +1,73 @@
+# Koha Easy Installer for Windows - bootstrapper.
+#
+#   One line, in PowerShell (no administrator needed; Windows asks once):
+#   [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
+#
+#   Or double-click "Install Koha.cmd" in the repository ZIP.
+#
+# It copies the Windows tools, the panel and its dictionaries to
+# C:\KohaEasy\bin (from the ZIP folder, or downloaded from GitHub with the
+# SHA-256 of the installer checked), then runs "KohaEasy.ps1 Install" in
+# Windows PowerShell 5.1: checks, WSL 2, Debian, systemd, Koha, shortcuts.
+# Running it again continues where it stopped.
+#
+# Options (environment variables): KOHAEASY_SOURCE (a local copy of the
+# repository), KOHAEASY_BRANCH (default main), KOHAEASY_ROOT (default C:\KohaEasy).
+# ASCII only: it must survive "irm | iex" in every Windows PowerShell.
+
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+function Install-KohaEasyBootstrap {
+    $ErrorActionPreference = 'Stop'
+    $repo = 'PauloFBaldiFH/Koha-Easy-Installer'
+    $branch = 'main'
+    if ($env:KOHAEASY_BRANCH) { $branch = $env:KOHAEASY_BRANCH }
+    $root = 'C:\KohaEasy'
+    if ($env:KOHAEASY_ROOT) { $root = $env:KOHAEASY_ROOT }
+    $bin = Join-Path $root 'bin'
+    $tmp = $null
+
+    Write-Host ''
+    Write-Host 'Koha Easy Installer for Windows' -ForegroundColor Green
+    if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'This installer runs on Windows 10 or 11.' }
+
+    $src = $env:KOHAEASY_SOURCE
+    if (-not $src) {
+        Write-Host ('[>] Downloading Koha Easy Installer ({0})...' -f $branch) -ForegroundColor Cyan
+        $tmp = Join-Path $env:TEMP ('KohaEasy-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $zip = Join-Path $tmp 'source.zip'
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri ('https://github.com/{0}/archive/refs/heads/{1}.zip' -f $repo, $branch) -OutFile $zip -UseBasicParsing
+        Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
+        $src = (Get-ChildItem -LiteralPath $tmp -Directory | Select-Object -First 1).FullName
+    } else {
+        Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+    }
+
+    foreach ($need in 'installer', 'installer.sha256', 'windows\KohaEasy.ps1', 'windows\KohaEasy.Install.psm1') {
+        if (-not (Test-Path -LiteralPath (Join-Path $src $need))) { throw ('Missing file in the installer package: ' + $need) }
+    }
+    $expected = ((Get-Content -LiteralPath (Join-Path $src 'installer.sha256') -TotalCount 1) -split '\s+')[0].ToUpperInvariant()
+    $actual = (Get-FileHash -LiteralPath (Join-Path $src 'installer') -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($expected -ne $actual) { throw 'The installer file is damaged (SHA-256 does not match installer.sha256). Download it again.' }
+
+    New-Item -ItemType Directory -Path (Join-Path $bin 'lang') -Force | Out-Null
+    Copy-Item -Path (Join-Path $src 'windows\*') -Destination $bin -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $src 'installer'), (Join-Path $src 'installer.sha256') -Destination $bin -Force
+    Copy-Item -Path (Join-Path $src 'lang\*.cache') -Destination (Join-Path $bin 'lang') -Force
+    if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # The tray and toasts need Windows PowerShell 5.1, even when this ran in PowerShell 7.
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $env:KOHAEASY_ROOT = $root
+    & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'KohaEasy.ps1') Install
+    return $LASTEXITCODE
+}
+
+try {
+    $code = Install-KohaEasyBootstrap
+    if ($code -eq 3) { Write-Host 'Restart Windows now. The installation continues after you sign in again.' -ForegroundColor Yellow }
+} catch {
+    Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red
+}

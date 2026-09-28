@@ -28,7 +28,7 @@ AfterAll {
 }
 
 Describe 'Windows PowerShell 5.1 compatibility' {
-    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1') {
+    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1', 'KohaEasy.Install.psm1') {
         $file = Join-Path $repo ('windows/' + $_)
         $bytes = [System.IO.File]::ReadAllBytes($file)
         ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeTrue

@@ -13,12 +13,13 @@
     KohaEasy.ps1 CompactDisk                   give unused space back to Windows (admin)
     KohaEasy.ps1 SetAutostart -Mode logon|manual
     KohaEasy.ps1 RegisterTasks [-Mode logon|manual]   tasks, tray at sign-in and shortcuts
+    KohaEasy.ps1 Install                       the whole installation (windows\install.ps1 starts it)
     KohaEasy.ps1 CreateShortcuts               Start menu "Koha" and desktop, with koha.ico
     -Quiet: no dialog boxes (scheduled tasks). Windows PowerShell 5.1.
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts')]
+    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -149,4 +150,16 @@ switch ($Command) {
         New-KohaShortcuts | Out-Null
     }
     'CreateShortcuts' { New-KohaShortcuts }
+    'Install' {
+        Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Install.psm1') -Force
+        try {
+            $code = Install-Koha
+        } catch {
+            Write-KohaLog ('install failed: ' + $_.Exception.Message) 'install'
+            Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red
+            Write-Host (T 'Run the installer again to continue from this step. The log is in C:\KohaEasy\logs.') -ForegroundColor Red
+            $code = 1
+        }
+        exit $code
+    }
 }
