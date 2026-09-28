@@ -217,7 +217,7 @@ sudo bash uninstall.sh --yes    # sem perguntas (automação)
 
 Copie seus backups para outro lugar antes de executá-lo.
 
-## Testes (para quem contribui)
+## Testes
 
 A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o `marc_replace.pl` (executado como CGI) e a atualização dos agendamentos.
 
@@ -229,7 +229,7 @@ sudo KEI_TEST_SANDBOX=1 tests/run.sh
 
 **Somente em um contêiner ou VM descartável:** os testes substituem o banco `koha_library` e instalam dublês de teste para as ferramentas `koha-*` e o `systemctl`. O `tests/run.sh` se recusa a rodar ao lado de um Koha real.
 
-## Traduções (para quem contribui)
+## Traduções
 
 Os textos do painel ficam em inglês dentro do `installer`; cada idioma tem um dicionário em `lang/<código>.cache` (`base64(inglês)|base64(tradução)`). O painel em si é Bash puro; os scripts Python abaixo são ferramentas opcionais para quem contribui.
 
