@@ -717,9 +717,150 @@ log() { printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RUN_LOG" 2>/
 log "===== panel started (v$PANEL_VERSION, user=$REAL_USER) ====="
 
 # ======================================================================
+# 6.5. PLATFORM: LINUX SERVER OR WINDOWS (WSL)
+# ----------------------------------------------------------------------
+# On Windows the panel runs inside WSL 2. Windows then owns the host:
+# swap (.wslconfig), clock, firewall, startup and reboot. Call sites ask
+# "host_can <capability>" instead of testing the platform, so the rules
+# live in one place.
+#   KEI_PLATFORM   linux | wsl2 | wsl1
+#   KEI_WSL_NET    mirrored | nat | unknown   (WSL networking mode)
+# The Windows installer writes $KEI_WIN_CONF (key=value). It is parsed with
+# a whitelist and never sourced.
+# ======================================================================
+KEI_PROC="${KEI_PROC:-/proc}"
+KEI_SYSTEMD_RUNDIR="${KEI_SYSTEMD_RUNDIR:-/run/systemd/system}"
+KEI_WIN_CONF="${KEI_WIN_CONF:-${CONF_DIR}/windows.conf}"
+KEI_WIN_KEYS="KEI_WIN_VERSION WIN_BUILD WIN_EDITION WIN_NET_MODE WIN_LAN_IP WIN_HOSTNAME WIN_USER WIN_BACKUP_DIR WIN_MEM_GB WIN_UPDATED_AT WIN_AUTOSTART"
+KEI_PLATFORM="linux"
+KEI_WSL_NET=""
+
+# Prints linux, wsl1 or wsl2. WSL 1 kernels end in "-Microsoft"
+# (4.4.0-19041-Microsoft); WSL 2 kernels contain "microsoft-standard-WSL2",
+# and custom WSL 2 kernels at least "microsoft" or the WSLInterop handler.
+# WSL_DISTRO_NAME is not used: sudo, cron and systemd units drop it.
+_detect_platform_kind() {
+    case "${KEI_PLATFORM_OVERRIDE:-}" in
+        linux|wsl1|wsl2) printf '%s' "$KEI_PLATFORM_OVERRIDE"; return 0 ;;
+    esac
+    local kernel="" f
+    [ -r "$KEI_PROC/sys/kernel/osrelease" ] && kernel=$(head -c 200 "$KEI_PROC/sys/kernel/osrelease" 2>/dev/null)
+    case "$kernel" in
+        *-Microsoft) printf 'wsl1'; return 0 ;;
+        *[Mm]icrosoft*|*WSL2*) printf 'wsl2'; return 0 ;;
+    esac
+    for f in "$KEI_PROC"/sys/fs/binfmt_misc/WSLInterop*; do
+        [ -e "$f" ] && { printf 'wsl2'; return 0; }
+    done
+    printf 'linux'
+}
+
+# WSL networking mode guessed from the default gateway ($1), for when the
+# Windows installer left no windows.conf: NAT puts WSL behind a virtual
+# switch in 172.16.0.0/12; mirrored mode shares the LAN router of Windows.
+_wsl_net_from_gateway() {
+    case "$1" in
+        "") printf 'unknown' ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) printf 'nat' ;;
+        *) printf 'mirrored' ;;
+    esac
+}
+
+# Checks one windows.conf value; an invalid value is dropped (left empty).
+_win_conf_valid() {
+    local key="$1" val="$2"
+    case "$key" in
+        WIN_NET_MODE)   [[ "$val" == mirrored || "$val" == nat ]] ;;
+        WIN_AUTOSTART)  [[ "$val" == logon || "$val" == manual ]] ;;
+        WIN_BUILD|WIN_MEM_GB) [[ "$val" =~ ^[0-9]{1,6}$ ]] ;;
+        WIN_LAN_IP)     [[ "$val" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ;;
+        WIN_HOSTNAME)   [[ "$val" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62})$ ]] ;;
+        WIN_USER)       [[ "$val" =~ ^[A-Za-z0-9._\ -]{1,64}$ && "$val" != *..* ]] ;;
+        WIN_BACKUP_DIR) [[ "$val" =~ ^/mnt/[a-z]/[A-Za-z0-9._/\ -]*$ && "$val" != *..* ]] ;;
+        *)              [ "${#val}" -le 64 ] ;;
+    esac
+}
+
+# Reads the Windows handshake file ($1, default $KEI_WIN_CONF) into the
+# WIN_* variables named in KEI_WIN_KEYS. Only KEY=value lines with a known
+# key and plain characters are taken; everything else is logged and
+# skipped. The file must be a regular file owned by root and not writable
+# by others (it describes the host the panel trusts). Returns 1 when the
+# file is missing or refused.
+read_windows_conf() {
+    local file="${1:-$KEI_WIN_CONF}" key val line n=0 owner mode
+    local re='^([A-Z][A-Z_]*)=([A-Za-z0-9._:/ -]*)$'
+    for key in $KEI_WIN_KEYS; do printf -v "$key" '%s' ""; done
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+    read -r owner mode < <(stat -c '%u %a' "$file" 2>/dev/null)
+    if [ "${owner:-x}" != "0" ] || [ -z "$mode" ] || (( (8#$mode & 8#022) != 0 )); then
+        log "windows.conf refused: owner ${owner:-?}, mode ${mode:-?} (must be root and not writable by others)"
+        return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        [ "$n" -gt 200 ] && break
+        [ "$n" -eq 1 ] && line="${line#$'\xEF\xBB\xBF'}"   # BOM of Windows PowerShell 5.1
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ ! "$line" =~ $re ]]; then
+            log "windows.conf: line $n ignored (not KEY=value with plain characters)"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        if [[ " $KEI_WIN_KEYS " != *" $key "* ]]; then
+            log "windows.conf: unknown key ignored: $key"
+        elif ! _win_conf_valid "$key" "$val"; then
+            log "windows.conf: invalid value ignored for $key"
+        else
+            printf -v "$key" '%s' "$val"
+        fi
+    done < "$file"
+    return 0
+}
+
+detect_platform() {
+    local gw=""
+    KEI_PLATFORM=$(_detect_platform_kind)
+    KEI_WSL_NET=""
+    [ "$KEI_PLATFORM" = "linux" ] && return 0
+    read_windows_conf "$KEI_WIN_CONF" || true
+    if [ -n "${WIN_NET_MODE:-}" ]; then
+        KEI_WSL_NET="$WIN_NET_MODE"
+    else
+        command -v ip >/dev/null 2>&1 && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+        KEI_WSL_NET=$(_wsl_net_from_gateway "$gw")
+    fi
+    log "platform: $KEI_PLATFORM (network: $KEI_WSL_NET, Windows build: ${WIN_BUILD:-?})"
+}
+
+is_wsl() { [ "$KEI_PLATFORM" != "linux" ]; }
+
+# host_can CAPABILITY: may the panel manage this part of the host?
+#   swap      create /swapfile          ntp       NTP sync (timesyncd)
+#   timezone  change the timezone       firewall  UFW
+#   fail2ban  Fail2ban jails            mdns      avahi-daemon
+#   reboot    reboot the machine        lan_direct other PCs reach ports 80/8080
+# Unknown capabilities are a programming error: logged, answer "no" (2).
+host_can() {
+    case "$1" in
+        swap|ntp|timezone|firewall|fail2ban|mdns|reboot|lan_direct) ;;
+        *) log "host_can: unknown capability '$1'"; return 2 ;;
+    esac
+    [ "$KEI_PLATFORM" = "linux" ] && return 0
+    [ "$1" = "lan_direct" ] && [ "$KEI_WSL_NET" = "mirrored" ] && return 0
+    return 1
+}
+
+# sd_booted(): systemd is PID 1 when /run/systemd/system exists.
+systemd_is_pid1() { [ -d "$KEI_SYSTEMD_RUNDIR" ]; }
+
+detect_platform
+
+# ======================================================================
 # 7. PANEL DEPENDENCIES
 # ======================================================================
-timedatectl set-ntp true >/dev/null 2>&1 || true
+host_can ntp && { timedatectl set-ntp true >/dev/null 2>&1 || true; }
 
 MISSING_DEPS=()
 for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg wget:wget fuser:psmisc ss:iproute2 flock:util-linux; do
@@ -1455,6 +1596,10 @@ validate_cron() {
 }
 
 validate_ufw() {
+    if ! host_can firewall; then
+        v_info "UFW: $(t "not used on Windows (WSL): the firewall is Windows Defender Firewall")."
+        return 0
+    fi
     if ! command -v ufw >/dev/null 2>&1; then
         v_warn "UFW: $(t "not installed")."; return 1
     fi
@@ -1516,9 +1661,13 @@ validate_network_and_system() {
     else v_fail "$(t "Disk"): ${free_disk:-0} MB $(t "free (under 2 GB)")."; fi
     
     swapon --show 2>/dev/null | grep -q '/' && v_ok "SWAP: $(t "active")." || v_warn "SWAP: $(t "none")."
-    timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$' \
-        && v_ok "NTP: $(t "synchronized")." \
-        || v_warn "NTP: $(t "unconfirmed")."
+    if ! host_can ntp; then
+        v_info "NTP: $(t "clock kept by Windows")."
+    elif timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
+        v_ok "NTP: $(t "synchronized")."
+    else
+        v_warn "NTP: $(t "unconfirmed")."
+    fi
     v_info "$(t "Timezone"): $(timedatectl show -p Timezone --value 2>/dev/null)"
 }
 
@@ -1538,7 +1687,11 @@ validate_complete_system() {
     fi
     validate_service koha-common  "Koha common"
     validate_service cron         "Cron"
-    validate_service fail2ban     "Fail2ban" "no"
+    if host_can fail2ban; then
+        validate_service fail2ban "Fail2ban" "no"
+    else
+        v_info "Fail2ban: $(t "not used on Windows (WSL): Windows protects the network")."
+    fi
     
     if plack_running; then
         v_ok "Plack (${INSTANCE}): $(t "running")."
@@ -1636,6 +1789,46 @@ platform_check() {
         amd64|arm64) v_ok "$(t "Architecture"): ${arch} (${machine})." ;;
         *) v_warn "$(t "Architecture"): ${arch:-?} (${machine:-?}) - $(t "only amd64 and arm64 are tested")." ;;
     esac
+    platform_wsl_check
+}
+
+# The panel runs Koha's services through systemd. A plain Linux server
+# always has it (the pre-installation check tests systemctl); under WSL it
+# is PID 1 only with [boot] systemd=true in /etc/wsl.conf, and never on WSL 1.
+require_systemd() {
+    is_wsl || return 0
+    if [ "$KEI_PLATFORM" = "wsl1" ]; then
+        msg_error "" "$(t "This Linux runs on WSL 1, which cannot run Koha.\n\nIn Windows PowerShell, convert it to WSL 2:\n  wsl --set-version <distribution> 2\n\nThen open the panel again.")" 14 76
+        return 1
+    fi
+    systemd_is_pid1 && return 0
+    msg_error "" "$(t "Koha needs systemd, which is not running in this WSL distribution.\n\nAdd these lines to /etc/wsl.conf:\n  [boot]\n  systemd=true\n\nThen run 'wsl --shutdown' in Windows PowerShell and open the panel again.")" 16 76
+    return 1
+}
+
+# Windows (WSL) lines of the validation reports: WSL 1 cannot run Koha's
+# services, and WSL 2 needs systemd as PID 1 ([boot] systemd=true).
+platform_wsl_check() {
+    local net
+    case "$KEI_PLATFORM" in
+        wsl1)
+            v_fail "$(t "Platform"): $(t "Windows (WSL 1) cannot run Koha: convert it to WSL 2")."
+            ;;
+        wsl2)
+            case "$KEI_WSL_NET" in
+                mirrored) net="$(t "mirrored (other computers can connect)")" ;;
+                nat)      net="$(t "NAT (this computer only)")" ;;
+                *)        net="$(t "unknown")" ;;
+            esac
+            v_ok "$(t "Platform"): Windows (WSL 2)${WIN_BUILD:+, build ${WIN_BUILD}}, $(t "network"): ${net}."
+            if systemd_is_pid1; then
+                v_ok "Systemd: $(t "running as PID 1")."
+            else
+                v_fail "Systemd: $(t "not running in WSL (add [boot] systemd=true to /etc/wsl.conf)")."
+            fi
+            ;;
+    esac
+    return 0
 }
 
 # Elasticsearch 7 is only packaged for amd64 and arm64.
@@ -2532,6 +2725,7 @@ EOF
 }
 
 configure_firewall() {
+    host_can firewall || { log "UFW skipped: the firewall is managed by Windows (WSL)"; return 0; }
     command -v ufw >/dev/null 2>&1 || return 0
     local p
     for p in $(get_ssh_ports); do ufw allow "${p}/tcp" >/dev/null 2>&1; done
@@ -2710,6 +2904,7 @@ ensure_elastic_repo() {
 # On Debian 12+ there is no /var/log/auth.log (logs live in journald) and the
 # default fail2ban sshd jail refuses to start. Use the systemd backend there.
 configure_fail2ban() {
+    host_can fail2ban || { log "Fail2ban skipped: not used on Windows (WSL)"; return 0; }
     command -v fail2ban-client >/dev/null 2>&1 || return 0
     if [ ! -f /var/log/auth.log ] && [ -d /etc/fail2ban/jail.d ]; then
         apt_install python3-systemd >/dev/null 2>&1 || true
@@ -2758,11 +2953,69 @@ install_panel_copy() {
     fi
 }
 
+# Packages of the "essential dependencies" step, one per line. Under WSL
+# the host tools are left out: UFW and Fail2ban (Windows Defender Firewall
+# filters the network) and avahi-daemon (mDNS belongs to Windows).
+essential_packages() {
+    printf '%s\n' nano curl wget gpg ca-certificates apt-transport-https \
+        libsasl2-modules rclone memcached libcache-memcached-fast-perl \
+        libxml2-utils unzip pv psmisc
+    host_can firewall && printf '%s\n' ufw
+    host_can fail2ban && printf '%s\n' fail2ban
+    host_can mdns && printf '%s\n' avahi-daemon
+    return 0
+}
+
+# Install step: NTP. Under WSL the clock belongs to Windows (timesyncd would
+# fight with the time WSL takes from the host).
+install_clock_sync() {
+    if ! host_can ntp; then
+        echo "$(t "[INFO] Clock kept by Windows (WSL): NTP skipped.")"
+        log "install: NTP skipped (clock kept by Windows)"
+        return 0
+    fi
+    display_explanation "Synchronizing the clock (NTP)..."
+    apt_install systemd-timesyncd >/dev/null 2>&1
+    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
+    timeout 15 bash -c 'until timedatectl show -p NTPSynchronized --value | grep -q yes; do sleep 1; done' >/dev/null 2>&1
+    return 0
+}
+
+# Install step: 4 GB swapfile. Under WSL swap is set by Windows (.wslconfig)
+# and a swapfile in /etc/fstab would only waste the virtual disk.
+install_swap() {
+    if ! host_can swap; then
+        echo "$(t "[INFO] SWAP managed by Windows (WSL, .wslconfig): swapfile skipped.")"
+        log "install: swapfile skipped (swap managed by Windows)"
+        return 0
+    fi
+    display_explanation "Creating virtual memory (4 GB SWAP)..."
+    if [ -z "$(swapon --noheadings --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+        if [ "$(get_free_space_mb /)" -ge 8192 ] 2>/dev/null; then
+            fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null 2>&1
+            if swapon /swapfile 2>/dev/null; then
+                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            else
+                rm -f /swapfile
+                echo "$(t "[WARN] SWAP could not be enabled (normal on WSL/containers).")"
+            fi
+        else
+            echo "$(t "[WARN] Not enough space for a 4 GB SWAP. Skipping.")"
+        fi
+    fi
+    return 0
+}
+
 function_install_koha() {
     validate_pre_installation || return 1
 
     local tz
-    if tz=$(choose_timezone) && [ -n "$tz" ]; then
+    if timezone_follows_host; then
+        tz=$(get_current_timezone)
+        log "install: timezone ${tz} kept (follows Windows)"
+    elif tz=$(choose_timezone) && [ -n "$tz" ]; then
         apply_timezone "$tz" || echo "$(t '[WARN] Could not apply the timezone ${tz}.')"
     fi
 
@@ -2786,27 +3039,8 @@ function_install_koha() {
     locale-gen "$sys_locale" en_US.UTF-8 >/dev/null 2>&1 || locale-gen >/dev/null 2>&1
     update-locale LANG="$sys_locale" >/dev/null 2>&1 || true
 
-    display_explanation "Synchronizing the clock (NTP)..."
-    apt_install systemd-timesyncd >/dev/null 2>&1
-    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
-    timeout 15 bash -c 'until timedatectl show -p NTPSynchronized --value | grep -q yes; do sleep 1; done' >/dev/null 2>&1
-
-    display_explanation "Creating virtual memory (4 GB SWAP)..."
-    if [ -z "$(swapon --noheadings --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
-        if [ "$(get_free_space_mb /)" -ge 8192 ] 2>/dev/null; then
-            fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-            chmod 600 /swapfile
-            mkswap /swapfile >/dev/null 2>&1
-            if swapon /swapfile 2>/dev/null; then
-                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-            else
-                rm -f /swapfile
-                echo "$(t "[WARN] SWAP could not be enabled (normal on WSL/containers).")"
-            fi
-        else
-            echo "$(t "[WARN] Not enough space for a 4 GB SWAP. Skipping.")"
-        fi
-    fi
+    install_clock_sync
+    install_swap
 
     wait_for_apt_locks || { install_step_failed "dpkg --configure -a"; return 1; }
     display_explanation "Upgrading the system..."
@@ -2818,14 +3052,15 @@ function_install_koha() {
     fi
 
     display_explanation "Installing essential dependencies..."
-    apt_install nano curl wget gpg ca-certificates ufw apt-transport-https \
-                fail2ban libsasl2-modules rclone avahi-daemon memcached libcache-memcached-fast-perl \
-                libxml2-utils unzip pv psmisc || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
+    local essentials=()
+    mapfile -t essentials < <(essential_packages)
+    apt_install "${essentials[@]}" || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
 
     # Labels utility installed separately to prevent batch failure if missing from repository
     apt_install glabels >/dev/null 2>&1 || true
 
-    systemctl enable --now avahi-daemon memcached >/dev/null 2>&1
+    systemctl enable --now memcached >/dev/null 2>&1
+    host_can mdns && systemctl enable --now avahi-daemon >/dev/null 2>&1
     configure_fail2ban
 
     display_explanation "Adding Koha and Elasticsearch repositories..."
@@ -3049,6 +3284,13 @@ EOF
         if prompt_yes_no "$(t "View Diagnostics")" "$diag_msg" 12 76; then
             show_validation_report
         fi
+    fi
+
+    if ! host_can reboot; then
+        display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
+        restart_koha_stack || true
+        msg_info "$(t "Koha is ready")" "$(t "All set! Koha services were restarted.\n\nCredentials have been saved to /root/koha_credentials.txt.")" 11 74
+        return 0
     fi
 
     if prompt_yes_no "$(t "Reboot Server (Recommended)")" \
@@ -4997,6 +5239,16 @@ get_current_timezone() {
     printf '%s' "${tz:-UTC}"
 }
 
+# Under WSL the timezone comes from Windows. If it still reads UTC, Windows
+# did not pass it on (or really is on UTC): the panel asks, as on Linux.
+timezone_follows_host() {
+    host_can timezone && return 1
+    case "$(get_current_timezone)" in
+        UTC|Etc/UTC|Etc/Universal|Universal|Zulu|Etc/Zulu|"") return 1 ;;
+    esac
+    return 0
+}
+
 # Applies a timezone, with a fallback for systems where timedatectl fails.
 apply_timezone() {
     local tz="$1"
@@ -5067,15 +5319,20 @@ choose_timezone() {
 }
 
 function_configure_clock() {
-    local tz
+    local tz cur_tz cur_time
+    if timezone_follows_host; then
+        cur_tz=$(get_current_timezone)
+        cur_time=$(date '+%Y-%m-%d %H:%M')
+        msg_info "$(t "Clock and timezone")" "$(t 'Timezone: ${cur_tz}\nCurrent time: ${cur_time}\n\nOn Windows (WSL) the clock and the timezone follow Windows.\nChange them in Windows: Settings > Time & language.')" 13 74
+        return 0
+    fi
     if tz=$(choose_timezone) && [ -n "$tz" ]; then
         if ! apply_timezone "$tz"; then
             msg_error "" "$(t 'Could not apply the timezone ${tz}.')" 9 70
         fi
     fi
-    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
+    host_can ntp && systemctl enable --now systemd-timesyncd >/dev/null 2>&1
     systemctl restart cron >/dev/null 2>&1
-    local cur_tz cur_time
     cur_tz=$(get_current_timezone)
     cur_time=$(date '+%Y-%m-%d %H:%M')
     msg_ok "$(t 'Timezone set to: ${cur_tz}\nCurrent time: ${cur_time}\n\nCron was restarted to pick up the new time.')" 11 74
@@ -5470,8 +5727,18 @@ function_autoupdate() {
 # ======================================================================
 # 26.1. SECURITY CENTER
 # ======================================================================
+# Security center under WSL: UFW and Fail2ban are not installed, network
+# access to Koha is filtered by Windows Defender Firewall.
+windows_firewall_notice() {
+    msg_info "$(t "Windows firewall")" "$(t "On Windows (WSL), Koha is protected by Windows Defender Firewall: UFW and Fail2ban are not used.\n\nOther computers reach ports 80 and 8080 only when Windows allows it (Windows 11 with mirrored networking). To publish the catalog, use option 6 (Cloudflare Tunnel).")" 14 76
+}
+
 function_fail2ban_status() {
     local info="" jail
+    if ! host_can fail2ban; then
+        windows_firewall_notice
+        return 0
+    fi
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         msg_error "" "$(t "Fail2ban is not installed. Install Koha first (option 1).")" 9 70
         return 0
@@ -5483,6 +5750,10 @@ function_fail2ban_status() {
 }
 
 function_staff_firewall() {
+    if ! host_can firewall; then
+        windows_firewall_notice
+        return 0
+    fi
     if ! command -v ufw >/dev/null 2>&1; then
         msg_error "" "$(t "UFW firewall is not installed. Install Koha first (option 1).")" 9 70
         return 0
@@ -5553,6 +5824,10 @@ function_rotate_db_password() {
 
 function_ufw_rules() {
     local rules
+    if ! host_can firewall; then
+        windows_firewall_notice
+        return 0
+    fi
     rules=$(ufw status verbose 2>/dev/null)
     [ -z "$rules" ] && rules="$(t "UFW firewall is not installed. Install Koha first (option 1).")"
     whiptail --title "$(t '☑ UFW')" --scrolltext --msgbox "$rules" 24 78 || true
@@ -5564,6 +5839,13 @@ function_ufw_rules() {
 # Reboots even when a desktop session is open: on machines with a graphical
 # login, GNOME/KDE "inhibit" a plain "reboot" while a user is logged in.
 reboot_now() {
+    # Inside WSL a reboot only shuts the Linux environment down, and nothing
+    # starts it again until Windows does: Koha would stay offline.
+    if ! host_can reboot; then
+        log "reboot refused: Windows (WSL) owns the machine"
+        msg_error "" "$(t "On Windows (WSL) the panel does not reboot the computer.\nUse 'Restart Koha services' (option 16), or restart Windows.")" 10 76
+        return 1
+    fi
     sync
     systemctl reboot -i >/dev/null 2>&1 \
         || systemctl reboot --check-inhibitors=no >/dev/null 2>&1 \
@@ -5575,7 +5857,36 @@ reboot_now() {
     return 1
 }
 
+# Restarts Koha's services without rebooting: MariaDB and the search engine
+# first, then koha-common, and ensure_koha_services for Memcached, Plack and
+# Apache (the boot order of install_boot_ordering). Used instead of a reboot
+# under WSL.
+restart_koha_stack() {
+    local rc=0
+    log "restart of Koha services requested"
+    systemctl restart mariadb >/dev/null 2>&1 || rc=1
+    if systemctl is-active --quiet elasticsearch 2>/dev/null; then
+        systemctl restart elasticsearch >/dev/null 2>&1 || rc=1
+    fi
+    systemctl restart koha-common >/dev/null 2>&1 || rc=1
+    ensure_koha_services >/dev/null 2>&1 || rc=1
+    systemctl restart cron >/dev/null 2>&1
+    log "restart of Koha services finished (rc=$rc)"
+    return "$rc"
+}
+
 function_reboot_server() {
+    if ! host_can reboot; then
+        prompt_yes_no "$(t "Restart Koha services")" "$(t "Restart Koha services now?\nEveryone using the catalog will be disconnected for a minute.")" 10 74 || return 0
+        clear
+        display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
+        if restart_koha_stack; then
+            msg_ok "$(t "Koha services restarted.")"
+        else
+            msg_error "" "$(t "Some services did not restart. Open Diagnostics (option 7) for details.")" 9 74
+        fi
+        return 0
+    fi
     prompt_yes_no "$(t "Reboot")" "$(t "Reboot the server now?\nEveryone using the catalog will be disconnected.")" 10 74 || return 0
     clear
     echo "$(t "Rebooting in 5 seconds...")"
@@ -11205,6 +11516,7 @@ while true; do
     m14=$(t '⟳  Update center')
     m15=$(t 'ℹ  About the program & support')
     m16=$(t '↻  Reboot server')
+    host_can reboot || m16=$(t '↻  Restart Koha services')
     m17=$(t '✖  Exit')
 
     MAIN_OPT=$(whiptail --title "${title_dash}" \
@@ -11227,6 +11539,12 @@ while true; do
         "15" "$m15" \
         "16" "$m16" \
         "17" "$m17" 3>&1 1>&2 2>&3) || { clear; exit 0; }
+
+    # Under WSL nothing works without systemd: only About and Exit are left.
+    case "$MAIN_OPT" in
+        15|17) ;;
+        *) require_systemd || continue ;;
+    esac
 
     case "$MAIN_OPT" in
         1) function_install_koha ;;
