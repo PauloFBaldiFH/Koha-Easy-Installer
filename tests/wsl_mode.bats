@@ -184,7 +184,7 @@ EOF
     panel essential_packages
     assert 'echo "$output" | grep -qx ufw && echo "$output" | grep -qx fail2ban && echo "$output" | grep -qx avahi-daemon' \
         "Linux keeps the host tools: $output"
-    assert 'grep -q "^host_can ntp && { timedatectl set-ntp true" "$KEI_REPO/installer"' "NTP at panel start is guarded"
+    assert 'grep -qF "host_can ntp && { timedatectl set-ntp true" "$KEI_REPO/installer"' "NTP at panel start is guarded"
     assert 'grep -q "host_can mdns && systemctl enable --now avahi-daemon" "$KEI_REPO/installer"'
 }
 

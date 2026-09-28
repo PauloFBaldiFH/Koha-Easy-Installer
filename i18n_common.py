@@ -25,6 +25,9 @@ import sys
 
 INSTALLER_FILE = "installer"
 LANG_DIR = "lang"
+# Windows scripts: their texts go through T '...' (windows/KohaEasy.Lang.psm1)
+# and share the same dictionaries.
+WINDOWS_DIR = "windows"
 
 # Dictionaries shipped with the panel (file names, see normalize_panel_language
 # in the installer for the mapping from Koha language codes).
@@ -45,6 +48,8 @@ _CALL_RE = re.compile(
     r"""(?:(?<![\w$.\-/])t|\bdisplay_explanation)\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')"""
 )
 _BASH_DQ_ESCAPE = re.compile(r'\\([$`"\\\n])')
+# PowerShell: T 'text' (single quotes, '' is one quote), placeholders {0}.
+_PS_CALL_RE = re.compile(r"""(?<![\w$.\-])T\s+'((?:[^']|'')*)'""")
 
 
 def bash_unescape_double_quoted(text):
@@ -72,7 +77,24 @@ def extract_strings(installer_file=INSTALLER_FILE):
         if "$(" in text:
             continue
         found.add(text)
+    found.update(extract_windows_strings())
     return sorted(found)
+
+
+def extract_windows_strings(windows_dir=WINDOWS_DIR):
+    found = set()
+    if not os.path.isdir(windows_dir):
+        return found
+    for name in sorted(os.listdir(windows_dir)):
+        if not name.endswith((".ps1", ".psm1")):
+            continue
+        with open(os.path.join(windows_dir, name), "r", encoding="utf-8-sig") as fh:
+            content = "".join(line for line in fh if not line.lstrip().startswith("#"))
+        for text in _PS_CALL_RE.findall(content):
+            text = text.replace("''", "'")
+            if len(text.strip()) >= 2:
+                found.add(text)
+    return found
 
 
 # ----------------------------------------------------------------------
@@ -85,6 +107,7 @@ PROTECTED_TERMS = [
     r"\\n",
     VAR_RE.pattern,
     r"%[sdb]",
+    r"\{\d+\}",
     r"https?://[^\s'\"]+",
     r"(?<![\w/])/(?:etc|var|root|usr|tmp|run|media|mnt)/[A-Za-z0-9_\-./*@]+",
     r"--[a-z0-9][a-z0-9_-]*",
@@ -137,6 +160,8 @@ def is_valid(src, tr):
     if src.count("%") != tr.count("%"):
         return False
     if var_signature(src) != var_signature(tr):
+        return False
+    if sorted(set(re.findall(r"\{\d+\}", src))) != sorted(set(re.findall(r"\{\d+\}", tr))):
         return False
     return True
 

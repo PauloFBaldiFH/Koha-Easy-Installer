@@ -641,10 +641,17 @@ REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)"
 # ======================================================================
 PANEL_LOCK_FILE="/var/run/koha_panel.lock"
 
-exec 9> "$PANEL_LOCK_FILE"
-if ! flock -n 9; then
-    echo "$(t "The panel is already running in another session. Aborting to prevent conflicts.")"
-    exit 1
+# Read-only commands for the Windows tools (section 21.5) run next to an
+# open panel: no lock, no dependency install, no menu.
+KEI_CLI_MODE=""
+case "${1:-}" in --status-json|--export-diagnostics) KEI_CLI_MODE="$1" ;; esac
+
+if [ -z "$KEI_CLI_MODE" ]; then
+    exec 9> "$PANEL_LOCK_FILE"
+    if ! flock -n 9; then
+        echo "$(t "The panel is already running in another session. Aborting to prevent conflicts.")"
+        exit 1
+    fi
 fi
 
 # ======================================================================
@@ -860,7 +867,7 @@ detect_platform
 # ======================================================================
 # 7. PANEL DEPENDENCIES
 # ======================================================================
-host_can ntp && { timedatectl set-ntp true >/dev/null 2>&1 || true; }
+[ -z "$KEI_CLI_MODE" ] && host_can ntp && { timedatectl set-ntp true >/dev/null 2>&1 || true; }
 
 MISSING_DEPS=()
 for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg wget:wget fuser:psmisc ss:iproute2 flock:util-linux; do
@@ -869,7 +876,7 @@ for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg
     fi
 done
 
-if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+if [ ${#MISSING_DEPS[@]} -gt 0 ] && [ -z "$KEI_CLI_MODE" ]; then
     echo "$(t "Installing panel dependencies... Please wait.")"
     wait_for_apt_locks || { echo "$(t "APT is locked. Aborting.")"; exit 1; }
     apt_update_indices
@@ -5754,6 +5761,203 @@ $(t "MACHINE")
 $(t "BACKUP")
   $(t "Latest SQL")    : $(find "$DIR_SQL" -name '*.sql.gz' -printf '%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort -r | head -n1 || echo '-')
   $(t "Cloud")         : $(grep -o 'RCLONE_REMOTE="[^"]*"' "$BACKUP_CONF" 2>/dev/null | cut -d'"' -f2 | grep . || echo "$(t "not configured")")" 29 78 2>/dev/null || true
+}
+
+# ======================================================================
+# 21.5. READ-ONLY COMMANDS FOR THE WINDOWS TOOLS (AND SUPPORT)
+# ----------------------------------------------------------------------
+#   config.sh --status-json               one JSON object on stdout
+#   config.sh --export-diagnostics DIR    a support folder inside DIR
+# The Windows tray polls the first and "Export diagnostics" calls the
+# second. Both only read: they skip the panel lock (they work while a panel
+# is open), install nothing and never print a password or token.
+# ======================================================================
+KEI_DIAG_REDACT='[REDACTED]'
+
+# JSON string literal of $1 (quotes, backslashes and control characters escaped).
+json_str() {
+    local s="$1" out="" c i
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == [$'\x01'-$'\x1f'] ]]; then
+            printf -v c '\\u%04x' "'$c"
+        fi
+        out+="$c"
+    done
+    printf '"%s"' "$out"
+}
+
+# Plain number, or 0.
+json_num() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$((10#$1))" ;; esac; }
+
+# HTTP status of a local Koha page, 000 when nothing answers.
+kei_http_code() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-4}" "$1" 2>/dev/null)
+    case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+
+# Newest nightly SQL backup and the last line the backup script logged.
+# Prints: epoch size result file   (result: ok | failed | skipped | none)
+kei_backup_summary() {
+    local newest epoch=0 size=0 file="" last result="none"
+    newest=$(find "$DIR_SQL" -maxdepth 1 -name '*.sql.gz' -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -n1)
+    if [ -n "$newest" ]; then
+        epoch="${newest%%.*}"
+        size=$(printf '%s' "$newest" | awk '{print $2}')
+        file="${newest#* * }"
+    fi
+    last=$(grep -E '\| (OK|FAILED|INFO: SQL backup skipped)' "${LOG_DIR}/backup_sql.log" 2>/dev/null | tail -n1)
+    case "$last" in
+        *'| OK:'*) result="ok" ;;
+        *'| FAILED'*) result="failed" ;;
+        *skipped*) result="skipped" ;;
+    esac
+    printf '%s %s %s %s\n' "$(json_num "$epoch")" "$(json_num "$size")" "$result" "$file"
+}
+
+# Time of the last line of the backup log (epoch), 0 when there is none.
+kei_backup_log_epoch() {
+    local stamp
+    stamp=$(grep -E '\| (OK|FAILED|INFO: SQL backup skipped)' "${LOG_DIR}/backup_sql.log" 2>/dev/null | tail -n1 | cut -d'|' -f1)
+    [ -n "$stamp" ] && date -d "$stamp" +%s 2>/dev/null || printf '0'
+}
+
+# Overall state for the tray: ok | degraded | stopped | not_installed.
+kei_overall_state() {
+    local apache="$1" db="$2" koha="$3" staff="$4"
+    is_koha_installed || { printf 'not_installed'; return 0; }
+    if [ "$apache" = active ] && [ "$db" = active ] && [ "$koha" = active ] && [ "$staff" != 000 ] && [ "$staff" -lt 500 ]; then
+        printf 'ok'
+    elif [ "$apache" != active ] && [ "$db" != active ] && [ "$koha" != active ]; then
+        printf 'stopped'
+    else
+        printf 'degraded'
+    fi
+}
+
+kei_status_json() {
+    local svc state json="" first=1 apache="" db="" koha="" staff opac plack=false
+    local b_epoch b_size b_result b_file df_line d_total d_free mem_total mem_avail
+    for svc in apache2 mariadb memcached koha-common cron elasticsearch cloudflared; do
+        state=$(systemctl is-active "$svc" 2>/dev/null | head -n1)
+        [ -n "$state" ] || state="unknown"
+        case "$svc" in apache2) apache="$state" ;; mariadb) db="$state" ;; koha-common) koha="$state" ;; esac
+        [ "$first" = 1 ] || json+=","
+        first=0
+        json+="$(json_str "$svc"):$(json_str "$state")"
+    done
+    staff=$(kei_http_code "http://127.0.0.1:8080/")
+    opac=$(kei_http_code "http://127.0.0.1/")
+    plack_running 2>/dev/null && plack=true
+    read -r b_epoch b_size b_result b_file < <(kei_backup_summary)
+    df_line=$(df -P -B1 / 2>/dev/null | awk 'NR==2{print $2" "$4}')
+    d_total="${df_line%% *}" d_free="${df_line##* }"
+    mem_total=$(awk '/^MemTotal:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
+    printf '{"schema":1,"generated_at":%s,"panel_version":%s,' "$(date +%s)" "$(json_str "${PANEL_VERSION# }")"
+    printf '"platform":%s,"wsl_net":%s,"autostart":%s,' "$(json_str "$KEI_PLATFORM")" "$(json_str "${KEI_WSL_NET:-}")" "$(json_str "${WIN_AUTOSTART:-}")"
+    printf '"state":%s,"koha_installed":%s,' "$(json_str "$(kei_overall_state "$apache" "$db" "$koha" "$staff")")" "$(is_koha_installed && echo true || echo false)"
+    printf '"services":{%s},"plack":%s,' "$json" "$plack"
+    printf '"http":{"staff":%s,"opac":%s},' "$(json_num "$staff")" "$(json_num "$opac")"
+    printf '"backup":{"last_file":%s,"last_epoch":%s,"last_size":%s,"last_result":%s,"log_epoch":%s},' \
+        "$(json_str "${b_file##*/}")" "$(json_num "$b_epoch")" "$(json_num "$b_size")" "$(json_str "$b_result")" "$(json_num "$(kei_backup_log_epoch)")"
+    printf '"disk":{"total":%s,"free":%s},' "$(json_num "$d_total")" "$(json_num "$d_free")"
+    printf '"memory":{"total":%s,"available":%s}}\n' "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+}
+
+# Removes secrets from text on stdin: key=value / key: value pairs whose key
+# names a password, token or secret, <pass> elements, HTTP authorization
+# headers, user:password@ in URLs and Google tokens (ya29., 1//).
+kei_redact() {
+    sed -E \
+        -e "s#(<(pass|password|user_pass|encryption_key|api_key)>)[^<]*(</[a-z_]+>)#\1${KEI_DIAG_REDACT}\3#Ig" \
+        -e "s#([a-z_-]*(pass(word)?|passwd|pwd|secret|token|api[_-]?key)[a-z_-]*[\"']?[[:space:]]*[:=][[:space:]]*[\"']?)[^\"'[:space:],;&}]+#\1${KEI_DIAG_REDACT}#Ig" \
+        -e "s#((proxy-)?authorization:[[:space:]]*[a-z]+)[[:space:]]+[^[:space:]]+#\1 ${KEI_DIAG_REDACT}#Ig" \
+        -e "s#(bearer|basic)[[:space:]]+[A-Za-z0-9._~+/=-]{8,}#\1 ${KEI_DIAG_REDACT}#Ig" \
+        -e "s#://[^/@[:space:]:]+:[^/@[:space:]]+@#://${KEI_DIAG_REDACT}@#g" \
+        -e "s#ya29\.[A-Za-z0-9._-]+#${KEI_DIAG_REDACT}#g" \
+        -e "s#1//[A-Za-z0-9._-]{20,}#${KEI_DIAG_REDACT}#g"
+}
+
+# Last $2 lines (default 400) of a log, redacted, into $3. Missing logs are skipped.
+kei_diag_tail() {
+    local src="$1" n="${2:-400}" dst="$3"
+    [ -f "$src" ] && [ -r "$src" ] || return 0
+    case "$src" in *.gz) zcat -- "$src" 2>/dev/null | tail -n "$n" ;; *) tail -n "$n" -- "$src" 2>/dev/null ;; esac \
+        | kei_redact > "$dst"
+}
+
+# Output of a command, redacted, into $1 (never fails the export).
+kei_diag_cmd() {
+    local dst="$1"; shift
+    { printf '$ %s\n' "$*"; timeout 20 "$@" 2>&1 | head -n 2000; printf '\n'; } | kei_redact >> "$dst"
+}
+
+# config.sh --export-diagnostics DIR: writes DIR/koha-diagnostics-HOST-DATE
+# and prints its path. Only logs and command output go in, each through
+# kei_redact; no configuration file (koha-conf.xml, rclone.conf, vision.conf,
+# the credentials file) is ever copied.
+kei_export_diagnostics() {
+    local dir="$1" out f svc name
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        echo "usage: config.sh --export-diagnostics <existing folder>" >&2
+        return 2
+    fi
+    out="${dir%/}/koha-diagnostics-$(hostname -s 2>/dev/null || echo koha)-$(date +%Y%m%d-%H%M%S)"
+    mkdir -m 700 "$out" "$out/logs" || return 1
+    kei_status_json > "$out/status.json" 2>/dev/null
+    {
+        printf 'Koha Easy Install %s  |  %s\n' "${PANEL_VERSION# }" "$(date '+%F %T %z')"
+        printf 'platform=%s  wsl_net=%s  autostart=%s  windows_build=%s\n\n' "$KEI_PLATFORM" "${KEI_WSL_NET:--}" "${WIN_AUTOSTART:--}" "${WIN_BUILD:--}"
+    } > "$out/system.txt"
+    kei_diag_cmd "$out/system.txt" uname -a
+    kei_diag_cmd "$out/system.txt" cat /etc/os-release
+    kei_diag_cmd "$out/system.txt" uptime
+    kei_diag_cmd "$out/system.txt" free -m
+    kei_diag_cmd "$out/system.txt" df -h
+    kei_diag_cmd "$out/system.txt" df -i /
+    kei_diag_cmd "$out/system.txt" timedatectl
+    kei_diag_cmd "$out/system.txt" ip -brief address
+    kei_diag_cmd "$out/system.txt" ip route
+    kei_diag_cmd "$out/system.txt" ss -tlnp
+    kei_diag_cmd "$out/system.txt" systemctl --failed --no-pager
+    kei_diag_cmd "$out/system.txt" dpkg-query -W koha-common mariadb-server apache2 elasticsearch cloudflared rclone
+    for svc in apache2 mariadb memcached koha-common cron elasticsearch cloudflared; do
+        kei_diag_cmd "$out/services.txt" systemctl status "$svc" --no-pager -n 30
+    done
+    kei_diag_cmd "$out/services.txt" journalctl -p err -b --no-pager -n 300
+    # Error logs only: access logs and the MariaDB query log hold patron data.
+    for f in /var/log/apache2/error.log /var/log/mysql/error.log \
+             /var/log/koha/"$INSTANCE"/*error*.log /var/log/koha/"$INSTANCE"/worker*.log \
+             /var/log/koha/"$INSTANCE"/indexer*.log /var/log/koha/"$INSTANCE"/zebra*.log \
+             "$LOG_DIR"/backup_*.log; do
+        [ -f "$f" ] || continue
+        name=$(printf '%s' "${f#/var/log/}" | tr '/' '_')
+        kei_diag_tail "$f" 400 "$out/logs/$name"
+    done
+    while IFS= read -r f; do
+        kei_diag_tail "$f" 1000 "$out/logs/panel_${f##*/}"
+    done < <(find "$LOG_DIR" -maxdepth 1 -name 'painel-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 3 | cut -d' ' -f2-)
+    kei_diag_cmd "$out/logs/mariadb_journal.txt" journalctl -u mariadb --no-pager -n 300
+    kei_diag_cmd "$out/logs/wsl_dmesg.txt" dmesg --ctime
+    cat > "$out/README.txt" << 'EOF'
+Koha diagnostics for support.
+status.json   services, web pages, last backup, disk and memory
+system.txt    operating system, network and package versions
+services.txt  state of each service and the recent system errors
+logs/         the last lines of the Apache, MariaDB, Koha and panel logs
+Passwords, tokens and keys are replaced by [REDACTED]. No configuration
+file, database content or credentials file is included.
+EOF
+    chmod -R go-rwx "$out" 2>/dev/null
+    log "diagnostics exported to $out"
+    printf '%s\n' "$out"
 }
 
 # ======================================================================
@@ -11664,6 +11868,18 @@ lt_mr_versions() {
 
 # Loaded with "source installer" (tests/): functions only, no menu.
 (return 0 2>/dev/null) && return 0
+
+# Read-only commands (section 21.5): answer and exit before anything else runs.
+# The panel's exit cleanup is not used: it removes /tmp/koha_tmp_* files that
+# belong to a panel open at the same time.
+if [ -n "$KEI_CLI_MODE" ]; then
+    trap - EXIT
+    case "$KEI_CLI_MODE" in
+        --status-json) kei_status_json ;;
+        --export-diagnostics) kei_export_diagnostics "${2:-}" ;;
+    esac
+    exit $?
+fi
 
 # ======================================================================
 # KEEP THE INSTALLED PANEL UP TO DATE

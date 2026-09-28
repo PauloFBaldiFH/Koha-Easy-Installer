@@ -2,6 +2,10 @@
   🇺🇸 English &nbsp;|&nbsp; <a href="README.pt-BR.md">🇧🇷 Português</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/koha-logo-green.png" alt="Koha logo" width="320">
+</p>
+
 # Koha Easy Installer & Manager
 
 A single Bash script that installs, tunes and maintains the **[Koha](https://koha-community.org/) Integrated Library System** on Debian/Ubuntu, through a friendly menu-driven control panel (whiptail, dark theme) available in **22 languages**.
@@ -259,3 +263,5 @@ Koha Easy Installer & Manager is free software under the [GNU General Public Lic
 ---
 
 Created with dedication by **Paulo F. Baldi FH** — Library Assistant, Castro Alves Public Library, Palotina, Paraná, Brazil.
+
+<sub>The Koha name and logo belong to the Koha community (koha-community.org); this installer is an independent project.</sub>
