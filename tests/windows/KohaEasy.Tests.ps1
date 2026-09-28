@@ -339,11 +339,24 @@ Describe 'Handshake file' {
 
     It 'is sent through stdin to a root-owned file replaced in one step' {
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
-        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        $script:linux = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [void]$script:linux.Add([pscustomobject]@{ Command = $Command; InputText = $InputText }); [pscustomobject]@{ ExitCode = 0; Output = '' } }
         Update-KohaHandshake | Should -BeTrue
-        Should -Invoke -ModuleName KohaEasy.Core Invoke-KohaLinux -ParameterFilter {
-            $Command[0] -eq 'sh' -and $Command[2] -match 'chown root:root' -and $Command[2] -match 'mv -f' -and $InputText -match 'WIN_AUTOSTART='
-        }
+        $script:linux.Count | Should -Be 3
+        $script:linux[0].Command[0] | Should -Be 'tee'
+        $script:linux[0].InputText | Should -Match 'chown root:root'
+        $script:linux[0].InputText | Should -Match 'mv -f'
+        $script:linux[1].Command[0] | Should -Be 'sh'
+        $script:linux[1].Command[1] | Should -Be $script:linux[0].Command[1]
+        $script:linux[1].InputText | Should -Match 'WIN_AUTOSTART='
+        $script:linux[2].Command -join ' ' | Should -Be ('rm -f ' + $script:linux[0].Command[1])
+    }
+
+    It 'never puts quotes or spaces on the wsl.exe command line, which Windows PowerShell 5.1 would mangle' {
+        $script:linux = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [void]$script:linux.Add($Command); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Invoke-KohaLinuxScript -Script 'd="/a b"; echo "$d" > /dev/null' -InputText 'x' | Out-Null
+        foreach ($c in $script:linux) { foreach ($a in $c) { $a | Should -Not -Match '[\s"'']' } }
     }
 }
 

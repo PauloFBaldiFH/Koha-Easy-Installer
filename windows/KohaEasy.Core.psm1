@@ -151,6 +151,27 @@ function Invoke-KohaLinux {
     return Invoke-KohaWsl -Arguments $wslArgs
 }
 
+# Runs a shell script as root inside the distro. The script crosses into
+# Linux through stdin (tee) and runs from a file, so only plain words go on
+# wsl.exe's command line: Windows PowerShell 5.1 does not escape the double
+# quotes inside a native command's arguments, and "sh -c <script>" arrived
+# in Linux cut into pieces. $InputText, when given, is the script's stdin.
+function Invoke-KohaLinuxScript {
+    param([Parameter(Mandatory = $true)][string]$Script, [string]$InputText)
+    $file = '/run/kohaeasy-{0}.sh' -f ([guid]::NewGuid().ToString('N'))
+    # "exit $?" ends the script before the CR LF that Windows adds after
+    # piped text, which sh would otherwise run as a command.
+    $body = ($Script -replace "`r", '') + "`nexit `$?`n"
+    $w = Invoke-KohaLinux -Command @('tee', $file) -InputText $body
+    if ($w.ExitCode -ne 0) { return $w }
+    try {
+        if ($PSBoundParameters.ContainsKey('InputText')) { return (Invoke-KohaLinux -Command @('sh', $file) -InputText $InputText) }
+        return (Invoke-KohaLinux -Command @('sh', $file))
+    } finally {
+        Invoke-KohaLinux -Command @('rm', '-f', $file) | Out-Null
+    }
+}
+
 # Names of the running distros. Never starts one (a status check must not
 # turn on a Koha the librarian stopped).
 function Get-KohaRunningDistros {
@@ -237,7 +258,7 @@ function Update-KohaHandshake {
         return $false
     }
     $script = 'umask 022; d=/etc/koha-easy-install; mkdir -p "$d" && t=$(mktemp "$d/.windows.conf.XXXXXX") && cat > "$t" && chown root:root "$t" && chmod 644 "$t" && mv -f "$t" "$d/windows.conf"'
-    $r = Invoke-KohaLinux -Command @('sh', '-c', $script) -InputText (New-KohaHandshake)
+    $r = Invoke-KohaLinuxScript -Script $script -InputText (New-KohaHandshake)
     if ($r.ExitCode -ne 0) {
         Write-KohaLog "handshake not written: $($r.Output)"
         return $false
