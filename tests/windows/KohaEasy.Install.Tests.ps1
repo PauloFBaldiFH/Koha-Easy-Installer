@@ -78,7 +78,7 @@ Describe 'Debian download' {
         Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
         Mock -ModuleName KohaEasy.Install Get-KohaDistributionManifest { '{"ModernDistributions":{"Debian":[{"Name":"Debian","Default":true,"Amd64Url":{"Url":"https://x.test/d.wsl","Sha256":"0x00"}}]}}' | ConvertFrom-Json }
         Mock -ModuleName KohaEasy.Install Save-KohaDownload { Set-Content -LiteralPath $Path -Value 'not debian' }
-        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { throw 'must not import' }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { if ($Arguments[0] -eq '--install') { return [pscustomobject]@{ ExitCode = 1; Output = 'Invalid command line argument: --location' } }; throw 'must not import' }
         { New-KohaDistro } | Should -Throw '*SHA-256*'
         @(Get-ChildItem (Get-KohaPath Wsl) -Filter '*.tar.gz').Count | Should -Be 0
     }
@@ -90,11 +90,30 @@ Describe 'Debian download' {
         $sha = (Get-FileHash -LiteralPath $script:img -Algorithm SHA256).Hash
         Mock -ModuleName KohaEasy.Install Get-KohaDistributionManifest { ('{"ModernDistributions":{"Debian":[{"Name":"Debian","Amd64Url":{"Url":"https://x.test/d.wsl","Sha256":"0x' + $sha + '"}}]}}') | ConvertFrom-Json }
         Mock -ModuleName KohaEasy.Install Save-KohaDownload { Copy-Item -LiteralPath $script:img -Destination $Path }
-        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [pscustomobject]@{ ExitCode = [int]($Arguments[0] -eq '--install'); Output = '' } }
         New-KohaDistro | Should -Be 'imported'
         Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -ParameterFilter { $Arguments[0] -eq '--import' -and $Arguments[1] -eq 'KohaEasy' -and $Arguments[-1] -eq '2' }
         Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $true }
         New-KohaDistro | Should -Be 'exists'
+    }
+
+    It 'lets WSL install and check Debian itself when it can, without downloading anything here' {
+        $script:installed = $false
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $script:installed }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { $script:installed = $true; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Get-KohaDistributionManifest { throw 'must not download' }
+        New-KohaDistro | Should -Be 'installed'
+        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter {
+            ($Arguments -join ' ') -eq ('--install Debian --name KohaEasy --location {0} --no-launch --web-download' -f (Get-KohaPath Wsl))
+        }
+    }
+
+    It 'downloads with a user agent that download servers do not treat as a browser' {
+        $text = [System.IO.File]::ReadAllText((Join-Path $repo 'windows/KohaEasy.Install.psm1'))
+        $body = $text.Substring($text.IndexOf('function Save-KohaDownload'))
+        $body = $body.Substring(0, $body.IndexOf("`n}"))
+        $body | Should -Match 'curl\.exe'
+        $body | Should -Match "Invoke-WebRequest [^\r\n]*-UserAgent 'KohaEasyInstaller'"
     }
 }
 
