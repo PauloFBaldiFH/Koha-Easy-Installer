@@ -21,14 +21,25 @@ $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.e
 $STATUS_EVERY_S = 60
 $DISK_EVERY_S = 1800
 
+# The Koha icon (koha.ico) with a status dot in the lower right corner; a
+# plain dot when the icon file is missing.
+$kohaIco = Join-Path $here 'koha.ico'
 function New-DotIcon {
     param([System.Drawing.Color]$Color)
     $bmp = New-Object System.Drawing.Bitmap 16, 16
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
-    $g.FillEllipse((New-Object System.Drawing.SolidBrush $Color), 1, 1, 14, 14)
-    $g.DrawEllipse((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(90, 0, 0, 0))), 1, 1, 14, 14)
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 1.5
+    if (Test-Path -LiteralPath $kohaIco) {
+        $base = New-Object System.Drawing.Icon($kohaIco, 16, 16)
+        $g.DrawIcon($base, (New-Object System.Drawing.Rectangle 0, 0, 16, 16))
+        $base.Dispose()
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush $Color), 8, 8, 7, 7)
+        $g.DrawEllipse($pen, 8, 8, 7, 7)
+    } else {
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush $Color), 1, 1, 14, 14)
+    }
     $g.Dispose()
     return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }

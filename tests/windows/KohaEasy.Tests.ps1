@@ -289,6 +289,36 @@ Describe 'Start, Stop and automatic start' {
     }
 }
 
+Describe 'Shortcuts' {
+    It 'gives every shortcut the Koha icon and puts only the two web pages on the desktop' {
+        $list = Get-KohaShortcutList
+        $list.Count | Should -BeGreaterThan 8
+        foreach ($s in $list) { $s.Icon | Should -BeLike '*koha.ico' }
+        @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop }).Count | Should -Be 2
+        ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
+    }
+
+    It 'writes .url files with IconFile, program shortcuts through WScript.Shell, and copies koha.ico' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        $sm = Join-Path $TestDrive 'Programs/Koha'
+        $dt = Join-Path $TestDrive 'Desktop'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        $made = New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico')
+        Test-Path -LiteralPath (Get-KohaIconPath) | Should -BeTrue
+        $url = Get-ChildItem -LiteralPath $dt -Filter '*.url' | Select-Object -First 1
+        @(Get-ChildItem -LiteralPath $dt).Count | Should -Be 2
+        Get-Content -Raw -LiteralPath $url.FullName | Should -Match ('IconFile=' + [regex]::Escape((Get-KohaIconPath)))
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 8 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
+        $made.Count | Should -Be 12
+    }
+
+    It 'ships koha.ico as a real Windows icon with a 16x16 image' {
+        $b = [System.IO.File]::ReadAllBytes((Join-Path $repo 'windows/koha.ico'))
+        ($b[0] -eq 0 -and $b[1] -eq 0 -and $b[2] -eq 1 -and $b[3] -eq 0) | Should -BeTrue
+        $b[6] | Should -Be 16
+    }
+}
+
 Describe 'Handshake file' {
     It 'writes only KEY=value lines the panel parser accepts' {
         Set-KohaState @{ autostart = 'manual' } | Out-Null

@@ -12,12 +12,13 @@
     KohaEasy.ps1 CheckDisk                     free space around the virtual disk
     KohaEasy.ps1 CompactDisk                   give unused space back to Windows (admin)
     KohaEasy.ps1 SetAutostart -Mode logon|manual
-    KohaEasy.ps1 RegisterTasks [-Mode logon|manual]
+    KohaEasy.ps1 RegisterTasks [-Mode logon|manual]   tasks, tray at sign-in and shortcuts
+    KohaEasy.ps1 CreateShortcuts               Start menu "Koha" and desktop, with koha.ico
     -Quiet: no dialog boxes (scheduled tasks). Windows PowerShell 5.1.
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks')]
+    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -145,5 +146,7 @@ switch ($Command) {
     'RegisterTasks' {
         if ($Mode) { Register-KohaTasks -Autostart $Mode } else { Register-KohaTasks }
         Set-KohaTrayAtSignIn -Enabled $true
+        New-KohaShortcuts | Out-Null
     }
+    'CreateShortcuts' { New-KohaShortcuts }
 }

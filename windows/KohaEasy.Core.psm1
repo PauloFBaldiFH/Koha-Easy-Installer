@@ -543,7 +543,7 @@ function Invoke-KohaDiskpart {
 #                            unlock and on resume only repair a Koha meant to run.
 #   "Start Koha at sign-in"  action Start -Trigger logon; enabled only in
 #                            "logon" mode.
-function Get-KohaScriptPath { return (Join-Path (Get-KohaPath Bin) 'KohaEasy.ps1') }
+function Get-KohaScriptPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.ps1') }
 
 function New-KohaAction {
     param([string]$Arguments)
@@ -779,6 +779,86 @@ function Export-KohaDiagnostics {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     Write-KohaLog "diagnostics exported: $zip"
     return $zip
+}
+
+# ----------------------------------------------------------------------
+# Shortcuts (Start menu folder "Koha" and desktop), all with koha.ico
+# ----------------------------------------------------------------------
+function Get-KohaIconPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'koha.ico') }
+
+# What to create (pure, tested). Kind "url" is an Internet shortcut (.url),
+# "lnk" a program shortcut. Commands run KohaEasy.ps1 in Windows PowerShell 5.1.
+function Get-KohaShortcutList {
+    $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $ps1 = Get-KohaScriptPath
+    $cmd = { param($a, $style) '-NoProfile -WindowStyle {0} -ExecutionPolicy Bypass -File "{1}" {2}' -f $style, $ps1, $a }
+    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $list = @(
+        @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl; Desktop = $true }
+        @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl; Desktop = $true }
+        @{ Name = (T 'Koha - Control panel'); Kind = 'lnk'; Target = $wsl; Arguments = ('-d {0} -u root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) }
+        @{ Name = (T 'Koha - Backups folder'); Kind = 'lnk'; Target = [System.IO.Path]::Combine([string]$env:SystemRoot, 'explorer.exe'); Arguments = ('"{0}"' -f (Get-KohaPath Backups)) }
+        @{ Name = (T 'Koha - Start'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Start' 'Hidden') }
+        @{ Name = (T 'Koha - Stop'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Stop' 'Hidden') }
+        @{ Name = (T 'Koha - Restart'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Restart' 'Hidden') }
+        @{ Name = (T 'Koha - Status'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Status' 'Hidden') }
+        @{ Name = (T 'Koha - Export diagnostics'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'ExportDiagnostics' 'Hidden') }
+        @{ Name = (T 'Koha - Status icon'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Tray' 'Hidden') }
+    )
+    foreach ($s in $list) { $s.Icon = Get-KohaIconPath }
+    return $list
+}
+
+# Characters Windows refuses in file names.
+function ConvertTo-KohaFileName { param([string]$Name) return ($Name -replace '[\\/:*?"<>|]', '-').Trim() }
+
+function Save-KohaUrlShortcut {
+    param([string]$Path, [string]$Url, [string]$Icon)
+    $text = "[InternetShortcut]`r`nURL=$Url`r`nIconFile=$Icon`r`nIconIndex=0`r`n"
+    [System.IO.File]::WriteAllText($Path, $text, [System.Text.Encoding]::ASCII)
+}
+
+function Save-KohaLnkShortcut {
+    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon)
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut($Path)
+    $lnk.TargetPath = $Target
+    $lnk.Arguments = $Arguments
+    $lnk.WorkingDirectory = Get-KohaPath Root
+    $lnk.IconLocation = $Icon + ',0'
+    $lnk.Save()
+}
+
+# Creates (or refreshes) every shortcut with the Koha icon. The icon is copied
+# next to KohaEasy.ps1 first, so shortcuts keep it if the ZIP folder is deleted.
+function New-KohaShortcuts {
+    param(
+        [string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'),
+        [string]$Desktop = [Environment]::GetFolderPath('Desktop'),
+        [string]$IconSource = [System.IO.Path]::Combine($PSScriptRoot, 'koha.ico')
+    )
+    $icon = Get-KohaIconPath
+    if ((Test-Path -LiteralPath $IconSource) -and ($IconSource -ne $icon)) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $icon) -Force | Out-Null
+        Copy-Item -LiteralPath $IconSource -Destination $icon -Force
+    }
+    New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null
+    $made = New-Object System.Collections.ArrayList
+    foreach ($s in Get-KohaShortcutList) {
+        $dirs = @($StartMenu)
+        if ($s.ContainsKey('Desktop') -and $s.Desktop -and $Desktop) { $dirs += $Desktop }
+        foreach ($d in $dirs) {
+            $file = [System.IO.Path]::Combine($d, (ConvertTo-KohaFileName $s.Name) + '.' + $s.Kind)
+            if ($s.Kind -eq 'url') {
+                Save-KohaUrlShortcut -Path $file -Url $s.Target -Icon $s.Icon
+            } else {
+                Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
+            }
+            [void]$made.Add($file)
+        }
+    }
+    Write-KohaLog ('shortcuts created: {0}' -f $made.Count)
+    return @($made)
 }
 
 # ----------------------------------------------------------------------
