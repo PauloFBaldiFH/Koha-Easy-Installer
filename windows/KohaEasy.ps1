@@ -6,6 +6,7 @@
     KohaEasy.ps1 Stop [-Force]                 Koha - Stop shortcut, tray
     KohaEasy.ps1 Restart [-Force]              Koha - Restart shortcut, tray
     KohaEasy.ps1 Status                        Koha - Status shortcut
+    KohaEasy.ps1 Open                          the "Koha" desktop icon: starts Koha if needed, opens the staff interface
     KohaEasy.ps1 Run                           action of the "Keep Koha running" task
     KohaEasy.ps1 Tray                          notification-area icon (starts at sign-in)
     KohaEasy.ps1 ExportDiagnostics             .zip for support on the desktop
@@ -19,7 +20,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'Install')]
+    [ValidateSet('Open', 'Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -63,6 +64,18 @@ switch ($Command) {
     'Start' {
         if (-not $Quiet) { Show-KohaNotification -Title 'Koha' -Text (T 'Starting Koha... (up to 3 minutes)') | Out-Null }
         Invoke-Start
+    }
+    'Open' {
+        $s = Get-KohaStatus
+        if ($s.State -eq 'not_installed') { Show-Box (Get-KohaStateText $s.State) 'OK' 'Warning' | Out-Null; break }
+        if ($s.State -ne 'running') {
+            Show-KohaNotification -Title 'Koha' -Text (T 'Starting Koha... (up to 3 minutes)') | Out-Null
+            if ((Start-Koha -Trigger user -Wait) -ne 'ready') {
+                Show-Box (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') 'OK' 'Error' | Out-Null
+                break
+            }
+        }
+        Start-Process $cfg.StaffUrl
     }
     'Stop' {
         if (Confirm-Stop (T 'Stop Koha?')) {
@@ -153,7 +166,9 @@ switch ($Command) {
     'Install' {
         Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Install.psm1') -Force
         try {
-            $code = Install-Koha
+            # Only the last value is the result: anything else a step prints
+            # must never turn the exit code into a list.
+            $code = [int](@(Install-Koha) | Select-Object -Last 1)
         } catch {
             Write-KohaLog ('install failed: ' + $_.Exception.Message) 'install'
             Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red
