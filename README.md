@@ -117,7 +117,7 @@ The installer does everything else and shows each step in plain language:
 
 1. It checks the PC: Windows 10 version 2004 or later, or Windows 11; 64-bit; at least 4 GB of memory (8 GB recommended); at least 10 GB free on C:; virtualization turned on in the BIOS.
 2. It installs WSL 2. Windows asks for permission once. If Windows needs a restart, the installer continues by itself after you sign in again.
-3. It downloads Debian from Microsoft's own WSL list, checks its SHA-256, and imports it as `KohaEasy` in `C:\KohaEasy\wsl`.
+3. It has WSL install Debian from Microsoft's own WSL list as `KohaEasy` in `C:\KohaEasy\wsl`. On an older WSL it downloads the same image itself, checks its SHA-256 and imports it.
 4. It enables systemd. On Windows 11 22H2 or later it also adds mirrored networking to your `.wslconfig`, keeping your own settings and a backup.
 5. It opens the Koha control panel. Choose your language, then **1 – Install Koha server**, and leave the panel with **Exit** when it finishes.
 6. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, starts Koha, and opens the staff interface. From then on, the **Koha** icon on the desktop starts Koha if it is off and opens the staff interface.

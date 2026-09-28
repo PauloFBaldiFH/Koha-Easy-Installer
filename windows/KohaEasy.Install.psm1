@@ -119,27 +119,52 @@ function Get-KohaDebianImage {
 
 function Get-KohaDistributionManifest { return (Invoke-RestMethod -Uri $script:ManifestUrl -UseBasicParsing) }
 
+# curl.exe (built into Windows 10 1803 and later) first: download servers
+# that screen browsers answer PowerShell's "Mozilla/5.0 ... WindowsPowerShell"
+# user agent with a check page instead of the file.
 function Save-KohaDownload {
     param([string]$Url, [string]$Path)
+    $curl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'curl.exe')
+    if (Test-Path -LiteralPath $curl) {
+        & $curl -fsSL --retry 3 -A 'KohaEasyInstaller' -o $Path $Url 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { return }
+        Write-KohaLog ('curl.exe exit {0} for {1}' -f $LASTEXITCODE, $Url) 'install'
+    }
     $prev = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'   # the progress bar makes 5.1 downloads many times slower
-    try { Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing } finally { $ProgressPreference = $prev }
+    try { Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -UserAgent 'KohaEasyInstaller' } finally { $ProgressPreference = $prev }
 }
 
-# Imports Debian as "KohaEasy" into C:\KohaEasy\wsl, after checking the
-# SHA-256 that Microsoft publishes for the image.
+# Debian as "KohaEasy" in C:\KohaEasy\wsl. First choice: WSL itself installs
+# Debian from Microsoft's list and checks its hash ("wsl --install --name
+# --location", WSL 2.4.4 and later). When that is not available, the image is
+# downloaded here, its SHA-256 checked against the same list, and imported.
 function New-KohaDistro {
     param([bool]$Arm = $false)
     if (Test-KohaDistroInstalled) { return 'exists' }
-    $img = Get-KohaDebianImage -Manifest (Get-KohaDistributionManifest) -Arm $Arm
+    $name = (Get-KohaConfig).Distro
     $dir = Get-KohaPath Wsl
+    $r = Invoke-KohaWsl -Arguments @('--install', 'Debian', '--name', $name, '--location', $dir, '--no-launch', '--web-download')
+    if ($r.ExitCode -eq 0 -and (Test-KohaDistroInstalled)) { return 'installed' }
+    Write-KohaLog ('wsl --install Debian did not work (exit {0}), downloading the image: {1}' -f $r.ExitCode, $r.Output) 'install'
+
+    $img = Get-KohaDebianImage -Manifest (Get-KohaDistributionManifest) -Arm $Arm
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    # A disk left by the failed attempt would block the import; the distro is
+    # not registered, so nothing uses it.
+    Remove-Item -LiteralPath ([System.IO.Path]::Combine($dir, 'ext4.vhdx')) -Force -ErrorAction SilentlyContinue
     $file = [System.IO.Path]::Combine($dir, 'debian-rootfs.tar.gz')
     Save-KohaDownload -Url $img.Url -Path $file
     try {
         $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToUpperInvariant()
-        if ($img.Sha256 -and $hash -ne $img.Sha256) { throw ((T 'The downloaded Debian image is damaged (SHA-256 does not match). Run the installer again.')) }
-        $r = Invoke-KohaWsl -Arguments @('--import', (Get-KohaConfig).Distro, $dir, $file, '--version', '2')
+        if ($img.Sha256 -and $hash -ne $img.Sha256) {
+            $head = ''
+            try { $head = (Get-Content -LiteralPath $file -TotalCount 1 -ErrorAction Stop | Out-String).Trim() } catch { }
+            if ($head.Length -gt 120) { $head = $head.Substring(0, 120) }
+            Write-KohaLog ('Debian image SHA-256 {0}, expected {1}, size {2}, from {3}, starts with: {4}' -f $hash, $img.Sha256, (Get-Item -LiteralPath $file).Length, $img.Url, $head) 'install'
+            throw ((T 'The downloaded Debian image is damaged (SHA-256 does not match). Run the installer again.'))
+        }
+        $r = Invoke-KohaWsl -Arguments @('--import', $name, $dir, $file, '--version', '2')
         if ($r.ExitCode -ne 0) { throw ('wsl --import: ' + $r.Output) }
     } finally {
         Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue

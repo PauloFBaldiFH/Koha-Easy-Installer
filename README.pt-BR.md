@@ -117,7 +117,7 @@ O instalador faz todo o resto e mostra cada etapa em linguagem simples:
 
 1. Verifica o computador: Windows 10 versão 2004 ou mais recente, ou Windows 11; 64 bits; pelo menos 4 GB de memória (8 GB recomendados); pelo menos 10 GB livres no C:; virtualização ativada na BIOS.
 2. Instala o WSL 2. O Windows pede permissão uma vez. Se o Windows precisar reiniciar, o instalador continua sozinho quando você entrar de novo.
-3. Baixa o Debian da lista oficial do WSL da Microsoft, confere o SHA-256 e o importa como `KohaEasy` em `C:\KohaEasy\wsl`.
+3. Pede ao WSL que instale o Debian da lista oficial do WSL da Microsoft como `KohaEasy` em `C:\KohaEasy\wsl`. Em um WSL mais antigo, baixa a mesma imagem, confere o SHA-256 e a importa.
 4. Ativa o systemd. No Windows 11 22H2 ou mais recente, também acrescenta a rede espelhada (mirrored) ao seu `.wslconfig`, mantendo as suas configurações e uma cópia de segurança.
 5. Abre o painel de controle do Koha. Escolha o idioma, depois **1 – Instalar servidor Koha**, e saia do painel com **Sair** quando terminar.
 6. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, inicia o Koha e abre a interface da equipe. A partir daí, o ícone **Koha** na área de trabalho liga o Koha se estiver desligado e abre a interface da equipe.
