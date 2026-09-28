@@ -2105,6 +2105,56 @@ prepare_koha_broker() {
     return 0
 }
 
+# RabbitMQ under WSL. koha-common's post-install script enables the STOMP
+# plugin and restarts RabbitMQ, which then refuses to start when it cannot
+# open STOMP's port 61613 ("could_not_start, rabbitmq_stomp"): with mirrored
+# networking Linux shares the ports of Windows, and Windows reserves blocks
+# of its dynamic range (49152-65535, where 61613 falls) for Hyper-V. Before
+# the package is configured, the plugin is enabled and its listener put on
+# 127.0.0.1 at a port below that range that nothing listens on;
+# koha-sites.conf then gives Koha the same address (define_koha_sites_conf).
+KEI_RABBITMQ_DIR="${KEI_RABBITMQ_DIR:-/etc/rabbitmq}"
+KOHA_WSL_STOMP_PORTS=(16613 26613 36613)
+
+port_in_use() { ss -lnt 2>/dev/null | grep -qE "[:.]$1[[:space:]]"; }
+
+# The STOMP port RabbitMQ listens on (61613 unless rabbitmq.conf says otherwise).
+koha_stomp_port() {
+    local p
+    p=$(sed -n -E 's/^[[:space:]]*stomp\.listeners\.tcp\.1[[:space:]]*=[[:space:]]*([0-9.]+:)?([0-9]+)[[:space:]]*$/\2/p' \
+        "$KEI_RABBITMQ_DIR/rabbitmq.conf" 2>/dev/null | tail -n1)
+    printf '%s' "${p:-61613}"
+}
+
+prepare_wsl_broker() {
+    is_wsl || return 0
+    local conf="$KEI_RABBITMQ_DIR/rabbitmq.conf" plugins="$KEI_RABBITMQ_DIR/enabled_plugins" port="" p
+    mkdir -p "$KEI_RABBITMQ_DIR" || return 1
+    if ! grep -q '^# koha-easy-installer' "$conf" 2>/dev/null; then
+        for p in "${KOHA_WSL_STOMP_PORTS[@]}"; do
+            port_in_use "$p" || { port="$p"; break; }
+        done
+        [ -n "$port" ] || port="${KOHA_WSL_STOMP_PORTS[0]}"
+        {
+            [ -f "$conf" ] && grep -v -E '^[[:space:]]*stomp\.listeners\.' "$conf"
+            echo "# koha-easy-installer (WSL): STOMP for Koha on the loopback, on a port Windows does not reserve"
+            echo "stomp.listeners.tcp.1 = 127.0.0.1:${port}"
+        } > "$conf.tmp" && chmod 644 "$conf.tmp" && mv -f "$conf.tmp" "$conf" || return 1
+    fi
+    # The listener setting is only valid while the plugin is enabled.
+    if ! grep -q 'rabbitmq_stomp' "$plugins" 2>/dev/null; then
+        if [ -f "$plugins" ] && command -v rabbitmq-plugins >/dev/null 2>&1; then
+            rabbitmq-plugins enable --offline rabbitmq_stomp >/dev/null 2>&1 || return 1
+        else
+            echo '[rabbitmq_stomp].' > "$plugins" || return 1
+            chmod 644 "$plugins"
+        fi
+    fi
+    id rabbitmq >/dev/null 2>&1 && chown rabbitmq:rabbitmq "$plugins" 2>/dev/null
+    dpkg -s rabbitmq-server >/dev/null 2>&1 && systemctl restart rabbitmq-server >/dev/null 2>&1
+    return 0
+}
+
 get_koha_es_worker_path() {
     local p
     for p in /usr/share/koha/bin/workers/es_indexer_daemon.pl \
@@ -2528,8 +2578,9 @@ validate_elasticsearch() {
         && v_ok "$(t "Indexer"): $(t "systemd unit installed (auto-restart)")." \
         || v_warn "$(t "Indexer"): $(t "no dedicated systemd unit")."
 
-    ss -lnt 2>/dev/null | grep -q ':61613' \
-        && v_ok "Broker: RabbitMQ/STOMP (61613) OK." \
+    local stomp; stomp=$(koha_stomp_port)
+    ss -lnt 2>/dev/null | grep -q ":${stomp} " \
+        && v_ok "Broker: RabbitMQ/STOMP (${stomp}) OK." \
         || v_warn "Broker: $(t "no RabbitMQ; Koha will read the queue straight from the database")."
 
     pend=$(get_pending_es_jobs)
@@ -2953,6 +3004,10 @@ EOF
     fi
     grep -q '^USE_MEMCACHED=' "$conf" || echo 'USE_MEMCACHED="yes"' >> "$conf"
     grep -q '^MEMCACHED_SERVERS=' "$conf" || echo 'MEMCACHED_SERVERS="127.0.0.1:11211"' >> "$conf"
+    if is_wsl; then     # the STOMP address prepare_wsl_broker gave RabbitMQ
+        sed -i -E '/^[[:space:]]*MESSAGE_BROKER_(HOST|PORT)=/d' "$conf"
+        printf 'MESSAGE_BROKER_HOST="127.0.0.1"\nMESSAGE_BROKER_PORT="%s"\n' "$(koha_stomp_port)" >> "$conf"
+    fi
 }
 
 # Shows why the installation stopped, with the end of the APT log, instead of
@@ -3164,6 +3219,7 @@ function_install_koha() {
 
     apt_update_indices || { install_step_failed "apt-get update (Koha)"; return 1; }
     display_explanation "Installing MariaDB and Koha (longest step)..."
+    prepare_wsl_broker || echo "[WARN] RabbitMQ could not be prepared for WSL." >>"$APT_LOG"
     apt_install mariadb-server koha-common || { install_step_failed "mariadb-server koha-common"; return 1; }
     ensure_koha_conffiles || { install_step_failed "$(t "Restoring missing Koha configuration files...")"; return 1; }
     systemctl enable --now mariadb >/dev/null 2>&1
@@ -4329,7 +4385,7 @@ function_repair_indexing() {
         local es_up idx broker pend bibs docs
         es_up=$(curl -s --max-time 5 http://127.0.0.1:9200 >/dev/null 2>&1 && echo "OK" || echo "$(t "DOWN")")
         is_koha_indexer_running && idx="$(t "running")" || idx="$(t "STOPPED")"
-        ss -lnt 2>/dev/null | grep -q ':61613' && broker="OK" || broker="$(t "absent")"
+        ss -lnt 2>/dev/null | grep -q ":$(koha_stomp_port) " && broker="OK" || broker="$(t "absent")"
         pend=$(get_pending_es_jobs); bibs=$(get_total_biblios); docs=$(get_total_es_documents)
         msg_info "$(t "Diagnostics")" \
 "Elasticsearch (9200) : ${es_up}

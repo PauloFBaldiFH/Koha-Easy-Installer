@@ -275,3 +275,32 @@ EOF
     panel eval 'v_reset test; platform_check "$BATS_TEST_TMPDIR/os-release"; echo "OK=$V_OK WARN=$V_WARN FAIL=$V_FAIL"'
     assert '! echo "$output" | grep -q "WSL"' "no Windows line on Linux: $output"
 }
+
+@test "W11 WSL: RabbitMQ's STOMP leaves the port range Windows reserves, and Koha follows it" {
+    command -v perl >/dev/null || skip "perl needed to hold a port"
+    export KEI_RABBITMQ_DIR="$BATS_TEST_TMPDIR/rabbitmq"
+    wsl eval 'prepare_wsl_broker; echo "rc=$? port=$(koha_stomp_port)"'
+    assert 'echo "$output" | grep -q "rc=0 port=16613"' "$output"
+    assert 'grep -qx "stomp.listeners.tcp.1 = 127.0.0.1:16613" "$KEI_RABBITMQ_DIR/rabbitmq.conf"' "$(cat "$KEI_RABBITMQ_DIR/rabbitmq.conf")"
+    assert 'grep -q "rabbitmq_stomp" "$KEI_RABBITMQ_DIR/enabled_plugins"' "the listener key is only valid with the plugin enabled"
+
+    # Run again: the port chosen is kept and nothing is duplicated.
+    wsl eval 'prepare_wsl_broker; echo "port=$(koha_stomp_port)"'
+    assert 'echo "$output" | grep -q "port=16613"' "$output"
+    assert '[ "$(grep -c "^stomp.listeners" "$KEI_RABBITMQ_DIR/rabbitmq.conf")" = "1" ]'
+
+    # Something already listens on 16613: the next port is used.
+    rm -rf "$KEI_RABBITMQ_DIR"
+    perl -MIO::Socket::INET -e '$s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 16613, Proto => "tcp", Listen => 1, ReuseAddr => 1) or exit 1; sleep 30' &
+    local holder=$!
+    sleep 1
+    wsl eval 'prepare_wsl_broker; echo "port=$(koha_stomp_port)"'
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null || true
+    assert 'echo "$output" | grep -q "port=26613"' "$output"
+
+    # Plain Linux: RabbitMQ keeps its own defaults (61613).
+    rm -rf "$KEI_RABBITMQ_DIR"
+    panel eval 'prepare_wsl_broker; echo "rc=$? port=$(koha_stomp_port)"'
+    assert 'echo "$output" | grep -q "rc=0 port=61613"' "$output"
+    assert '[ ! -e "$KEI_RABBITMQ_DIR" ]' "nothing written on Linux"
+}
