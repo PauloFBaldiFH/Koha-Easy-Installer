@@ -31,6 +31,35 @@ prompt_yes_no() {
     [ "$ans" = "yes" ]
 }
 select_file()      { printf '%s' "${KEI_SELECT_FILE:-}"; [ -n "${KEI_SELECT_FILE:-}" ]; }
+
+# Menus and input boxes of the library tools: answers from $KEI_S/inputs,
+# one per line. With an empty queue a menu takes its first tag and an input
+# box its default value; "CANCEL" cancels the dialog. Text boxes are
+# recorded (the last one shown is kept in $KEI_S/textbox.last).
+_kei_next_input() {
+    local ans=""
+    if [ -s "$KEI_S/inputs" ]; then
+        ans=$(head -n1 "$KEI_S/inputs")
+        sed -i '1d' "$KEI_S/inputs"
+    fi
+    printf '%s' "$ans"
+}
+ui_menu() {
+    local title="$1" ans
+    shift 2
+    ans=$(_kei_next_input); [ -n "$ans" ] || ans="${1:-}"
+    _kei_dialog "MENU [$title] => $ans"
+    [ "$ans" = "CANCEL" ] && return 1
+    printf '%s' "$ans"
+}
+ui_input() {
+    local ans
+    ans=$(_kei_next_input); [ -n "$ans" ] || ans="${3:-}"
+    _kei_dialog "INPUT [$1] $2 => $ans"
+    [ "$ans" = "CANCEL" ] && return 1
+    printf '%s' "$ans"
+}
+ui_textbox() { _kei_dialog "TEXTBOX [$1] $2"; cp -f "$2" "$KEI_S/textbox.last" 2>/dev/null; return 0; }
 select_directory() { printf '%s' "${KEI_SELECT_DIR:-}";  [ -n "${KEI_SELECT_DIR:-}" ]; }
 
 # ---- packages and platform --------------------------------------------

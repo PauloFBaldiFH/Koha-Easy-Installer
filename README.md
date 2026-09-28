@@ -4,7 +4,7 @@
 
 # Koha Easy Installer & Manager
 
-A single Bash script that installs, tunes and maintains the **[Koha](https://koha-community.org/) Integrated Library System** on Debian/Ubuntu, through a friendly menu-driven control panel (whiptail) available in **22 languages**.
+A single Bash script that installs, tunes and maintains the **[Koha](https://koha-community.org/) Integrated Library System** on Debian/Ubuntu, through a friendly menu-driven control panel (whiptail, dark theme) available in **22 languages**.
 
 It was born from real-life experience facing technical barriers in collection management, and is designed for libraries without budget for expensive commercial systems or dedicated technical support.
 
@@ -19,7 +19,8 @@ It was born from real-life experience facing technical barriers in collection ma
 - **Publishing to the internet**: Cloudflare Tunnel (no open ports), free SSL certificate (Certbot) and a Google Search Console assistant.
 - **Diagnostics**: full health check with a detailed report, server status, real-time Apache log viewer and deep database maintenance.
 - **Security**: Fail2ban, UFW firewall (with option to restrict the staff port 8080) and database password rotation.
-- **Koha settings**: server sizing profiles, e-mail/overdue notices, super librarian creation, SIP2 and Z39.50, clock and timezone.
+- **Koha settings**: server sizing profiles, e-mail notices (Koha's own schedule, enabled with `koha-email-enable`), super librarian creation, SIP2 and Z39.50, clock and timezone.
+- **Library tools**: guided MARC import with undo, essential SQL reports pack, patron import from CSV and school-year category turnover, catalog data-quality check, and privacy (LGPD) housekeeping. Every change is previewed first with Koha's own dry run and protected by a verified backup (see [Library tools](#library-tools)).
 - **Languages**: installs Koha language packs and translates the panel itself (22 languages).
 - **Self-update** from GitHub with SHA-256 verification.
 
@@ -77,13 +78,33 @@ sudo config.sh
 | 7 | Diagnostics & maintenance | Status, health check, logs, optimization |
 | 8 | Security center | Fail2ban, firewall, password rotation |
 | 9 | Koha settings & parameters | Sizing, e-mail, super librarian, SIP2/Z39.50, clock |
-| 10 | General tools | htop/nethogs, terminal browser, file manager |
-| 11 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
-| 12 | Koha languages | Koha language packs and panel language |
-| 13 | Update center | System/Koha updates and panel self-update |
-| 14 | About | Project information and support |
-| 15 | Reboot server | |
-| 16 | Exit | |
+| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD) |
+| 11 | General tools | htop/nethogs, terminal browser, file manager |
+| 12 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
+| 13 | Koha languages | Koha language packs and panel language |
+| 14 | Update center | System/Koha updates and panel self-update |
+| 15 | About | Project information and support |
+| 16 | Reboot server | |
+| 17 | Exit | |
+
+The dialogs use a dark theme, a fixed width and adapt to small terminals. For newt's default colours in a monochrome terminal, start the panel with `NO_COLOR=1`.
+
+## Library tools
+
+Day-to-day tasks for the library staff, run with Koha's own command-line tools as the instance user (`koha-shell library -c ...`). Anything that changes data follows the same steps: the backup/restore lock (no nightly backup or restore can run in the middle), a **preview** (Koha's own dry run), an explicit confirmation, a **verified `PRE-*` backup** in `/var/backups/koha_sql`, and only then the real run. The tools never stop Koha's services, and the `PRE-*` backup undoes any change (**Restore database**).
+
+| Tool | Koha scripts | Preview | Backup |
+|------|--------------|---------|--------|
+| Import MARC records (ISO 2709 / MARCXML), keeping or replacing matching records | `stage_file.pl`, `commit_file.pl` | Staging report (nothing enters the catalog) | `PRE-IMPORT` |
+| Undo a MARC import | `commit_file.pl --revert` | Records and items of the batch | `PRE-UNDO-IMPORT` |
+| Essential SQL reports pack: 8 read-only reports (most borrowed, overdue with contacts, never borrowed, new acquisitions, expiring accounts, loans per month, items without barcode/call number, lost items), tagged so that updating or removing the pack never touches other reports | — (`saved_sql`) | Each query is checked against this Koha version | `PRE-REPORTS` |
+| Import patrons from CSV (template in `/root/koha_patrons_template.csv`; UTF-8, commas) | `import_patrons.pl` | Native dry run: new, updated, skipped, invalid | `PRE-PATRONS` |
+| School-year turnover: move patrons between categories (all, over the age limit, or registered before a date) | `update_patrons_category.pl` | Native dry run with the list of patrons | `PRE-PATRONS` |
+| Catalog data-quality check (read-only) | `search_for_data_inconsistencies.pl` | — | — |
+| Privacy (LGPD): anonymise old loan and hold history | `batch_anonymise.pl` | Counts computed like Koha does | `PRE-PRIVACY` |
+| Privacy (LGPD): delete expired patrons who borrowed nothing since (typed confirmation) | `delete_patrons.pl` | Native dry run | `PRE-PRIVACY` |
+
+Every run is logged in `/var/log/koha-easy-install/tools/` (readable by root only: the logs may contain patron names), also viewable from the menu.
 
 ## Automated tasks
 
@@ -93,11 +114,12 @@ Installed in `/etc/cron.d/koha_tasks`:
 |------|------|
 | Daily 23:00 | Compressed SQL backup (verified, optional cloud upload) |
 | Sundays 03:00 | MARC21 export of bibliographic and authority records |
-| Daily 01:30 | Session and database cleanup |
+| Daily 01:30 | Session and Zebra queue cleanup (`cleanup_database.pl --confirm`) |
 | Daily 05:00 | Plack restart (keeps memory low) |
-| Daily 08:00 / 08:05 | Overdue notices and e-mail queue |
 | Every 2 min | Zebra indexing watchdog: keeps Koha's indexer daemon (`koha-indexer`) running and restarts it if records wait more than 10 min |
 | Every 5 min (Elasticsearch only) | Elasticsearch indexer watchdog |
+
+E-mail notices are left to Koha's own schedule (`koha-common`): overdue and advance notices once a day and the message queue every 15 minutes, for the instance enabled with `koha-email-enable` (done at installation and in **Koha settings > Configure email**). Schedules written by older versions of the panel are upgraded automatically: the 01:30 cleanup gets `--confirm` (without it, it only reported what it would delete) and the old 08:00/08:05 e-mail jobs, which duplicated Koha's, are removed once e-mail is enabled.
 
 ## Important files
 
@@ -107,7 +129,8 @@ Installed in `/etc/cron.d/koha_tasks`:
 | `/etc/koha/sites/library/koha-conf.xml` | Koha instance configuration |
 | `/var/backups/koha_sql`, `/var/backups/koha_marc` | Local backups |
 | `/etc/koha-easy-install/` | Panel settings (language, backup) |
-| `/var/log/koha-easy-install/` | Panel, APT and validation logs |
+| `/var/log/koha-easy-install/` | Panel, APT and validation logs (`tools/`: library tools, root only) |
+| `/root/koha_patrons_template.csv` | Empty CSV template for the patron import |
 
 If the installation stops, the panel shows the failed step. The full package manager output is in `/var/log/koha-easy-install/apt.log`.
 
@@ -124,7 +147,7 @@ Copy your backups somewhere else before running it.
 
 ## Tests (for contributors)
 
-`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64.
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting) and the schedule upgrade.
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail
