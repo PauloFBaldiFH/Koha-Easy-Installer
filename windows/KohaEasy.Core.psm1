@@ -1,0 +1,801 @@
+﻿# Koha Easy Installer for Windows: shared logic for the shortcuts, the
+# scheduled tasks and the tray (blueprint, part 2).
+#   * state.json: what the librarian asked for (desired running/stopped,
+#     automatic start) and what was already notified.
+#   * Start / Stop / Restart and the automatic start at sign-in (2.5.1).
+#   * Status, read from "config.sh --status-json" inside the distro.
+#   * Windows notifications for service events and nightly backups.
+#   * Diagnostics exported to one .zip for support.
+#   * Watchdog for the free space around the distro's virtual disk (ext4.vhdx).
+# Windows PowerShell 5.1 compatible (no ??, ternary or &&). UTF-8 with BOM.
+
+Set-StrictMode -Version 2.0
+Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Lang.psm1')
+
+$script:Cfg = @{
+    Root        = 'C:\KohaEasy'
+    Distro      = 'KohaEasy'
+    TaskPath    = '\KohaEasy\'
+    KeepTask    = 'Keep Koha running'
+    SignInTask  = 'Start Koha at sign-in'
+    PanelPath   = '/usr/local/bin/config.sh'
+    StaffUrl    = 'http://localhost:8080/'
+    OpacUrl     = 'http://localhost/'
+    StartWaitS  = 180
+    DiskWarnGB  = 10
+    DiskCritGB  = 5
+    StaleBackupH = 36
+    ToastAppId  = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+}
+if ($env:KOHAEASY_ROOT) { $script:Cfg.Root = $env:KOHAEASY_ROOT }
+
+# Set by the tray: notifications fall back to its balloon tips when Windows
+# toasts are unavailable.
+$script:TrayIcon = $null
+
+function Get-KohaConfig { return $script:Cfg }
+function Set-KohaTrayIcon { param($Icon) $script:TrayIcon = $Icon }
+function Set-KohaConfig {
+    param([hashtable]$Values)
+    foreach ($k in $Values.Keys) { $script:Cfg[$k] = $Values[$k] }
+}
+
+# ----------------------------------------------------------------------
+# Paths, log and state.json
+# ----------------------------------------------------------------------
+function Get-KohaPath {
+    param([ValidateSet('Root', 'Bin', 'Logs', 'Backups', 'State', 'Wsl', 'Lang')][string]$Name)
+    $r = $script:Cfg.Root
+    switch ($Name) {
+        'Root'    { return $r }
+        'Bin'     { return [System.IO.Path]::Combine($r, 'bin') }
+        'Logs'    { return [System.IO.Path]::Combine($r, 'logs') }
+        'Backups' { return [System.IO.Path]::Combine($r, 'Backups') }
+        'State'   { return [System.IO.Path]::Combine($r, 'state.json') }
+        'Wsl'     { return [System.IO.Path]::Combine($r, 'wsl') }
+        'Lang'    { return [System.IO.Path]::Combine($r, 'bin', 'lang') }
+    }
+}
+
+function Write-KohaLog {
+    param([string]$Message, [string]$Name = 'koha')
+    try {
+        $dir = Get-KohaPath Logs
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $file = Join-Path $dir ('{0}-{1}.log' -f $Name, (Get-Date -Format 'yyyyMMdd'))
+        $line = '{0} | {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+        Add-Content -LiteralPath $file -Value $line -Encoding UTF8
+    } catch { }
+}
+
+$script:StateDefaults = [ordered]@{
+    desired              = 'running'
+    autostart            = 'logon'
+    startedAt            = 0
+    lastState            = ''
+    firstSeen            = 0
+    lastBackupLogEpoch   = 0
+    lastStaleBackupWarn  = 0
+    lastDiskLevel        = 'ok'
+    lastDiskWarn         = 0
+    notifyBackupOk       = $true
+    handshakePending     = $false
+}
+
+# state.json as an ordered hashtable, with defaults for missing keys. A
+# damaged file is kept aside (state.json.bad) instead of breaking Start/Stop.
+function Get-KohaState {
+    $state = [ordered]@{}
+    foreach ($k in $script:StateDefaults.Keys) { $state[$k] = $script:StateDefaults[$k] }
+    $file = Get-KohaPath State
+    if (Test-Path -LiteralPath $file) {
+        try {
+            $json = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($p in $json.PSObject.Properties) { $state[$p.Name] = $p.Value }
+        } catch {
+            Write-KohaLog "state.json unreadable, kept as state.json.bad: $($_.Exception.Message)"
+            Copy-Item -LiteralPath $file -Destination ($file + '.bad') -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (@('running', 'stopped') -notcontains $state.desired) { $state.desired = 'running' }
+    if (@('logon', 'manual') -notcontains $state.autostart) { $state.autostart = 'logon' }
+    return $state
+}
+
+# Merges $Changes into state.json. Written to a temporary file and moved, so
+# a shortcut and the tray writing at the same time never leave half a file.
+function Set-KohaState {
+    param([Parameter(Mandatory = $true)][hashtable]$Changes)
+    $state = Get-KohaState
+    foreach ($k in $Changes.Keys) { $state[$k] = $Changes[$k] }
+    $file = Get-KohaPath State
+    $dir = Split-Path -Parent $file
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = $file + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmp, ($state | ConvertTo-Json -Depth 5), $utf8)
+    Move-Item -LiteralPath $tmp -Destination $file -Force
+    return $state
+}
+
+function Get-UnixTime { return [int64][Math]::Floor(([DateTimeOffset]::UtcNow).ToUnixTimeSeconds()) }
+
+# ----------------------------------------------------------------------
+# WSL
+# ----------------------------------------------------------------------
+# Runs wsl.exe with UTF-8 output. Returns ExitCode and Output (one string).
+function Invoke-KohaWsl {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText)
+    $env:WSL_UTF8 = '1'
+    $prev = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        if ($PSBoundParameters.ContainsKey('InputText')) {
+            $out = $InputText | & wsl.exe @Arguments 2>&1
+        } else {
+            $out = & wsl.exe @Arguments 2>&1
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        [Console]::OutputEncoding = $prev
+    }
+    $text = (@($out) | ForEach-Object { [string]$_ }) -join "`n"
+    return [pscustomobject]@{ ExitCode = $code; Output = $text.Replace([string][char]0, '') }
+}
+
+# Command inside the distro, as root.
+function Invoke-KohaLinux {
+    param([Parameter(Mandatory = $true)][string[]]$Command, [string]$InputText)
+    $wslArgs = @('-d', $script:Cfg.Distro, '-u', 'root', '--') + $Command
+    if ($PSBoundParameters.ContainsKey('InputText')) { return Invoke-KohaWsl -Arguments $wslArgs -InputText $InputText }
+    return Invoke-KohaWsl -Arguments $wslArgs
+}
+
+# Names of the running distros. Never starts one (a status check must not
+# turn on a Koha the librarian stopped).
+function Get-KohaRunningDistros {
+    $r = Invoke-KohaWsl -Arguments @('--list', '--running', '--quiet')
+    if ($r.ExitCode -ne 0) { return @() }
+    return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Get-KohaInstalledDistros {
+    $r = Invoke-KohaWsl -Arguments @('--list', '--quiet')
+    if ($r.ExitCode -ne 0) { return @() }
+    return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Test-KohaDistroRunning { return (@(Get-KohaRunningDistros) -contains $script:Cfg.Distro) }
+function Test-KohaDistroInstalled { return (@(Get-KohaInstalledDistros) -contains $script:Cfg.Distro) }
+
+# ----------------------------------------------------------------------
+# Handshake file (/etc/koha-easy-install/windows.conf)
+# ----------------------------------------------------------------------
+# Keeps only the characters the panel's parser accepts for each key.
+function ConvertTo-KohaConfValue {
+    param([string]$Value, [int]$Max = 64)
+    $v = ([string]$Value) -replace '[^A-Za-z0-9._:/ -]', ''
+    $v = $v -replace '\.\.+', '.'
+    if ($v.Length -gt $Max) { $v = $v.Substring(0, $Max) }
+    return $v.Trim()
+}
+
+# Network mode of WSL: mirrored when .wslconfig asks for it on a build that
+# supports it (Windows 11 22H2, build 22621+), NAT otherwise.
+function Get-KohaNetMode {
+    param([int]$Build = [Environment]::OSVersion.Version.Build)
+    if (-not $env:USERPROFILE) { return 'nat' }
+    $cfg = Join-Path $env:USERPROFILE '.wslconfig'
+    if ($Build -ge 22621 -and (Test-Path -LiteralPath $cfg)) {
+        if ((Get-Content -LiteralPath $cfg -Raw) -match '(?im)^\s*networkingMode\s*=\s*mirrored\s*$') { return 'mirrored' }
+    }
+    return 'nat'
+}
+
+function Get-KohaLanIp {
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1
+        $ip = Get-NetIPAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+        return [string]$ip.IPAddress
+    } catch { return '' }
+}
+
+function New-KohaHandshake {
+    param([System.Collections.IDictionary]$State = (Get-KohaState))
+    $os = [Environment]::OSVersion.Version
+    $edition = ''
+    try { $edition = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).EditionID } catch { }
+    $memGb = 0
+    try { $memGb = [int][Math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB) } catch { }
+    $backup = Get-KohaPath Backups
+    $wslBackup = ''
+    if ($backup -match '^([A-Za-z]):[\\/](.*)$') { $wslBackup = '/mnt/' + $Matches[1].ToLowerInvariant() + '/' + ($Matches[2] -replace '[\\/]', '/') }
+    $lines = @(
+        '# Written by KohaEasy.ps1. Read by the panel (read_windows_conf), never executed.'
+        'KEI_WIN_VERSION=' + (ConvertTo-KohaConfValue $script:KohaEasyVersion)
+        'WIN_BUILD=' + $os.Build
+        'WIN_EDITION=' + (ConvertTo-KohaConfValue $edition)
+        'WIN_NET_MODE=' + (Get-KohaNetMode -Build $os.Build)
+        'WIN_LAN_IP=' + (ConvertTo-KohaConfValue (Get-KohaLanIp))
+        'WIN_HOSTNAME=' + (ConvertTo-KohaConfValue $env:COMPUTERNAME 63)
+        'WIN_USER=' + (ConvertTo-KohaConfValue $env:USERNAME)
+        'WIN_BACKUP_DIR=' + (ConvertTo-KohaConfValue $wslBackup 200)
+        'WIN_MEM_GB=' + $memGb
+        'WIN_UPDATED_AT=' + (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+        'WIN_AUTOSTART=' + $State.autostart
+    )
+    # An empty value would be logged as invalid by the panel: leave the key out.
+    return (@($lines | Where-Object { $_ -notmatch '^[A-Z_]+=$' }) -join "`n") + "`n"
+}
+
+# Writes the handshake through stdin: root-owned, 0644, replaced atomically,
+# as read_windows_conf requires. Needs the distro running: when it is not,
+# the write waits for the next Start (handshakePending).
+function Update-KohaHandshake {
+    if (-not (Test-KohaDistroRunning)) {
+        Set-KohaState @{ handshakePending = $true } | Out-Null
+        return $false
+    }
+    $script = 'umask 022; d=/etc/koha-easy-install; mkdir -p "$d" && t=$(mktemp "$d/.windows.conf.XXXXXX") && cat > "$t" && chown root:root "$t" && chmod 644 "$t" && mv -f "$t" "$d/windows.conf"'
+    $r = Invoke-KohaLinux -Command @('sh', '-c', $script) -InputText (New-KohaHandshake)
+    if ($r.ExitCode -ne 0) {
+        Write-KohaLog "handshake not written: $($r.Output)"
+        return $false
+    }
+    Set-KohaState @{ handshakePending = $false } | Out-Null
+    return $true
+}
+
+# ----------------------------------------------------------------------
+# Status
+# ----------------------------------------------------------------------
+# Koha's own view of itself (config.sh --status-json), or $null.
+function Get-KohaLinuxStatus {
+    $r = Invoke-KohaLinux -Command @($script:Cfg.PanelPath, '--status-json')
+    if ($r.ExitCode -ne 0) { return $null }
+    $line = @($r.Output -split "`n" | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    if ($line.Count -eq 0) { return $null }
+    try { return ($line[0] | ConvertFrom-Json) } catch { return $null }
+}
+
+# One-word state for the tray and the Status shortcut:
+#   running | starting | not_responding | stopped_by_user | stopped | not_installed
+function Resolve-KohaState {
+    param($Installed, $Running, $Linux, [System.Collections.IDictionary]$State, [int64]$Now = (Get-UnixTime))
+    if (-not $Installed) { return 'not_installed' }
+    if (-not $Running) {
+        if ($State.desired -eq 'stopped') { return 'stopped_by_user' }
+        return 'stopped'
+    }
+    $recent = ($State.startedAt -gt 0) -and (($Now - [int64]$State.startedAt) -lt $script:Cfg.StartWaitS)
+    if ($null -ne $Linux -and $Linux.state -eq 'ok') { return 'running' }
+    if ($null -ne $Linux -and $Linux.state -eq 'not_installed') { return 'not_installed' }
+    if ($recent) { return 'starting' }
+    return 'not_responding'
+}
+
+function Get-KohaStatus {
+    $state = Get-KohaState
+    $installed = Test-KohaDistroInstalled
+    $running = $false
+    $linux = $null
+    if ($installed) { $running = Test-KohaDistroRunning }
+    if ($running) { $linux = Get-KohaLinuxStatus }
+    return [pscustomobject]@{
+        State     = (Resolve-KohaState -Installed $installed -Running $running -Linux $linux -State $state)
+        Desired   = $state.desired
+        Autostart = $state.autostart
+        Linux     = $linux
+        CheckedAt = (Get-UnixTime)
+    }
+}
+
+function Get-KohaStateText {
+    param([string]$State)
+    switch ($State) {
+        'running'         { return (T 'Koha is running') }
+        'starting'        { return (T 'Koha is starting...') }
+        'not_responding'  { return (T 'Koha is not responding') }
+        'stopped_by_user' { return (T 'Koha is stopped (you stopped it)') }
+        'stopped'         { return (T 'Koha is stopped') }
+        default           { return (T 'Koha is not installed') }
+    }
+}
+
+# ----------------------------------------------------------------------
+# Notifications
+# ----------------------------------------------------------------------
+# Windows toast (WinRT, Windows PowerShell 5.1). Falls back to the tray's
+# balloon tip, and always goes to logs\notifications-*.log.
+function Show-KohaNotification {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Text,
+        [ValidateSet('info', 'warning', 'error')][string]$Level = 'info'
+    )
+    Write-KohaLog ("[{0}] {1}: {2}" -f $Level, $Title, $Text) 'notifications'
+    try {
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $scenario = ''
+        if ($Level -eq 'error') { $scenario = ' scenario="reminder"' }
+        $xml.LoadXml(('<toast{0}><visual><binding template="ToastGeneric"><text>{1}</text><text>{2}</text></binding></visual></toast>' -f
+                $scenario, [Security.SecurityElement]::Escape($Title), [Security.SecurityElement]::Escape($Text)))
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:Cfg.ToastAppId).Show($toast)
+        return 'toast'
+    } catch {
+        if ($null -ne $script:TrayIcon) {
+            $icon = [System.Windows.Forms.ToolTipIcon]::Info
+            if ($Level -eq 'warning') { $icon = [System.Windows.Forms.ToolTipIcon]::Warning }
+            if ($Level -eq 'error') { $icon = [System.Windows.Forms.ToolTipIcon]::Error }
+            $script:TrayIcon.ShowBalloonTip(10000, $Title, $Text, $icon)
+            return 'balloon'
+        }
+        return 'log'
+    }
+}
+
+function Format-KohaSize {
+    param([double]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    return ('{0:N0} KB' -f ($Bytes / 1KB))
+}
+
+# What to tell the librarian after a status check, and the state.json
+# changes that remember it. Pure function: the tray shows the result.
+#   $Previous  last state word shown ('' on the first check)
+#   $Status    Get-KohaStatus result
+#   $Disk      Get-KohaDiskHealth result or $null
+function Get-KohaNotifications {
+    param([string]$Previous, $Status, $Disk, [System.Collections.IDictionary]$State, [int64]$Now = (Get-UnixTime))
+    $out = New-Object System.Collections.ArrayList
+    $changes = @{ lastState = $Status.State }
+    $cur = $Status.State
+    $wanted = ($State.desired -eq 'running')
+
+    # Service events (only while the librarian wants Koha on).
+    if ($wanted -and $Previous -and $Previous -ne $cur) {
+        if ($cur -eq 'not_responding') {
+            [void]$out.Add(@{ Level = 'error'; Title = (T 'Koha is not responding'); Text = (T 'The library system stopped answering. Use Restart Koha in the tray menu; if it happens again, export the diagnostics for support.') })
+        } elseif ($cur -eq 'stopped' -and @('running', 'starting') -contains $Previous) {
+            [void]$out.Add(@{ Level = 'error'; Title = (T 'Koha stopped unexpectedly'); Text = (T 'Koha was turned off without Stop Koha. It will be started again automatically.') })
+        } elseif ($cur -eq 'running' -and @('not_responding', 'stopped') -contains $Previous) {
+            [void]$out.Add(@{ Level = 'info'; Title = (T 'Koha is working again'); Text = (T 'The staff interface and the catalog are answering again.') })
+        }
+    }
+
+    # Nightly backup: one notification per new line of backup_sql.log.
+    if ($null -ne $Status.Linux -and $null -ne $Status.Linux.backup) {
+        $b = $Status.Linux.backup
+        if ([int64]$b.log_epoch -gt [int64]$State.lastBackupLogEpoch) {
+            $changes.lastBackupLogEpoch = [int64]$b.log_epoch
+            if ($State.lastBackupLogEpoch -gt 0 -or ($Now - [int64]$b.log_epoch) -lt 86400) {
+                if ($b.last_result -eq 'ok' -and $State.notifyBackupOk) {
+                    [void]$out.Add(@{ Level = 'info'; Title = (T 'Backup completed'); Text = ((T 'The nightly backup of the catalog was saved ({0}).') -f (Format-KohaSize ([double]$b.last_size))) })
+                } elseif ($b.last_result -eq 'failed') {
+                    [void]$out.Add(@{ Level = 'error'; Title = (T 'Backup FAILED'); Text = (T 'The nightly backup of the catalog failed. Open the tray menu and export the diagnostics for support.') })
+                }
+            }
+        }
+        # No good backup for too long (in manual mode Koha may be off at 23:00).
+        # Counted from the first time Koha was seen, so a new install is not warned.
+        $limit = $script:Cfg.StaleBackupH * 3600
+        $first = [int64]$State.firstSeen
+        if ($first -le 0) { $first = $Now; $changes.firstSeen = $Now }
+        $age = $Now - [int64]$b.last_epoch
+        if ($Status.Linux.koha_installed -and $age -gt $limit -and ($Now - $first) -gt $limit -and ($Now - [int64]$State.lastStaleBackupWarn) -gt 86400) {
+            $changes.lastStaleBackupWarn = $Now
+            $text = T 'There is no recent backup of the catalog. Use Control panel > Manual backup, or keep Koha on at 23:00.'
+            if ($State.autostart -eq 'manual') {
+                $text = T 'There is no recent backup of the catalog. Koha starts only when you click Koha - Start, and the nightly backup runs at 23:00 only while Koha is on.'
+            }
+            [void]$out.Add(@{ Level = 'warning'; Title = (T 'No recent backup'); Text = $text })
+        }
+    }
+
+    # Disk space: on every level change, and a critical level again every 6 hours.
+    if ($null -ne $Disk) {
+        $changes.lastDiskLevel = $Disk.Level
+        $again = ($Disk.Level -eq 'critical') -and (($Now - [int64]$State.lastDiskWarn) -gt 21600)
+        if ($Disk.Level -ne 'ok' -and ($Disk.Level -ne $State.lastDiskLevel -or $again)) {
+            $changes.lastDiskWarn = $Now
+            $title = T 'Disk space is low'
+            if ($Disk.Level -eq 'critical') { $title = T 'Disk space is critically low' }
+            [void]$out.Add(@{ Level = $(if ($Disk.Level -eq 'critical') { 'error' } else { 'warning' }); Title = $title; Text = $Disk.Message })
+        }
+    }
+    return [pscustomobject]@{ Notifications = @($out); Changes = $changes }
+}
+
+# ----------------------------------------------------------------------
+# Virtual disk watchdog
+# ----------------------------------------------------------------------
+# Folder of the distro (BasePath in HKCU\...\Lxss) and its ext4.vhdx.
+function Get-KohaVhdxPath {
+    $lxss = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (-not (Test-Path $lxss)) { return $null }
+    foreach ($k in Get-ChildItem $lxss -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if ($null -ne $p -and $p.PSObject.Properties['DistributionName'] -and $p.DistributionName -eq $script:Cfg.Distro) {
+            $base = ([string]$p.BasePath) -replace '^\\\\\?\\', ''
+            $file = Join-Path $base 'ext4.vhdx'
+            if (Test-Path -LiteralPath $file) { return $file }
+        }
+    }
+    return $null
+}
+
+# Level from the numbers alone (pure, tested):
+#   HostFree/HostTotal  the Windows drive that holds ext4.vhdx
+#   VhdxSize            the file today (it grows, it does not shrink by itself)
+#   LinuxUsed/LinuxTotal  "df /" inside the distro, 0 when unknown
+function Measure-KohaDiskLevel {
+    param([double]$HostFree, [double]$HostTotal, [double]$VhdxSize, [double]$LinuxUsed, [double]$LinuxTotal)
+    $level = 'ok'
+    $msgs = New-Object System.Collections.ArrayList
+    $warn = $script:Cfg.DiskWarnGB * 1GB
+    $crit = $script:Cfg.DiskCritGB * 1GB
+    if ($HostTotal -gt 0) {
+        if ($HostFree -lt $crit) {
+            $level = 'critical'
+        } elseif ($HostFree -lt $warn) {
+            $level = 'warning'
+        }
+        if ($level -ne 'ok') {
+            [void]$msgs.Add(((T 'Only {0} free on the Windows drive that holds Koha. When it is full, Koha and its backups stop working.') -f (Format-KohaSize $HostFree)))
+        }
+    }
+    if ($LinuxTotal -gt 0) {
+        $pct = $LinuxUsed / $LinuxTotal
+        if ($pct -ge 0.95) { $level = 'critical' } elseif ($pct -ge 0.90 -and $level -eq 'ok') { $level = 'warning' }
+        if ($pct -ge 0.90) { [void]$msgs.Add(((T 'The Koha disk is {0}% full.') -f [int]($pct * 100))) }
+    }
+    $reclaim = 0
+    if ($VhdxSize -gt 0 -and $LinuxTotal -gt 0) {
+        $reclaim = [Math]::Max([double]0, $VhdxSize - $LinuxUsed)
+        if ($reclaim -gt 10GB -and $reclaim -gt ($VhdxSize * 0.3) -and $level -ne 'ok') {
+            [void]$msgs.Add(((T 'About {0} can be given back to Windows: tray menu > Check disk space > Compact.') -f (Format-KohaSize $reclaim)))
+        }
+    }
+    return [pscustomobject]@{ Level = $level; Message = ($msgs -join ' '); Reclaimable = $reclaim }
+}
+
+function Get-KohaDiskHealth {
+    param($Linux)
+    $vhdx = Get-KohaVhdxPath
+    $size = 0
+    $drive = (Get-KohaPath Root).Substring(0, 2)
+    if ($vhdx) {
+        $size = (Get-Item -LiteralPath $vhdx).Length
+        $drive = $vhdx.Substring(0, 2)
+    }
+    $free = 0; $total = 0
+    try {
+        $di = New-Object System.IO.DriveInfo($drive)
+        $free = $di.AvailableFreeSpace; $total = $di.TotalSize
+    } catch { }
+    $lUsed = 0; $lTotal = 0
+    if ($null -ne $Linux -and $null -ne $Linux.disk) {
+        $lTotal = [double]$Linux.disk.total
+        $lUsed = $lTotal - [double]$Linux.disk.free
+    }
+    $m = Measure-KohaDiskLevel -HostFree $free -HostTotal $total -VhdxSize $size -LinuxUsed $lUsed -LinuxTotal $lTotal
+    return [pscustomobject]@{
+        Level = $m.Level; Message = $m.Message; Reclaimable = $m.Reclaimable
+        Vhdx = $vhdx; VhdxSize = $size; Drive = $drive; HostFree = $free; HostTotal = $total
+        LinuxUsed = $lUsed; LinuxTotal = $lTotal
+    }
+}
+
+function Test-KohaAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Gives the unused space of ext4.vhdx back to Windows: fstrim inside Linux,
+# "wsl --shutdown" (the disk must be detached; this also stops any other WSL
+# distro), diskpart "compact vdisk", then Koha is started again if it was
+# meant to run. Needs administrator rights (diskpart). [verify] on real WSL.
+function Invoke-KohaDiskCompact {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    $vhdx = Get-KohaVhdxPath
+    if (-not $vhdx) { throw (T 'The Koha virtual disk (ext4.vhdx) was not found.') }
+    if (-not (Test-KohaAdmin)) { throw (T 'Compacting the disk needs administrator rights.') }
+    $state = Get-KohaState
+    $before = (Get-Item -LiteralPath $vhdx).Length
+    if (-not $PSCmdlet.ShouldProcess($vhdx, 'compact')) { return }
+    if (Test-KohaDistroRunning) { Invoke-KohaLinux -Command @('fstrim', '-av') | Out-Null }
+    Stop-KohaKeepAlive
+    Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+    $script = @(
+        ('select vdisk file="{0}"' -f $vhdx)
+        'attach vdisk readonly'
+        'compact vdisk'
+        'detach vdisk'
+    ) -join "`r`n"
+    $tmp = Join-Path $env:TEMP ('kohaeasy-compact-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+    Set-Content -LiteralPath $tmp -Value $script -Encoding ASCII
+    try {
+        $out = Invoke-KohaDiskpart -ScriptFile $tmp
+        Write-KohaLog "compact: $out"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if ($state.desired -eq 'running') { Start-KohaKeepAlive }
+    $after = (Get-Item -LiteralPath $vhdx).Length
+    return [pscustomobject]@{ Before = $before; After = $after; Freed = [Math]::Max([double]0, [double]($before - $after)) }
+}
+
+function Invoke-KohaDiskpart {
+    param([string]$ScriptFile)
+    return ((& diskpart.exe /s $ScriptFile 2>&1) -join "`n")
+}
+
+# ----------------------------------------------------------------------
+# Start, Stop and automatic start (blueprint 2.5.1)
+# ----------------------------------------------------------------------
+# Two tasks of the user (no administrator rights, no stored password):
+#   "Keep Koha running"      action Run: holds the distro open; triggers on
+#                            unlock and on resume only repair a Koha meant to run.
+#   "Start Koha at sign-in"  action Start -Trigger logon; enabled only in
+#                            "logon" mode.
+function Get-KohaScriptPath { return (Join-Path (Get-KohaPath Bin) 'KohaEasy.ps1') }
+
+function New-KohaAction {
+    param([string]$Arguments)
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arg = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
+    return New-ScheduledTaskAction -Execute $ps -Argument $arg
+}
+
+function Register-KohaTasks {
+    param([ValidateSet('logon', 'manual')][string]$Autostart = (Get-KohaState).autostart)
+    $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    $keepSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -Hidden
+    $ns = 'Root/Microsoft/Windows/TaskScheduler'
+    $unlock = New-CimInstance -CimClass (Get-CimClass -Namespace $ns -ClassName MSFT_TaskSessionStateChangeTrigger) -ClientOnly -Property @{ StateChange = 8; UserId = $user }
+    $resume = New-CimInstance -CimClass (Get-CimClass -Namespace $ns -ClassName MSFT_TaskEventTrigger) -ClientOnly -Property @{
+        Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and EventID=1]]</Select></Query></QueryList>'
+    }
+    Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -Action (New-KohaAction 'Run') `
+        -Trigger @($unlock, $resume) -Principal $principal -Settings $keepSettings -Force | Out-Null
+
+    $signSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Hidden
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
+    Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.SignInTask -Action (New-KohaAction 'Start -Trigger logon') `
+        -Trigger $logon -Principal $principal -Settings $signSettings -Force | Out-Null
+    Set-KohaAutostart -Mode $Autostart | Out-Null
+}
+
+function Set-KohaSignInTask {
+    param([bool]$Enabled)
+    if ($Enabled) {
+        Enable-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.SignInTask | Out-Null
+    } else {
+        Disable-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.SignInTask | Out-Null
+    }
+}
+function Start-KohaKeepAlive { Start-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask }
+function Stop-KohaKeepAlive {
+    Stop-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -ErrorAction SilentlyContinue
+}
+
+# "Start Koha automatically when I sign in to Windows": Yes (logon) / No (manual).
+# Changes only the sign-in task and the saved choice; never stops a running Koha.
+function Set-KohaAutostart {
+    param([Parameter(Mandatory = $true)][ValidateSet('logon', 'manual')][string]$Mode)
+    Set-KohaSignInTask -Enabled ($Mode -eq 'logon')
+    Set-KohaState @{ autostart = $Mode } | Out-Null
+    Update-KohaHandshake | Out-Null
+    Write-KohaLog "autostart set to $Mode"
+    return $Mode
+}
+
+# Waits until the staff interface answers (any HTTP status below 500).
+function Wait-KohaHttp {
+    param([int]$Seconds = $script:Cfg.StartWaitS, [scriptblock]$OnTick)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $r = Invoke-WebRequest -Uri $script:Cfg.StaffUrl -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop
+            if ([int]$r.StatusCode -lt 500) { return $true }
+        } catch {
+            $resp = $null
+            if ($_.Exception.PSObject.Properties['Response']) { $resp = $_.Exception.Response }
+            if ($null -ne $resp -and [int]$resp.StatusCode -lt 500) { return $true }
+        }
+        if ($OnTick) { & $OnTick }
+        Start-Sleep -Seconds 3
+    }
+    return $false
+}
+
+# KohaEasy.ps1 Start [-Trigger user|logon]
+#   user   the Koha - Start shortcut or the tray: always starts
+#   logon  the sign-in task: starts only in "logon" mode
+function Start-Koha {
+    param([ValidateSet('user', 'logon')][string]$Trigger = 'user', [switch]$Wait)
+    $state = Get-KohaState
+    if ($Trigger -eq 'logon' -and $state.autostart -ne 'logon') {
+        Write-KohaLog 'sign-in: automatic start is off, nothing started'
+        return 'skipped'
+    }
+    Set-KohaState @{ desired = 'running'; startedAt = (Get-UnixTime) } | Out-Null
+    Start-KohaKeepAlive
+    Write-KohaLog "start requested ($Trigger)"
+    if (-not $Wait) { return 'started' }
+    if (Wait-KohaHttp) { return 'ready' }
+    return 'timeout'
+}
+
+# KohaEasy.ps1 Stop: desired=stopped first, so the keep-alive task's
+# restart-on-failure does not bring Koha back a minute later.
+function Stop-Koha {
+    Set-KohaState @{ desired = 'stopped'; startedAt = 0 } | Out-Null
+    Stop-KohaKeepAlive
+    Invoke-KohaWsl -Arguments @('--terminate', $script:Cfg.Distro) | Out-Null
+    Write-KohaLog 'stopped by the user'
+    return 'stopped'
+}
+
+# The keep-alive task's action. Exits at once when Koha is meant to be off
+# (Stop pressed, or an unlock/resume trigger while it was off). Otherwise it
+# refreshes the handshake, starts the holder that keeps the distro alive and
+# waits on it; a holder that dies ends the task with an error, and the task
+# setting restarts it one minute later.
+function Invoke-KohaRun {
+    param([scriptblock]$Holder)
+    $state = Get-KohaState
+    if ($state.desired -ne 'running') {
+        Write-KohaLog 'keep-alive: Koha is meant to be stopped, exiting'
+        return 0
+    }
+    if (-not $Holder) {
+        $Holder = {
+            $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-d', $script:Cfg.Distro, '-u', 'root', '--exec', '/bin/sleep', 'infinity') -WindowStyle Hidden -PassThru
+            return $p
+        }
+    }
+    $proc = & $Holder
+    Start-Sleep -Seconds 2
+    Update-KohaHandshake | Out-Null
+    if (-not (Wait-KohaHttp)) {
+        Write-KohaLog 'keep-alive: the staff interface did not answer in time' 'health'
+        Show-KohaNotification -Title (T 'Koha did not start') -Text (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') -Level error | Out-Null
+    }
+    $proc.WaitForExit()
+    if ((Get-KohaState).desired -ne 'running') { return 0 }
+    Write-KohaLog "keep-alive: the WSL holder ended (exit $($proc.ExitCode)); the task will restart it"
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------
+# Same rules as kei_redact in the installer.
+function Protect-KohaText {
+    param([AllowEmptyString()][string]$Text)
+    $r = '[REDACTED]'
+    $t = $Text
+    $t = [regex]::Replace($t, '(?i)(<(pass|password|user_pass|encryption_key|api_key)>)[^<]*(</[a-z_]+>)', ('$1' + $r + '$3'))
+    $t = [regex]::Replace($t, '(?i)([a-z_-]*(pass(word)?|passwd|pwd|secret|token|api[_-]?key)[a-z_-]*["'']?\s*[:=]\s*["'']?)[^"''\s,;&}]+', ('$1' + $r))
+    $t = [regex]::Replace($t, '(?i)((proxy-)?authorization:\s*[a-z]+)\s+\S+', ('$1 ' + $r))
+    $t = [regex]::Replace($t, '(?i)(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}', ('$1 ' + $r))
+    $t = [regex]::Replace($t, '://[^/@\s:]+:[^/@\s]+@', ('://' + $r + '@'))
+    $t = [regex]::Replace($t, 'ya29\.[A-Za-z0-9._-]+', $r)
+    $t = [regex]::Replace($t, '1//[A-Za-z0-9._-]{20,}', $r)
+    return $t
+}
+
+function Save-KohaText {
+    param([string]$Path, [string]$Text)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, (Protect-KohaText $Text), $utf8)
+}
+
+function Invoke-KohaCapture {
+    param([scriptblock]$Block)
+    try { return ((& $Block 2>&1 | Out-String -Width 200)) } catch { return ('ERROR: ' + $_.Exception.Message) }
+}
+
+# Collects the Windows side, asks Linux for its own bundle
+# (config.sh --export-diagnostics) and zips both into $Destination.
+# A stopped Koha is started for the export and stopped again afterwards.
+function Export-KohaDiagnostics {
+    param([string]$Destination = [Environment]::GetFolderPath('Desktop'))
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $work = Join-Path $env:TEMP ('KohaEasy-diagnostics-' + $stamp)
+    $win = Join-Path $work 'windows'
+    New-Item -ItemType Directory -Path $win -Force | Out-Null
+    $state = Get-KohaState
+
+    Save-KohaText (Join-Path $win 'wsl.txt') ((Invoke-KohaWsl -Arguments @('--version')).Output + "`n`n" +
+        (Invoke-KohaWsl -Arguments @('--status')).Output + "`n`n" + (Invoke-KohaWsl -Arguments @('--list', '--verbose')).Output)
+    Save-KohaText (Join-Path $win 'computer.txt') (Invoke-KohaCapture {
+            Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture, TotalVisibleMemorySize, FreePhysicalMemory, LastBootUpTime | Format-List
+            Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer, Model, HypervisorPresent, NumberOfLogicalProcessors | Format-List
+            Get-CimInstance Win32_Processor | Select-Object Name, VirtualizationFirmwareEnabled | Format-List
+            Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free -AutoSize
+        })
+    if ($env:USERPROFILE) {
+        $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
+        if (Test-Path -LiteralPath $wslconfig) { Save-KohaText (Join-Path $win 'wslconfig.txt') (Get-Content -LiteralPath $wslconfig -Raw) }
+    }
+    Save-KohaText (Join-Path $win 'state.json') ($state | ConvertTo-Json -Depth 5)
+    Save-KohaText (Join-Path $win 'tasks.txt') (Invoke-KohaCapture {
+            Get-ScheduledTask -TaskPath $script:Cfg.TaskPath | ForEach-Object {
+                $_ | Select-Object TaskName, State | Format-List
+                $_ | Get-ScheduledTaskInfo | Select-Object LastRunTime, LastTaskResult, NextRunTime, NumberOfMissedRuns | Format-List
+            }
+        })
+    $wasRunning = Test-KohaDistroRunning
+    $linux = $null
+    if ($wasRunning) { $linux = Get-KohaLinuxStatus }
+    Save-KohaText (Join-Path $win 'disk.txt') (Invoke-KohaCapture { Get-KohaDiskHealth -Linux $linux | Format-List })
+    Save-KohaText (Join-Path $win 'events.txt') (Invoke-KohaCapture {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'; Level = 1, 2, 3; StartTime = (Get-Date).AddDays(-3) } -MaxEvents 2000 -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -match 'wsl|Lxss|Hyper-V|vmcompute|Kernel-Power|Power-Troubleshooter|disk|Ntfs' } |
+                Select-Object -First 300 | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+        })
+    $logs = Get-KohaPath Logs
+    if (Test-Path -LiteralPath $logs) {
+        $dst = Join-Path $win 'logs'
+        New-Item -ItemType Directory -Path $dst -Force | Out-Null
+        Get-ChildItem -LiteralPath $logs -Filter '*.log' | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-7) } | ForEach-Object {
+            Save-KohaText (Join-Path $dst $_.Name) ((Get-Content -LiteralPath $_.FullName -Tail 2000) -join "`n")
+        }
+    }
+
+    # Linux side, written straight into the work folder.
+    $note = ''
+    if (Test-KohaDistroInstalled) {
+        $lp = (Invoke-KohaLinux -Command @('wslpath', '-a', '-u', $work)).Output.Trim()
+        $r = Invoke-KohaLinux -Command @($script:Cfg.PanelPath, '--export-diagnostics', $lp)
+        if ($r.ExitCode -eq 0) {
+            $dir = ($r.Output -split "`n" | Where-Object { $_ -like '/*' } | Select-Object -Last 1)
+            if ($dir) {
+                $name = Split-Path -Leaf $dir
+                if (Test-Path -LiteralPath (Join-Path $work $name)) { Rename-Item -LiteralPath (Join-Path $work $name) -NewName 'linux' }
+            }
+        } else {
+            $note = 'Linux diagnostics failed: ' + $r.Output
+        }
+        if (-not $wasRunning -and $state.desired -ne 'running') { Invoke-KohaWsl -Arguments @('--terminate', $script:Cfg.Distro) | Out-Null }
+    } else {
+        $note = 'The KohaEasy distro is not installed.'
+    }
+    if ($note) { Save-KohaText (Join-Path $work 'NOTE.txt') $note }
+
+    if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+    $zip = Join-Path $Destination ('Koha-diagnostics-{0}-{1}.zip' -f $env:COMPUTERNAME, $stamp)
+    Compress-Archive -Path (Join-Path $work '*') -DestinationPath $zip -Force
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    Write-KohaLog "diagnostics exported: $zip"
+    return $zip
+}
+
+# ----------------------------------------------------------------------
+# Tray at sign-in (HKCU Run: no administrator rights)
+# ----------------------------------------------------------------------
+function Set-KohaTrayAtSignIn {
+    param([bool]$Enabled = $true)
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if ($Enabled) {
+        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $cmd = '"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" Tray' -f $ps, (Get-KohaScriptPath)
+        New-ItemProperty -Path $key -Name 'KohaEasyTray' -Value $cmd -PropertyType String -Force | Out-Null
+    } else {
+        Remove-ItemProperty -Path $key -Name 'KohaEasyTray' -ErrorAction SilentlyContinue
+    }
+}
+
+$script:KohaEasyVersion = '0.1.0'
+
+Export-ModuleMember -Function * -Variable KohaEasyVersion
