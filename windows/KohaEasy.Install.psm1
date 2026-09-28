@@ -150,9 +150,13 @@ function New-KohaDistro {
 
     $img = Get-KohaDebianImage -Manifest (Get-KohaDistributionManifest) -Arm $Arm
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    # A disk left by the failed attempt would block the import; the distro is
-    # not registered, so nothing uses it.
-    Remove-Item -LiteralPath ([System.IO.Path]::Combine($dir, 'ext4.vhdx')) -Force -ErrorAction SilentlyContinue
+    # A disk left behind would block the import. The distro is not registered,
+    # so nothing uses it, but it is set aside rather than deleted: it could
+    # hold a library's data.
+    $old = [System.IO.Path]::Combine($dir, 'ext4.vhdx')
+    if (Test-Path -LiteralPath $old) {
+        Move-Item -LiteralPath $old -Destination ('{0}.{1}.bak' -f $old, (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
+    }
     $file = [System.IO.Path]::Combine($dir, 'debian-rootfs.tar.gz')
     Save-KohaDownload -Url $img.Url -Path $file
     try {
@@ -170,6 +174,31 @@ function New-KohaDistro {
         Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
     }
     return 'imported'
+}
+
+# The KohaEasy distro must still be registered when a later phase runs.
+# When WSL no longer knows it, its disk is registered again in place
+# (wsl --import-in-place), so Debian, its settings and any Koha data come
+# back; without a disk, the install goes back to the Debian phase.
+#   ok | reattached | missing
+function Restore-KohaDistro {
+    if (Test-KohaDistroInstalled) { return 'ok' }
+    # A second, direct check: never act on a list that failed to parse.
+    $probe = Invoke-KohaLinux -Command @('true')
+    if ($probe.ExitCode -eq 0) { return 'ok' }
+    $name = (Get-KohaConfig).Distro
+    $list = Invoke-KohaWsl -Arguments @('--list', '--verbose')
+    Write-KohaLog ('distro {0} is not registered: {1} | wsl --list --verbose: {2}' -f $name, $probe.Output, $list.Output) 'install'
+    $vhd = [System.IO.Path]::Combine((Get-KohaPath Wsl), 'ext4.vhdx')
+    if (Test-Path -LiteralPath $vhd) {
+        $r = Invoke-KohaWsl -Arguments @('--import-in-place', $name, $vhd)
+        if ($r.ExitCode -eq 0 -and (Test-KohaDistroInstalled)) {
+            Write-KohaLog ('distro {0} registered again from {1}' -f $name, $vhd) 'install'
+            return 'reattached'
+        }
+        Write-KohaLog ('wsl --import-in-place failed (exit {0}): {1}' -f $r.ExitCode, $r.Output) 'install'
+    }
+    return 'missing'
 }
 
 # ----------------------------------------------------------------------
@@ -348,6 +377,12 @@ function Install-Koha {
             }
         }
         Write-KohaStep (T 'WSL 2 is ready.') 'ok'
+        Set-KohaState @{ phase = 'distro' } | Out-Null; $phase = 'distro'
+    }
+
+    # Debian must still be there for the phases after it (it can go missing
+    # between two runs); when it cannot be brought back, install it again.
+    if ((Test-KohaPhaseDone 'distro' $phase) -and (Restore-KohaDistro) -eq 'missing') {
         Set-KohaState @{ phase = 'distro' } | Out-Null; $phase = 'distro'
     }
 

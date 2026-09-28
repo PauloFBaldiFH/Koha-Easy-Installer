@@ -133,6 +133,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install New-KohaShortcuts { [void]$script:calls.Add('shortcuts') }
         Mock -ModuleName KohaEasy.Install Start-Koha { [void]$script:calls.Add('start'); 'ready' }
         Mock -ModuleName KohaEasy.Install Start-KohaTray { }
+        Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
     }
 
     It 'stops before touching Windows when a check fails' {
@@ -170,11 +171,79 @@ Describe 'Install flow' {
         }
     }
 
+    It 'installs Debian again when it went missing after its phase, then carries on' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'missing' }
+        Set-KohaState @{ phase = 'koha' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 0
+        $script:calls[0..2] | Should -Be @('distro', 'systemd', 'copy panel')
+    }
+
+    It 'goes straight on when Debian was registered again from its disk' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'reattached' }
+        Set-KohaState @{ phase = 'koha' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 0
+        $script:calls[0] | Should -Be 'copy panel'
+    }
+
     It 'stops when systemd does not start in WSL' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroConfig { $false }
         Install-Koha -Facts $good -NonInteractive | Should -Be 1
         (Get-KohaState).phase | Should -Be 'systemd'
+    }
+}
+
+Describe 'Debian gone missing' {
+    BeforeEach {
+        Remove-Item -LiteralPath (Get-KohaPath Root) -Recurse -Force -ErrorAction SilentlyContinue
+        $script:wsl = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 1; Output = 'Wsl/Service/WSL_E_DISTRO_NOT_FOUND' } }
+    }
+
+    It 'does nothing while WSL still knows it' {
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $true }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { throw 'must not touch WSL' }
+        Restore-KohaDistro | Should -Be 'ok'
+    }
+
+    It 'trusts a direct check over the list' {
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { throw 'must not touch WSL' }
+        Restore-KohaDistro | Should -Be 'ok'
+    }
+
+    It 'registers its disk again in place when the disk is still there' {
+        $script:installed = $false
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $script:installed }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [void]$script:wsl.Add($Arguments -join ' '); if ($Arguments[0] -eq '--import-in-place') { $script:installed = $true }; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        New-Item -ItemType Directory -Path (Get-KohaPath Wsl) -Force | Out-Null
+        $vhd = [System.IO.Path]::Combine((Get-KohaPath Wsl), 'ext4.vhdx')
+        Set-Content -LiteralPath $vhd -Value 'disk'
+        Restore-KohaDistro | Should -Be 'reattached'
+        $script:wsl | Should -Contain ('--import-in-place KohaEasy ' + $vhd)
+    }
+
+    It 'reports missing when there is no disk to bring back' {
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Restore-KohaDistro | Should -Be 'missing'
+    }
+
+    It 'sets an old disk aside instead of deleting it before importing a new Debian' {
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [pscustomobject]@{ ExitCode = [int]($Arguments[0] -eq '--install'); Output = '' } }
+        $script:img = Join-Path $TestDrive 'img'
+        Set-Content -LiteralPath $script:img -Value 'debian' -NoNewline
+        $sha = (Get-FileHash -LiteralPath $script:img -Algorithm SHA256).Hash
+        Mock -ModuleName KohaEasy.Install Get-KohaDistributionManifest { ('{"ModernDistributions":{"Debian":[{"Name":"Debian","Amd64Url":{"Url":"https://x.test/d.wsl","Sha256":"' + $sha + '"}}]}}') | ConvertFrom-Json }
+        Mock -ModuleName KohaEasy.Install Save-KohaDownload { Copy-Item -LiteralPath $script:img -Destination $Path }
+        New-Item -ItemType Directory -Path (Get-KohaPath Wsl) -Force | Out-Null
+        Set-Content -LiteralPath ([System.IO.Path]::Combine((Get-KohaPath Wsl), 'ext4.vhdx')) -Value 'library data'
+        New-KohaDistro | Should -Be 'imported'
+        @(Get-ChildItem -LiteralPath (Get-KohaPath Wsl) -Filter 'ext4.vhdx.*.bak').Count | Should -Be 1
     }
 }
 
