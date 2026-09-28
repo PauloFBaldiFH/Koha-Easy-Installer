@@ -163,6 +163,16 @@ As configurações (com os tokens) ficam em `/etc/koha/sites/library/kei-messagi
 
 A página é verificada com os módulos Perl do Koha antes de ser instalada; removê-la mantém as versões guardadas.
 
+#### Catalogação com IA (fotos do livro)
+
+Mais duas abas da mesma página catalogam um livro a partir de fotos da capa, da folha de rosto e do verso da folha de rosto (com a ficha catalográfica):
+
+- **Configuração da IA** (só para quem pode alterar as preferências do sistema): o modelo de visão, seja uma API na nuvem com token (OpenAI, Anthropic ou qualquer serviço compatível com a OpenAI), seja um modelo na própria rede da biblioteca (Ollama `http://localhost:11434` ou LM Studio `http://localhost:1234/v1` com um modelo de visão como `qwen2.5vl`, `llama3.2-vision` ou `gemma3`). A configuração fica em `kei-marc-replace/vision.conf`, legível só pelo usuário da instância do Koha; o token nunca volta a ser exibido e é recusado em `http` simples para um servidor fora da rede local. **Testar a conexão** lista os modelos do servidor. Nenhum token vem com o painel.
+- **Catalogação com IA**: as fotos vão para o modelo, que responde com os dados bibliográficos em JSON (conferidos contra um esquema fixo: nada inventado, marcadores vazios descartados). Em seguida as regras nacionais são aplicadas por `KohaEasy::Cataloguing::Rules`: pontuação AACR2 e ISBD (245 `:` `/`, 260 com `[S.l.]` / `[s.n.]`, 300), nomes invertidos como na catalogação brasileira (`Assis, Machado de`, `Andrade Filho, José de`), caracteres a desconsiderar do 245, dígito verificador do ISBN (os errados vão para o 020 `$z`), a CDD impressa na ficha catalográfica (senão a sugestão do modelo, marcada para conferência) no 082 e 090, e a **notação de autor da tabela PHA ou Cutter-Sanborn da própria biblioteca**, calculada por uma versão em Perl do algoritmo do painel, de modo que a página e o **Auxílio à catalogação** dão a mesma notação.
+- O bibliotecário corrige o rascunho ao lado das fotos e segue uma **prévia obrigatória**. Só então o registro é incluído com o `AddBiblio` do Koha, numa única transação sob uma trava do banco, depois de conferir de novo o ISBN no catálogo (um registro com o mesmo ISBN exige marcar uma caixa), com uma cópia do registro e da resposta do modelo guardada em `kei-marc-replace/vision/`. Um formulário enviado duas vezes não inclui nada. Com um biblionumber, o rascunho vai para a substituição acima (com a trava e a versão guardada dela).
+
+Os dois módulos são instalados com a página em `/usr/local/lib/site_perl/KohaEasy/Cataloguing/` e removidos com ela (a configuração fica junto das versões guardadas).
+
 ## Tarefas automáticas
 
 Instaladas em `/etc/cron.d/koha_tasks`:

@@ -8906,6 +8906,18 @@ MR_DIR="/var/lib/koha/${INSTANCE}/kei-marc-replace"
 MR_STATE="${CONF_DIR}/marc_replace.state"
 MR_JS_BEGIN="/* koha-easy-installer marc_replace begin */"
 MR_JS_END="/* koha-easy-installer marc_replace end */"
+# Texts of the AI cataloguing tabs (see mr_text).
+MR_VISION_KEYS="tab_replace tab_vision tab_settings v_title v_intro v_img_cover v_img_title v_img_verso v_img_hint \
+    v_bn v_framework v_default_fw v_read v_not_installed v_no_conf v_draft v_draft_hint v_photos v_rules \
+    v_missing v_model_notes v_w_place v_w_publisher v_w_year v_w_ddc v_w_ddc_model v_w_notation \
+    v_w_no_table v_w_isbn f_title f_authors f_publisher f_place f_year f_isbn r_isbn r_ddc r_notation \
+    r_cip_notation r_nonfiling src_cip src_model isbn_ok isbn_bad v_new_confirm v_add v_dups v_dup_ok \
+    v_err_dup v_added v_twice v_err_busy v_err_add v_err_image v_err_noimg v_err_model v_add_items \
+    v_edit v_another e_URL e_TOKEN_PLAIN e_NO_TOKEN e_NO_IMAGES e_UNREACHABLE e_HTTP e_EMPTY e_NO_JSON \
+    s_title s_intro s_perm s_provider p_openai p_anthropic p_ollama p_compatible s_url s_model s_token \
+    s_token_saved s_token_clear s_timeout s_max_px s_lang s_org s_country s_table t_auto t_none s_ddc_ed \
+    s_save s_test s_saved s_err_save s_err_perm s_test_ok s_test_fail ddc0 ddc1 ddc2 ddc3 ddc4 ddc5 ddc6 \
+    ddc7 ddc8 ddc9 table_pha table_cutter"
 
 # The page: Perl code around the strings of the panel language.
 marc_replace_script() {
@@ -8927,6 +8939,19 @@ marc_replace_script() {
 # and replaced with ModBiblio. The item fields (952, or the field of
 # items.itemnumber) are always left out: the items are never touched.
 #
+# AI cataloguing (tabs "AI cataloguing" and "AI settings"): photos of a
+# book (cover, title page, verso with the CIP block) go to the vision model
+# set in the AI settings (a cloud API with a token, or Ollama / LM Studio
+# on the library's network); KohaEasy::Cataloguing::Vision checks its
+# answer against a fixed schema and KohaEasy::Cataloguing::Rules applies
+# the cataloguing rules (AACR2 punctuation, author notation of the
+# library's PHA or Cutter-Sanborn table, CDD). The librarian corrects the
+# draft, checks the preview and only then the record is added (AddBiblio)
+# in one transaction, under a database lock, after a check for the same
+# ISBN and with a copy of the record and of the model's answer saved; a
+# form sent twice adds nothing. With a biblionumber the draft goes to the
+# replacement above instead. Without the two modules the tabs only say so.
+#
 # Technical note (kept from the original): no named sub captures
 # file-scope lexical variables, because under Koha's persistent Plack the
 # Perl process lives between requests and that causes "Variable is not
@@ -8934,16 +8959,19 @@ marc_replace_script() {
 
 use Modern::Perl;
 use CGI qw ( -utf8 );
-use C4::Auth qw( checkauth );
-use C4::Biblio qw( ModBiblio GetFrameworkCode GetMarcFromKohaField );
+use C4::Auth qw( checkauth haspermission );
+use C4::Biblio qw( AddBiblio ModBiblio GetFrameworkCode GetMarcFromKohaField );
 use C4::Charset qw( MarcToUTF8Record );
 use C4::Context;
+use Koha::BiblioFrameworks;
 use Koha::Biblios;
 use Koha::Database;
 use Koha::ItemTypes;
 use Koha::Token;
 use Digest::SHA qw( sha1_hex );
 use Encode qw( decode encode );
+use Fcntl qw( O_CREAT O_EXCL O_WRONLY );
+use JSON::PP;
 use MIME::Base64 qw( decode_base64 encode_base64 );
 use MARC::Record;
 use MARC::Field;
@@ -8954,10 +8982,10 @@ use POSIX qw( strftime );
 sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
 MRPL1
     local k
-    printf "our \$BACKUP_DIR = '%s';\nour %%T = (\n" "$MR_DIR"
+    printf "our \$BACKUP_DIR = '%s';\nour \$TABLE_DIR = '%s';\nour \$VISION_CONF = \"\$BACKUP_DIR/vision.conf\";\nour \$USER = '';\nour %%T = (\n" "$MR_DIR" "$CAT_DIR"
     for k in title intro paste paste_hint file bn itype keep preview replace cancel err_csrf err_bn err_nobib \
              err_input err_parse err_many err_lines err_title err_changed err_backup err_mod current new items_kept \
-             items_dropped charset confirm ok view prev_dl undo_hint warnings not_found; do
+             items_dropped charset confirm ok view prev_dl undo_hint warnings not_found $MR_VISION_KEYS; do
         printf '    %s => _d(q{%s}),\n' "$k" "$(mr_text "$k" | base64 -w0)"
     done
     printf ');\n'
@@ -9126,17 +9154,24 @@ sub current_metadata {
 
 sub digest { my $s = shift // ''; return sha1_hex( utf8::is_utf8($s) ? encode( 'UTF-8', $s ) : $s ) }
 
+# A file written whole or not at all (a temporary file renamed over it);
+# dies on failure.
+sub write_atomic {
+    my ( $file, $data ) = @_;
+    die "exists: $file\n" if -e $file;
+    open( my $fh, '>:raw', "$file.tmp" ) or die "$file.tmp: $!\n";
+    print {$fh} utf8::is_utf8($data) ? encode( 'UTF-8', $data ) : $data;
+    close($fh) or die "$file.tmp: $!\n";
+    chmod 0640, "$file.tmp";
+    rename( "$file.tmp", $file ) or die "$file: $!\n";
+    return 1;
+}
+
 # The previous version as MARCXML; returns its stamp (dies on failure).
 sub save_version {
     my ( $biblionumber, $xml ) = @_;
     my $stamp = strftime( '%Y%m%d-%H%M%S', localtime );
-    my $file  = "$BACKUP_DIR/$biblionumber-$stamp.xml";
-    die "exists: $file\n" if -e $file;
-    open( my $fh, '>:raw', "$file.tmp" ) or die "$file.tmp: $!\n";
-    print {$fh} utf8::is_utf8($xml) ? encode( 'UTF-8', $xml ) : $xml;
-    close($fh) or die "$file.tmp: $!\n";
-    chmod 0640, "$file.tmp";
-    rename( "$file.tmp", $file ) or die "$file: $!\n";
+    write_atomic( "$BACKUP_DIR/$biblionumber-$stamp.xml", $xml );
     return $stamp;
 }
 
@@ -9146,6 +9181,7 @@ sub run {
     # Staff login with permission to edit the catalogue (the session of
     # the staff interface is reused: no new login).
     my ( $user, $cookie, $sessionID ) = checkauth( $cgi, 0, { editcatalogue => 'edit_catalogue' }, 'intranet' );
+    $USER = $user // '';    # package variable: set again on every request (Plack)
     my $op = $cgi->param('op') // '';
 
     if ( $cgi->request_method eq 'GET' && $op eq 'download' ) {
@@ -9157,6 +9193,10 @@ sub run {
 
     if ( $cgi->request_method eq 'POST' ) {
         handle_post( $cgi, $op );
+    } elsif ( $op eq 'vision' ) {
+        render_vision_form( $cgi, '' );
+    } elsif ( $op eq 'vision-settings' ) {
+        render_settings( $cgi, '' );
     } else {
         render_form( $cgi, '' );
     }
@@ -9191,7 +9231,16 @@ sub handle_post {
         }
     );
     if ( !$csrf_ok ) {
-        render_form( $cgi, '<div class="msg err">' . h( $T{err_csrf} ) . '</div>' );
+        my $msg = '<div class="msg err">' . h( $T{err_csrf} ) . '</div>';
+        if    ( $op =~ /^cud-vision-(?:settings|test)$/ ) { render_settings( $cgi, $msg ) }
+        elsif ( $op =~ /^cud-vision/ )                    { render_vision_form( $cgi, $msg ) }
+        else                                              { render_form( $cgi, $msg ) }
+        return;
+    }
+
+    # AI cataloguing: a new record, or a draft sent to the replacement below.
+    if ( $op =~ /^cud-vision/ ) {
+        handle_vision( $cgi, $op );
         return;
     }
 
@@ -9296,19 +9345,35 @@ sub do_replace {
 }
 
 sub render_page {
-    my ($body) = @_;
+    my ( $body, $tab ) = @_;
+    $tab ||= 'replace';
+    my $nav = '<nav class="tabs">'
+        . join( '',
+        map { '<a href="' . $_->[1] . '"' . ( $_->[0] eq $tab ? ' class="on"' : '' ) . '>' . h( $T{"tab_$_->[0]"} ) . '</a>' }
+            ( [ replace => 'marc_replace.pl' ], [ vision => 'marc_replace.pl?op=vision' ], [ settings => 'marc_replace.pl?op=vision-settings' ] ) )
+        . '</nav>';
     my $html = <<"HTML";
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>@{[ h( $T{title} ) ]}</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 12px; }
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 12px; }
     label { display: block; margin-top: 16px; font-weight: bold; }
-    input[type=text], select { width: 100%; padding: 8px; box-sizing: border-box; }
-    input[type=submit] { margin-top: 20px; padding: 10px 20px; }
+    label.inline { display: inline; font-weight: normal; }
+    input[type=text], input[type=password], input[type=url], input[type=number], select { width: 100%; padding: 8px; box-sizing: border-box; }
+    input[type=submit], button { margin-top: 20px; padding: 10px 20px; }
+    textarea { width: 100%; font-family: monospace; box-sizing: border-box; }
     pre { background: #f6f6f6; padding: 10px; overflow-x: auto; white-space: pre-wrap; }
+    table.rules { border-collapse: collapse; width: 100%; }
+    table.rules td, table.rules th { border-bottom: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
+    .photos img { max-width: 32%; max-height: 360px; margin: 4px 1% 4px 0; border: 1px solid #ccc; }
+    .hint { font-size: 0.85em; color: #666; }
+    .tabs { border-bottom: 1px solid #ccc; margin-bottom: 8px; }
+    .tabs a { display: inline-block; padding: 8px 14px; text-decoration: none; color: #333; }
+    .tabs a.on { border: 1px solid #ccc; border-bottom: 2px solid #fff; margin-bottom: -1px; font-weight: bold; }
     .msg { margin-top: 16px; padding: 10px; border-radius: 4px; }
     .ok { background: #dff0d8; color: #3c763d; }
     .err { background: #f2dede; color: #a94442; }
@@ -9316,6 +9381,7 @@ sub render_page {
   </style>
 </head>
 <body>
+$nav
 $body
 </body>
 </html>
@@ -9324,16 +9390,21 @@ HTML
     return;
 }
 
+sub itemtype_options {
+    my $options = '<option value="">' . h( $T{keep} ) . '</option>';
+    for my $it ( Koha::ItemTypes->search( {}, { order_by => 'description' } )->as_list ) {
+        $options .= '<option value="' . h( $it->itemtype ) . '">' . h( $it->description ) . ' (' . h( $it->itemtype ) . ')</option>';
+    }
+    return $options;
+}
+
 sub render_form {
     my ( $cgi, $message ) = @_;
 
     my $csrf_token   = Koha::Token->new->generate_csrf( { session_id => scalar $cgi->cookie('CGISESSID') } );
     my $biblionumber = $cgi->param('biblionumber') // '';
     $biblionumber =~ s/\D//g;
-    my $options = '<option value="">' . h( $T{keep} ) . '</option>';
-    for my $it ( Koha::ItemTypes->search( {}, { order_by => 'description' } )->as_list ) {
-        $options .= '<option value="' . h( $it->itemtype ) . '">' . h( $it->description ) . ' (' . h( $it->itemtype ) . ')</option>';
-    }
+    my $options = itemtype_options();
 
     render_page( '<h2>' . h( $T{title} ) . '</h2><p>' . h( $T{intro} ) . "</p>$message"
             . '<form method="post" enctype="multipart/form-data">'
@@ -9352,7 +9423,1427 @@ sub render_form {
             . '</form>' );
     return;
 }
+
+# ----------------------------------------------------------------------
+# AI cataloguing
+# ----------------------------------------------------------------------
+
+# The two modules of the panel (Perl folder of the site); loaded on first
+# use, so the replacement works without them.
+sub vision_ready {
+    return eval { require KohaEasy::Cataloguing::Vision; require KohaEasy::Cataloguing::Rules; 1 } ? 1 : 0;
+}
+
+# Changing the model or its token: the permission to change the system
+# preferences (superlibrarians have it).
+sub can_configure {
+    return $USER ne '' && haspermission( $USER, { parameters => 'manage_sysprefs' } ) ? 1 : 0;
+}
+
+sub err_box  { return '<div class="msg err">' . h( $_[0] ) . '</div>' }
+sub warn_box { return '<div class="msg warn">' . join( '<br>', map { h($_) } @_ ) . '</div>' }
+sub csrf     { return Koha::Token->new->generate_csrf( { session_id => scalar $_[0]->cookie('CGISESSID') } ) }
+sub digits   { my $s = shift // ''; $s =~ s/\D//g; return $s }
+
+sub framework_options {
+    my ($selected) = @_;
+    $selected //= '';
+    my $options = '<option value="">' . h( $T{v_default_fw} ) . '</option>';
+    for my $fw ( Koha::BiblioFrameworks->search( {}, { order_by => 'frameworktext' } )->as_list ) {
+        next if $fw->frameworkcode eq '';
+        $options .= '<option value="' . h( $fw->frameworkcode ) . '"' . ( $fw->frameworkcode eq $selected ? ' selected' : '' ) . '>'
+            . h( $fw->frameworktext ) . ' (' . h( $fw->frameworkcode ) . ')</option>';
+    }
+    return $options;
+}
+
+sub framework_param {
+    my $fw = shift // '';
+    return $fw =~ /^[A-Za-z0-9_]{1,4}$/ ? $fw : '';
+}
+
+sub render_vision_form {
+    my ( $cgi, $message ) = @_;
+    my $body = '<h2>' . h( $T{v_title} ) . '</h2>';
+    if ( !vision_ready() ) {
+        render_page( $body . err_box( $T{v_not_installed} ), 'vision' );
+        return;
+    }
+    my $bn = digits( scalar $cgi->param('biblionumber') );
+    $body .= '<p>' . h( $T{v_intro} ) . "</p>$message";
+    $body .= warn_box( $T{v_no_conf} ) unless -e $VISION_CONF;
+    $body .= '<form method="post" enctype="multipart/form-data">'
+        . '<input type="hidden" name="op" value="cud-vision">'
+        . '<input type="hidden" name="csrf_token" value="' . h( csrf($cgi) ) . '">';
+    for my $role (qw( cover title verso )) {
+        $body .= qq{<label for="img_$role">} . h( $T{"v_img_$role"} ) . '</label>'
+            . qq{<input type="file" id="img_$role" name="img_$role" accept="image/jpeg,image/png,image/webp">};
+    }
+    $body .= '<p class="hint">' . h( $T{v_img_hint} ) . '</p>'
+        . '<label for="biblionumber">' . h( $T{v_bn} ) . '</label>'
+        . '<input type="text" id="biblionumber" name="biblionumber" value="' . h($bn) . '" placeholder="12345" inputmode="numeric">'
+        . '<label for="itemtype">' . h( $T{itype} ) . ' (942$c)</label>'
+        . '<select id="itemtype" name="itemtype">' . itemtype_options() . '</select>'
+        . '<label for="frameworkcode">' . h( $T{v_framework} ) . '</label>'
+        . '<select id="frameworkcode" name="frameworkcode">' . framework_options() . '</select>'
+        . '<input type="submit" value="' . h( $T{v_read} ) . '">'
+        . '</form>';
+    render_page( $body, 'vision' );
+    return;
+}
+
+sub handle_vision {
+    my ( $cgi, $op ) = @_;
+    if ( $op eq 'cud-vision-settings' || $op eq 'cud-vision-test' ) {
+        do_settings( $cgi, $op );
+    } elsif ( !vision_ready() ) {
+        render_vision_form( $cgi, '' );
+    } elsif ( $op eq 'cud-vision-preview' ) {
+        do_vision_preview($cgi);
+    } elsif ( $op eq 'cud-vision-add' ) {
+        do_vision_add($cgi);
+    } else {
+        do_vision($cgi);
+    }
+    return;
+}
+
+# Photos -> model -> rules -> a draft the librarian corrects.
+sub do_vision {
+    my ($cgi) = @_;
+    my $conf = KohaEasy::Cataloguing::Vision::load_conf($VISION_CONF);
+    my $bn   = digits( scalar $cgi->param('biblionumber') );
+    if ( $bn ne '' && !Koha::Biblios->find($bn) ) {
+        render_vision_form( $cgi, err_box( $T{err_nobib} . " ($bn)" ) );
+        return;
+    }
+    my @images;
+    for my $role (qw( cover title verso )) {
+        my $fh = $cgi->upload("img_$role") or next;
+        binmode $fh;
+        my $raw = do { local $/; <$fh> };
+        next unless defined $raw && length $raw;
+        my $img = eval { KohaEasy::Cataloguing::Vision::prepare_image( $raw, $conf->{max_px} ) };
+        if ( !$img ) {
+            render_vision_form( $cgi, err_box( $T{v_err_image} ) );
+            return;
+        }
+        push @images, { %$img, role => $role };
+    }
+    if ( !@images ) {
+        render_vision_form( $cgi, err_box( $T{v_err_noimg} ) );
+        return;
+    }
+
+    my $res = KohaEasy::Cataloguing::Vision::extract( $conf, \@images );
+    if ( !$res->{ok} ) {
+        my $code = $res->{error_code} eq 'CONFIG' ? $res->{error} : $res->{error_code};
+        my $msg  = $T{v_err_model} . ' ' . ( $T{"e_$code"} // $code );
+        $msg .= ' ' . $res->{error} if $res->{error_code} =~ /^(?:UNREACHABLE|HTTP|NO_JSON)$/ && $res->{error} ne '';
+        render_vision_form( $cgi, err_box($msg) );
+        return;
+    }
+
+    my $built = KohaEasy::Cataloguing::Rules::build(
+        $res->{data},
+        {
+            lang        => $conf->{lang},
+            country     => $conf->{country},
+            org_code    => $conf->{org_code},
+            ddc_edition => $conf->{ddc_edition},
+            table       => $conf->{table},
+            table_dir   => $TABLE_DIR,
+        }
+    );
+
+    my $d = $res->{data};
+    my @warnings;
+    for my $w ( @{ $built->{warnings} } ) {
+        if ( $w =~ /^ISBN ([0-9X]+)/ ) { push @warnings, "$T{v_w_isbn} $1"; next }
+        push @warnings, $T{"v_w_$w"} if $T{"v_w_$w"};
+    }
+    my %label = map { $_ => $T{"f_$_"} // $_ } @{ $res->{missing} };
+    my $info = '<p class="hint">' . h("$res->{provider} / $res->{model} ($res->{seconds} s)") . '</p>';
+    $info .= warn_box( $T{v_missing} . ' ' . join( ', ', map { $label{$_} } @{ $res->{missing} } ) ) if @{ $res->{missing} };
+    $info .= warn_box(@warnings) if @warnings;
+    $info .= warn_box( $T{v_model_notes} . ' ' . $d->{notes} ) if $d->{notes} ne '';
+
+    if ( @{ $built->{report} } ) {
+        $info .= '<h3>' . h( $T{v_rules} ) . '</h3><table class="rules">';
+        for my $r ( @{ $built->{report} } ) {
+            my ( $rule, $value, $source, $detail ) = @$r;
+            my $src =
+                  $rule eq 'ddc'      ? $T{"src_$source"} // $source
+                : $rule eq 'notation' ? $T{"table_$source"} // $source
+                : $rule eq 'isbn'     ? ( $source eq 'ok' ? $T{isbn_ok} : $T{isbn_bad} )
+                :                       '';
+            $detail = ddc_caption_text($detail) if $rule eq 'ddc';
+            $info .= '<tr><th>' . h( $T{"r_$rule"} // $rule ) . '</th><td><b>' . h($value) . '</b></td><td>' . h( join( ' ', grep { defined && $_ ne '' } $src, $detail ) ) . '</td></tr>';
+        }
+        $info .= '</table>';
+    }
+
+    my $photos = '<h3>' . h( $T{v_photos} ) . '</h3><div class="photos">'
+        . join( '', map { '<img src="data:' . $_->{mime} . ';base64,' . encode_base64( $_->{data}, '' ) . '" alt="' . h( $T{"v_img_$_->{role}"} ) . '">' } @images )
+        . '</div>';
+    my $extraction = encode_base64( JSON::PP->new->utf8->canonical->encode( { provider => $res->{provider}, model => $res->{model}, data => $d } ), '' );
+    render_draft( $cgi, $info . $photos, KohaEasy::Cataloguing::Rules::as_text( $built->{record} ), $extraction );
+    return;
+}
+
+# The main class of the CDD in the language of the page (the caption of
+# the schedule loaded by the library is shown as it is).
+sub ddc_caption_text {
+    my $detail = shift // '';
+    return $detail =~ /^(\d)00 / && $T{"ddc$1"} ? "$1" . "00 " . $T{"ddc$1"} : $detail;
+}
+
+# The draft: MARC lines the librarian can correct, then the preview (the
+# replacement's own preview when a biblionumber was given).
+sub render_draft {
+    my ( $cgi, $info, $text, $extraction ) = @_;
+    my $bn   = digits( scalar $cgi->param('biblionumber') );
+    my $itype = $cgi->param('itemtype') // '';
+    my $body = '<h2>' . h( $T{v_draft} ) . ( $bn ne '' ? ' (' . h( $T{bn} ) . " $bn)" : '' ) . '</h2>' . $info;
+    $body .= '<form method="post" enctype="multipart/form-data">'
+        . '<input type="hidden" name="op" value="' . ( $bn ne '' ? 'cud-preview' : 'cud-vision-preview' ) . '">'
+        . '<input type="hidden" name="csrf_token" value="' . h( csrf($cgi) ) . '">'
+        . '<input type="hidden" name="biblionumber" value="' . h($bn) . '">'
+        . '<input type="hidden" name="itemtype" value="' . h($itype) . '">'
+        . '<input type="hidden" name="frameworkcode" value="' . h( framework_param( scalar $cgi->param('frameworkcode') ) ) . '">'
+        . '<input type="hidden" name="extraction" value="' . h( $extraction // '' ) . '">'
+        . '<label for="marctext">' . h( $T{v_draft} ) . '</label>'
+        . '<p class="hint">' . h( $T{v_draft_hint} ) . '</p>'
+        . '<textarea id="marctext" name="marctext" rows="22">' . h($text) . '</textarea>'
+        . '<input type="submit" value="' . h( $T{preview} ) . '"> '
+        . '<a href="marc_replace.pl?op=vision">' . h( $T{cancel} ) . '</a></form>';
+    render_page( $body, 'vision' );
+    return;
+}
+
+# ISBNs of the record (020 $a and $z, digits and X only).
+sub record_isbns {
+    my ($record) = @_;
+    my %seen;
+    return grep { length >= 10 && !$seen{$_}++ } map { ( my $x = uc $_ ) =~ s/[^0-9X]//g; $x } grep { defined } map { $_->subfield('a'), $_->subfield('z') } $record->field('020');
+}
+
+# Records of the catalogue with one of the ISBNs: [ biblionumber, title ].
+sub find_duplicates {
+    my ($record) = @_;
+    my ( %seen, @dups );
+    for my $isbn ( record_isbns($record) ) {
+        my $rows = C4::Context->dbh->selectall_arrayref(
+            "SELECT bi.biblionumber, b.title FROM biblioitems bi JOIN biblio b ON b.biblionumber = bi.biblionumber WHERE REPLACE(bi.isbn, '-', '') LIKE ? LIMIT 10",
+            undef, "%$isbn%" ) || [];
+        push @dups, grep { !$seen{ $_->[0] }++ } @$rows;
+    }
+    return @dups;
+}
+
+sub do_vision_preview {
+    my ($cgi) = @_;
+    my $text = $cgi->param('marctext') // '';
+    my $back = sub { render_draft( $cgi, err_box( $_[0] ), $text, scalar $cgi->param('extraction') ) };
+    if ( $text !~ /\S/ ) { $back->( $T{err_input} ); return }
+    my ( $record, $bad ) = parse_mnemonic_marc($text);
+    if (@$bad) { $back->( $T{err_lines} . ' ' . join( ', ', @$bad ) ); return }
+    set_itemtype( $record, scalar $cgi->param('itemtype') );
+    my $dropped = strip_items($record);
+    if ( !$record->field('245') ) { $back->( $T{err_title} ); return }
+
+    my $fw    = framework_param( scalar $cgi->param('frameworkcode') );
+    my @dups  = find_duplicates($record);
+    my $nonce = sha1_hex( join ':', time, $$, rand(), csrf($cgi) );
+    my $xml   = encode( 'UTF-8', $record->as_xml_record('MARC21') );
+
+    my $body = '<h2>' . h( $T{v_title} ) . '</h2><p>' . h( $T{v_new_confirm} ) . '</p>';
+    $body .= '<p>' . h( $T{items_dropped} ) . " $dropped</p>" if $dropped;
+    $body .= '<p>' . h( $T{v_framework} ) . ': ' . h( $fw eq '' ? $T{v_default_fw} : $fw ) . '</p>';
+    if (@dups) {
+        $body .= '<div class="msg warn"><b>' . h( $T{v_dups} ) . '</b><br>'
+            . join( '<br>', map { '<a href="/cgi-bin/koha/catalogue/detail.pl?biblionumber=' . h( $_->[0] ) . '" target="_blank">' . h( $_->[0] ) . '</a> ' . h( $_->[1] // '' ) } @dups )
+            . '</div>';
+    }
+    $body .= '<h3>' . h( $T{new} ) . '</h3><pre>' . h( $record->as_formatted ) . '</pre>';
+    $body .= '<form method="post">'
+        . '<input type="hidden" name="op" value="cud-vision-add">'
+        . '<input type="hidden" name="csrf_token" value="' . h( csrf($cgi) ) . '">'
+        . '<input type="hidden" name="record" value="' . encode_base64( $xml, '' ) . '">'
+        . '<input type="hidden" name="frameworkcode" value="' . h($fw) . '">'
+        . '<input type="hidden" name="nonce" value="' . h($nonce) . '">'
+        . '<input type="hidden" name="extraction" value="' . h( scalar $cgi->param('extraction') // '' ) . '">'
+        . ( @dups ? '<p><input type="checkbox" id="allow_dup" name="allow_dup" value="1"> <label class="inline" for="allow_dup">' . h( $T{v_dup_ok} ) . '</label></p>' : '' )
+        . '<input type="submit" value="' . h( $T{v_add} ) . '"> '
+        . '<a href="marc_replace.pl?op=vision">' . h( $T{cancel} ) . '</a></form>';
+    render_page( $body, 'vision' );
+    return;
+}
+
+# The new record and what the model read, next to the saved versions;
+# returns the stamp (dies on failure).
+sub save_new_copy {
+    my ( $biblionumber, $record, $extraction ) = @_;
+    my $dir = "$BACKUP_DIR/vision";
+    my $stamp = strftime( '%Y%m%d-%H%M%S', localtime );
+    write_atomic( "$dir/$biblionumber-$stamp.xml", encode( 'UTF-8', $record->as_xml_record('MARC21') ) );
+    write_atomic( "$dir/$biblionumber-$stamp.json", $extraction ) if $extraction ne '';
+    return $stamp;
+}
+
+# Adds the record: the form is claimed first (a second send adds nothing),
+# then under a database lock and in one transaction the ISBN is checked
+# again, the record added and its copy saved; any failure keeps nothing.
+sub do_vision_add {
+    my ($cgi) = @_;
+    my $record = eval { MARC::Record->new_from_xml( decode_base64( scalar $cgi->param('record') // '' ), 'UTF-8', 'MARC21' ) };
+    my $nonce  = $cgi->param('nonce') // '';
+    if ( !$record || !$record->field('245') || $nonce !~ /^[0-9a-f]{40}$/ ) {
+        render_vision_form( $cgi, err_box( $T{err_parse} ) );
+        return;
+    }
+    strip_items($record);
+    my $fw         = framework_param( scalar $cgi->param('frameworkcode') );
+    my $extraction = eval { decode_base64( scalar $cgi->param('extraction') // '' ) } // '';
+    $extraction = '' unless length($extraction) <= 500_000 && eval { JSON::PP->new->utf8->decode($extraction); 1 };
+
+    my $dir = "$BACKUP_DIR/vision";
+    mkdir( $dir, 0750 ) unless -d $dir;
+    my $claim = "$dir/.sent-$nonce";
+    my $cfh;
+    if ( !sysopen( $cfh, $claim, O_WRONLY | O_CREAT | O_EXCL, 0640 ) ) {
+        my $done;
+        if ( -e $claim && open( my $in, '<', $claim ) ) { local $/; $done = <$in> // ''; close $in }
+        if ( defined $done && $done =~ /^(\d+)$/ ) {
+            render_page( '<h2>' . h( $T{v_title} ) . '</h2>' . warn_box( $T{v_twice} ) . record_links($1), 'vision' );
+        } else {
+            render_vision_form( $cgi, err_box( defined $done ? $T{v_err_busy} : "$T{err_backup} $claim: $!" ) );
+        }
+        return;
+    }
+
+    my $dbh = C4::Context->dbh;
+    my ($locked) = $dbh->selectrow_array( 'SELECT GET_LOCK(?, 30)', undef, 'kei_marc_replace_vision' );
+    if ( !$locked ) {
+        close $cfh;
+        unlink $claim;
+        render_vision_form( $cgi, err_box( $T{v_err_busy} ) );
+        return;
+    }
+    my ( $biblionumber, $stamp );
+    my $success = eval {
+        Koha::Database->new->schema->txn_do(
+            sub {
+                die "DUPLICATE\n" if find_duplicates($record) && !$cgi->param('allow_dup');
+                ($biblionumber) = AddBiblio( $record, $fw );
+                die "ADDBIBLIO\n" unless $biblionumber;
+                $stamp = eval { save_new_copy( $biblionumber, $record, $extraction ) };
+                die 'BACKUP ' . short_error($@) . "\n" unless $stamp;
+            }
+        );
+        1;
+    };
+    my $err = $@ // '';
+    $dbh->selectrow_array( 'SELECT RELEASE_LOCK(?)', undef, 'kei_marc_replace_vision' );
+
+    if ($success) {
+        print {$cfh} $biblionumber;
+        close $cfh;
+        render_page( '<h2>' . h( $T{v_title} ) . '</h2><div class="msg ok">' . h( $T{v_added} ) . " ($biblionumber)</div>" . record_links($biblionumber), 'vision' );
+        return;
+    }
+    close $cfh;
+    unlink $claim;
+    unlink glob("$dir/$biblionumber-$stamp.*") if $biblionumber && $stamp;
+    my $msg =
+          $err =~ /^DUPLICATE/     ? $T{v_err_dup}
+        : $err =~ /^BACKUP (.*)/   ? "$T{err_backup} $1"
+        :                            $T{v_err_add} . ' ' . short_error( $err =~ /^ADDBIBLIO/ ? 'AddBiblio' : $err );
+    render_vision_form( $cgi, err_box($msg) );
+    return;
+}
+
+sub record_links {
+    my $bn = shift;
+    return '<p>'
+        . qq{<a href="/cgi-bin/koha/catalogue/detail.pl?biblionumber=$bn" target="_blank">} . h( $T{view} ) . '</a><br>'
+        . qq{<a href="/cgi-bin/koha/cataloguing/additem.pl?biblionumber=$bn" target="_blank">} . h( $T{v_add_items} ) . '</a><br>'
+        . qq{<a href="/cgi-bin/koha/cataloguing/addbiblio.pl?biblionumber=$bn" target="_blank">} . h( $T{v_edit} ) . '</a></p>'
+        . '<p><a href="marc_replace.pl?op=vision">' . h( $T{v_another} ) . '</a></p>';
+}
+
+# ----------------------------------------------------------------------
+# AI settings
+# ----------------------------------------------------------------------
+
+sub render_settings {
+    my ( $cgi, $message, $conf ) = @_;
+    no warnings 'once';    # package variables of KohaEasy::Cataloguing::Vision
+    my $body = '<h2>' . h( $T{s_title} ) . '</h2>';
+    if ( !vision_ready() ) {
+        render_page( $body . err_box( $T{v_not_installed} ), 'settings' );
+        return;
+    }
+    $body .= '<p>' . h( $T{s_intro} ) . "</p>$message";
+    if ( !can_configure() ) {
+        render_page( $body . warn_box( $T{s_perm} ), 'settings' );
+        return;
+    }
+    my $c   = $conf || KohaEasy::Cataloguing::Vision::load_conf($VISION_CONF);
+    my $sel = sub {
+        my ( $name, $value, @opts ) = @_;
+        return qq{<select id="$name" name="$name">}
+            . join( '', map { '<option value="' . h( $_->[0] ) . '"' . ( $_->[0] eq $value ? ' selected' : '' ) . '>' . h( $_->[1] ) . '</option>' } @opts )
+            . '</select>';
+    };
+    my $text = sub {
+        my ( $name, $value, $type, $placeholder ) = @_;
+        return qq{<input type="$type" id="$name" name="$name" value="} . h($value) . '"' . ( $placeholder ? ' placeholder="' . h($placeholder) . '"' : '' ) . '>';
+    };
+    my $d = $KohaEasy::Cataloguing::Vision::DEFAULTS{ $c->{provider} };
+    $body .= '<form method="post">'
+        . '<input type="hidden" name="csrf_token" value="' . h( csrf($cgi) ) . '">'
+        . '<label for="provider">' . h( $T{s_provider} ) . '</label>'
+        . $sel->( 'provider', $c->{provider}, map { [ $_, $T{"p_$_"} // $_ ] } @KohaEasy::Cataloguing::Vision::PROVIDERS )
+        . '<label for="url">' . h( $T{s_url} ) . '</label>' . $text->( 'url', $c->{url}, 'text', $d->{url} )
+        . '<p class="hint">Ollama: http://localhost:11434 &middot; LM Studio: http://localhost:1234/v1</p>'
+        . '<label for="model">' . h( $T{s_model} ) . '</label>' . $text->( 'model', $c->{model}, 'text', $d->{model} )
+        . '<label for="token">' . h( $T{s_token} ) . '</label>'
+        . '<input type="password" id="token" name="token" value="" autocomplete="new-password">'
+        . ( $c->{token} ne ''
+            ? '<p class="hint">' . h( $T{s_token_saved} ) . ' <input type="checkbox" id="token_clear" name="token_clear" value="1"> <label class="inline" for="token_clear">' . h( $T{s_token_clear} ) . '</label></p>'
+            : '' )
+        . '<label for="timeout">' . h( $T{s_timeout} ) . '</label>' . $text->( 'timeout', $c->{timeout}, 'number' )
+        . '<label for="max_px">' . h( $T{s_max_px} ) . '</label>' . $text->( 'max_px', $c->{max_px}, 'number' )
+        . '<label for="lang">' . h( $T{s_lang} ) . '</label>' . $sel->( 'lang', $c->{lang}, map { [ $_, $_ ] } qw( por eng spa ) )
+        . '<label for="org_code">' . h( $T{s_org} ) . '</label>' . $text->( 'org_code', $c->{org_code}, 'text' )
+        . '<label for="country">' . h( $T{s_country} ) . '</label>' . $text->( 'country', $c->{country}, 'text' )
+        . '<label for="table">' . h( $T{s_table} ) . '</label>'
+        . $sel->( 'table', $c->{table}, [ auto => $T{t_auto} ], [ pha => $T{table_pha} ], [ cutter => $T{table_cutter} ], [ none => $T{t_none} ] )
+        . '<label for="ddc_edition">' . h( $T{s_ddc_ed} ) . '</label>' . $text->( 'ddc_edition', $c->{ddc_edition}, 'text' )
+        . '<button type="submit" name="op" value="cud-vision-settings">' . h( $T{s_save} ) . '</button> '
+        . '<button type="submit" name="op" value="cud-vision-test">' . h( $T{s_test} ) . '</button>'
+        . '</form>';
+    render_page( $body, 'settings' );
+    return;
+}
+
+# Saves the settings, or tests them without saving. The token is never
+# shown again: an empty field keeps the saved one.
+sub do_settings {
+    my ( $cgi, $op ) = @_;
+    no warnings 'once';    # package variables of KohaEasy::Cataloguing::Vision
+    if ( !vision_ready() || !can_configure() ) {
+        render_settings( $cgi, err_box( $T{s_err_perm} ) );
+        return;
+    }
+    my $old = KohaEasy::Cataloguing::Vision::load_conf($VISION_CONF);
+    my %c;
+    for my $k (@KohaEasy::Cataloguing::Vision::CONF_KEYS) {
+        next if $k eq 'token';
+        my $v = $cgi->param($k) // '';
+        $v =~ s/[\x00-\x1F\x7F]+//g;
+        $v =~ s/^\s+|\s+$//g;
+        $c{$k} = substr( $v, 0, 300 );
+    }
+    # Switching the service: the address and model of the old one would be wrong.
+    @c{qw( url model )} = ( '', '' ) if $c{provider} ne $old->{provider} && $c{url} eq $old->{url} && $c{model} eq $old->{model};
+    my $token = $cgi->param('token') // '';
+    $token =~ s/\s+//g;
+    $c{token} = $token ne '' ? $token : $cgi->param('token_clear') ? '' : $old->{token};
+    my $conf = KohaEasy::Cataloguing::Vision::with_defaults( \%c );
+
+    my $problem = KohaEasy::Cataloguing::Vision::endpoint_problem($conf);
+    if ( $problem eq 'URL' || $problem eq 'TOKEN_PLAIN' ) {
+        render_settings( $cgi, err_box( $T{s_err_save} . ' ' . $T{"e_$problem"} ), $conf );
+        return;
+    }
+    if ( $op eq 'cud-vision-test' ) {
+        my ( $ok, $msg ) = KohaEasy::Cataloguing::Vision::check_connection($conf);
+        render_settings( $cgi, ( $ok ? '<div class="msg ok">' . h("$T{s_test_ok} $msg") . '</div>' : err_box("$T{s_test_fail} $msg") ), $conf );
+        return;
+    }
+    if ( !eval { KohaEasy::Cataloguing::Vision::save_conf( $VISION_CONF, $conf ); 1 } ) {
+        render_settings( $cgi, err_box( $T{s_err_save} . ' ' . short_error($@) ), $conf );
+        return;
+    }
+    render_settings( $cgi, '<div class="msg ok">' . h( $T{s_saved} ) . '</div>' . ( $problem ? warn_box( $T{"e_$problem"} ) : '' ) );
+    return;
+}
 MRPL2
+}
+
+# The two modules of the AI cataloguing tabs, installed in the Perl folder
+# of the site (KEI_PERL_DIR) next to the messaging modules.
+MR_PM_DIR="${KEI_PERL_DIR}/KohaEasy/Cataloguing"
+
+mr_pm_vision() {
+    cat <<'MRVISION'
+package KohaEasy::Cataloguing::Vision;
+
+# koha-easy-installer: AI-assisted cataloguing, step 1 (computer vision),
+# used by marc_replace.pl (tab "AI cataloguing").
+#
+# Sends the photos of a book (cover, title page, verso of the title page with
+# the CIP block) to a vision model and returns the bibliographic data it read,
+# checked against a fixed schema. Nothing here knows about Koha, MARC or the
+# cataloguing rules (KohaEasy::Cataloguing::Rules): photos in, plain data out.
+# The settings (vision.conf, readable by the Koha instance user only) are
+# written by the "AI settings" tab; no token ships with the panel.
+#
+# Providers:
+#   openai      OpenAI Chat Completions (https://api.openai.com/v1)
+#   anthropic   Anthropic Messages API (https://api.anthropic.com)
+#   ollama      Ollama native API, local (http://localhost:11434)
+#   compatible  any OpenAI-compatible server: LM Studio, vLLM, llama.cpp,
+#               LocalAI, OpenRouter... (http://localhost:1234/v1)
+#
+# Errors never die out of extract(): the caller always gets a hash, with
+# error_code / error when the model could not be used, so the cataloguer can
+# type the record by hand instead.
+
+use strict;
+use warnings;
+use utf8;
+use HTTP::Tiny;
+use JSON::PP;
+use MIME::Base64 qw( encode_base64 );
+use Time::HiRes qw( time );
+
+our $VERSION = '1';
+
+our %DEFAULTS = (
+    openai     => { url => 'https://api.openai.com/v1', model => 'gpt-4.1-mini' },
+    anthropic  => { url => 'https://api.anthropic.com', model => 'claude-sonnet-5' },
+    ollama     => { url => 'http://localhost:11434',    model => 'qwen2.5vl:7b' },
+    compatible => { url => 'http://localhost:1234/v1',  model => '' },
+);
+our @PROVIDERS = qw( openai anthropic ollama compatible );
+
+# Settings the page and the panel may write (key=value lines, see load_conf).
+our @CONF_KEYS = qw( provider url model token timeout max_px lang org_code table ddc_edition country );
+
+# Image roles, in the order they are shown to the model.
+our @ROLES = qw( cover title verso );
+
+# ----------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------
+
+# key=value lines; unknown keys are ignored. Missing file: empty settings.
+sub load_conf {
+    my ($path) = @_;
+    my %c;
+    if ( defined $path && open( my $fh, '<:encoding(UTF-8)', $path ) ) {
+        while ( my $line = <$fh> ) {
+            chomp $line;
+            next if $line =~ /^\s*(#|$)/;
+            my ( $k, $v ) = split /=/, $line, 2;
+            next unless defined $v && grep { $_ eq $k } @CONF_KEYS;
+            $c{$k} = $v;
+        }
+        close $fh;
+    }
+    return with_defaults( \%c );
+}
+
+# The settings with the provider defaults filled in (a new hash).
+sub with_defaults {
+    my ($in) = @_;
+    my %c = %{ $in || {} };
+    $c{provider} = 'openai' unless defined $c{provider} && grep { $_ eq $c{provider} } @PROVIDERS;
+    my $d = $DEFAULTS{ $c{provider} };
+    $c{url}   = $d->{url}   if !defined $c{url}   || $c{url} eq '';
+    $c{model} = $d->{model} if !defined $c{model} || $c{model} eq '';
+    $c{timeout}     = 120   unless ( $c{timeout} // '' ) =~ /^\d+$/ && $c{timeout} >= 5 && $c{timeout} <= 900;
+    $c{max_px}      = 1600  unless ( $c{max_px}  // '' ) =~ /^\d+$/ && $c{max_px} >= 512 && $c{max_px} <= 4096;
+    $c{lang}        = 'por' unless ( $c{lang}    // '' ) =~ /^[a-z]{3}$/;
+    $c{ddc_edition} = '23'  unless ( $c{ddc_edition} // '' ) =~ /^\d{1,2}$/;
+    $c{country}     = 'bl'  unless ( $c{country} // '' ) =~ /^[a-z]{2,3}$/;
+    $c{table}       = 'auto' unless ( $c{table}  // '' ) =~ /^(auto|pha|cutter|none)$/;
+    $c{$_} //= '' for qw( token org_code );
+    return \%c;
+}
+
+# Written atomically, readable by its owner only (it holds the API token).
+sub save_conf {
+    my ( $path, $c ) = @_;
+    my $tmp = "$path.tmp$$";
+    open( my $fh, '>:encoding(UTF-8)', $tmp ) or die "cannot write $tmp: $!\n";
+    chmod 0600, $tmp;
+    print {$fh} "# koha-easy-installer: AI cataloguing settings (marc_replace.pl / Library tools)\n";
+    for my $k (@CONF_KEYS) {
+        my $v = $c->{$k} // '';
+        $v =~ s/[\r\n]+//g;
+        print {$fh} "$k=$v\n";
+    }
+    close($fh) or die "cannot write $tmp: $!\n";
+    rename( $tmp, $path ) or die "cannot replace $path: $!\n";
+    return 1;
+}
+
+sub _is_local_host {
+    my ($host) = @_;
+    return 1 if $host =~ /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/;
+    return 1 if $host =~ /\.(local|lan|internal|home\.arpa)$/ || $host !~ /\./;
+    return 0;
+}
+
+# '' when the endpoint can be used, otherwise a code:
+#   URL          not an http(s) address
+#   TOKEN_PLAIN  a token would travel unencrypted to a host outside the LAN
+#   NO_TOKEN     the cloud providers need a token
+sub endpoint_problem {
+    my ($c) = @_;
+    my $url = $c->{url} // '';
+    return 'URL' unless $url =~ m{^(https?)://([A-Za-z0-9.-]+)(?::\d{1,5})?(?:/[^\s]*)?$};
+    my ( $scheme, $host ) = ( lc $1, lc $2 );
+    my $token = $c->{token} // '';
+    return 'TOKEN_PLAIN' if $scheme eq 'http' && $token ne '' && !_is_local_host($host);
+    return 'NO_TOKEN'    if $token eq '' && ( $c->{provider} eq 'anthropic' || ( $c->{provider} eq 'openai' && !_is_local_host($host) ) );
+    return '';
+}
+
+# Base address of each API (trailing slashes, and a /v1 the user may or may
+# not have typed, handled here once).
+sub _base {
+    my ($c) = @_;
+    my $u = $c->{url};
+    $u =~ s{/+$}{};
+    if ( $c->{provider} eq 'anthropic' ) { $u =~ s{/v1$}{}; return $u }
+    if ( $c->{provider} eq 'ollama' )    { $u =~ s{/(api|v1)$}{}; return $u }
+    $u .= '/v1' if $u =~ m{^https?://[^/]+$};    # OpenAI-compatible servers live under /v1
+    return $u;
+}
+
+# ----------------------------------------------------------------------
+# Images
+# ----------------------------------------------------------------------
+
+sub sniff_mime {
+    my ($b) = @_;
+    return 'image/jpeg' if substr( $b, 0, 3 ) eq "\xFF\xD8\xFF";
+    return 'image/png'  if substr( $b, 0, 8 ) eq "\x89PNG\r\n\x1A\n";
+    return 'image/webp' if substr( $b, 0, 4 ) eq 'RIFF' && substr( $b, 8, 4 ) eq 'WEBP';
+    return;
+}
+
+# EXIF orientation of a JPEG (1 = upright): phones store the photo sideways
+# and only record how to turn it.
+sub exif_orientation {
+    my ($b) = @_;
+    my $len = length $b;
+    return 1 unless $len > 4 && substr( $b, 0, 2 ) eq "\xFF\xD8";
+    my $pos = 2;
+    while ( $pos + 4 <= $len ) {
+        return 1 unless ord( substr( $b, $pos, 1 ) ) == 0xFF;
+        my $m = ord( substr( $b, $pos + 1, 1 ) );
+        return 1 if $m == 0xDA || $m == 0xD9;    # image data starts: no EXIF before it
+        my $seg = unpack( 'n', substr( $b, $pos + 2, 2 ) );
+        if ( $m == 0xE1 && substr( $b, $pos + 4, 6 ) eq "Exif\0\0" ) {
+            my $t  = $pos + 10;
+            my $le = substr( $b, $t, 2 ) eq 'II';
+            my $u16 = sub { return $_[0] + 2 <= $len ? unpack( $le ? 'v' : 'n', substr( $b, $_[0], 2 ) ) : 0 };
+            my $u32 = sub { return $_[0] + 4 <= $len ? unpack( $le ? 'V' : 'N', substr( $b, $_[0], 4 ) ) : 0 };
+            my $ifd = $t + $u32->( $t + 4 );
+            my $n   = $u16->($ifd);
+            for my $i ( 0 .. $n - 1 ) {
+                my $e = $ifd + 2 + 12 * $i;
+                last if $e + 12 > $len;
+                next unless $u16->($e) == 0x0112;
+                my $v = $u16->( $e + 8 );
+                return $v >= 1 && $v <= 8 ? $v : 1;
+            }
+            return 1;
+        }
+        $pos += 2 + $seg;
+    }
+    return 1;
+}
+
+# prepare_image(BYTES, MAX_PX): { mime, data, width, height, changed }.
+# Turned upright and reduced to MAX_PX on the longest side when GD (a
+# dependency of Koha) can read it; otherwise sent as it is. Dies with
+# "UNSUPPORTED" (not JPEG / PNG / WebP) or "TOO_LARGE".
+sub prepare_image {
+    my ( $bytes, $max_px ) = @_;
+    $max_px ||= 1600;
+    my $mime = sniff_mime( $bytes // '' ) or die "UNSUPPORTED\n";
+    my %out = ( mime => $mime, data => $bytes, width => 0, height => 0, changed => 0 );
+    my $orient = $mime eq 'image/jpeg' ? exif_orientation($bytes) : 1;
+    if ( eval { require GD; 1 } ) {
+        my $img = eval { GD::Image->trueColor(1); GD::Image->new($bytes) };
+        if ($img) {
+            my $turned = $orient == 3 ? $img->copyRotate180 : $orient == 6 ? $img->copyRotate90 : $orient == 8 ? $img->copyRotate270 : undef;
+            $img = $turned if $turned;
+            my ( $w, $h ) = $img->getBounds;
+            my $scale = ( $w > $h ? $w : $h ) > $max_px ? $max_px / ( $w > $h ? $w : $h ) : 1;
+            if ( $scale < 1 ) {
+                my ( $nw, $nh ) = ( int( $w * $scale + 0.5 ) || 1, int( $h * $scale + 0.5 ) || 1 );
+                my $small = GD::Image->new( $nw, $nh, 1 );
+                $small->copyResampled( $img, 0, 0, 0, 0, $nw, $nh, $w, $h );
+                ( $img, $w, $h ) = ( $small, $nw, $nh );
+            }
+            if ( $turned || $scale < 1 ) {
+                @out{qw( mime data changed )} = ( 'image/jpeg', $img->jpeg(85), 1 );
+            }
+            @out{qw( width height )} = ( $w, $h );
+        }
+    }
+    die "TOO_LARGE\n" if length( $out{data} ) > 15 * 1024 * 1024;
+    return \%out;
+}
+
+# ----------------------------------------------------------------------
+# The request
+# ----------------------------------------------------------------------
+
+my %LANG_NAME = ( por => 'Portuguese', eng => 'English', spa => 'Spanish', fre => 'French', ger => 'German', ita => 'Italian' );
+
+# The instructions: one JSON object with a fixed set of keys, null for
+# anything not legible, no invented digits.
+sub prompt_text {
+    my (%o) = @_;
+    my $lang = $LANG_NAME{ $o{lang} // 'por' } // 'Portuguese';
+    my $shown = $o{roles} && @{ $o{roles} } ? join( '; ', map { 'photo ' . ( $_ + 1 ) . ' = ' . _role_name( $o{roles}[$_] ) } 0 .. $#{ $o{roles} } ) : 'photos of the book';
+    return <<"PROMPT";
+You are a professional library cataloguer. The images show one printed book ($shown).
+Read them and answer with ONLY one JSON object (no Markdown, no comments) with exactly these keys:
+{
+  "title": "main title as printed on the title page (prefer the title page to the cover), without the subtitle",
+  "subtitle": "other title information, or null",
+  "responsibility": "statement of responsibility as printed on the title page, e.g. \\"Machado de Assis ; ilustrações de Ana Silva\\", or null",
+  "authors": [ { "name": "personal name inverted as Surname, Forename (AACR2; Portuguese names: last surname first, e.g. \\"Assis, Machado de\\"; Filho, Neto, Júnior and Sobrinho stay with the surname, e.g. \\"Andrade Filho, José de\\")", "role": "author | editor | translator | illustrator | other" } ],
+  "corporate": "corporate body responsible for the work, or null",
+  "edition": "edition statement as printed, e.g. \\"2. ed. rev.\\", or null",
+  "place": "place of publication (city), or null",
+  "publisher": "publisher in its shortest recognisable form, e.g. \\"Ática\\" for \\"Editora Ática S.A.\\", or null",
+  "year": "year of publication, 4 digits (the copyright year when no other is given), or null",
+  "isbn": [ "every ISBN printed, digits and X only" ],
+  "pages": "number of the last numbered page, or null",
+  "series": "series title and number, or null",
+  "language": "MARC 21 code of the language of the text, e.g. por, eng, spa",
+  "subjects": [ "up to 5 topical subject headings in $lang, most specific first" ],
+  "cip": { "present": true or false (a cataloguing-in-publication block, e.g. \\"Dados Internacionais de Catalogação na Publicação (CIP)\\", is visible), "ddc": "the CDD / DDC number printed in it, or null", "subjects": [ "the subjects printed in it, without their numbering" ], "cutter": "the author notation printed in it, or null" },
+  "ddc": "your own suggestion of a Dewey Decimal Classification number for this book, e.g. \\"869.3\\"",
+  "notes": "anything the cataloguer should check (unclear text, conflicting data), or null"
+}
+Rules: copy the text exactly as printed, keeping accents; never translate titles; capitalise titles as cataloguers do (first word and proper names only).
+Never invent: if something is not legible or not in the images, use null. Never guess ISBN digits.
+PROMPT
+}
+
+sub _role_name { my %n = ( cover => 'cover', title => 'title page', verso => 'verso of the title page / CIP' ); return $n{ $_[0] // '' } // 'photo' }
+
+sub _short {
+    my $s = shift // '';
+    $s =~ s/\s+/ /g;
+    return substr( $s, 0, 300 );
+}
+
+sub _http {
+    my ($c) = @_;
+    return HTTP::Tiny->new( timeout => $c->{timeout}, verify_SSL => 1, agent => "koha-easy-installer-vision/$VERSION" );
+}
+
+# (response, decoded JSON or undef)
+sub _call {
+    my ( $c, $method, $url, $headers, $body ) = @_;
+    my %req = ( headers => { %$headers, ( $body ? ( 'Content-Type' => 'application/json' ) : () ) } );
+    $req{content} = JSON::PP->new->utf8->canonical->encode($body) if $body;
+    my $res  = _http($c)->request( $method, $url, \%req );
+    my $data = eval { JSON::PP->new->utf8->decode( $res->{content} // '' ) };
+    return ( $res, $data );
+}
+
+# Error text from the usual JSON error bodies (OpenAI, Anthropic, Ollama).
+sub _api_error {
+    my ( $res, $data ) = @_;
+    if ( ref $data eq 'HASH' ) {
+        my $e = $data->{error};
+        return _short( $e->{message} ) if ref $e eq 'HASH' && defined $e->{message};
+        return _short($e) if defined $e && !ref $e;
+    }
+    return _short( $res->{status} == 599 ? $res->{content} : $res->{reason} );
+}
+
+sub _auth_headers {
+    my ($c) = @_;
+    return { 'x-api-key' => $c->{token}, 'anthropic-version' => '2023-06-01' } if $c->{provider} eq 'anthropic';
+    return $c->{token} ne '' ? { Authorization => "Bearer $c->{token}" } : {};
+}
+
+# Request body of each provider: the same instructions and photos.
+sub _request_body {
+    my ( $c, $prompt, $images ) = @_;
+    my $ask = 'Catalogue this book from the images. Answer with the JSON object only.';
+    if ( $c->{provider} eq 'anthropic' ) {
+        return {
+            model      => $c->{model},
+            max_tokens => 2000,
+            system     => $prompt,
+            messages   => [ { role => 'user', content => [
+                ( map { { type => 'image', source => { type => 'base64', media_type => $_->{mime}, data => encode_base64( $_->{data}, '' ) } } } @$images ),
+                { type => 'text', text => $ask } ] } ],
+        };
+    }
+    if ( $c->{provider} eq 'ollama' ) {
+        return {
+            model    => $c->{model},
+            stream   => JSON::PP::false,
+            format   => 'json',
+            options  => { temperature => 0 },
+            messages => [ { role => 'system', content => $prompt }, { role => 'user', content => $ask, images => [ map { encode_base64( $_->{data}, '' ) } @$images ] } ],
+        };
+    }
+    my %body = (
+        model    => $c->{model},
+        messages => [
+            { role => 'system', content => $prompt },
+            { role => 'user', content => [ { type => 'text', text => $ask },
+                map { { type => 'image_url', image_url => { url => "data:$_->{mime};base64," . encode_base64( $_->{data}, '' ) } } } @$images ] },
+        ],
+    );
+    if ( $c->{provider} eq 'openai' ) {
+        # JSON mode; newer OpenAI models take max_completion_tokens and only
+        # their default temperature.
+        $body{response_format}       = { type => 'json_object' };
+        $body{max_completion_tokens} = 4000;
+    } else {
+        $body{temperature} = 0;
+        $body{max_tokens}  = 2000;
+    }
+    return \%body;
+}
+
+sub _endpoint {
+    my ($c) = @_;
+    my $b = _base($c);
+    return "$b/v1/messages" if $c->{provider} eq 'anthropic';
+    return "$b/api/chat"    if $c->{provider} eq 'ollama';
+    return "$b/chat/completions";
+}
+
+# Text of the answer in each API's response.
+sub _reply_text {
+    my ( $c, $data ) = @_;
+    return '' unless ref $data eq 'HASH';
+    if ( $c->{provider} eq 'anthropic' ) {
+        return join '', map { $_->{text} // '' } grep { ref $_ eq 'HASH' && ( $_->{type} // '' ) eq 'text' } @{ $data->{content} || [] };
+    }
+    if ( $c->{provider} eq 'ollama' ) {
+        return ref $data->{message} eq 'HASH' ? $data->{message}{content} // '' : '';
+    }
+    my $m = ref $data->{choices} eq 'ARRAY' && ref $data->{choices}[0] eq 'HASH' ? $data->{choices}[0]{message} : undef;
+    return '' unless ref $m eq 'HASH';
+    return $m->{content} if defined $m->{content} && !ref $m->{content};
+    return join '', map { ref $_ eq 'HASH' ? $_->{text} // '' : '' } @{ ref $m->{content} eq 'ARRAY' ? $m->{content} : [] };
+}
+
+# ----------------------------------------------------------------------
+# The answer
+# ----------------------------------------------------------------------
+
+# The first complete {...} of the text (models sometimes wrap the object in
+# ```json fences or add a sentence around it). Dies "NO_JSON".
+sub parse_json_reply {
+    my ($text) = @_;
+    $text //= '';
+    my $start = index( $text, '{' );
+    die "NO_JSON\n" if $start < 0;
+    my ( $depth, $in_str, $esc ) = ( 0, 0, 0 );
+    for my $i ( $start .. length($text) - 1 ) {
+        my $ch = substr( $text, $i, 1 );
+        if ($in_str) {
+            if    ($esc)        { $esc = 0 }
+            elsif ( $ch eq '\\' ) { $esc = 1 }
+            elsif ( $ch eq '"' )  { $in_str = 0 }
+            next;
+        }
+        if    ( $ch eq '"' ) { $in_str = 1 }
+        elsif ( $ch eq '{' ) { $depth++ }
+        elsif ( $ch eq '}' && --$depth == 0 ) {
+            my $obj = eval { JSON::PP->new->relaxed->decode( substr( $text, $start, $i - $start + 1 ) ) };
+            die "NO_JSON\n" unless ref $obj eq 'HASH';
+            return $obj;
+        }
+    }
+    die "NO_JSON\n";
+}
+
+# A clean one-line string; placeholders for "nothing" become ''.
+sub _str {
+    my ( $v, $max ) = @_;
+    return '' if !defined $v || ref $v;
+    $v = "$v";
+    $v =~ s/[\x00-\x1F\x7F]+/ /g;
+    $v =~ s/\s+/ /g;
+    $v =~ s/^\s+|\s+$//g;
+    return '' if $v =~ m{^(?:null|none|nil|n/?a|unknown|not (?:visible|legible|found|available|given)|desconhecid[oa]|não (?:consta|identificad[oa]|legível|informad[oa])|s\.?\s?d\.?|-+|\?+)$}i;
+    return substr( $v, 0, $max || 300 );
+}
+
+sub _list {
+    my ( $v, $max, $n ) = @_;
+    my @in = ref $v eq 'ARRAY' ? @$v : defined $v && !ref $v ? split( /\s*(?:;|\n)\s*/, $v ) : ();
+    my ( %seen, @out );
+    for my $x (@in) {
+        my $s = _str( $x, $max );
+        push @out, $s if $s ne '' && !$seen{ lc $s }++;
+        last if @out >= ( $n || 10 );
+    }
+    return \@out;
+}
+
+# The model's object reduced to the fixed schema: every key present, strings
+# trimmed and bounded, lists deduplicated. Anything else is dropped.
+sub coerce {
+    my ($raw) = @_;
+    $raw = {} unless ref $raw eq 'HASH';
+    my %d = map { $_ => _str( $raw->{$_}, 300 ) } qw( title subtitle responsibility );
+    $d{$_} = _str( $raw->{$_}, 200 ) for qw( corporate series place publisher );
+    $d{edition}  = _str( $raw->{edition}, 100 );
+    $d{notes}    = _str( $raw->{notes}, 500 );
+    $d{year}     = _str( $raw->{year}, 20 );
+    $d{pages}    = _str( $raw->{pages}, 40 );
+    $d{ddc}      = _str( $raw->{ddc}, 20 );
+    $d{language} = lc _str( $raw->{language}, 3 );
+    $d{language} = '' unless $d{language} =~ /^[a-z]{3}$/;
+    $d{isbn}     = [ grep { /\d{9}/ } map { ( my $x = $_ ) =~ s/[^0-9Xx]//g; uc $x } @{ _list( $raw->{isbn}, 40, 4 ) } ];
+    $d{subjects} = _list( $raw->{subjects}, 120, 8 );
+
+    my @authors;
+    for my $a ( ref $raw->{authors} eq 'ARRAY' ? @{ $raw->{authors} } : defined $raw->{authors} ? ( $raw->{authors} ) : () ) {
+        my ( $name, $role ) = ref $a eq 'HASH' ? ( $a->{name}, $a->{role} ) : ( $a, 'author' );
+        $name = _str( $name, 150 );
+        next if $name eq '';
+        push @authors, { name => $name, role => lc _str( $role, 20 ) || 'author' };
+        last if @authors >= 12;
+    }
+    $d{authors} = \@authors;
+
+    my $cip = ref $raw->{cip} eq 'HASH' ? $raw->{cip} : {};
+    $d{cip} = {
+        present  => ( $cip->{present} && "$cip->{present}" !~ /^(false|0|no)$/i ) ? 1 : 0,
+        ddc      => _str( $cip->{ddc}, 20 ),
+        cutter   => _str( $cip->{cutter}, 20 ),
+        subjects => _list( $cip->{subjects}, 120, 8 ),
+    };
+    return \%d;
+}
+
+# Fields a cataloguer needs and the model could not read.
+sub missing_fields {
+    my ($d) = @_;
+    my @m;
+    push @m, 'title'     if $d->{title} eq '';
+    push @m, 'authors'   if !@{ $d->{authors} } && $d->{corporate} eq '';
+    push @m, $_ for grep { $d->{$_} eq '' } qw( publisher place year );
+    push @m, 'isbn'      if !@{ $d->{isbn} };
+    return \@m;
+}
+
+# ----------------------------------------------------------------------
+# Public calls
+# ----------------------------------------------------------------------
+
+# extract(CONF, [ { role, mime, data } ... ]) -> {
+#   ok, data (coerce), missing, raw (text of the answer), provider, model,
+#   seconds, error_code (CONFIG / UNREACHABLE / HTTP / EMPTY / NO_JSON), error }
+sub extract {
+    my ( $conf, $images ) = @_;
+    my $c = with_defaults($conf);
+    my %r = ( ok => 0, provider => $c->{provider}, model => $c->{model}, raw => '', error => '', error_code => '', seconds => 0 );
+    my $empty = coerce( {} );
+    ( $r{data}, $r{missing} ) = ( $empty, missing_fields($empty) );
+
+    if ( my $p = endpoint_problem($c) ) { @r{qw( error_code error )} = ( 'CONFIG', $p ); return \%r }
+    if ( !$images || !@$images )         { @r{qw( error_code error )} = ( 'CONFIG', 'NO_IMAGES' ); return \%r }
+
+    my $t0     = time;
+    my $prompt = prompt_text( lang => $c->{lang}, roles => [ map { $_->{role} } @$images ] );
+    my ( $res, $data ) = eval { _call( $c, 'POST', _endpoint($c), _auth_headers($c), _request_body( $c, $prompt, $images ) ) };
+    $r{seconds} = sprintf( '%.1f', time - $t0 );
+    if ( !$res ) { @r{qw( error_code error )} = ( 'UNREACHABLE', _short($@) ); return \%r }
+    if ( $res->{status} == 599 ) { @r{qw( error_code error )} = ( 'UNREACHABLE', _api_error( $res, $data ) ); return \%r }
+    if ( !$res->{success} ) { @r{qw( error_code error )} = ( 'HTTP', "HTTP $res->{status}: " . _api_error( $res, $data ) ); return \%r }
+
+    $r{raw} = _reply_text( $c, $data );
+    if ( $r{raw} !~ /\S/ ) { @r{qw( error_code error )} = ( 'EMPTY', '' ); return \%r }
+    my $obj = eval { parse_json_reply( $r{raw} ) };
+    if ( !$obj ) { @r{qw( error_code error )} = ( 'NO_JSON', _short( $r{raw} ) ); return \%r }
+
+    $r{data}    = coerce($obj);
+    $r{missing} = missing_fields( $r{data} );
+    $r{ok}      = 1;
+    return \%r;
+}
+
+# check_connection(CONF) -> ( ok, message ): lists the models of the server
+# and tells whether the configured one is among them.
+sub check_connection {
+    my ($conf) = @_;
+    my $c = with_defaults($conf);
+    if ( my $p = endpoint_problem($c) ) { return ( 0, $p ) }
+    my $b   = _base($c);
+    my $url = $c->{provider} eq 'anthropic' ? "$b/v1/models" : $c->{provider} eq 'ollama' ? "$b/api/tags" : "$b/models";
+    my ( $res, $data ) = _call( $c, 'GET', $url, _auth_headers($c) );
+    return ( 0, $res->{status} == 599 ? 'UNREACHABLE ' . _api_error( $res, $data ) : "HTTP $res->{status}: " . _api_error( $res, $data ) ) unless $res->{success};
+    my @ids = ref $data eq 'HASH'
+        ? ( $c->{provider} eq 'ollama' ? map { $_->{name} // '' } @{ $data->{models} || [] } : map { $_->{id} // '' } @{ $data->{data} || [] } )
+        : ();
+    my $m = $c->{model};
+    my $found = grep { $_ eq $m || ( $c->{provider} eq 'ollama' && $m !~ /:/ && $_ eq "$m:latest" ) } @ids;
+    return ( 1, sprintf( 'OK %s (%d models); %s: %s', $url, scalar @ids, $m, $found ? 'found' : 'NOT FOUND' ) );
+}
+
+1;
+MRVISION
+}
+
+mr_pm_rules() {
+    cat <<'MRRULES'
+package KohaEasy::Cataloguing::Rules;
+
+# koha-easy-installer: AI-assisted cataloguing, step 2 (the rules).
+#
+# Turns the data read by KohaEasy::Cataloguing::Vision into a MARC 21
+# record following the practice of Brazilian libraries (AACR2 and ISBD
+# punctuation, 260, "[S.l.]" / "[s.n.]"), with the author notation of the
+# library's own PHA or Cutter-Sanborn table and a CDD number.
+#
+# The author notation is a line-by-line port of the awk code of the panel
+# (cat_awk_lib and cat_notation in the installer, "Cataloguing aids"): the
+# same table file (CONF_DIR/tables/<kind>.tsv, "letter<TAB>key<TAB>number
+# <TAB>entry" sorted by letter and key) gives the same notation in the
+# terminal and in marc_replace.pl. Change both together.
+#
+# Nothing here talks to Koha or to the network: data in, record out.
+
+use strict;
+use warnings;
+use utf8;
+use MARC::Record;
+use MARC::Field;
+use POSIX qw( strftime );
+
+our $VERSION = '1';
+
+# ----------------------------------------------------------------------
+# Author notation (port of cat_awk_lib / cat_notation)
+# ----------------------------------------------------------------------
+
+sub trim { my $s = shift // ''; $s =~ s/^[ \t\r]+|[ \t\r]+$//g; return $s }
+
+sub unaccent {
+    my $s = shift // '';
+    $s =~ tr/áàâãäÁÀÂÃÄéèêëÉÈÊËíìîïÍÌÎÏóòôõöÓÒÔÕÖúùûüÚÙÛÜçÇñÑýÿÝ/aaaaaaaaaaeeeeeeeeiiiiiiiioooooooooouuuuuuuuccnnyyy/;
+    return $s;
+}
+
+# Name as the tables sort it: lower case, no accents, M' and Mc as Mac,
+# a prefix joined to the word after it, only letters and single spaces.
+sub name_key {
+    my $s = lc unaccent( trim(shift) );
+    if    ( $s =~ /^m'/ ) { $s = 'mac' . substr( $s, 2 ) }
+    elsif ( $s =~ /^mc/ ) { $s = 'mac' . substr( $s, 2 ) }
+    $s =~ s/[’']//g;
+    $s =~ s/[^a-z0-9 ]/ /g;
+    $s =~ s/  +/ /g;
+    $s = trim($s);
+    if ( $s =~ /^(van der|van den|van de|de la|de las|de los|von der|von) [a-z]/ ) { $s =~ s/ //; $s =~ s/ // }
+    elsif ( $s =~ /^(la|le|les|du|des|van|ten|ter|del|della|delle|di|da|de|dos|das|do|lo|el|al) [a-z]/ ) { $s =~ s/ // }
+    return $s;
+}
+
+# "Surname, Forename" -> key of the surname plus the forename.
+sub author_key {
+    my $s = shift // '';
+    my $p = index( $s, ',' );
+    return name_key($s) if $p < 0;
+    my $sur  = name_key( substr( $s, 0, $p ) );
+    my $fore = name_key( substr( $s, $p + 1 ) );
+    return $fore eq '' ? $sur : "$sur $fore";
+}
+
+sub is_article {
+    return ( $_[0] // '' ) =~ /^(o|a|os|as|um|uma|uns|umas|the|an|el|la|los|las|lo|le|les|un|une|il|gli|der|die|das|ein|eine)$/ ? 1 : 0;
+}
+
+# Title without its initial article (or without the first IND2 characters).
+sub title_rest {
+    my ( $t, $ind2 ) = @_;
+    $t = trim($t);
+    return trim( substr( $t, $ind2 ) ) if defined $ind2 && $ind2 =~ /^[1-9]$/;
+    return trim( substr( $t, 2 ) ) if lc($t) =~ /^l'/;
+    my $w = lc unaccent($t);
+    $w =~ s/[ \t].*//s;
+    return trim( substr( $t, index( $t, ' ' ) + 1 ) ) if is_article($w) && index( $t, ' ' ) >= 0;
+    return $t;
+}
+
+sub work_mark {
+    my ( $t, $ind2 ) = @_;
+    $t = lc unaccent( title_rest( $t, $ind2 ) );
+    $t =~ s/[^a-z0-9]//g;
+    my $c = substr( $t, 0, 1 );
+    return $c eq 'l' ? 'L' : $c;
+}
+
+# notation(TABLE_FILE, NAME, TITLE, IND2, MODE) -> { notation, entry,
+# number, prev, next } or { error => 2 (no table) | 3 (no letter) | 4 (no
+# entry for the letter) }. MODE: person (default), corporate (first word of
+# the name) or title (anonymous work: first word of the title, no mark).
+sub notation {
+    my ( $table, $name, $title, $ind2, $mode ) = @_;
+    $title //= '';
+    $mode ||= 'person';
+    return { error => 2 } unless defined $table && -s $table;
+    my ( $key, $mark );
+    if ( $mode eq 'title' ) {
+        $key = title_rest( $title, $ind2 );
+        $key =~ s/[ \t].*//s;
+        ( $key, $mark ) = ( name_key($key), '' );
+    } elsif ( $mode eq 'corporate' ) {
+        $key = $name // '';
+        $key =~ s/[ \t,].*//s;
+        ( $key, $mark ) = ( name_key($key), work_mark( $title, $ind2 ) );
+    } else {
+        ( $key, $mark ) = ( author_key($name), work_mark( $title, $ind2 ) );
+    }
+    my $L = substr( $key, 0, 1 );
+    return { error => 3 } unless $L =~ /[a-z]/;
+
+    open( my $fh, '<:encoding(UTF-8)', $table ) or return { error => 2 };
+    my ( $found, $hit, $ent, $prev, $next_n, $first, $firstent ) = ( 0, '', '', '', '', '', '' );
+    while ( my $line = <$fh> ) {
+        chomp $line;
+        my @f = split /\t/, $line, -1;
+        next unless @f >= 4 && $f[0] eq $L;
+        if ( $f[1] le $key ) { ( $prev, $hit, $ent, $next_n, $found ) = ( $hit, $f[2], $f[3], '', 1 ); next }
+        $next_n = $f[2] if $found && $next_n eq '';
+        ( $first, $firstent ) = ( $f[2], $f[3] ) if !$found && $first eq '';
+    }
+    close $fh;
+    if ( !$found ) {
+        return { error => 4 } if $first eq '';
+        ( $hit, $ent ) = ( $first, $firstent );
+    }
+    return { notation => uc($L) . $hit . $mark, entry => $ent, number => $hit, prev => $prev, next => $next_n };
+}
+
+# ----------------------------------------------------------------------
+# Names (AACR2 22.5: entry under the last surname; Portuguese compound
+# surnames Filho, Neto, Júnior and Sobrinho stay with it; the particles
+# de, da, do, dos, das and e go after the forename)
+# ----------------------------------------------------------------------
+
+sub invert_name {
+    my $n = shift // '';
+    $n =~ s/\s+/ /g;
+    $n = trim($n);
+    $n =~ s/[.,;:\s]+$// unless $n =~ /\b\p{Lu}\.$/;    # keep the full stop of an initial
+    if ( $n =~ /,/ ) {
+        my ( $sur, $fore ) = split /\s*,\s*/, $n, 2;
+        return $fore ne '' ? "$sur, $fore" : $sur;
+    }
+    my @w = split / /, $n;
+    return $n if @w < 2;
+    my $take = $w[-1] =~ /^(Filho|Neto|Netto|J[úu]nior|Jr\.?|Sobrinho|Segundo)$/i && @w >= 3 ? 2 : 1;
+    my @sur  = splice( @w, -$take );
+    return join( ' ', @sur ) . ', ' . join( ' ', @w );
+}
+
+# ----------------------------------------------------------------------
+# Numbers
+# ----------------------------------------------------------------------
+
+# CDD / DDC number as written in the schedules ("869.3"), or ''.
+sub ddc_normalise {
+    my $s = shift // '';
+    $s =~ s/^\s*(?:CDD|DDC|CDU)?[\s:.-]*//i;
+    return '' unless $s =~ /^[A-Z]?\s*(\d{3})(?:\s*\.\s*(\d+))?/i;
+    my ( $int, $dec ) = ( $1, $2 );
+    return defined $dec && $dec ne '' ? "$int.$dec" : $int;
+}
+
+# ( normalised, valid ): ISBN-10 or ISBN-13 with its check digit.
+sub isbn_check {
+    my $s = uc( shift // '' );
+    $s =~ s/[^0-9X]//g;
+    if ( $s =~ /^\d{9}[\dX]$/ ) {
+        my $sum = 0;
+        $sum += ( 10 - $_ ) * substr( $s, $_, 1 ) for 0 .. 8;
+        my $c = ( 11 - $sum % 11 ) % 11;
+        return ( $s, ( $c == 10 ? 'X' : $c ) eq substr( $s, 9, 1 ) ? 1 : 0 );
+    }
+    if ( $s =~ /^\d{13}$/ ) {
+        my $sum = 0;
+        $sum += substr( $s, $_, 1 ) * ( $_ % 2 ? 3 : 1 ) for 0 .. 11;
+        return ( $s, ( 10 - $sum % 10 ) % 10 == substr( $s, 12, 1 ) ? 1 : 0 );
+    }
+    return ( $s, 0 );
+}
+
+# Main classes of the DDC (first summary), in English; the page shows its
+# own translation.
+our @DDC_CLASSES = (
+    'Computer science, information and general works', 'Philosophy and psychology', 'Religion', 'Social sciences', 'Language',
+    'Science', 'Technology', 'Arts and recreation', 'Literature', 'History and geography',
+);
+
+# Caption of a number in the schedule loaded by the library (the longest
+# number of the schedule that starts the given one), or ''.
+sub ddc_caption {
+    my ( $table, $num ) = @_;
+    return ( '', '' ) unless defined $table && -s $table && $num ne '';
+    open( my $fh, '<:encoding(UTF-8)', $table ) or return ( '', '' );
+    my ( $best, $cap ) = ( '', '' );
+    while ( my $line = <$fh> ) {
+        chomp $line;
+        my ( $n, $c ) = split /\t/, $line, 2;
+        next unless defined $c && index( $num, $n ) == 0 && length($n) > length($best);
+        ( $best, $cap ) = ( $n, $c );
+    }
+    close $fh;
+    return ( $best, $cap );
+}
+
+# ----------------------------------------------------------------------
+# The record
+# ----------------------------------------------------------------------
+
+# Words of the language of cataloguing (040 $b): relators of added entries
+# (AACR2 abbreviations) and the ISBD placeholders.
+my %WORDS = (
+    por => { editor => 'org.', translator => 'trad.', illustrator => 'il.', sl => '[S.l.]', sn => '[s.n.]', sd => '[s.d.]', p => 'p.' },
+    spa => { editor => 'ed.',  translator => 'tr.',   illustrator => 'il.', sl => '[S.l.]', sn => '[s.n.]', sd => '[s.f.]', p => 'p.' },
+    eng => { editor => 'ed.',  translator => 'tr.',   illustrator => 'ill.', sl => '[S.l.]', sn => '[s.n.]', sd => '[n.d.]', p => 'p.' },
+);
+
+sub _words { return $WORDS{ $_[0] // 'por' } // $WORDS{por} }
+
+# Final punctuation of a MARC field: a full stop unless it already ends
+# with one (or with ?, !, - or a closing bracket after a stop).
+sub _stop {
+    my $s = trim(shift);
+    return $s if $s eq '' || $s =~ /[.?!]$/ || $s =~ /[.?!]["'”\])]$/ || $s =~ /-$/;
+    return "$s.";
+}
+
+sub _clean_value { my $s = trim(shift); $s =~ s/\|/\//g; $s =~ s/\s+/ /g; return $s }
+
+# Non-filing characters of a title (245 ind2): the initial article and
+# the space after it, or "L'" (2).
+sub nonfiling {
+    my $t = trim(shift);
+    return 2 if $t =~ /^[LlDd]'\S/;
+    my ($w) = $t =~ /^(\S+)\s/;
+    return 0 unless defined $w && is_article( lc unaccent($w) );
+    my $n = length($w) + 1;
+    return $n <= 9 ? $n : 0;
+}
+
+# 008 for a printed book (40 characters).
+sub field_008 {
+    my ( $year, $country, $lang, $today ) = @_;
+    my $date1 = defined $year && $year =~ /^(\d{4})$/ ? $1 : '';
+    my $v = ( $today // strftime( '%y%m%d', localtime ) ) . ( $date1 ne '' ? "s$date1    " : 'nuuuu    ' );
+    $v .= substr( ( $country || 'bl' ) . '   ', 0, 3 );
+    $v .= '    ' . ' ' . ' ' . '    ' . ' ' . '0' . '0' . '0' . ' ' . '0' . ' ';
+    $v .= substr( ( $lang || 'por' ) . '   ', 0, 3 ) . ' d';
+    return $v;
+}
+
+# build(DATA, OPTS) -> { record, report => [ [ rule, value, detail ] ],
+# warnings => [ ... ], notation, ddc, ddc_source }
+# DATA: the hash of Vision::coerce. OPTS: lang (cataloguing language),
+# country (008), org_code (040), ddc_edition, table (auto|pha|cutter|none),
+# table_dir (where the panel keeps pha.tsv, cutter.tsv and cdd.tsv),
+# today (yymmdd, for tests).
+sub build {
+    my ( $d, $o ) = @_;
+    $o ||= {};
+    my $lang = ( $o->{lang} // '' ) =~ /^[a-z]{3}$/ ? $o->{lang} : 'por';
+    my $w    = _words($lang);
+    my ( @report, @warn );
+    my $r = MARC::Record->new;
+    $r->leader('00000nam a2200000 a 4500');
+
+    my $title = _clean_value( $d->{title} );
+    $title =~ s/\s*[:\/;=.]+$//;
+    my $sub  = _clean_value( $d->{subtitle} );
+    $sub =~ s/\s*[:\/;=.]+$//;
+    my $resp = _clean_value( $d->{responsibility} );
+    $resp =~ s/\s*\.$//;
+    my $year = ( $d->{year} // '' ) =~ /(1[5-9]\d\d|20\d\d)/ ? $1 : '';
+    my $rec_lang = ( $d->{language} // '' ) =~ /^[a-z]{3}$/ ? $d->{language} : $lang;
+
+    $r->append_fields( MARC::Field->new( '008', field_008( $year, $o->{country}, $rec_lang, $o->{today} ) ) );
+
+    # 020: valid ISBNs in $a, the others in $z (for the cataloguer to check).
+    for my $isbn ( @{ $d->{isbn} || [] } ) {
+        my ( $n, $ok ) = isbn_check($isbn);
+        next if $n eq '';
+        $r->append_fields( MARC::Field->new( '020', ' ', ' ', ( $ok ? 'a' : 'z' ) => $n ) );
+        push @report, [ 'isbn', $n, $ok ? 'ok' : 'invalid' ];
+        push @warn, "ISBN $n: check digit" unless $ok;
+    }
+
+    if ( ( $o->{org_code} // '' ) =~ /^[A-Za-z0-9-]{2,20}$/ ) {
+        $r->append_fields( MARC::Field->new( '040', ' ', ' ', a => $o->{org_code}, b => $lang, c => $o->{org_code} ) );
+    }
+
+    # Main entry: the first author (role author), else a corporate body,
+    # else the title. Editors, translators and illustrators are added
+    # entries (AACR2 21.6, 21.7).
+    my @people = @{ $d->{authors} || [] };
+    my ($main) = grep { ( $_->{role} // 'author' ) eq 'author' } @people;
+    my $corporate = _clean_value( $d->{corporate} );
+    my ( $main_name, $mode ) = ( '', 'title' );
+    if ($main) {
+        $main_name = invert_name( _clean_value( $main->{name} ) );
+        $mode      = 'person';
+        $r->append_fields( MARC::Field->new( '100', '1', ' ', a => _stop($main_name) ) );
+    } elsif ( $corporate ne '' ) {
+        ( $main_name, $mode ) = ( $corporate, 'corporate' );
+        $r->append_fields( MARC::Field->new( '110', '2', ' ', a => _stop($corporate) ) );
+    }
+
+    # 245 with ISBD punctuation: $a Title :$b subtitle /$c responsibility.
+    my $ind2 = nonfiling($title);
+    my @sf245;
+    my @parts = ( [ a => $title ] );
+    push @parts, [ b => $sub ]  if $sub ne '';
+    push @parts, [ c => $resp ] if $resp ne '';
+    for my $i ( 0 .. $#parts ) {
+        my ( $code, $v ) = @{ $parts[$i] };
+        my $next = $i < $#parts ? $parts[ $i + 1 ][0] : '';
+        $v .= ' :' if $next eq 'b';
+        $v .= ' /' if $next eq 'c';
+        $v = _stop($v) if $next eq '';
+        push @sf245, $code, $v;
+    }
+    $r->append_fields( MARC::Field->new( '245', ( $mode eq 'title' ? '0' : '1' ), $ind2, @sf245 ) ) if $title ne '';
+    push @report, [ 'nonfiling', $ind2, '' ] if $ind2;
+
+    if ( ( my $ed = _clean_value( $d->{edition} ) ) ne '' ) {
+        $r->append_fields( MARC::Field->new( '250', ' ', ' ', a => _stop($ed) ) );
+    }
+
+    # 260 (AACR2): $a Place :$b Publisher,$c year.
+    my $place = _clean_value( $d->{place} );
+    my $publ  = _clean_value( $d->{publisher} );
+    push @warn, 'place' if $place eq '';
+    push @warn, 'publisher' if $publ eq '';
+    push @warn, 'year' if $year eq '';
+    $r->append_fields(
+        MARC::Field->new(
+            '260', ' ', ' ',
+            a => ( $place ne '' ? $place : $w->{sl} ) . ' :',
+            b => ( $publ ne '' ? $publ : $w->{sn} ) . ',',
+            c => _stop( $year ne '' ? $year : $w->{sd} )
+        )
+    );
+
+    if ( ( $d->{pages} // '' ) =~ /(\d+)/ ) {
+        my $p = $1;
+        my ($roman) = ( $d->{pages} =~ /\b([ivxlcdm]+)\s*,/i );
+        $r->append_fields( MARC::Field->new( '300', ' ', ' ', a => ( $roman ? lc($roman) . ', ' : '' ) . "$p $w->{p}" ) );
+    }
+
+    if ( ( my $series = _clean_value( $d->{series} ) ) ne '' ) {
+        $series =~ s/\s*\.$//;
+        $r->append_fields( MARC::Field->new( '490', '0', ' ', a => $series ) );
+    }
+
+    # Subjects: the CIP block of the book first, then the model's.
+    my @subjects = @{ ( $d->{cip} && @{ $d->{cip}{subjects} || [] } ) ? $d->{cip}{subjects} : $d->{subjects} || [] };
+    my %seen;
+    for my $s (@subjects) {
+        my $v = _clean_value($s);
+        $v =~ s/^\s*(?:\d+|[IVX]+)\s*[.)-]\s*//;    # "1. Poesia brasileira" in the CIP
+        $v =~ s/\s+(?:I|II|III|IV|V|VI)\.\s.*$//;    # "... I. Título. II. Série" of the CIP
+        $v =~ s/\s*[.;]+$//;
+        next if $v eq '' || $seen{ lc $v }++;
+        $r->append_fields( MARC::Field->new( '650', ' ', '4', a => _stop($v) ) );
+        last if keys %seen >= 6;
+    }
+
+    my @added = grep { !$main || $_ != $main } @people;
+    for my $p (@added) {
+        my $n = invert_name( _clean_value( $p->{name} ) );
+        next if $n eq '';
+        my $role = $w->{ $p->{role} // '' };
+        $r->append_fields( MARC::Field->new( '700', '1', ' ', ( $role ? ( a => "$n,", e => $role ) : ( a => _stop($n) ) ) ) );
+    }
+    $r->append_fields( MARC::Field->new( '710', '2', ' ', a => _stop($corporate) ) ) if $corporate ne '' && $mode ne 'corporate';
+
+    # CDD: the number printed in the CIP block, otherwise the model's.
+    my ( $ddc, $ddc_source ) = ( ddc_normalise( $d->{cip} ? $d->{cip}{ddc} : '' ), 'cip' );
+    ( $ddc, $ddc_source ) = ( ddc_normalise( $d->{ddc} ), 'model' ) if $ddc eq '';
+    $ddc_source = '' if $ddc eq '';
+    my $table_dir = $o->{table_dir} // '';
+    if ( $ddc ne '' ) {
+        my ( $n, $cap ) = ddc_caption( "$table_dir/cdd.tsv", $ddc );
+        my $class = $DDC_CLASSES[ substr( $ddc, 0, 1 ) ];
+        push @report, [ 'ddc', $ddc, $ddc_source, $cap ne '' ? "$n $cap" : substr( $ddc, 0, 1 ) . '00 ' . $class ];
+        push @warn, 'ddc_model' if $ddc_source eq 'model';
+        my $ed = ( $o->{ddc_edition} // '' ) =~ /^\d{1,2}$/ ? $o->{ddc_edition} : '23';
+        $r->append_fields( MARC::Field->new( '082', '0', '4', a => $ddc, 2 => $ed ) );
+    } else {
+        push @warn, 'ddc';
+    }
+
+    # Author notation with the table of the library.
+    my $kind = $o->{table} // 'auto';
+    if ( $kind eq 'auto' ) {
+        ($kind) = grep { -s "$table_dir/$_.tsv" } qw( pha cutter );
+        $kind //= 'none';
+    }
+    my $nota = '';
+    if ( $kind ne 'none' ) {
+        my $name = $mode eq 'title' ? $title : $main_name;
+        my $res  = notation( "$table_dir/$kind.tsv", $name, $title, $ind2, $mode );
+        if ( $res->{notation} ) {
+            $nota = $res->{notation};
+            push @report, [ 'notation', $nota, $kind, "$res->{entry} ($res->{number})" ];
+        } else {
+            push @warn, 'notation';
+        }
+    } else {
+        push @warn, 'no_table';
+    }
+    my $cip_cutter = _clean_value( $d->{cip} ? $d->{cip}{cutter} : '' );
+    push @report, [ 'cip_notation', $cip_cutter, '' ] if $cip_cutter ne '';
+    if ( $ddc ne '' || $nota ne '' ) {
+        $r->append_fields( MARC::Field->new( '090', ' ', ' ', ( $ddc ne '' ? ( a => $ddc ) : () ), ( $nota ne '' ? ( b => $nota ) : () ) ) );
+    }
+    $r->append_fields( MARC::Field->new( '942', ' ', ' ', 2 => 'ddc' ) ) if $ddc ne '';
+
+    # Fields in tag order (the order the cataloguers read them in).
+    my @sorted = sort { $a->tag cmp $b->tag } $r->fields;
+    $r->delete_fields( $r->fields );
+    $r->append_fields(@sorted);
+
+    return { record => $r, report => \@report, warnings => \@warn, notation => $nota, ddc => $ddc, ddc_source => $ddc_source };
+}
+
+# The record as the lines marc_replace.pl reads back (Biblioteca Nacional
+# style: "245 10 |a Title :|b subtitle"; "_" is a blank indicator).
+sub as_text {
+    my ($r) = @_;
+    my @l = ( '000    ' . $r->leader );
+    for my $f ( $r->fields ) {
+        if ( $f->is_control_field ) { push @l, $f->tag . '    ' . $f->data; next }
+        my $ind = join '', map { my $i = $f->indicator($_); $i eq ' ' ? '_' : $i } 1, 2;
+        push @l, $f->tag . " $ind " . join( '', map { "|$_->[0] " . _clean_value( $_->[1] ) } $f->subfields );
+    }
+    return join( "\n", @l ) . "\n";
+}
+
+1;
+MRRULES
 }
 
 # English texts of the page (translated with the panel).
@@ -9392,6 +10883,114 @@ mr_text() {
         undo_hint)     t "To undo, send that file here with the same biblionumber." ;;
         warnings)      t "Warnings:" ;;
         not_found)     t "This saved version does not exist." ;;
+        tab_replace)      t "Replace a record" ;;
+        tab_vision)       t "AI cataloguing" ;;
+        tab_settings)     t "AI settings" ;;
+        v_title)          t "Catalogue a book from photos (AI)" ;;
+        v_intro)          t "Photograph the cover, the title page and the verso of the title page (with the cataloguing-in-publication block, if the book has one). The AI model reads the photos, the cataloguing rules of the library are applied and you check everything before the record is saved. Nothing is saved without your confirmation." ;;
+        v_img_cover)      t "Cover" ;;
+        v_img_title)      t "Title page" ;;
+        v_img_verso)      t "Verso of the title page (CIP block)" ;;
+        v_img_hint)       t "JPEG, PNG or WebP photos. At least one; the title page gives the best results." ;;
+        v_bn)             t "Biblionumber of a record to replace (leave empty for a new record)" ;;
+        v_framework)      t "MARC framework of the new record" ;;
+        v_default_fw)     t "Default framework" ;;
+        v_read)           t "Read the photos" ;;
+        v_not_installed)  t "The AI cataloguing modules are not installed. Install or update this page in the panel (Library tools, Replace a MARC record)." ;;
+        v_no_conf)        t "The AI model is not configured yet. Someone allowed to change the system preferences must fill in the AI settings tab." ;;
+        v_draft)          t "Draft of the record" ;;
+        v_draft_hint)     t "Compare the record with the photos and correct it here: one field per line (245 10 |a Title). Item fields are never saved. Nothing is saved yet." ;;
+        v_photos)         t "Photos sent to the model" ;;
+        v_rules)          t "Cataloguing rules applied" ;;
+        v_missing)        t "Not read from the photos (check or type):" ;;
+        v_model_notes)    t "Notes of the model:" ;;
+        v_w_place)        t "Place of publication not read: [S.l.] was used." ;;
+        v_w_publisher)    t "Publisher not read: [s.n.] was used." ;;
+        v_w_year)         t "Year of publication not read: check field 260 and 008." ;;
+        v_w_ddc)          t "No CDD number: classify the book (fields 082 and 090)." ;;
+        v_w_ddc_model)    t "The CDD number is a suggestion of the model (the book has no CIP number): check it in the schedules." ;;
+        v_w_notation)     t "No author notation: the table has no entry for this letter." ;;
+        v_w_no_table)     t "No PHA or Cutter-Sanborn table is loaded, so there is no author notation (load one in the panel: Cataloguing aids)." ;;
+        v_w_isbn)         t "ISBN with a wrong check digit, kept in 020 z for checking:" ;;
+        f_title)          t "title" ;;
+        f_authors)        t "author" ;;
+        f_publisher)      t "publisher" ;;
+        f_place)          t "place" ;;
+        f_year)           t "year" ;;
+        f_isbn)           t "ISBN" ;;
+        r_isbn)           t "ISBN" ;;
+        r_ddc)            t "CDD" ;;
+        r_notation)       t "Author notation" ;;
+        r_cip_notation)   t "Author notation printed in the book" ;;
+        r_nonfiling)      t "Initial article left out of the filing (245, second indicator)" ;;
+        src_cip)          t "from the CIP block of the book" ;;
+        src_model)        t "suggested by the model" ;;
+        isbn_ok)          t "check digit correct" ;;
+        isbn_bad)         t "wrong check digit" ;;
+        v_new_confirm)    t "Add this record to the catalogue? A copy of it and of what the model read is saved with it." ;;
+        v_add)            t "Add to the catalogue" ;;
+        v_dups)           t "Records with the same ISBN already in the catalogue:" ;;
+        v_dup_ok)         t "Add it anyway (it is another record)" ;;
+        v_err_dup)        t "A record with the same ISBN is already in the catalogue. Nothing was added: tick the box if it really is another record." ;;
+        v_added)          t "Record added." ;;
+        v_twice)          t "This form was already sent: the record was added only once." ;;
+        v_err_busy)       t "Another record is being added right now. Nothing was added: try again in a moment." ;;
+        v_err_add)        t "Koha could not add the record. Nothing was changed:" ;;
+        v_err_image)      t "Photos must be JPEG, PNG or WebP files of up to 15 MB." ;;
+        v_err_noimg)      t "Choose at least one photo." ;;
+        v_err_model)      t "The AI model could not be used:" ;;
+        v_add_items)      t "Add items" ;;
+        v_edit)           t "Edit in the cataloguing editor of Koha" ;;
+        v_another)        t "Catalogue another book" ;;
+        e_URL)            t "the address of the model is not a valid http or https address." ;;
+        e_TOKEN_PLAIN)    t "a token cannot be sent without encryption (http) to a server outside the local network: use https." ;;
+        e_NO_TOKEN)       t "this service needs an API token." ;;
+        e_NO_IMAGES)      t "no photo was sent." ;;
+        e_UNREACHABLE)    t "the server did not answer:" ;;
+        e_HTTP)           t "the server refused the request:" ;;
+        e_EMPTY)          t "the model gave an empty answer." ;;
+        e_NO_JSON)        t "the answer of the model was not the expected data:" ;;
+        s_title)          t "Settings of the AI model" ;;
+        s_intro)          t "A vision model reads the photos: a cloud service with an API token (OpenAI, Anthropic or any OpenAI-compatible service) or a model on the library's own network (Ollama or LM Studio with a vision model, e.g. qwen2.5vl, llama3.2-vision or gemma3). The photos are sent only to the address below." ;;
+        s_perm)           t "Only staff allowed to change the system preferences can see and change these settings." ;;
+        s_provider)       t "Service" ;;
+        p_openai)         t "OpenAI (API token)" ;;
+        p_anthropic)      t "Anthropic Claude (API token)" ;;
+        p_ollama)         t "Ollama (local)" ;;
+        p_compatible)     t "OpenAI-compatible: LM Studio, vLLM, llama.cpp, OpenRouter" ;;
+        s_url)            t "Address (empty: the default of the service)" ;;
+        s_model)          t "Model (empty: the default of the service)" ;;
+        s_token)          t "API token (not needed for a local model)" ;;
+        s_token_saved)    t "A token is saved and is never shown. Leave the field empty to keep it." ;;
+        s_token_clear)    t "Remove the saved token" ;;
+        s_timeout)        t "Time limit of the model (seconds)" ;;
+        s_max_px)         t "Largest side of the photos sent (pixels)" ;;
+        s_lang)           t "Language of cataloguing (field 040 and the subjects)" ;;
+        s_org)            t "MARC code of the library for field 040 (optional)" ;;
+        s_country)        t "Country of publication for field 008 (MARC code, e.g. bl)" ;;
+        s_table)          t "Author notation table" ;;
+        t_auto)           t "Automatic (PHA, otherwise Cutter-Sanborn)" ;;
+        t_none)           t "None" ;;
+        s_ddc_ed)         t "CDD edition (field 082)" ;;
+        s_save)           t "Save the settings" ;;
+        s_test)           t "Test the connection" ;;
+        s_saved)          t "Settings saved." ;;
+        s_err_save)       t "The settings were not saved:" ;;
+        s_err_perm)       t "You are not allowed to change these settings." ;;
+        s_test_ok)        t "Connection OK:" ;;
+        s_test_fail)      t "Connection failed:" ;;
+        ddc0)             t "Computer science, information and general works" ;;
+        ddc1)             t "Philosophy and psychology" ;;
+        ddc2)             t "Religion" ;;
+        ddc3)             t "Social sciences" ;;
+        ddc4)             t "Language" ;;
+        ddc5)             t "Science" ;;
+        ddc6)             t "Technology" ;;
+        ddc7)             t "Arts and recreation" ;;
+        ddc8)             t "Literature" ;;
+        ddc9)             t "History and geography" ;;
+        table_pha)        t "PHA table (Heloísa de Almeida Prado)" ;;
+        table_cutter)     printf 'Cutter-Sanborn' ;;
     esac
 }
 
@@ -9467,9 +11066,13 @@ _lt_mr_install() {
     new="$TOOLS_WORK/marc_replace.pl"
     marc_replace_script > "$new"
     chmod 644 "$new"
+    mr_pm_vision > "$TOOLS_WORK/Vision.pm"
+    mr_pm_rules > "$TOOLS_WORK/Rules.pm"
+    chmod 644 "$TOOLS_WORK/Vision.pm" "$TOOLS_WORK/Rules.pm"
     display_explanation "Checking the page with the Perl modules of Koha..."
-    # Compiled as the instance user with Koha's libraries before it is installed.
-    if ! koha_exec "$log" perl-check /usr/bin/perl -c "$new"; then
+    # Compiled as the instance user with Koha's libraries before it is installed
+    # (the page loads the AI cataloguing modules only when their tabs are used).
+    if ! koha_exec "$log" perl-check /usr/bin/perl -c "$new"         || ! koha_exec "$log" perl-check /usr/bin/perl -c "$TOOLS_WORK/Vision.pm"         || ! koha_exec "$log" perl-check /usr/bin/perl -c "$TOOLS_WORK/Rules.pm"; then
         ui_textbox "$(t "Replace a MARC record")" "$log"
         msg_error "" "$(t 'The page does not compile with this version of Koha. Nothing was changed.\n\nLog: ${log}')" 11 74
         return 1
@@ -9487,7 +11090,7 @@ _lt_mr_install() {
         fi
         memcached_flush || true
     fi
-    install -o root -g root -m 755 "$new" "${MR_FILE}.new" && mv -f "${MR_FILE}.new" "$MR_FILE" || {
+    { mkdir -p "$MR_PM_DIR"         && install -o root -g root -m 644 "$TOOLS_WORK/Vision.pm" "$MR_PM_DIR/Vision.pm.new"         && install -o root -g root -m 644 "$TOOLS_WORK/Rules.pm" "$MR_PM_DIR/Rules.pm.new"         && mv -f "$MR_PM_DIR/Vision.pm.new" "$MR_PM_DIR/Vision.pm"         && mv -f "$MR_PM_DIR/Rules.pm.new" "$MR_PM_DIR/Rules.pm"         && install -o root -g root -m 755 "$new" "${MR_FILE}.new" && mv -f "${MR_FILE}.new" "$MR_FILE"; } || {
         msg_error "" "$(t "The page could not be installed. Nothing was changed.")" 8 64; return 1; }
     printf 'installed=%s\nlink=%s\n' "$(date +%F)" "$link" > "$MR_STATE"
     # Plack keeps compiled pages in memory: an updated page needs a restart.
@@ -9516,7 +11119,8 @@ _lt_mr_remove() {
         fi
         memcached_flush || true
     fi
-    rm -f "$MR_FILE" "$MR_STATE"
+    rm -f "$MR_FILE" "$MR_STATE" "$MR_PM_DIR/Vision.pm" "$MR_PM_DIR/Rules.pm"
+    rmdir "$MR_PM_DIR" 2>/dev/null || true
     plack_restart
     log "marc_replace: page removed"
     msg_ok "$(t "✔ The page was removed.")"

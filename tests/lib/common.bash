@@ -167,7 +167,7 @@ kei_reset_env() {
     rm -rf /usr/local/lib/site_perl/KohaEasy /usr/local/lib/site_perl/SMS/Send/KohaEasy /usr/local/lib/koha-easy-installer \
            /etc/koha/sites/library/kei-messaging.conf /var/lib/koha/library/kei-messaging /var/lib/koha/library/kei-marc-replace \
            /etc/koha-easy-install/messaging.state /etc/koha-easy-install/marc_replace.state /etc/koha-easy-install/tables \
-           "$KEI_S/koha" "$KEI_S/http.log" "$KEI_S/http-fail" "$KEI_S/tg-updates.json"
+           "$KEI_S/koha" "$KEI_S/http.log" "$KEI_S/http-fail" "$KEI_S/tg-updates.json" "$KEI_S/vision-reply.txt" "$KEI_S/vision-fail"
     rm -f /etc/systemd/system/koha-common.service.d/koha-easy-install.conf /etc/systemd/system/apache2.service.d/koha-easy-install.conf
     cp -f "$KEI_REPO/tests/mocks/koha-conf.xml" /etc/koha/sites/library/koha-conf.xml
     printf 'USE_INDEXER_DAEMON="yes"\n' > /etc/default/koha-common
@@ -360,7 +360,8 @@ INSERT INTO items (biblionumber, barcode, homebranch, itemcallnumber) VALUES (20
 SQL
 }
 
-# The WhatsApp / Telegram test double on 127.0.0.1:PORT (default 18080).
+# The WhatsApp / Telegram / vision model test double on 127.0.0.1:PORT
+# (default 18080).
 kei_http_mock_start() {
     local port="${1:-18080}" i
     kei_detached /usr/local/lib/kei-mock/http-mock "$port" "$KEI_S"

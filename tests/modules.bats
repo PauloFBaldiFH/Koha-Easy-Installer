@@ -247,15 +247,9 @@ EOF
     assert '[ "$(pre_backups)" = "0" ]' "a table is not a database change"
 }
 
-@test "C02 author notation follows the rules of the PHA explanation" {
-    mkdir -p /etc/koha-easy-install/tables
-    pha_rows > "$W/pha.txt"
-    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
-    local c
-    while IFS='|' read -r name title mode want; do
-        panel cat_notation pha "$name" "$title" "" "${mode:-person}"
-        assert '[ "$(cut -f1 <<< "$output")" = "$want" ]' "$name / $title: got $(cut -f1 <<< "$output"), want $want"
-    done <<'EOF'
+# Heading|title|mode|notation (the rules of the PHA explanation).
+notation_cases() {
+    cat <<'EOF'
 Lentino, Noêmia|Classificação decimal||L589c
 Libonato, José|Lendas do sul||L671L
 Sampaio, Francisco|O mar||S183m
@@ -273,6 +267,17 @@ Sampaio|Poemas||S183p
 Lent|Xadrez||L589x
 |Mil e uma noites|title|M672
 EOF
+}
+
+@test "C02 author notation follows the rules of the PHA explanation" {
+    mkdir -p /etc/koha-easy-install/tables
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    local c
+    while IFS='|' read -r name title mode want; do
+        panel cat_notation pha "$name" "$title" "" "${mode:-person}"
+        assert '[ "$(cut -f1 <<< "$output")" = "$want" ]' "$name / $title: got $(cut -f1 <<< "$output"), want $want"
+    done < <(notation_cases)
     panel cat_notation pha "Lentino, Noêmia" "Classificação decimal"
     assert '[ "$(cut -f2-5 <<< "$output")" = "$(printf "Lent\t589\t588\t59")" ]' "entry, number and neighbours: $output"
     panel cat_notation pha "123 Editora" "Livro"
@@ -497,7 +502,7 @@ XML
     assert 'cmp -s "$KS/biblio/7.xml" "$W/old7.xml"'
 }
 
-@test "R07 panel: the page is compiled with Koha's modules, installed read-only, linked in the Edit menu and removed cleanly" {
+@test "R07 panel: the page and its AI cataloguing modules are compiled with Koha's modules, installed read-only, linked in the Edit menu and removed cleanly" {
     export KOHA_INTRA_CGI="$W/cgi"
     mkdir -p "$W/cgi/tools"
     local js_before; js_before=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB" | md5sum)
@@ -507,6 +512,9 @@ XML
     assert '[ -f "$page" ] && [ "$(stat -c "%a %U" "$page")" = "755 root" ]' "$(ls -l "$page" 2>&1) $(dialogs | tail -2)"
     assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \"-c\" \".*marc_replace.pl\"" "$KEI_S/calls.log"' "compiled as the instance user first: $(calls)"
     assert '[ -d /var/lib/koha/library/kei-marc-replace ] && [ "$(pre_backups MARC-REPLACE)" = "1" ]'
+    assert '[ "$(stat -c "%a %U" "$PM/KohaEasy/Cataloguing/Vision.pm")" = "644 root" ] && [ -f "$PM/KohaEasy/Cataloguing/Rules.pm" ]' "AI cataloguing modules installed"
+    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \"-c\" \".*Vision.pm\"" "$KEI_S/calls.log" && grep -q "koha-shell library -c \"/usr/bin/perl\" \"-c\" \".*Rules.pm\"" "$KEI_S/calls.log"' "modules compiled first"
+    assert 'perl -I "$PM" -MKohaEasy::Cataloguing::Vision -MKohaEasy::Cataloguing::Rules -e 1' "the modules load"
     local js; js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
     assert '[[ "$js" == "/* the library'"'"'s own code */"$'"'"'\n'"'"'"\$(document).ready(function () { var re = /a\\b/; });"* ]]' "the library code is kept as it was: $js"
     assert 'grep -q "tools/marc_replace.pl?biblionumber=" <<< "$js" && grep -q "Replace the record (MARC file)" <<< "$js"'
@@ -516,7 +524,7 @@ XML
     assert '[ "$(grep -c "marc_replace begin" <<< "$js")" = "1" ] && grep -q "^koha-plack --restart library" "$KEI_S/calls.log"' "updated once, Plack restarted"
     answer yes
     panel lt_mr_remove
-    assert '[ ! -e "$page" ] && [ -d /var/lib/koha/library/kei-marc-replace ]'
+    assert '[ ! -e "$page" ] && [ -d /var/lib/koha/library/kei-marc-replace ] && [ ! -e "$PM/KohaEasy/Cataloguing" ]'
     assert '[ "$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = '"'"'IntranetUserJS'"'"';" "$DB" | md5sum)" = "$js_before" ]' "IntranetUserJS back to the original"
 }
 
@@ -527,6 +535,183 @@ XML
     answer no
     panel lt_mr_install
     assert 'dialogs | grep -q "does not compile" && [ ! -e "$W/cgi/tools/marc_replace.pl" ] && [ "$(pre_backups)" = "0" ]' "$(dialogs | tail -2)"
+}
+
+# --- marc_replace.pl: AI cataloguing ------------------------------------------------
+
+VD=/var/lib/koha/library/kei-marc-replace
+# The page and its two modules (in $W/lib, as the site Perl folder), the PHA
+# table of the cataloguing aids and a vision model on the HTTP double.
+vision_setup() {
+    mr_setup
+    mkdir -p "$W/lib/KohaEasy/Cataloguing" /etc/koha-easy-install/tables
+    "$KEI_SH" "$PANEL" mr_pm_vision > "$W/lib/KohaEasy/Cataloguing/Vision.pm"
+    "$KEI_SH" "$PANEL" mr_pm_rules > "$W/lib/KohaEasy/Cataloguing/Rules.pm"
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    kei_http_mock_start
+    printf 'provider=compatible\nurl=http://127.0.0.1:18080/v1\nmodel=vision-test\ntoken=sk-local-123\norg_code=BR-XxBIB\n' > "$VD/vision.conf"
+    perl -MGD -e '$i = GD::Image->new(2400, 1600, 1); $i->filledRectangle(0, 0, 2399, 1599, $i->colorAllocate(200, 50, 50)); open F, ">", shift; binmode F; print F $i->jpeg(80)' "$W/titlepage.jpg"
+    cat > "$KEI_S/vision-reply.txt" <<'JSON'
+Here is the record:
+```json
+{"title": "Dom Casmurro", "subtitle": "romance", "responsibility": "Machado de Assis ; ilustrações de <b>Ana</b> Silva",
+ "authors": [{"name": "Machado de Assis", "role": "author"}, {"name": "Ana Silva", "role": "illustrator"}],
+ "corporate": null, "edition": "2. ed", "place": "São Paulo", "publisher": "Ática", "year": "1997",
+ "isbn": ["978-85-359-0277-8", "85-08-00000-1"], "pages": "256", "series": "N/A", "language": "por",
+ "subjects": ["Romance brasileiro"], "cip": {"present": true, "ddc": "869.3", "subjects": ["1. Ficção brasileira. I. Título."], "cutter": "A848d"},
+ "ddc": "B869.35", "notes": "<script>alert(1)</script>"}
+```
+JSON
+}
+vcgi() { run env PERL5LIB="$KEI_REPO/tests/mocks/perl5:$W/lib" "$KEI_REPO/tests/lib/cgi-run" "$W/marc_replace.pl" "$@"; }
+draft_text() { python3 -c 'import html, re, sys; print(html.unescape(re.search(r"<textarea[^>]*>(.*?)</textarea>", sys.stdin.read(), re.S).group(1)), end="")' <<< "$output"; }
+# Photos -> draft -> preview; leaves the preview in $output.
+vision_preview() {
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg" itemtype=LIVRO frameworkcode=FA
+    local text ext
+    text=$(draft_text)$'\n952 __ |a CPL |p 123'; ext=$(field extraction)
+    vcgi POST op=cud-vision-preview csrf_token=tok-SESSID1 "marctext=$text" itemtype=LIVRO frameworkcode=FA "extraction=$ext"
+}
+
+@test "V01 AI cataloguing tab: CSRF form for the photos, frameworks and item types of Koha escaped; without the modules or the settings it says so" {
+    vision_setup
+    vcgi GET op=vision
+    assert '[ "$(field csrf_token)" = "tok-SESSID1" ] && [ "$(field op)" = "cud-vision" ]' "$output"
+    assert 'grep -q "name=\"img_cover\"" <<< "$output" && grep -q "name=\"img_title\"" <<< "$output" && grep -q "name=\"img_verso\"" <<< "$output"'
+    assert 'grep -q "Seriados &lt;i&gt; (SER)" <<< "$output" && grep -q "Revista &lt;b&gt; (REV)" <<< "$output"' "frameworks and item types escaped"
+    assert 'grep -q "class=\"on\">AI cataloguing" <<< "$output" && ! grep -q "not configured yet" <<< "$output"'
+    rm -f "$VD/vision.conf"
+    vcgi GET op=vision
+    assert 'grep -q "The AI model is not configured yet" <<< "$output"'
+    cgi GET op=vision
+    assert 'grep -q "The AI cataloguing modules are not installed" <<< "$output" && ! grep -q "img_cover" <<< "$output"' "page without the modules"
+    cgi GET biblionumber=7
+    assert '[ "$(field op)" = "cud-preview" ] && grep -q "Replace a record" <<< "$output"' "the replacement is unchanged"
+}
+
+@test "V02 photos to the model: JSON read, national rules applied (PHA notation, CDD of the CIP, AACR2), draft escaped, nothing saved" {
+    vision_setup
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg" itemtype=LIVRO frameworkcode=FA
+    local req; req=$(grep chat/completions "$KEI_S/http.log")
+    assert 'grep -q "\"authorization\": \"Bearer sk-local-123\"" <<< "$req" && grep -q "\"model\": \"vision-test\"" <<< "$req" && grep -q "photo 1 = title page" <<< "$req"' "$req"
+    local text; text=$(draft_text)
+    assert 'grep -qx "100 1_ |a Assis, Machado de." <<< "$text"' "name inverted: $text"
+    assert 'grep -qx "245 10 |a Dom Casmurro :|b romance /|c Machado de Assis ; ilustrações de <b>Ana</b> Silva." <<< "$text"' "ISBD punctuation"
+    assert 'grep -qx "260 __ |a São Paulo :|b Ática,|c 1997." <<< "$text" && grep -qx "250 __ |a 2. ed." <<< "$text" && grep -qx "300 __ |a 256 p." <<< "$text"'
+    assert 'grep -qx "082 04 |a 869.3|2 23" <<< "$text" && grep -qx "090 __ |a 869.3|b A176d" <<< "$text"' "CDD of the CIP, PHA notation of the table (the panel gives $(panel cat_notation pha "Assis, Machado de" "Dom Casmurro"; cut -f1 <<< "$output"))"
+    assert 'grep -qx "020 __ |a 9788535902778" <<< "$text" && grep -qx "020 __ |z 8508000001" <<< "$text"' "valid ISBN in a, wrong check digit in z"
+    assert 'grep -qx "650 _4 |a Ficção brasileira." <<< "$text" && grep -qx "700 1_ |a Silva, Ana,|e il." <<< "$text" && grep -qx "040 __ |a BR-XxBIB|b por|c BR-XxBIB" <<< "$text"'
+    assert '! grep -q "^490" <<< "$text"' "placeholders such as N/A are dropped"
+    assert '! grep -q "<script>" <<< "$output" && ! grep -q "<b>Ana" <<< "$output" && grep -q "&lt;script&gt;" <<< "$output"' "model text escaped"
+    assert 'grep -q "from the CIP block of the book" <<< "$output" && grep -q "wrong check digit" <<< "$output" && grep -q "<img src=\"data:image/jpeg;base64," <<< "$output"'
+    assert '[ "$(field op)" = "cud-vision-preview" ] && [ "$(field frameworkcode)" = "FA" ] && [ -n "$(field extraction)" ]'
+    assert '! grep -q "AddBiblio\|ModBiblio" "$KS/calls.log" && [ ! -e "$VD/vision" ]' "nothing saved by the draft"
+    printf 'not a photo' > "$W/bad.jpg"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_cover=@$W/bad.jpg"
+    assert 'grep -q "Photos must be JPEG, PNG or WebP" <<< "$output"'
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1
+    assert 'grep -q "Choose at least one photo" <<< "$output"'
+    touch "$KEI_S/vision-fail"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg"
+    assert 'grep -q "The AI model could not be used: the server refused the request: HTTP 500: model crashed" <<< "$output"' "$output"
+    rm -f "$KEI_S/vision-fail"; printf 'Sorry, I cannot read it.' > "$KEI_S/vision-reply.txt"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg"
+    assert 'grep -q "was not the expected data: Sorry, I cannot read it." <<< "$output"'
+}
+
+@test "V03 mandatory preview, then one atomic insertion: lock, ISBN check, AddBiblio and the copy in one transaction; a second send adds nothing" {
+    vision_setup
+    vision_preview
+    assert 'grep -q "Item fields found in the file and left out: 1" <<< "$output" && grep -q "942    _2ddc" <<< "$output" && grep -q "_cLIVRO" <<< "$output"' "$output"
+    assert '[ "$(field op)" = "cud-vision-add" ] && [ -n "$(field record)" ] && [[ "$(field nonce)" =~ ^[0-9a-f]{40}$ ]] && ! grep -q allow_dup <<< "$output"'
+    assert '! grep -q AddBiblio "$KS/calls.log"' "the preview adds nothing"
+    local rec nonce ext
+    rec=$(field record); nonce=$(field nonce); ext=$(field extraction)
+    : > "$KS/calls.log"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" frameworkcode=FA "nonce=$nonce" "extraction=$ext"
+    assert 'grep -q "Record added. (8)" <<< "$output" && grep -q "additem.pl?biblionumber=8" <<< "$output"' "$output"
+    assert '[ "$(tr "\n" "|" < "$KS/calls.log")" = "checkauth intranet editcatalogue=edit_catalogue|get-lock kei_marc_replace_vision|txn-begin|select-isbn 9788535902778|select-isbn 8508000001|AddBiblio 8 fw=FA tags=008,020,020,040,082,090,100,245,250,260,300,650,700,942|txn-commit|release-lock kei_marc_replace_vision|" ]' "$(cat "$KS/calls.log")"
+    assert '! grep -q "tag=\"952\"" "$KS/biblio/8.xml" && grep -q "Dom Casmurro" "$KS/biblio/8.xml"'
+    assert 'cmp -s "$KS/biblio/8.xml" $VD/vision/8-*.xml && grep -q "\"model\":\"vision-test\"" $VD/vision/8-*.json && [ "$(stat -c %a $VD/vision/8-*.xml)" = "640" ]' "copy of the record and of the model's answer"
+    assert '! grep -rq "sk-local-123" $VD/vision' "the token is not in the copies"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" frameworkcode=FA "nonce=$nonce" "extraction=$ext"
+    assert 'grep -q "This form was already sent" <<< "$output" && [ ! -e "$KS/biblio/9.xml" ] && [ "$(grep -c AddBiblio "$KS/calls.log")" = "1" ]' "$output"
+}
+
+@test "V04 refused without any write: wrong token, same ISBN already in the catalogue, lock busy, AddBiblio failing" {
+    vision_setup
+    vision_preview
+    local rec; rec=$(field record)
+    vcgi POST op=cud-vision-add csrf_token=tok-OTHER "record=$rec" "nonce=$(field nonce)"
+    assert 'grep -q "Invalid or expired security token" <<< "$output" && [ ! -e "$KS/biblio/8.xml" ]'
+    touch "$KS/lock.busy"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" "nonce=$(printf a%.0s {1..40})"
+    assert 'grep -q "Another record is being added right now" <<< "$output" && ! grep -q txn-begin "$KS/calls.log"'
+    rm -f "$KS/lock.busy"; touch "$KS/addbiblio.fail"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" "nonce=$(printf b%.0s {1..40})"
+    assert 'grep -q "Koha could not add the record" <<< "$output" && grep -q txn-rollback "$KS/calls.log" && [ -z "$(ls $VD/vision)" ]' "$output"
+    rm -f "$KS/addbiblio.fail"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" "nonce=$(printf c%.0s {1..40})"
+    assert 'grep -q "Record added. (8)" <<< "$output"'
+    vision_preview
+    assert 'grep -q "Records with the same ISBN already in the catalogue" <<< "$output" && grep -q "detail.pl?biblionumber=8" <<< "$output" && grep -q "name=\"allow_dup\"" <<< "$output"' "$output"
+    rec=$(field record)
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" "nonce=$(field nonce)"
+    assert 'grep -q "A record with the same ISBN is already in the catalogue" <<< "$output" && [ ! -e "$KS/biblio/9.xml" ]'
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$rec" "nonce=$(printf d%.0s {1..40})" allow_dup=1
+    assert 'grep -q "Record added. (9)" <<< "$output"'
+}
+
+@test "V05 a biblionumber sends the draft to the replacement, with its own preview, lock and saved version" {
+    vision_setup
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg" biblionumber=7
+    assert '[ "$(field op)" = "cud-preview" ] && [ "$(field biblionumber)" = "7" ]' "$output"
+    local text; text=$(draft_text)
+    vcgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marctext=$text"
+    assert 'grep -q "Items of the record (kept as they are): 3" <<< "$output" && [ "$(field op)" = "cud-replace" ]' "$output"
+    local asked; asked=$(grep -c chat/completions "$KEI_S/http.log")
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg" biblionumber=99
+    assert 'grep -q "There is no record with this biblionumber" <<< "$output" && [ "$(grep -c chat/completions "$KEI_S/http.log")" = "$asked" ]' "the model is not asked"
+}
+
+@test "V06 AI settings: only with the system preferences permission; the token is never shown, kept, removed or refused over plain http" {
+    vision_setup
+    vcgi GET op=vision-settings
+    assert 'grep -q "name=\"provider\"" <<< "$output" && grep -q "A token is saved" <<< "$output" && ! grep -q "sk-local-123" <<< "$output"' "$output"
+    assert 'grep -qx "haspermission librarian parameters=manage_sysprefs" <(grep haspermission "$KS/calls.log" | tail -1)'
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=compatible url=http://127.0.0.1:18080/v1 model=vision-test token= timeout=60 max_px=1200 lang=por table=pha ddc_edition=22 country=bl org_code=
+    assert 'grep -q "Settings saved" <<< "$output" && grep -qx "token=sk-local-123" "$VD/vision.conf" && grep -qx "ddc_edition=22" "$VD/vision.conf" && [ "$(stat -c %a "$VD/vision.conf")" = "600" ]' "$output"
+    vcgi POST op=cud-vision-test csrf_token=tok-SESSID1 provider=compatible url=http://127.0.0.1:18080/v1 model=vision-test token=
+    assert 'grep -q "Connection OK: OK http://127.0.0.1:18080/v1/models (2 models); vision-test: found" <<< "$output"' "$output"
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=openai url=http://ai.example.com/v1 model=x token=sk-new
+    assert 'grep -q "cannot be sent without encryption" <<< "$output" && grep -qx "token=sk-local-123" "$VD/vision.conf"' "not saved"
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=ollama url=http://127.0.0.1:18080 model=qwen2.5vl:7b token= token_clear=1
+    assert 'grep -qx "token=" "$VD/vision.conf" && grep -qx "provider=ollama" "$VD/vision.conf"'
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg"
+    assert 'grep -q "^{\"path\": \"/api/chat\", \"authorization\": null" <<< "$(tail -n1 "$KEI_S/http.log")" && grep -qx "100 1_ |a Assis, Machado de." <<< "$(draft_text)"' "local Ollama without a token"
+    vcgi POST op=cud-vision-settings csrf_token=tok-OTHER provider=openai token=sk-evil
+    assert 'grep -q "Invalid or expired security token" <<< "$output" && grep -qx "provider=ollama" "$VD/vision.conf"'
+    touch "$KS/noconfig"
+    vcgi GET op=vision-settings
+    assert 'grep -q "Only staff allowed to change the system preferences" <<< "$output" && ! grep -q "name=\"provider\"" <<< "$output"'
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=openai token=sk-evil
+    assert 'grep -q "You are not allowed to change these settings" <<< "$output" && grep -qx "provider=ollama" "$VD/vision.conf"'
+}
+
+@test "V07 the author notation of the page is the notation of the panel (same table, same rules)" {
+    mkdir -p /etc/koha-easy-install/tables "$W/lib/KohaEasy/Cataloguing"
+    "$KEI_SH" "$PANEL" mr_pm_rules > "$W/lib/KohaEasy/Cataloguing/Rules.pm"
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    local name title mode want got
+    while IFS='|' read -r name title mode want; do
+        got=$(perl -I "$W/lib" -MKohaEasy::Cataloguing::Rules -CA -e 'my $r = KohaEasy::Cataloguing::Rules::notation(@ARGV); print $r->{notation} // "error $r->{error}"' \
+            /etc/koha-easy-install/tables/pha.tsv "$name" "$title" "" "${mode:-person}")
+        assert '[ "$got" = "$want" ]' "$name / $title: got $got, want $want"
+    done < <(notation_cases)
+    got=$(perl -I "$W/lib" -MKohaEasy::Cataloguing::Rules -CSA -e 'print join "|", map { KohaEasy::Cataloguing::Rules::invert_name($_) } @ARGV' "Machado de Assis" "José de Andrade Filho" "Assis, Machado de" "Érico Veríssimo" "Platão")
+    assert '[ "$got" = "Assis, Machado de|Andrade Filho, José de|Assis, Machado de|Veríssimo, Érico|Platão" ]' "$got"
 }
 
 # --- Opt-in ------------------------------------------------------------------------
