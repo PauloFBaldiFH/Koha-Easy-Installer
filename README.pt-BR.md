@@ -21,6 +21,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 - **Restauração segura** de backups `.sql` / `.sql.gz`: o arquivo é verificado (teste do gzip, mysqldump completo, tabelas do Koha) e importado antes em um banco temporário; o catálogo atual só é substituído depois de existir uma cópia de segurança verificada, volta automaticamente se algo falhar, e a restauração não fica pela metade por causa de um CTRL+C ou de uma queda da conexão SSH.
 - **Motor de busca**: troca entre Zebra e Elasticsearch 7, vigia (watchdog) do indexador e ferramentas de reparo/reconstrução.
 - **Publicação na internet**: Túnel Cloudflare (sem abrir portas), certificado SSL gratuito (Certbot) e assistente do Google Search Console.
+- **Autorização por QR code**: quando o Cloudflare ou o Google Drive pedem para autorizar o servidor, o painel deixa você escolher como abrir a página. O Cloudflare oferece um QR code para ler com o celular, o navegador deste computador (o navegador do Windows no WSL) ou um link para copiar. O Google Drive oferece o navegador ou o link: o Google só volta ao computador que executa o rclone, então o celular não conclui esse login, e em um servidor sem tela o painel explica o túnel SSH. O token do Google nunca aparece na tela.
 - **Diagnóstico**: verificação completa com relatório detalhado, status do servidor, logs do Apache em tempo real e manutenção profunda do banco.
 - **Segurança**: Fail2ban, firewall UFW (com opção de restringir a porta 8080 do Staff) e troca da senha do banco de dados.
 - **Configurações do Koha**: perfis de dimensionamento, avisos por e-mail (agenda do próprio Koha, ativada com `koha-email-enable`), criação de superbibliotecário, SIP2 e Z39.50, relógio e fuso horário.
@@ -28,6 +29,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 - **Brasil: localização e migração** (opcional, nunca aplicado pela instalação nem por agendamento): migração MARC do Biblivre, SophiA e Pergamum (conversão para UTF-8, exemplares levados para o 952 do Koha), planilhas do acervo (Biblioteca Fácil), planilhas de leitores do sistema antigo com verificação do CPF, auditoria de CPF (módulo 11), modelos de etiquetas Pimaco, ficha catalográfica e feriados brasileiros no calendário do Koha (veja [Brasil: localização e migração](#brasil-localização-e-migração)).
 - **Mensagens: WhatsApp e Telegram** (opcional): os próprios avisos do Koha (empréstimo, devolução, atraso, vencimento, reserva) entregues por um gateway de WhatsApp próprio (Evolution API ou similar) ou por um bot do Telegram, com os números dos leitores completados e corrigidos no caminho (veja [Mensagens](#mensagens-whatsapp-e-telegram)).
 - **Auxílio à catalogação**: notação de autor com a tabela PHA ou Cutter-Sanborn carregada pela biblioteca, consulta à CDD e uma página da interface da equipe que substitui um registro pelo biblionumber sem mexer nos exemplares (veja [Auxílio à catalogação](#auxílio-à-catalogação-pha-cutter-sanborn-cdd) e [Substituir um registro MARC](#substituir-um-registro-marc-interface-da-equipe)).
+- **Windows 10/11 (WSL 2)**: o Koha em um único computador com Windows, com atalhos Iniciar/Parar que usam o ícone oficial do Koha, ícone de status, notificações do Windows, diagnóstico com um clique e vigia do disco (veja [Windows (WSL 2)](#windows-wsl-2)).
 - **Idiomas**: instala os pacotes de idioma do Koha e traduz o próprio painel (22 idiomas).
 - **Autoatualização** pelo GitHub com verificação SHA-256.
 
@@ -35,7 +37,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 
 | Item | Mínimo |
 |------|--------|
-| Sistema operacional | Debian 11/12/13 ou Ubuntu 22.04/24.04, 64 bits (amd64 ou arm64, ex.: Oracle Ampere, AWS Graviton, Raspberry Pi 4/5) |
+| Sistema operacional | Debian 11/12/13 ou Ubuntu 22.04/24.04, 64 bits (amd64 ou arm64, ex.: Oracle Ampere, AWS Graviton, Raspberry Pi 4/5), ou Windows 10/11 pelo WSL 2 (veja [Windows](#windows-wsl-2)) |
 | RAM | 2 GB (recomendado 4 GB ou mais; o Elasticsearch precisa de ~1,5 GB a mais) |
 | Disco livre | 5 GB (recomendado 10 GB ou mais) |
 | Acesso | `root` ou usuário com `sudo` |
@@ -71,6 +73,52 @@ sudo config.sh
 2. Entre com o usuário e a senha do banco de dados mostrados no fim da instalação (também salvos em `/root/koha_credentials.txt`) e conclua o **Web Installer** do Koha.
 3. De volta ao painel, crie seu próprio superbibliotecário (**9 – Configurações do Koha > Criar superbibliotecário**).
 4. O catálogo público (OPAC) fica em `http://IP-DO-SERVIDOR:80`.
+
+## Windows (WSL 2)
+
+O Koha também pode rodar em um único computador com Windows 10 ou 11. É o caso de bibliotecas pequenas com um só balcão, de treinamentos da equipe e de avaliações. Bibliotecas com vários balcões devem continuar com um servidor Linux dedicado.
+
+O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para Linux), administrado pelo mesmo painel. Pequenas ferramentas em **PowerShell** permitem controlá-lo pelo Windows, sem abrir um terminal.
+
+### O que já funciona no Windows
+
+- **Modo WSL no painel**: o WSL 2 é detectado automaticamente. O WSL 1 é recusado, com explicação.
+  - As tarefas do computador ficam com o Windows: sem swapfile, NTP, UFW, Fail2ban ou avahi. O fuso horário segue o do Windows.
+  - "Reiniciar servidor" vira **Reiniciar os serviços do Koha**.
+  - O systemd precisa estar ativado no WSL.
+  - O lado Windows conversa com o painel pelo arquivo `/etc/koha-easy-install/windows.conf`. Ele é lido com uma lista fechada de chaves e nunca é executado.
+- **Rede**: no Windows 11, a rede espelhada (mirrored) do WSL deixa os outros computadores da rede acessarem o Koha. No Windows 10 (NAT), use o **Túnel Cloudflare** do painel para publicá-lo.
+- **Ícone e atalhos do Koha**: uma pasta *Koha* no menu Iniciar, com os links da interface da equipe e do catálogo também na área de trabalho, todos com o ícone oficial `koha.ico`. Ela traz:
+  - Interface da equipe, Catálogo público, Painel de controle e Pasta de backups
+  - **Iniciar**, **Parar** e **Reiniciar**
+  - Status, Exportar diagnóstico e Ícone de status
+- **Iniciar e parar**: o Koha pode iniciar sozinho quando você entra no Windows ou só quando você clica em *Koha - Iniciar*. Isso pode ser trocado a qualquer momento pelo menu do ícone. Depois de **Parar**, o Koha fica desligado até você iniciá-lo de novo, e nada o liga sem você saber.
+- **Ícone de status (área de notificação)**: o ícone do Koha com um ponto colorido (verde funcionando, amarelo iniciando, vermelho sem resposta, cinza parado). O menu abre a interface da equipe e o catálogo, inicia, para e reinicia o Koha e exporta o diagnóstico.
+- **Notificações do Windows**:
+  - o Koha para de responder, para sem aviso ou volta a funcionar
+  - o backup noturno é concluído (dá para desligar esse aviso), falha ou não roda há 36 horas
+  - o espaço em disco fica baixo
+- **Diagnóstico com um clique**: um `.zip` na área de trabalho com os logs do WSL, do Windows, do Apache, do MariaDB, do Koha e do painel, além do status do sistema, pronto para enviar a quem dá suporte à biblioteca. Senhas, tokens e chaves são removidos, e nenhum arquivo de configuração entra.
+- **Vigia do disco**: avisa quando a unidade que guarda o disco virtual do Koha (`ext4.vhdx`) tem menos de 10 GB livres, e em nível crítico abaixo de 5 GB. Quando o disco virtual tem muito espaço sem uso, **Compactar** devolve esse espaço ao Windows (pede permissão de administrador).
+- **Idiomas**: as ferramentas do Windows usam os 22 idiomas do painel.
+
+### Como instalar no Windows hoje
+
+> **Em breve:** um instalador de um clique (`Install Koha.cmd`, um ZIP com um inicializador em PowerShell). Ele vai verificar a virtualização, instalar o WSL 2, criar o sistema Debian, instalar o Koha e criar os atalhos, tudo no idioma de quem instala. Vai vir com um guia para o aviso do SmartScreen do Windows, porque os scripts não são assinados. Até lá, os passos abaixo são para quem já tem familiaridade com o PowerShell.
+
+1. No PowerShell como administrador: `wsl --install --no-distribution`, depois reinicie o Windows.
+2. Crie um sistema Debian chamado `KohaEasy` (as ferramentas do Windows procuram esse nome). Por exemplo, instale o Debian pela Microsoft Store, depois `wsl --export Debian debian.tar` e `wsl --import KohaEasy C:\KohaEasy\wsl debian.tar`.
+3. Dentro dele (`wsl -d KohaEasy -u root`), ative o systemd acrescentando `[boot]` e `systemd=true` ao `/etc/wsl.conf`. Depois rode `wsl --terminate KohaEasy` no PowerShell e abra-o de novo.
+4. Instale o Koha como no Linux ([Instalação](#instalação)).
+5. Copie a pasta `windows\` e a pasta `lang\` para `C:\KohaEasy\bin` e rode, com o seu usuário normal:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File C:\KohaEasy\bin\KohaEasy.ps1 RegisterTasks -Mode logon
+   ```
+
+   Isso cria as tarefas de inicialização, os atalhos no menu Iniciar e na área de trabalho e o ícone de status ao entrar no Windows. Use `-Mode manual` para o Koha iniciar só quando você clicar em *Koha - Iniciar*.
+
+O comportamento em um Windows real (notificações, ícone de status, Agendador de Tarefas e compactação do disco) ainda está sendo conferido em computadores físicos, então avise se algo parecer estranho.
 
 ## Menu principal
 
@@ -207,6 +255,8 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 | `/usr/local/lib/site_perl/SMS/Send/KohaEasy/Gateway.pm` | O driver de mensagens do Koha (com `KohaEasy/Messaging.pm`) |
 | `/etc/koha-easy-install/tables/` | Tabelas de autor e tabela da CDD carregadas pela biblioteca |
 | `/var/lib/koha/library/kei-marc-replace/` | Registros como estavam antes de cada substituição |
+| `/etc/koha-easy-install/windows.conf` | Só no Windows: o que as ferramentas do Windows informam ao painel (modo de rede, início automático...) |
+| `C:\KohaEasy\` | Só no Windows: `bin\` (scripts e `koha.ico`), `logs\`, `Backups\`, `state.json` |
 
 Se a instalação parar, o painel mostra a etapa que falhou. A saída completa do gerenciador de pacotes fica em `/var/log/koha-easy-install/apt.log`.
 
@@ -223,7 +273,7 @@ Copie seus backups para outro lugar antes de executá-lo.
 
 ## Testes
 
-A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o `marc_replace.pl` (executado como CGI) e a atualização dos agendamentos.
+A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o `marc_replace.pl` (executado como CGI), a atualização dos agendamentos, o modo WSL, a autorização por QR code / navegador / link e as ferramentas do Windows (os testes em PowerShell rodam com o [Pester 5](https://pester.dev) quando o `pwsh` está instalado).
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \
