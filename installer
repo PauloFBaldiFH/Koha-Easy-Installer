@@ -731,7 +731,7 @@ log "===== panel started (v$PANEL_VERSION, user=$REAL_USER) ====="
 KEI_PROC="${KEI_PROC:-/proc}"
 KEI_SYSTEMD_RUNDIR="${KEI_SYSTEMD_RUNDIR:-/run/systemd/system}"
 KEI_WIN_CONF="${KEI_WIN_CONF:-${CONF_DIR}/windows.conf}"
-KEI_WIN_KEYS="KEI_WIN_VERSION WIN_BUILD WIN_EDITION WIN_NET_MODE WIN_LAN_IP WIN_HOSTNAME WIN_USER WIN_BACKUP_DIR WIN_MEM_GB WIN_UPDATED_AT"
+KEI_WIN_KEYS="KEI_WIN_VERSION WIN_BUILD WIN_EDITION WIN_NET_MODE WIN_LAN_IP WIN_HOSTNAME WIN_USER WIN_BACKUP_DIR WIN_MEM_GB WIN_UPDATED_AT WIN_AUTOSTART"
 KEI_PLATFORM="linux"
 KEI_WSL_NET=""
 
@@ -771,6 +771,7 @@ _win_conf_valid() {
     local key="$1" val="$2"
     case "$key" in
         WIN_NET_MODE)   [[ "$val" == mirrored || "$val" == nat ]] ;;
+        WIN_AUTOSTART)  [[ "$val" == logon || "$val" == manual ]] ;;
         WIN_BUILD|WIN_MEM_GB) [[ "$val" =~ ^[0-9]{1,6}$ ]] ;;
         WIN_LAN_IP)     [[ "$val" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ;;
         WIN_HOSTNAME)   [[ "$val" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62})$ ]] ;;

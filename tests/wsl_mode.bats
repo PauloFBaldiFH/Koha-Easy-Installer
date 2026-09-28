@@ -94,6 +94,7 @@ WIN_HOSTNAME=BIBLIOTECA-PC
 WIN_USER=maria silva
 WIN_BACKUP_DIR=/mnt/c/KohaEasy/Backups
 WIN_MEM_GB=4
+WIN_AUTOSTART=manual
 WIN_EDITION=$(touch /tmp/kei-pwned)
 WIN_UPDATED_AT=`touch /tmp/kei-pwned`
 WIN_USER2=x; touch /tmp/kei-pwned
@@ -111,6 +112,7 @@ EOF
     assert 'echo "$output" | grep -qx "WIN_USER=maria silva"'
     assert 'echo "$output" | grep -qx "WIN_BACKUP_DIR=/mnt/c/KohaEasy/Backups"'
     assert 'echo "$output" | grep -qx "WIN_MEM_GB=4"'
+    assert 'echo "$output" | grep -qx "WIN_AUTOSTART=manual"' "start mode chosen on Windows: $output"
     assert 'echo "$output" | grep -qx "WIN_EDITION="' "command substitution must not be taken"
     assert 'echo "$output" | grep -qx "WIN_UPDATED_AT="' "backticks must not be taken"
     assert '! echo "$output" | grep -q "^PATH=/tmp$"' "only whitelisted keys may be set"
@@ -120,9 +122,9 @@ EOF
 
 @test "W04 windows.conf: invalid values dropped, unsafe files refused" {
     win_conf 'WIN_NET_MODE=bridged' 'WIN_BUILD=22631a' 'WIN_LAN_IP=192.168.0' \
-             'WIN_HOSTNAME=-bad' 'WIN_BACKUP_DIR=/mnt/c/../../etc' 'WIN_USER=../root' 'WIN_MEM_GB=4'
-    wsl eval 'echo "$WIN_NET_MODE|$WIN_BUILD|$WIN_LAN_IP|$WIN_HOSTNAME|$WIN_BACKUP_DIR|$WIN_USER|$WIN_MEM_GB"'
-    assert '[ "$output" = "||||||4" ]' "only the valid value is kept: $output"
+             'WIN_HOSTNAME=-bad' 'WIN_BACKUP_DIR=/mnt/c/../../etc' 'WIN_USER=../root' 'WIN_AUTOSTART=always' 'WIN_MEM_GB=4'
+    wsl eval 'echo "$WIN_NET_MODE|$WIN_BUILD|$WIN_LAN_IP|$WIN_HOSTNAME|$WIN_BACKUP_DIR|$WIN_USER|$WIN_AUTOSTART|$WIN_MEM_GB"'
+    assert '[ "$output" = "|||||||4" ]' "only the valid value is kept: $output"
 
     win_conf 'WIN_BUILD=22631'
     chmod 666 "$KEI_WIN_CONF"
