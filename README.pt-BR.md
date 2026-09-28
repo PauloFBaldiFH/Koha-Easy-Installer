@@ -21,6 +21,7 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 - **Segurança**: Fail2ban, firewall UFW (com opção de restringir a porta 8080 do Staff) e troca da senha do banco de dados.
 - **Configurações do Koha**: perfis de dimensionamento, avisos por e-mail (agenda do próprio Koha, ativada com `koha-email-enable`), criação de superbibliotecário, SIP2 e Z39.50, relógio e fuso horário.
 - **Ferramentas da biblioteca**: importação MARC guiada com opção de desfazer, pacote de relatórios SQL essenciais, importação de leitores por CSV e virada do ano letivo (troca de categorias), verificação da qualidade do catálogo e rotinas de privacidade (LGPD). Toda alteração mostra antes uma prévia com a simulação do próprio Koha e é protegida por um backup verificado (veja [Ferramentas da biblioteca](#ferramentas-da-biblioteca)).
+- **Brasil: localização e migração** (opcional, nunca aplicado pela instalação nem por agendamento): migração MARC do Biblivre, SophiA e Pergamum (conversão para UTF-8, exemplares levados para o 952 do Koha), planilhas de leitores do sistema antigo com verificação do CPF, auditoria de CPF (módulo 11), modelos de etiquetas Pimaco, ficha catalográfica e feriados brasileiros no calendário do Koha (veja [Brasil: localização e migração](#brasil-localização-e-migração)).
 - **Idiomas**: instala os pacotes de idioma do Koha e traduz o próprio painel (22 idiomas).
 - **Autoatualização** pelo GitHub com verificação SHA-256.
 
@@ -78,7 +79,7 @@ sudo config.sh
 | 7 | Diagnóstico e manutenção | Status, verificação, logs, otimização |
 | 8 | Central de segurança | Fail2ban, firewall, troca de senha |
 | 9 | Configurações e parâmetros do Koha | Dimensionamento, e-mail, superbibliotecário, SIP2/Z39.50, relógio |
-| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD) |
+| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração |
 | 11 | Ferramentas gerais | htop/nethogs, navegador de terminal, gerenciador de arquivos |
 | 12 | Agendamentos e tarefas (cron) | Ver, entender, regenerar ou editar as tarefas automáticas |
 | 13 | Idiomas do Koha e do painel | Pacotes de idioma do Koha e idioma do painel |
@@ -106,6 +107,24 @@ Tarefas do dia a dia da equipe da biblioteca, feitas com as próprias ferramenta
 
 Cada execução fica registrada em `/var/log/koha-easy-install/tools/` (só o root lê: os logs podem ter nomes de leitores), que também podem ser vistos pelo menu.
 
+### Brasil: localização e migração
+
+**Ferramentas da biblioteca > Brasil: localização e migração**. Nada aqui é aplicado durante a instalação nem por agendamento: cada opção só age quando você a escolhe, segue os mesmos passos das outras ferramentas (trava, prévia, confirmação, backup `PRE-*` verificado) e pode ser desfeita.
+
+| Ferramenta | Como funciona | Prévia | Backup |
+|------------|---------------|--------|--------|
+| Migrar MARC do Biblivre, SophiA, Pergamum ou de outro sistema (mapa de campos digitado) | Os caracteres são convertidos para UTF-8 com o `yaz-marcdump` (de Latin-1 ou MARC-8; o pacote `yaz` é oferecido se faltar); o campo de exemplar (Biblivre 949, Pergamum 852, SophiA 990 ou o seu próprio mapa) vai para o 952 do Koha (código de barras, número de chamada, exemplar, notas, biblioteca, tipo de material) com o MARC::Record do próprio Koha; depois vem a importação MARC normal (`stage_file.pl` / `commit_file.pl`, desfazer com `--revert`) | Contagens e uma amostra dos exemplares convertidos, depois o relatório de preparação do Koha | `PRE-IMPORT` |
+| Importar leitores de uma planilha do sistema antigo | Encontra as colunas pelo nome em português ou inglês (Nome, Matrícula, CPF, E-mail, Nascimento...), Windows-1252 ou UTF-8, `;` ou `,`; verifica o CPF (módulo 11, dígitos repetidos, duplicados), usa o CPF como número do cartão quando não há um e o guarda em um atributo de leitor com código `CPF` quando esse tipo existe; depois roda o `import_patrons.pl` | Linhas rejeitadas com o motivo, depois a simulação do Koha | `PRE-PATRONS` |
+| Verificar CPFs dos leitores (somente leitura) | Número do cartão, usuário, sort1/sort2 ou o atributo `CPF`: válidos, inválidos, compartilhados por dois leitores | — | — |
+| Modelos de etiquetas Pimaco | Folhas 6180, 6181, 6287 (Carta) e A4256, A4251 (A4) mais 3 leiautes (lombada, código de barras, título e código de barras) no criador de etiquetas do Koha; atualiza ou remove só os próprios modelos | Resumo antes da alteração | `PRE-LABELS` |
+| Ficha catalográfica | Folhas de estilo que envolvem a visualização de detalhes padrão do Koha (OPAC e interface da equipe, uma por idioma instalado) e acrescentam a ficha abaixo do registro, com botão de impressão; configuradas em `OPACXSLTDetailsDisplay` / `XSLTDetailsDisplay`. Os valores anteriores são guardados e **Ocultar a ficha** os devolve; os arquivos são regravados sempre que o painel abre, acompanhando as atualizações do Koha | Valores antigos e novos | `PRE-FICHA` |
+| Feriados brasileiros no calendário | Feriados nacionais de um ano, Carnaval (segunda e terça), Sexta-feira Santa e Corpus Christi (Páscoa pelo algoritmo de Meeus/Jones/Butcher) e um feriado municipal opcional, para uma biblioteca ou todas; os dias que já estão no calendário são ignorados e **Remover** tira só os dias adicionados pelo painel | Datas com o dia da semana | `PRE-CALENDAR` |
+
+- As medidas das etiquetas são as equivalentes Avery de cada folha Pimaco: faça um teste de impressão em papel comum e ajuste o modelo no Koha se a impressora deslocar a página.
+- A ficha segue o leiaute AACR2 usado nas bibliotecas brasileiras (coluna do número de chamada, recuo francês, assuntos numerados, entradas secundárias em algarismos romanos).
+- As predefinições do Biblivre, SophiA e Pergamum seguem o leiaute de exportação mais comum desses sistemas. A prévia mostra o resultado antes de qualquer gravação; **Outro formato** aceita qualquer campo de exemplar.
+- Carnaval e Corpus Christi são ponto facultativo, não feriados nacionais: remova-os em Ferramentas > Calendário se a biblioteca abrir. O Dia da Consciência Negra (20/11) entra a partir de 2024.
+
 ## Tarefas automáticas
 
 Instaladas em `/etc/cron.d/koha_tasks`:
@@ -131,6 +150,7 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 | `/etc/koha-easy-install/` | Configurações do painel (idioma, backup) |
 | `/var/log/koha-easy-install/` | Logs do painel, do APT e das validações (`tools/`: ferramentas da biblioteca, só root) |
 | `/root/koha_patrons_template.csv` | Modelo CSV vazio para a importação de leitores |
+| `/var/lib/koha/library/kei-xslt/` | Folhas de estilo da ficha catalográfica (só enquanto a ficha estiver ativada) |
 
 Se a instalação parar, o painel mostra a etapa que falhou. A saída completa do gerenciador de pacotes fica em `/var/log/koha-easy-install/apt.log`.
 
@@ -147,10 +167,10 @@ Copie seus backups para outro lugar antes de executá-lo.
 
 ## Testes (para quem contribui)
 
-A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`) e a atualização dos agendamentos.
+A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica) e a atualização dos agendamentos.
 
 ```bash
-sudo apt-get install bats mariadb-server memcached whiptail
+sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl
 sudo KEI_TEST_SANDBOX=1 tests/run.sh
 ```
 

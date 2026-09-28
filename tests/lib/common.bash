@@ -154,7 +154,7 @@ kei_reset_env() {
     kei_kill_daemons
     rm -rf "$KEI_S/calls.log" "$KEI_S/dialogs.log" "$KEI_S/answers" "$KEI_S/syslog" \
            "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs" \
-           "$KEI_S/inputs" "$KEI_S/textbox.last" "$KEI_S"/batch-*.biblios
+           "$KEI_S/inputs" "$KEI_S/textbox.last" "$KEI_S/textboxes.log" "$KEI_S/last-staged.mrc" "$KEI_S"/batch-*.biblios
     rm -rf /var/log/koha-easy-install/tools /var/lib/koha/library/email.enabled /root/koha_patrons_template.csv
     mkdir -p "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs"
     touch "$KEI_S/svc/mariadb" "$KEI_S/svc/memcached" "$KEI_S/svc/apache2" "$KEI_S/svc/cron"
@@ -268,4 +268,48 @@ INSERT INTO saved_sql (borrowernumber, date_created, savedsql, report_name, type
   VALUES (NULL, NOW(), 'SELECT 1', 'My own report', '1', 'written by the library');
 SQL
 }
-tools_sql() { mysql -Nse "$1" "$DB"; }
+tools_sql() { mysql --default-character-set=utf8mb4 -Nse "$1" "$DB"; }
+
+# ---------------------------------------------------------------------
+# Brazil tools: item types, label creator, calendar, patron attributes and
+# the detail-view preferences (same columns as Koha 26.05). On top of
+# kei_tools_catalog: one template, one layout and one closed day that were
+# not made by the panel, and CPFs in sort1 for the CPF report.
+# ---------------------------------------------------------------------
+kei_br_catalog() {
+    mysql "$DB" <<'SQL'
+CREATE TABLE itemtypes (itemtype varchar(10) NOT NULL PRIMARY KEY, description longtext) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO itemtypes VALUES ('LIVRO', 'Livro'), ('REV', 'Revista');
+CREATE TABLE creator_templates (template_id int(4) NOT NULL AUTO_INCREMENT PRIMARY KEY, profile_id int(4) DEFAULT NULL,
+  template_code char(100) NOT NULL DEFAULT 'DEFAULT TEMPLATE', template_desc char(100) NOT NULL DEFAULT 'Default description',
+  page_width float NOT NULL DEFAULT 0, page_height float NOT NULL DEFAULT 0, label_width float NOT NULL DEFAULT 0, label_height float NOT NULL DEFAULT 0,
+  top_text_margin float NOT NULL DEFAULT 0, left_text_margin float NOT NULL DEFAULT 0, top_margin float NOT NULL DEFAULT 0, left_margin float NOT NULL DEFAULT 0,
+  cols int(2) NOT NULL DEFAULT 0, `rows` int(2) NOT NULL DEFAULT 0, col_gap float NOT NULL DEFAULT 0, row_gap float NOT NULL DEFAULT 0,
+  units char(20) NOT NULL DEFAULT 'POINT', creator char(15) NOT NULL DEFAULT 'Labels') DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE creator_layouts (layout_id int(4) NOT NULL AUTO_INCREMENT PRIMARY KEY, barcode_type char(100) NOT NULL DEFAULT 'CODE39',
+  start_label int(2) NOT NULL DEFAULT 1, printing_type char(32) NOT NULL DEFAULT 'BAR', layout_name char(25) NOT NULL DEFAULT 'DEFAULT',
+  guidebox int(1) DEFAULT 0, oblique_title int(1) DEFAULT 1, font char(10) NOT NULL DEFAULT 'TR', font_size int(4) NOT NULL DEFAULT 10,
+  scale_width decimal(28,6) NOT NULL DEFAULT 0.800000, scale_height decimal(28,6) NOT NULL DEFAULT 0.010000, units char(20) NOT NULL DEFAULT 'POINT',
+  callnum_split int(1) DEFAULT 0, text_justify char(1) NOT NULL DEFAULT 'L', format_string varchar(210) NOT NULL DEFAULT 'barcode',
+  layout_xml mediumtext NOT NULL, creator char(15) NOT NULL DEFAULT 'Labels') DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO creator_templates (template_code, template_desc, units) VALUES ('MINHA', 'Modelo da biblioteca', 'MM');
+INSERT INTO creator_layouts (layout_name, layout_xml) VALUES ('Meu layout', '');
+CREATE TABLE special_holidays (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, branchcode varchar(10) NOT NULL, day smallint(6) NOT NULL DEFAULT 0,
+  month smallint(6) NOT NULL DEFAULT 0, year smallint(6) NOT NULL DEFAULT 0, isexception smallint(1) NOT NULL DEFAULT 1,
+  title varchar(50) NOT NULL DEFAULT '', description mediumtext NOT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO special_holidays (branchcode, day, month, year, isexception, title, description) VALUES ('CPL', 25, 12, 2025, 0, 'Natal', 'dia de fechar');
+CREATE TABLE borrower_attribute_types (code varchar(64) NOT NULL PRIMARY KEY, description varchar(255) NOT NULL);
+CREATE TABLE borrower_attributes (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11) NOT NULL, code varchar(64) NOT NULL, attribute varchar(255));
+ALTER TABLE borrowers ADD COLUMN sort1 varchar(80);
+UPDATE borrowers SET sort1 = '529.982.247-25' WHERE cardnumber = 'S1';
+UPDATE borrowers SET sort1 = '52998224725' WHERE cardnumber = 'S2';
+UPDATE borrowers SET sort1 = '123.456.789-00' WHERE cardnumber = 'S3';
+UPDATE borrowers SET sort1 = '5299822472' WHERE cardnumber = 'E1';
+UPDATE borrowers SET sort1 = 'turma 3B' WHERE cardnumber = 'E2';
+INSERT INTO systempreferences (variable, value, type) VALUES ('OPACXSLTDetailsDisplay', 'default', 'Free'), ('XSLTDetailsDisplay', '', 'Free');
+SQL
+}
+
+# kei_marc FILE ENCODING MARCXML: ISO 2709 file written by yaz-marcdump
+# (leader/09 blank, like the exports of older systems).
+kei_marc() { yaz-marcdump -i marcxml -o marc -f UTF-8 -t "$2" -l 9=32 "$3" > "$1"; }

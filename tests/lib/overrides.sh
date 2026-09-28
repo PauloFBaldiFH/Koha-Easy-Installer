@@ -59,7 +59,23 @@ ui_input() {
     [ "$ans" = "CANCEL" ] && return 1
     printf '%s' "$ans"
 }
-ui_textbox() { _kei_dialog "TEXTBOX [$1] $2"; cp -f "$2" "$KEI_S/textbox.last" 2>/dev/null; return 0; }
+ui_textbox() {
+    _kei_dialog "TEXTBOX [$1] $2"
+    cp -f "$2" "$KEI_S/textbox.last" 2>/dev/null
+    { printf '=== %s\n' "$1"; cat "$2" 2>/dev/null; } >> "$KEI_S/textboxes.log"
+    return 0
+}
+# Checklist: one input line with the chosen tags (space separated); an
+# empty queue keeps the items that start ON. "CANCEL" cancels.
+ui_checklist() {
+    local title="$1" ans tags=()
+    shift 2
+    while [ $# -ge 3 ]; do [ "$3" = "ON" ] && tags+=("$1"); shift 3; done
+    ans=$(_kei_next_input); [ -n "$ans" ] || ans="${tags[*]}"
+    _kei_dialog "CHECKLIST [$title] => $ans"
+    [ "$ans" = "CANCEL" ] && return 1
+    printf '%s\n' $ans
+}
 select_directory() { printf '%s' "${KEI_SELECT_DIR:-}";  [ -n "${KEI_SELECT_DIR:-}" ]; }
 
 # ---- packages and platform --------------------------------------------

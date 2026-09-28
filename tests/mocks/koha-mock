@@ -53,6 +53,11 @@ case "$name" in
         shift
         [ "${1:-}" = "-c" ] && { shift; exec /bin/sh -c "env KOHA_CONF=/etc/koha/sites/library/koha-conf.xml /bin/bash -c '$*'"; }
         ;;
+    koha-mysql)
+        # koha-mysql INSTANCE [mysql options]: SQL from stdin, Koha's database.
+        shift
+        exec mysql --default-character-set=utf8mb4 koha_library "$@"
+        ;;
     koha-email-enable)
         mkdir -p "/var/lib/koha/$1" && touch "/var/lib/koha/$1/email.enabled"
         echo "Enabled email for instance $1."

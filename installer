@@ -74,7 +74,7 @@ shield_signals() { trap '' INT TERM HUP; SIGNALS_SHIELDED=1; }
 trap on_exit EXIT
 unshield_signals
 
-PANEL_VERSION=" 1.2.0"
+PANEL_VERSION=" 1.3.0"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -5632,7 +5632,7 @@ TOOLS_PRE=""
 # Path of one of Koha's command-line scripts (Debian package layout).
 koha_script() {
     local d
-    for d in "$KOHA_BIN" "$KOHA_BIN/cronjobs" "$KOHA_BIN/maintenance" "$KOHA_BIN/migration_tools"; do
+    for d in "$KOHA_BIN" "$KOHA_BIN/cronjobs" "$KOHA_BIN/maintenance" "$KOHA_BIN/migration_tools" "$KOHA_BIN/admin"; do
         [ -f "$d/$1" ] && { printf '%s' "$d/$1"; return 0; }
     done
     return 1
@@ -5651,21 +5651,40 @@ kq() {
 # koha_tool LOG SCRIPT [ARGS...]: runs a Koha script as the instance user
 # (koha-shell), appending the command line and its output to LOG.
 koha_tool() {
-    local log="$1" name="$2" path cmd a q
+    local log="$1" name="$2" path
     shift 2
     if ! path=$(koha_script "$name"); then
         printf '%s: not found in %s\n' "$name" "$KOHA_BIN" >> "$log"
         return 127
     fi
-    cmd=$(kq "$path") || return 2
+    koha_exec "$log" "$name" "$path" "$@"
+}
+
+# koha_exec LOG LABEL PROGRAM [ARGS...]: runs PROGRAM as the instance user
+# through koha-shell (Koha's environment and Perl libraries), every argument
+# quoted with kq. The command line (under LABEL) and its output go to LOG.
+koha_exec() {
+    local log="$1" label="$2" cmd="" a q
+    shift 2
     for a in "$@"; do
         q=$(kq "$a") || { printf 'refused argument: %s\n' "$a" >> "$log"; return 2; }
-        cmd+=" $q"
+        cmd+="${cmd:+ }$q"
     done
-    printf '$ %s %s\n' "$name" "$*" >> "$log"
-    log "tools: $name $*"
+    printf '$ %s %s\n' "$label" "${*:2}" >> "$log"
+    log "tools: $label ${*:2}"
     ( cd "${TOOLS_WORK:-/tmp}" 2>/dev/null || cd /tmp || exit 1
       koha_ctl /usr/sbin/koha-shell "$INSTANCE" -c "$cmd" ) >> "$log" 2>&1 </dev/null
+}
+
+# koha_sql_run LOG FILE: runs an SQL file with Koha's own database account
+# (koha-mysql, as the instance user through koha-shell). The files start a
+# transaction, so a failure keeps nothing.
+koha_sql_run() {
+    local log="$1" sql="$2"
+    printf '$ koha-mysql %s < %s\n' "$INSTANCE" "${sql##*/}" >> "$log"
+    log "tools: koha-mysql < ${sql##*/}"
+    ( cd "${TOOLS_WORK:-/tmp}" 2>/dev/null || cd /tmp || exit 1
+      koha_ctl /usr/sbin/koha-shell "$INSTANCE" -c "/usr/sbin/koha-mysql $(kq "$INSTANCE")" ) < "$sql" >> "$log" 2>&1
 }
 
 # Output of the last command written to LOG by koha_tool.
@@ -5695,7 +5714,7 @@ tools_workdir() {
 # tools_copy SRC NAME: copy of SRC in the work folder; prints its path.
 tools_copy() {
     local dst="${TOOLS_WORK}/$2"
-    cp -f -- "$1" "$dst" 2>/dev/null || return 1
+    [ "$1" -ef "$dst" ] || cp -f -- "$1" "$dst" 2>/dev/null || return 1
     chown "${INSTANCE}-koha:" "$dst" 2>/dev/null || true
     chmod 600 "$dst"
     printf '%s' "$dst"
@@ -5751,6 +5770,11 @@ ui_input() {    # ui_input TITLE TEXT [DEFAULT] -> typed text
 }
 ui_textbox() {  # ui_textbox TITLE FILE (scrollable)
     whiptail --title "$1" --scrolltext --textbox "$2" 0 0 3>&1 1>&2 2>&3 || true
+}
+ui_checklist() {  # ui_checklist TITLE TEXT TAG ITEM ON|OFF [...] -> chosen tags, one per line
+    local title="$1" text="$2"
+    shift 2
+    whiptail --title "$title" --separate-output --checklist "$text" 0 0 0 "$@" 3>&1 1>&2 2>&3
 }
 # tools_pick TITLE TEXT SQL [TAG ITEM]: menu built from a "code<TAB>name" query.
 tools_pick() {
@@ -6268,7 +6292,8 @@ function_library_tools() {
             "6" "$(t "◈  Catalog data-quality check")" \
             "7" "$(t "◌  Privacy (LGPD): anonymise old history")" \
             "8" "$(t "✖  Privacy (LGPD): delete old patrons")" \
-            "9" "$(t "▤  View tool logs")" 3>&1 1>&2 2>&3) || return 0
+            "9" "$(t "▤  View tool logs")" \
+            "10" "$(t "◆  Brazil: localization & migration")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_marc_import ;;
             2) lt_marc_undo ;;
@@ -6279,6 +6304,983 @@ function_library_tools() {
             7) lt_privacy_anonymise ;;
             8) lt_privacy_delete ;;
             9) lt_view_logs ;;
+            10) function_brazil_tools ;;
+        esac
+        clear
+    done
+}
+
+# ======================================================================
+# 30. BRAZIL: LOCALIZATION & MIGRATION (opt-in)
+# ----------------------------------------------------------------------
+# Presets for Brazilian libraries: migration from Biblivre, SophiA and
+# Pergamum, CPF checks, Pimaco label templates, the catalogue card (ficha
+# catalográfica) and the national holidays. Nothing here runs during the
+# installation or by itself: every tool is started from Library tools >
+# Brazil and follows the rules of the other tools (Koha's own programs
+# through koha-shell, the backup/restore lock, a preview, an explicit
+# confirmation and a verified PRE-* backup before any write).
+# ======================================================================
+YAZ_MARCDUMP="yaz-marcdump"
+BR_TAG="koha-easy-installer"
+KOHA_OPAC_TMPL="/usr/share/koha/opac/htdocs/opac-tmpl/bootstrap"
+KOHA_INTRA_TMPL="/usr/share/koha/intranet/htdocs/intranet-tmpl/prog"
+FICHA_DIR="/var/lib/koha/${INSTANCE}/kei-xslt"
+FICHA_STATE="${CONF_DIR}/ficha.state"
+
+file_is_utf8() { iconv -f UTF-8 -t UTF-8 "$1" >/dev/null 2>&1; }
+marc_count()   { tr -cd '\035' < "$1" | wc -c; }
+xml_escape()   { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&gt;}"; }
+
+# Koha keeps system preferences and the calendar in Memcached: after a
+# direct change the cached copies are dropped (flush_all, no restart).
+memcached_flush() {
+    local reply=""
+    { exec 6<>/dev/tcp/127.0.0.1/11211; } 2>/dev/null || return 1
+    printf 'flush_all\r\n' >&6
+    IFS= read -r -t 3 reply <&6
+    exec 6>&-
+    [[ "$reply" == OK* ]]
+}
+
+# yaz-marcdump (package yaz, also used by Koha's Zebra) converts the
+# character set of ISO 2709 files and recomputes their record lengths.
+require_yaz() {
+    command -v "$YAZ_MARCDUMP" >/dev/null 2>&1 && return 0
+    prompt_yes_no "$(t "Missing tool")" "$(t "The MARC conversion needs yaz-marcdump (package yaz, the same toolkit Koha uses for Zebra).\n\nInstall it now?")" 11 72 || return 1
+    apt_install yaz >/dev/null 2>&1
+    command -v "$YAZ_MARCDUMP" >/dev/null 2>&1 && return 0
+    msg_error "" "$(t "The yaz package could not be installed. Nothing was changed.")" 9 70
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# CPF (Brazilian taxpayer number): modulo-11 check digits. One awk function
+# used by the validator, the patron converter and the CPF report.
+# ----------------------------------------------------------------------
+CPF_AWK='function cpf_ok(s,   i, sum, r, same) {
+    gsub(/[^0-9]/, "", s)
+    if (length(s) != 11) return 0
+    same = 1
+    for (i = 2; i <= 11; i++) if (substr(s, i, 1) != substr(s, 1, 1)) same = 0
+    if (same) return 0
+    sum = 0
+    for (i = 1; i <= 9; i++) sum += substr(s, i, 1) * (11 - i)
+    r = (sum * 10) % 11; if (r == 10) r = 0
+    if (r != substr(s, 10, 1) + 0) return 0
+    sum = 0
+    for (i = 1; i <= 10; i++) sum += substr(s, i, 1) * (12 - i)
+    r = (sum * 10) % 11; if (r == 10) r = 0
+    return r == substr(s, 11, 1) + 0
+}'
+# cpf_valid VALUE: 0 when VALUE (digits, dots and dash allowed) is a valid CPF.
+cpf_valid() {
+    [[ "$1" =~ ^[0-9]{3}\.?[0-9]{3}\.?[0-9]{3}-?[0-9]{2}$ ]] || return 1
+    awk -v s="$1" "$CPF_AWK"' BEGIN { exit !cpf_ok(s) }'
+}
+
+# ----------------------------------------------------------------------
+# 1. Legacy migration: MARC export -> UTF-8 (yaz-marcdump) -> items moved
+#    to 952 (MARC::Record, as the instance user) -> Koha's staged import.
+# ----------------------------------------------------------------------
+# br_preset NAME: item field, 952 subfield map and record call number of a
+# legacy export. They follow the usual export layouts; the preview shows
+# the result on the real file before anything is written, and "custom"
+# takes any other layout ("949 p=a,o=b+c": 952$p from $a, 952$o from $b $c).
+br_preset() {
+    BR_CN="090:ab|082:a"
+    case "$1" in
+        biblivre) BR_ITEM_TAG=949; BR_MAP="p=a" ;;
+        pergamum) BR_ITEM_TAG=852; BR_MAP="p=p,o=h+i,t=t,z=z,x=x" ;;
+        sophia)   BR_ITEM_TAG=990; BR_MAP="p=a,o=b" ;;
+        *)
+            [[ "$1" =~ ^([0-9]{3})\ ([a-z0-9]=[a-z0-9](\+[a-z0-9])*(,[a-z0-9]=[a-z0-9](\+[a-z0-9])*)*)$ ]] || return 1
+            [ "${BASH_REMATCH[1]}" != "952" ] && [ "${BASH_REMATCH[1]}" -ge 10 ] || return 1
+            BR_ITEM_TAG="${BASH_REMATCH[1]}"; BR_MAP="${BASH_REMATCH[2]}" ;;
+    esac
+    return 0
+}
+
+# The MARC::Record program that moves the items (written next to the file).
+br_write_remapper() {
+    cat > "$1" <<'MARCPL'
+use strict;
+use warnings;
+use Getopt::Long;
+use MARC::File::USMARC;
+use MARC::Field;
+
+# koha-easy-installer: moves the item fields of a legacy export (one item
+# per occurrence of --item-tag) into Koha's 952. --map "p=a,o=h+i" builds
+# 952$p from $a and 952$o from $h and $i; --callnumber "090:ab|082:a" is the
+# record call number used when the item has none. 952$a/$b (library) and
+# $y (item type) come from --branch and --itype. Records that already have
+# a 952 are kept as they are.
+my %o = ( map => '', callnumber => '', sample => 3, branch => '', itype => '' );
+GetOptions( \%o, 'in=s', 'out=s', 'item-tag=s', 'map=s', 'callnumber=s',
+    'branch=s', 'itype=s', 'dry-run', 'sample=i' ) or exit 2;
+die "usage: --in FILE --item-tag TAG --branch CODE (--out FILE | --dry-run)\n"
+    unless $o{in} && $o{'item-tag'} && $o{branch} && ( $o{'dry-run'} || $o{out} );
+
+my @map = grep { $_->[0] !~ /^[aby]$/ } map { [ split /=/, $_, 2 ] } grep { /^[a-z0-9]=[a-z0-9+]+$/ } split /,/, $o{map};
+my @cn  = map { [ split /:/, $_, 2 ] } grep { /^\d{3}:[a-z0-9]+$/ } split /\|/, $o{callnumber};
+
+sub values_of {
+    my ( $field, $codes ) = @_;
+    my $v = join ' ', grep { defined && length } map { $field->subfield($_) } @$codes;
+    $v =~ s/^\s+|\s+$//g;
+    return $v;
+}
+
+sub callnumber {
+    my ($rec) = @_;
+    for my $c (@cn) {
+        for my $f ( $rec->field( $c->[0] ) ) {
+            next if $f->is_control_field;
+            my $v = values_of( $f, [ split //, $c->[1] ] );
+            return $v if length $v;
+        }
+    }
+    return '';
+}
+
+my $in = MARC::File::USMARC->in( $o{in} ) or die "cannot read $o{in}\n";
+my $out;
+unless ( $o{'dry-run'} ) {
+    open( $out, '>', $o{out} ) or die "cannot write $o{out}: $!\n";
+    binmode $out;
+}
+binmode STDOUT, ':encoding(UTF-8)';
+
+my %n = map { $_ => 0 } qw(records converted items no_barcode kept_952 errors);
+my @sample;
+while (1) {
+    my $rec = eval { $in->next };
+    if ($@) { $n{errors}++; next; }
+    last unless $rec;
+    $n{records}++;
+    my @new;
+    if ( $rec->field('952') ) {
+        $n{kept_952}++;
+    } else {
+        my @src = grep { !$_->is_control_field } $rec->field( $o{'item-tag'} );
+        my $cn  = callnumber($rec);
+        for my $f (@src) {
+            my %s;
+            for my $m (@map) {
+                my $v = values_of( $f, [ split /\+/, $m->[1] ] );
+                $s{ $m->[0] } = $v if length $v;
+            }
+            $s{o} = $cn if !defined $s{o} && length $cn;
+            $n{no_barcode}++ unless defined $s{p};
+            my @subs = ( a => $o{branch}, b => $o{branch} );
+            push @subs, y => $o{itype} if length $o{itype};
+            push @subs, map { ( $_ => $s{$_} ) } sort keys %s;
+            push @new, MARC::Field->new( '952', ' ', ' ', @subs );
+        }
+        if (@new) {
+            $rec->delete_fields(@src);
+            # insert_fields_ordered puts a field before those with the same tag
+            $rec->insert_fields_ordered($_) for reverse @new;
+            $n{converted}++;
+            $n{items} += @new;
+        }
+    }
+    push @sample, $rec->as_formatted if @new && @sample < $o{sample};
+    next if $o{'dry-run'};
+    my $raw = $rec->as_usmarc;
+    utf8::encode($raw) if utf8::is_utf8($raw);
+    print {$out} $raw;
+}
+close $out if $out;
+
+print "Records read: $n{records}\n";
+print "Records with new 952 items: $n{converted}\n";
+print "Items created: $n{items}\n";
+print "Items without barcode: $n{no_barcode}\n";
+print "Records that already had 952 (kept): $n{kept_952}\n";
+print "Unreadable records: $n{errors}\n";
+print "\n--- Sample ---\n", join( "\n\n", @sample ), "\n" if @sample;
+exit( $n{records} ? 0 : 1 );
+MARCPL
+    chmod 644 "$1"
+}
+
+lt_br_migrate_marc() {
+    require_database || return 0
+    local file preset spec guess enc branch itype mode encs=()
+    file=$(select_file "/root" "mrc iso marc" "$(t "Pick the MARC export of the old system (.mrc or .iso):")" "$(t "MARC file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    if ! [[ "$(head -c 5 "$file")" =~ ^[0-9]{5}$ ]]; then
+        msg_error "" "$(t "This is not an ISO 2709 MARC file (it must start with the 5-digit record length).\nNothing was changed.")" 10 74
+        return 1
+    fi
+    preset=$(ui_menu "$(t "Legacy migration")" "$(t "Which system exported the file? (the preview shows the result before anything is written)")" \
+        "biblivre" "Biblivre (949 \$a)" \
+        "pergamum" "Pergamum (852, MARC 21 holdings)" \
+        "sophia"   "SophiA (990 \$a \$b)" \
+        "custom"   "$(t "Other layout (type the field map)")") || return 0
+    if [ "$preset" = "custom" ]; then
+        spec=$(ui_input "$(t "Legacy migration")" "$(t "Item field and 952 map, e.g. 949 p=a,o=b+c\n(in 952: p = barcode, o = call number, t = copy, z = public note; library and item type are asked next)")" "949 p=a") || return 0
+        if ! br_preset "$spec"; then
+            msg_error "" "$(t "Invalid field map. Use: TAG p=a,o=b+c\nNothing was changed.")" 9 70
+            return 1
+        fi
+    else
+        br_preset "$preset"
+    fi
+    # Old systems export either UTF-8 without the leader flag or Latin-1.
+    if file_is_utf8 "$file"; then
+        guess="UTF-8"; encs=("UTF-8" "Unicode" "ISO-8859-1" "Latin-1 / Windows" "MARC-8" "MARC-8 (ANSEL)")
+    else
+        guess="ISO-8859-1"; encs=("ISO-8859-1" "Latin-1 / Windows" "UTF-8" "Unicode" "MARC-8" "MARC-8 (ANSEL)")
+    fi
+    enc=$(ui_menu "$(t "Character encoding")" "$(t 'Encoding of the records (the file says: ${guess}):')" "${encs[@]}") || return 0
+    branch=$(tools_pick "$(t "Legacy migration")" "$(t "Library of the items:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    itype=$(tools_pick "$(t "Legacy migration")" "$(t "Item type of the items:")" "SELECT itemtype, description FROM ${DB_NAME}.itemtypes ORDER BY description;") || return 0
+    mode=$(ui_menu "$(t "Records already in the catalog")" "$(t "When an incoming record matches one in the catalog (ISBN and title):")" \
+        "keep"    "$(t "Keep the catalog record, add only new items")" \
+        "replace" "$(t "Replace the catalog record with the incoming one")" \
+        "new"     "$(t "Do not compare: every record becomes a new title")") || return 0
+    require_yaz || return 1
+    tools_workdir || return 1
+    _lt_br_migrate_run "$file" "$enc" "$branch" "$itype" "$mode"
+}
+
+_lt_br_migrate_run() {
+    local file="$1" enc="$2" branch="$3" itype="$4" mode="$5" log name utf8 out script n_in n_out recs items
+    local args=()
+    log=$(tools_log migrate-marc)
+    name="${file##*/}"; name="${name%.*}"; name="${name//[^A-Za-z0-9._-]/_}"
+    utf8="${TOOLS_WORK}/${name}-utf8.mrc"; out="${TOOLS_WORK}/${name}-koha.mrc"; script="${TOOLS_WORK}/remap952.pl"
+    display_explanation "Converting the characters to UTF-8..."
+    printf '$ %s -f %s -t UTF-8 -l 9=97 %s\n' "$YAZ_MARCDUMP" "$enc" "$file" >> "$log"
+    "$YAZ_MARCDUMP" -i marc -o marc -f "$enc" -t UTF-8 -l 9=97 "$file" > "$utf8" 2>> "$log"
+    n_in=$(marc_count "$file"); n_out=$(marc_count "$utf8")
+    if [ "$n_out" -eq 0 ] || [ "$n_out" -ne "$n_in" ] || ! file_is_utf8 "$utf8"; then
+        msg_error "" "$(t 'The character conversion failed (${n_out} of ${n_in} records). Nothing was changed.\n\nLog: ${log}')" 11 76
+        return 1
+    fi
+    chown "${INSTANCE}-koha:" "$utf8" 2>/dev/null || true
+    chmod 600 "$utf8"
+    br_write_remapper "$script"
+    args=(--in "$utf8" --item-tag "$BR_ITEM_TAG" --map "$BR_MAP" --callnumber "$BR_CN" --branch "$branch" --itype "$itype")
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_exec "$log" remap952 /usr/bin/perl "$script" "${args[@]}" --dry-run; then
+        ui_textbox "$(t "Legacy migration")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    recs=$(tools_num "$log" "Records read:"); items=$(tools_num "$log" "Items created:")
+    ui_textbox "$(t "Preview (dry run)")" "$log"
+    prompt_yes_no "$(t "Legacy migration")" "$(t 'Records: ${recs}\nItems moved to 952: ${items}\n\nConvert the file and go on to the MARC import? Nothing enters the catalog before you confirm the import.')" 13 72 defaultno || return 0
+    if ! koha_exec "$log" remap952 /usr/bin/perl "$script" "${args[@]}" --out "$out" || [ ! -s "$out" ]; then
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    log "tools: legacy MARC converted ($recs records, $items items, map $BR_ITEM_TAG $BR_MAP)"
+    tools_locked _lt_marc_import_run "$out" "ISO2709" "UTF-8" "$mode"
+}
+
+# ----------------------------------------------------------------------
+# Legacy patron spreadsheets -> import_patrons.pl CSV (with CPF checks).
+# Columns are recognised by their usual Portuguese or English names.
+# ----------------------------------------------------------------------
+br_patrons_awk() {
+    cat <<'PATAWK'
+function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+function csvq(s) { gsub(/"/, "\"\"", s); return "\"" s "\"" }
+function csv_split(line, f, sep,   n, i, c, q, cur, len) {
+    split("", f)
+    n = 0; cur = ""; q = 0; len = length(line)
+    for (i = 1; i <= len; i++) {
+        c = substr(line, i, 1)
+        if (q) {
+            if (c == "\"") { if (substr(line, i + 1, 1) == "\"") { cur = cur "\""; i++ } else q = 0 }
+            else cur = cur c
+        } else if (c == "\"") q = 1
+        else if (c == sep) { f[++n] = cur; cur = "" }
+        else cur = cur c
+    }
+    f[++n] = cur
+    return n
+}
+function norm(s) {
+    s = tolower(trim(s))
+    gsub(/á|à|â|ã|ä|Á|À|Â|Ã|Ä/, "a", s); gsub(/é|ê|ë|É|Ê|Ë/, "e", s); gsub(/í|ï|Í|Ï/, "i", s)
+    gsub(/ó|ô|õ|ö|Ó|Ô|Õ|Ö/, "o", s); gsub(/ú|ü|Ú|Ü/, "u", s); gsub(/ç|Ç/, "c", s)
+    gsub(/[._:#º°ª()\/-]/, " ", s); gsub(/  +/, " ", s)
+    return trim(s)
+}
+function iso_date(s,   d) {
+    s = trim(s)
+    if (s ~ /^[0-9][0-9]?\/[0-9][0-9]?\/[0-9][0-9][0-9][0-9]$/) { split(s, d, "/"); return sprintf("%04d-%02d-%02d", d[3], d[2], d[1]) }
+    if (s ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return s
+    return ""
+}
+BEGIN {
+    alias["cardnumber"] = "cardnumber"; alias["matricula"] = "cardnumber"; alias["cartao"] = "cardnumber"
+    alias["carteirinha"] = "cardnumber"; alias["n cartao"] = "cardnumber"; alias["numero do cartao"] = "cardnumber"
+    alias["codigo"] = "cardnumber"; alias["codigo do leitor"] = "cardnumber"; alias["codigo do usuario"] = "cardnumber"
+    alias["id"] = "cardnumber"; alias["registro"] = "cardnumber"; alias["ra"] = "cardnumber"; alias["prontuario"] = "cardnumber"
+    alias["nome"] = "fullname"; alias["nome completo"] = "fullname"; alias["name"] = "fullname"; alias["leitor"] = "fullname"
+    alias["usuario"] = "fullname"; alias["nome do leitor"] = "fullname"; alias["nome do usuario"] = "fullname"
+    alias["surname"] = "surname"; alias["sobrenome"] = "surname"
+    alias["firstname"] = "firstname"; alias["primeiro nome"] = "firstname"; alias["prenome"] = "firstname"
+    alias["cpf"] = "cpf"; alias["n cpf"] = "cpf"; alias["numero do cpf"] = "cpf"; alias["cpf do leitor"] = "cpf"; alias["documento"] = "cpf"
+    alias["email"] = "email"; alias["e mail"] = "email"; alias["correio eletronico"] = "email"
+    alias["telefone"] = "phone"; alias["fone"] = "phone"; alias["phone"] = "phone"; alias["tel"] = "phone"
+    alias["celular"] = "mobile"; alias["telefone celular"] = "mobile"; alias["whatsapp"] = "mobile"; alias["mobile"] = "mobile"
+    alias["data de nascimento"] = "dateofbirth"; alias["nascimento"] = "dateofbirth"; alias["data nasc"] = "dateofbirth"
+    alias["dt nascimento"] = "dateofbirth"; alias["dt nasc"] = "dateofbirth"; alias["dateofbirth"] = "dateofbirth"
+    alias["endereco"] = "address"; alias["logradouro"] = "address"; alias["rua"] = "address"; alias["address"] = "address"
+    alias["bairro"] = "address2"; alias["cidade"] = "city"; alias["municipio"] = "city"; alias["city"] = "city"
+    alias["uf"] = "state"; alias["estado"] = "state"; alias["state"] = "state"; alias["cep"] = "zipcode"; alias["zipcode"] = "zipcode"
+    alias["sexo"] = "sex"; alias["genero"] = "sex"; alias["sex"] = "sex"
+    alias["validade"] = "dateexpiry"; alias["data de validade"] = "dateexpiry"; alias["vencimento"] = "dateexpiry"; alias["dateexpiry"] = "dateexpiry"
+    alias["data de cadastro"] = "dateenrolled"; alias["cadastro"] = "dateenrolled"; alias["data de inscricao"] = "dateenrolled"; alias["dateenrolled"] = "dateenrolled"
+    alias["branchcode"] = "branchcode"; alias["categorycode"] = "categorycode"; alias["userid"] = "userid"
+    alias["sort1"] = "sort1"; alias["sort2"] = "sort2"; alias["othernames"] = "othernames"
+    ok = 0; bad = 0; bad_cpf = 0; dup = 0
+}
+NR == 1 {
+    sub(/^\357\273\277/, ""); sub(/\r$/, "")
+    nh = csv_split($0, h, sep)
+    for (i = 1; i <= nh; i++) {
+        k = norm(h[i])
+        if ((k in alias) && !(alias[k] in used)) { col[i] = alias[k]; used[alias[k]] = i; printf "  %-24s -> %s\n", trim(h[i]), alias[k] > map }
+        else printf "  %-24s -> -\n", trim(h[i]) > map
+    }
+    if (!("fullname" in used) && !("surname" in used)) exit 3
+    if (!("cardnumber" in used) && !("cpf" in used)) exit 4
+    card_from_cpf = !("cardnumber" in used)
+    split("cardnumber surname firstname email phone mobile dateofbirth address address2 city state zipcode sex dateexpiry dateenrolled branchcode categorycode userid sort1 sort2 othernames", order, " ")
+    no = 0
+    for (i = 1; i in order; i++) {
+        fld = order[i]
+        if (fld == "cardnumber" || fld == "surname" || (fld in used) || (fld == "firstname" && ("fullname" in used))) out_f[++no] = fld
+    }
+    if (("cpf" in used) && !card_from_cpf && cpf_attr) out_f[++no] = "patron_attributes"
+    line = ""
+    for (i = 1; i <= no; i++) line = line (i > 1 ? "," : "") out_f[i]
+    print line > out
+    next
+}
+{
+    sub(/\r$/, "")
+    if ($0 ~ /^[ \t,;]*$/) next
+    csv_split($0, f, sep)
+    split("", v)
+    for (i in col) v[col[i]] = trim(f[i])
+    if (v["fullname"] != "" && v["surname"] == "") {
+        full = v["fullname"]; gsub(/  +/, " ", full)
+        p = index(full, " ")
+        if (p && v["firstname"] == "") { v["firstname"] = substr(full, 1, p - 1); v["surname"] = substr(full, p + 1) }
+        else v["surname"] = full
+    }
+    cpf = v["cpf"]; gsub(/[^0-9]/, "", cpf)
+    card = card_from_cpf ? cpf : v["cardnumber"]
+    reason = ""
+    if (v["cpf"] != "" && !cpf_ok(cpf)) { reason = r_cpf " " v["cpf"]; bad_cpf++ }
+    else if (cpf != "" && (cpf in seen_cpf)) { reason = r_dupcpf " (" r_line " " seen_cpf[cpf] ")"; dup++ }
+    else if (v["surname"] == "") reason = r_noname
+    else if (card == "") reason = r_nocard
+    else if (card in seen_card) { reason = r_dupcard " (" r_line " " seen_card[card] ")"; dup++ }
+    if (reason != "") { printf "%s %d: %s\n", r_line, NR, reason > rej; bad++; next }
+    if (cpf != "") seen_cpf[cpf] = NR
+    seen_card[card] = NR
+    v["cardnumber"] = card
+    v["dateofbirth"] = iso_date(v["dateofbirth"]); v["dateexpiry"] = iso_date(v["dateexpiry"]); v["dateenrolled"] = iso_date(v["dateenrolled"])
+    s = toupper(substr(v["sex"], 1, 1)); v["sex"] = (s == "M" || s == "F") ? s : ""
+    v["patron_attributes"] = (cpf != "") ? "CPF:" cpf : ""
+    line = ""
+    for (i = 1; i <= no; i++) line = line (i > 1 ? "," : "") csvq(v[out_f[i]])
+    print line > out
+    ok++
+}
+END {
+    if (NR == 0) exit 5
+    printf "Lines read: %d\nPatrons ready: %d\nRejected: %d\nInvalid CPF: %d\nDuplicates: %d\n", (NR > 0 ? NR - 1 : 0), ok, bad, bad_cpf, dup
+    printf "Card number from CPF: %d\n", card_from_cpf
+}
+PATAWK
+}
+
+lt_br_patrons() {
+    require_database || return 0
+    local file log src utf8 out rej map sep semi comma tab cpf_attr rc branch cat over="no" ready match="cardnumber"
+    file=$(select_file "/root" "csv txt" "$(t "Pick the spreadsheet exported by the old system (.csv):")" "$(t "CSV file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    tools_workdir || return 1
+    log=$(tools_log legacy-patrons)
+    utf8="${TOOLS_WORK}/legacy-utf8.csv"; out="${TOOLS_WORK}/legacy-patrons.csv"
+    rej="${TOOLS_WORK}/legacy-rejected.txt"; map="${TOOLS_WORK}/legacy-columns.txt"
+    # Spreadsheets saved by Excel in Brazil are usually Windows-1252.
+    if file_is_utf8 "$file"; then
+        cp -f -- "$file" "$utf8"; src="UTF-8"
+    else
+        iconv -f WINDOWS-1252 -t UTF-8 "$file" > "$utf8" 2>> "$log" || { msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70; return 1; }
+        src="Windows-1252"
+    fi
+    # Byte order mark written by Excel (raw, or already read as Windows-1252).
+    sed -i '1s/^\xEF\xBB\xBF//; 1s/^\xC3\xAF\xC2\xBB\xC2\xBF//' "$utf8"
+    semi=$(head -n 1 "$utf8" | tr -cd ';' | wc -c); comma=$(head -n 1 "$utf8" | tr -cd ',' | wc -c); tab=$(head -n 1 "$utf8" | tr -cd '\t' | wc -c)
+    sep=","; [ "$semi" -gt "$comma" ] && sep=";"; [ "$tab" -gt "$semi" ] && [ "$tab" -gt "$comma" ] && sep=$'\t'
+    cpf_attr=0
+    [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.borrower_attribute_types WHERE code = 'CPF';")" = "1" ] && cpf_attr=1
+    : > "$rej"; : > "$map"
+    rc=0
+    awk -v sep="$sep" -v out="$out" -v rej="$rej" -v map="$map" -v cpf_attr="$cpf_attr" \
+        -v r_cpf="$(t "invalid CPF")" -v r_dupcpf="$(t "duplicate CPF")" -v r_noname="$(t "no name")" \
+        -v r_nocard="$(t "no card number")" -v r_dupcard="$(t "duplicate card number")" -v r_line="$(t "line")" \
+        "${CPF_AWK}"$'\n'"$(br_patrons_awk)" "$utf8" >> "$log" 2>&1 || rc=$?
+    case "$rc" in
+        0) ;;
+        3|4) msg_error "" "$(t "The spreadsheet needs a name column (Nome) and a card number or CPF column (Matrícula, Código, CPF).\nNothing was changed.")" 11 76; return 1 ;;
+        *) msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74; return 1 ;;
+    esac
+    ready=$(tools_num "$log" "Patrons ready:")
+    {
+        printf '%s: %s    %s: "%s"\n\n' "$(t "Encoding")" "$src" "$(t "Separator")" "${sep/$'\t'/TAB}"
+        printf '%s\n' "$(t "Columns:")"; cat "$map"; printf '\n'
+        grep -E '^(Lines read|Patrons ready|Rejected|Invalid CPF|Duplicates):' "$log"
+        [ "$(tools_num "$log" "Card number from CPF:")" = "1" ] && printf '\n%s\n' "$(t "No card number column: the CPF is used as the card number.")"
+        [ "$cpf_attr" = "0" ] && grep -q ' -> cpf$' "$map" && printf '\n%s\n' "$(t "The CPF is checked but not stored: create a patron attribute type with code CPF to keep it.")"
+        if [ -s "$rej" ]; then printf '\n%s\n' "$(t "Rejected lines:")"; head -n 200 "$rej"; fi
+    } > "${TOOLS_WORK}/legacy-preview.txt"
+    cat "${TOOLS_WORK}/legacy-preview.txt" >> "$log"
+    ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/legacy-preview.txt"
+    if [ "${ready:-0}" = "0" ]; then
+        msg_info "$(t "Legacy patrons")" "$(t 'No patron is ready to import. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 0
+    fi
+    prompt_yes_no "$(t "Legacy patrons")" "$(t '${ready} patron(s) converted to the Koha format.\n\nContinue to the patron import (a Koha dry run comes first)?')" 11 72 defaultno || return 0
+    branch=$(tools_pick "$(t "Import patrons")" "$(t "Library for the lines without branchcode:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    cat=$(tools_pick "$(t "Import patrons")" "$(t "Category for the lines without categorycode:")" "SELECT categorycode, description FROM ${DB_NAME}.categories ORDER BY description;") || return 0
+    prompt_yes_no "$(t "Import patrons")" "$(t 'Update the patrons that are already registered (same ${match})?\n\nNo = keep them as they are and import only the new ones.')" 11 72 defaultno && over="yes"
+    tools_locked _lt_patron_import_run "$out" "cardnumber" "$branch" "$cat" "$over"
+}
+
+# ----------------------------------------------------------------------
+# CPF report (read-only): invalid check digits and CPFs shared by patrons.
+# ----------------------------------------------------------------------
+lt_br_cpf_audit() {
+    require_database || return 0
+    local field sql log
+    field=$(ui_menu "$(t "Check patron CPFs")" "$(t "Which patron field holds the CPF?")" \
+        "cardnumber" "cardnumber" "userid" "userid" "sort1" "sort1" "sort2" "sort2" \
+        "attribute" "$(t "Patron attribute with code CPF")") || return 0
+    case "$field" in
+        cardnumber|userid|sort1|sort2)
+            sql="SELECT borrowernumber, COALESCE(cardnumber, ''), ${field}, CONCAT_WS(' ', firstname, surname) FROM ${DB_NAME}.borrowers WHERE COALESCE(${field}, '') <> '' ORDER BY borrowernumber;" ;;
+        attribute)
+            sql="SELECT b.borrowernumber, COALESCE(b.cardnumber, ''), a.attribute, CONCAT_WS(' ', b.firstname, b.surname) FROM ${DB_NAME}.borrower_attributes a JOIN ${DB_NAME}.borrowers b ON b.borrowernumber = a.borrowernumber WHERE a.code = 'CPF' ORDER BY b.borrowernumber;" ;;
+        *) return 0 ;;
+    esac
+    log=$(tools_log cpf-check)
+    run_sql "$sql" | awk -F'\t' -v l_inv="$(t "Invalid CPF")" -v l_dup="$(t "CPF shared by two patrons")" \
+        -v l_sum="$(t "Checked: %d   valid: %d   invalid: %d   shared: %d   other values (not a CPF): %d")" \
+        "$CPF_AWK"'
+        {
+            raw = $3; d = raw; gsub(/[^0-9]/, "", d)
+            if (raw !~ /^[0-9 .\/-]+$/ || length(d) < 9 || length(d) > 12) { other++; next }
+            total++
+            if (!cpf_ok(d)) { inv++; printf "%s: %s  (%s %s)\n", l_inv, raw, $2, $4; next }
+            valid++
+            if (d in seen) { dup++; printf "%s: %s  (%s / %s)\n", l_dup, raw, seen[d], $2 " " $4 }
+            else seen[d] = $2 " " $4
+        }
+        END { printf "\n" l_sum "\n", total, valid, inv, dup, other }' > "$log"
+    ui_textbox "$(t "Check patron CPFs")" "$log"
+}
+
+# ----------------------------------------------------------------------
+# 2. Printing and cataloguing: Pimaco label templates and the catalogue card.
+# ----------------------------------------------------------------------
+# Pimaco sheets are sold as equivalents of Avery sheets; the geometry below
+# is the Avery one (LibreOffice label database, mm). A test print on plain
+# paper against the sheet is still advised.
+# code|description|page w|page h|label w|label h|top|left|cols|rows|col gap|row gap
+BR_PIMACO='6180|Pimaco 6180 / 6080 / 6280 - Carta, 66,7 x 25,4 mm, 30 por folha|215.9|279.4|66.68|25.4|12.7|4.78|3|10|3.17|0
+6181|Pimaco 6181 / 6081 / 6281 - Carta, 101,6 x 25,4 mm, 20 por folha|215.9|279.4|101.6|25.4|12.7|3.96|2|10|4.76|0
+6287|Pimaco 6287 / 6087 / 6187 - Carta, 44,45 x 12,7 mm, 80 por folha|215.9|279.4|44.45|12.7|12.7|7.14|4|20|7.95|0
+A4256|Pimaco A4256 - A4, 63,5 x 38,1 mm, 21 por folha|210|297|63.5|38.1|15.15|7.2|3|7|2.54|0
+A4251|Pimaco A4251 - A4, 38,1 x 21,2 mm, 65 por folha|210|297|38.1|21.17|10.9|4.67|5|13|2.54|0'
+# name|printing type|barcode|format|call number split|font size
+BR_LAYOUTS='KEI Lombada|BIB|CODE39|itemcallnumber|1|9
+KEI Codigo de barras|BAR|CODE39|barcode|0|8
+KEI Titulo e codigo|BIBBAR|CODE39|title, barcode|0|8'
+
+lt_br_labels() {
+    require_database || return 0
+    local choice items=() code desc
+    choice=$(ui_menu "$(t "Pimaco label templates")" "$(t "Label templates and layouts for Koha's label creator (Tools > Label creator):")" \
+        "1" "$(t "Install or update templates")" "2" "$(t "Remove the panel's templates")") || return 0
+    case "$choice" in
+        1)
+            while IFS='|' read -r code desc _; do items+=("$code" "$desc" "ON"); done <<< "$BR_PIMACO"
+            choice=$(ui_checklist "$(t "Pimaco label templates")" "$(t "Sheets to install (space bar selects):")" "${items[@]}") || return 0
+            choice=$(printf '%s' "$choice" | tr -d '"' | tr '\n' ' ')
+            [ -n "${choice// /}" ] || return 0
+            tools_locked _lt_br_labels_install "$choice" ;;
+        2) tools_locked _lt_br_labels_remove ;;
+    esac
+}
+
+_lt_br_labels_install() {
+    local chosen=" $1 " log sql code desc pw ph lw lh top left cols rows cg rg tcode n=0 name ptype bc fmt split fs
+    log=$(tools_log labels)
+    sql="${TOOLS_WORK}/labels.sql"
+    printf 'SET NAMES utf8mb4;\nSTART TRANSACTION;\n' > "$sql"
+    : > "${TOOLS_WORK}/preview.txt"
+    while IFS='|' read -r code desc pw ph lw lh top left cols rows cg rg; do
+        [[ "$chosen" == *" $code "* ]] || continue
+        tcode="KEI-PIMACO-${code}"; n=$((n + 1))
+        printf '● %s\n    %s x %s mm, %s x %s, %s\n' "$desc" "$lw" "$lh" "$cols" "$rows" "$tcode" >> "${TOOLS_WORK}/preview.txt"
+        cat >> "$sql" <<SQL
+UPDATE creator_templates SET template_desc = $(sql_quote "$desc"), page_width = $pw, page_height = $ph, label_width = $lw, label_height = $lh, top_text_margin = 1.5, left_text_margin = 2, top_margin = $top, left_margin = $left, cols = $cols, \`rows\` = $rows, col_gap = $cg, row_gap = $rg, units = 'MM' WHERE template_code = '$tcode' AND creator = 'Labels';
+INSERT INTO creator_templates (profile_id, template_code, template_desc, page_width, page_height, label_width, label_height, top_text_margin, left_text_margin, top_margin, left_margin, cols, \`rows\`, col_gap, row_gap, units, creator)
+SELECT NULL, '$tcode', $(sql_quote "$desc"), $pw, $ph, $lw, $lh, 1.5, 2, $top, $left, $cols, $rows, $cg, $rg, 'MM', 'Labels' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM creator_templates WHERE template_code = '$tcode' AND creator = 'Labels');
+SQL
+    done <<< "$BR_PIMACO"
+    while IFS='|' read -r name ptype bc fmt split fs; do
+        printf '● %s (%s)\n' "$name" "$fmt" >> "${TOOLS_WORK}/preview.txt"
+        cat >> "$sql" <<SQL
+INSERT INTO creator_layouts (barcode_type, start_label, printing_type, layout_name, guidebox, oblique_title, font, font_size, units, callnum_split, text_justify, format_string, layout_xml, creator)
+SELECT '$bc', 1, '$ptype', '$name', 0, 0, 'TR', $fs, 'POINT', $split, 'L', '$fmt', '', 'Labels' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM creator_layouts WHERE layout_name = '$name' AND creator = 'Labels');
+SQL
+    done <<< "$BR_LAYOUTS"
+    printf 'COMMIT;\n' >> "$sql"
+    cat "${TOOLS_WORK}/preview.txt" >> "$log"
+    ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
+    prompt_yes_no "$(t "Pimaco label templates")" "$(t 'Install ${n} template(s) and 3 layouts? Existing templates of the panel are updated, other templates are not touched. A verified backup is made first.\n\nDo a test print on plain paper before using the adhesive sheets.')" 13 74 defaultno || return 0
+    tools_safety_backup LABELS || return 1
+    if ! koha_sql_run "$log" "$sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    msg_ok "$(t '✔ Label templates installed: ${n}\n\nIn Koha: Tools > Label creator > Manage > Templates / Layouts.\nSafety backup: ${TOOLS_PRE}')" 12 76
+}
+
+_lt_br_labels_remove() {
+    local log sql nt nl
+    log=$(tools_log labels)
+    nt=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.creator_templates WHERE template_code LIKE 'KEI-PIMACO-%';")
+    nl=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.creator_layouts WHERE layout_name LIKE 'KEI %' AND creator = 'Labels';")
+    if [ "${nt:-0}" = "0" ] && [ "${nl:-0}" = "0" ]; then
+        msg_info "$(t "Pimaco label templates")" "$(t "The pack is not installed. Nothing was changed.")" 9 70
+        return 0
+    fi
+    prompt_yes_no "$(t "Pimaco label templates")" "$(t 'Remove ${nt} template(s) and ${nl} layout(s) installed by the panel? Other templates are not touched. A verified backup is made first.')" 11 72 defaultno || return 0
+    tools_safety_backup LABELS || return 1
+    sql="${TOOLS_WORK}/labels.sql"
+    printf "SET NAMES utf8mb4;\nSTART TRANSACTION;\nDELETE FROM creator_templates WHERE template_code LIKE 'KEI-PIMACO-%%';\nDELETE FROM creator_layouts WHERE layout_name LIKE 'KEI %%' AND creator = 'Labels';\nCOMMIT;\n" > "$sql"
+    if ! koha_sql_run "$log" "$sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    msg_ok "$(t "✔ The panel's label templates were removed.")" 8 64
+}
+
+# Catalogue card (ficha catalográfica, AACR2): an XSLT that imports Koha's
+# default detail view of the same language and adds the card below it.
+# Koha picks the file per language ({langcode} in the system preference).
+ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!-- Koha Easy Installer: Koha'"'"'s default detail view plus the Brazilian catalogue card (ficha catalografica, AACR2). Generated file. -->\n'
+    printf '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:marc="http://www.loc.gov/MARC21/slim" exclude-result-prefixes="marc">\n'
+    printf '  <xsl:import href="%s"/>\n' "$(xml_escape "$1")"
+    printf '  <xsl:variable name="kei-title">%s</xsl:variable>\n' "$(xml_escape "$2")"
+    printf '  <xsl:variable name="kei-print">%s</xsl:variable>\n' "$(xml_escape "$3")"
+    cat <<'FICHA'
+  <xsl:template match="marc:record">
+    <xsl:apply-imports/>
+    <xsl:call-template name="kei-ficha"/>
+  </xsl:template>
+
+  <xsl:template name="kei-sub">
+    <xsl:param name="codes"/>
+    <xsl:for-each select="marc:subfield[contains($codes, @code)]">
+      <xsl:if test="position() &gt; 1"><xsl:text> </xsl:text></xsl:if>
+      <xsl:value-of select="normalize-space(.)"/>
+    </xsl:for-each>
+  </xsl:template>
+
+  <!-- AACR2 tracings and headings end with a full stop. -->
+  <xsl:template name="kei-dot">
+    <xsl:param name="s"/>
+    <xsl:variable name="v" select="normalize-space($s)"/>
+    <xsl:variable name="last" select="substring($v, string-length($v))"/>
+    <xsl:choose>
+      <xsl:when test="$v = ''"/>
+      <xsl:when test="$last = ',' or $last = ';' or $last = ':' or $last = '/'"><xsl:value-of select="concat(normalize-space(substring($v, 1, string-length($v) - 1)), '.')"/></xsl:when>
+      <xsl:when test="$last = '.' or $last = '?' or $last = '!' or $last = ')' or $last = '-'"><xsl:value-of select="$v"/></xsl:when>
+      <xsl:otherwise><xsl:value-of select="concat($v, '.')"/></xsl:otherwise>
+    </xsl:choose>
+  </xsl:template>
+
+  <xsl:template name="kei-ficha">
+    <xsl:variable name="class">
+      <xsl:choose>
+        <xsl:when test="marc:datafield[@tag='090']/marc:subfield[@code='a']"><xsl:value-of select="marc:datafield[@tag='090']/marc:subfield[@code='a']"/></xsl:when>
+        <xsl:when test="marc:datafield[@tag='082']/marc:subfield[@code='a']"><xsl:value-of select="marc:datafield[@tag='082']/marc:subfield[@code='a']"/></xsl:when>
+        <xsl:otherwise><xsl:value-of select="marc:datafield[@tag='080']/marc:subfield[@code='a']"/></xsl:otherwise>
+      </xsl:choose>
+    </xsl:variable>
+    <xsl:variable name="has-entry" select="boolean(marc:datafield[@tag='100' or @tag='110' or @tag='111'])"/>
+    <div class="kei-ficha-box" id="kei-ficha">
+      <style type="text/css">
+.kei-ficha-box { margin: 1.5em 0; }
+.kei-ficha { display: flex; gap: 0.3cm; box-sizing: border-box; width: 12.5cm; min-height: 7.5cm; padding: 0.4cm 0.5cm; border: 1px solid #333; background: #fff; color: #000; font-family: "Times New Roman", Times, serif; font-size: 10pt; line-height: 1.35; }
+.kei-ficha-num { flex: 0 0 1.7cm; white-space: nowrap; }
+.kei-ficha-body { flex: 1 1 auto; }
+.kei-ficha-body p { margin: 0 0 0.35em 0; }
+.kei-entrada { padding-left: 2.2em; text-indent: -2.2em; }
+.kei-par { text-indent: 2.2em; }
+.kei-pistas { text-indent: 2.2em; margin-top: 0.7em !important; }
+.kei-cdd { text-align: right; margin-top: 0.7em !important; }
+@media print {
+  body.kei-print * { visibility: hidden; }
+  body.kei-print #kei-ficha, body.kei-print #kei-ficha * { visibility: visible; }
+  body.kei-print #kei-ficha { position: absolute; left: 0; top: 0; }
+  .kei-ficha-print { display: none; }
+}
+      </style>
+      <h3 class="kei-ficha-title"><xsl:value-of select="$kei-title"/></h3>
+      <div class="kei-ficha">
+        <div class="kei-ficha-num">
+          <div><xsl:value-of select="$class"/></div>
+          <div><xsl:value-of select="marc:datafield[@tag='090']/marc:subfield[@code='b']"/></div>
+        </div>
+        <div class="kei-ficha-body">
+          <xsl:for-each select="(marc:datafield[@tag='100'] | marc:datafield[@tag='110'] | marc:datafield[@tag='111'])[1]">
+            <p class="kei-entrada"><xsl:call-template name="kei-dot"><xsl:with-param name="s"><xsl:call-template name="kei-sub"><xsl:with-param name="codes">abcdnq</xsl:with-param></xsl:call-template></xsl:with-param></xsl:call-template></p>
+          </xsl:for-each>
+          <p>
+            <xsl:attribute name="class"><xsl:choose><xsl:when test="$has-entry">kei-par</xsl:when><xsl:otherwise>kei-entrada</xsl:otherwise></xsl:choose></xsl:attribute>
+            <xsl:for-each select="marc:datafield[@tag='245'][1]"><xsl:call-template name="kei-sub"><xsl:with-param name="codes">abnpc</xsl:with-param></xsl:call-template></xsl:for-each>
+            <xsl:for-each select="marc:datafield[@tag='250'][1]"><xsl:text> – </xsl:text><xsl:call-template name="kei-sub"><xsl:with-param name="codes">ab</xsl:with-param></xsl:call-template></xsl:for-each>
+            <xsl:for-each select="(marc:datafield[@tag='260'] | marc:datafield[@tag='264'][@ind2='1'])[1]"><xsl:text> – </xsl:text><xsl:call-template name="kei-sub"><xsl:with-param name="codes">abc</xsl:with-param></xsl:call-template></xsl:for-each>
+          </p>
+          <xsl:if test="marc:datafield[@tag='300' or @tag='490']">
+            <p class="kei-par">
+              <xsl:for-each select="marc:datafield[@tag='300'][1]"><xsl:call-template name="kei-sub"><xsl:with-param name="codes">abce</xsl:with-param></xsl:call-template></xsl:for-each>
+              <xsl:for-each select="marc:datafield[@tag='490']"><xsl:text> – (</xsl:text><xsl:call-template name="kei-sub"><xsl:with-param name="codes">av</xsl:with-param></xsl:call-template><xsl:text>)</xsl:text></xsl:for-each>
+            </p>
+          </xsl:if>
+          <xsl:for-each select="marc:datafield[@tag='500']"><p class="kei-par"><xsl:value-of select="normalize-space(marc:subfield[@code='a'])"/></p></xsl:for-each>
+          <xsl:for-each select="marc:datafield[@tag='020']/marc:subfield[@code='a']"><p class="kei-par">ISBN <xsl:value-of select="normalize-space(.)"/></p></xsl:for-each>
+          <p class="kei-pistas">
+            <xsl:for-each select="marc:datafield[@tag='600' or @tag='610' or @tag='611' or @tag='630' or @tag='650' or @tag='651']">
+              <xsl:value-of select="position()"/><xsl:text>. </xsl:text>
+              <xsl:call-template name="kei-dot"><xsl:with-param name="s">
+                <xsl:for-each select="marc:subfield[contains('abcdtvxyz', @code)]">
+                  <xsl:if test="position() &gt; 1"><xsl:choose><xsl:when test="contains('vxyz', @code)"><xsl:text> – </xsl:text></xsl:when><xsl:otherwise><xsl:text> </xsl:text></xsl:otherwise></xsl:choose></xsl:if>
+                  <xsl:value-of select="normalize-space(.)"/>
+                </xsl:for-each>
+              </xsl:with-param></xsl:call-template>
+              <xsl:text> </xsl:text>
+            </xsl:for-each>
+            <xsl:for-each select="marc:datafield[@tag='700' or @tag='710' or @tag='711']">
+              <xsl:number value="position()" format="I"/><xsl:text>. </xsl:text>
+              <xsl:call-template name="kei-dot"><xsl:with-param name="s"><xsl:call-template name="kei-sub"><xsl:with-param name="codes">abcdq</xsl:with-param></xsl:call-template></xsl:with-param></xsl:call-template>
+              <xsl:text> </xsl:text>
+            </xsl:for-each>
+            <xsl:if test="marc:datafield[@tag='245'][1]/@ind1 = '1'">
+              <xsl:number value="count(marc:datafield[@tag='700' or @tag='710' or @tag='711']) + 1" format="I"/><xsl:text>. Título.</xsl:text>
+            </xsl:if>
+          </p>
+          <p class="kei-cdd">
+            <xsl:if test="marc:datafield[@tag='082']/marc:subfield[@code='a']">CDD <xsl:value-of select="marc:datafield[@tag='082']/marc:subfield[@code='a']"/></xsl:if>
+            <xsl:if test="marc:datafield[@tag='080']/marc:subfield[@code='a']"><xsl:text>   CDU </xsl:text><xsl:value-of select="marc:datafield[@tag='080']/marc:subfield[@code='a']"/></xsl:if>
+          </p>
+        </div>
+      </div>
+      <button type="button" class="btn btn-default btn-sm kei-ficha-print" onclick="document.body.classList.add('kei-print'); window.print(); document.body.classList.remove('kei-print');"><xsl:value-of select="$kei-print"/></button>
+    </div>
+  </xsl:template>
+</xsl:stylesheet>
+FICHA
+}
+
+# Writes the card stylesheets for every language Koha has (OPAC and staff),
+# each one importing the default view of its own language (English when a
+# side lacks that language). Prints the number of languages.
+ficha_write() {
+    local langs=() l d opac staff title print_label
+    title="$(t "Cataloguing card")"; print_label="$(t "Print the card")"
+    for d in "$KOHA_OPAC_TMPL"/*/xslt/MARC21slim2OPACDetail.xsl "$KOHA_INTRA_TMPL"/*/xslt/MARC21slim2intranetDetail.xsl; do
+        [ -f "$d" ] || continue
+        l="${d%/xslt/*}"; l="${l##*/}"
+        [[ " ${langs[*]} " == *" $l "* ]] || langs+=("$l")
+    done
+    [ ${#langs[@]} -gt 0 ] || return 1
+    for l in "${langs[@]}"; do
+        opac="$KOHA_OPAC_TMPL/$l/xslt/MARC21slim2OPACDetail.xsl"; [ -f "$opac" ] || opac="$KOHA_OPAC_TMPL/en/xslt/MARC21slim2OPACDetail.xsl"
+        staff="$KOHA_INTRA_TMPL/$l/xslt/MARC21slim2intranetDetail.xsl"; [ -f "$staff" ] || staff="$KOHA_INTRA_TMPL/en/xslt/MARC21slim2intranetDetail.xsl"
+        mkdir -p "$FICHA_DIR/$l" || return 1
+        ficha_xsl "$opac" "$title" "$print_label" > "$FICHA_DIR/$l/opac-detail.xsl" || return 1
+        ficha_xsl "$staff" "$title" "$print_label" > "$FICHA_DIR/$l/staff-detail.xsl" || return 1
+    done
+    chown -R "root:${INSTANCE}-koha" "$FICHA_DIR" 2>/dev/null || true
+    chmod -R u=rwX,g=rX,o= "$FICHA_DIR"
+    printf '%s' "${#langs[@]}"
+}
+
+# Languages installed after the card was enabled get their stylesheet too
+# (at panel start): Koha would otherwise fail to show their detail pages.
+ficha_refresh() {
+    [ -s "$FICHA_STATE" ] || return 0
+    ficha_write >/dev/null 2>&1 || true
+}
+
+lt_br_ficha() {
+    require_database || return 0
+    local state choice
+    state="$(t "off")"
+    [ -s "$FICHA_STATE" ] && state="$(t "on")"
+    choice=$(ui_menu "$(t "Cataloguing card")" "$(t 'Brazilian catalogue card (ficha catalográfica, AACR2) below the record in the OPAC and in the staff interface. Now: ${state}')" \
+        "on" "$(t "Show the card")" "off" "$(t "Hide the card (Koha's default view)")") || return 0
+    case "$choice" in
+        on)  tools_locked _lt_br_ficha_on ;;
+        off) tools_locked _lt_br_ficha_off ;;
+    esac
+}
+
+_lt_br_ficha_on() {
+    local log n opac_now staff_now
+    log=$(tools_log ficha)
+    opac_now=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'OPACXSLTDetailsDisplay';")
+    staff_now=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'XSLTDetailsDisplay';")
+    prompt_yes_no "$(t "Cataloguing card")" "$(t 'The detail pages will use the stylesheets of the panel (the default Koha view plus the card):\n  OPACXSLTDetailsDisplay: ${opac_now}\n  XSLTDetailsDisplay: ${staff_now}\nThe current values are kept to be restored later. A verified backup is made first.')" 14 76 defaultno || return 0
+    if ! n=$(ficha_write); then
+        msg_error "" "$(t "Koha's default detail stylesheets were not found. Nothing was changed.")" 9 72
+        return 1
+    fi
+    tools_safety_backup FICHA || return 1
+    if [ ! -s "$FICHA_STATE" ]; then
+        printf 'OPACXSLTDetailsDisplay=%s\nXSLTDetailsDisplay=%s\n' "${opac_now:-default}" "${staff_now:-default}" > "$FICHA_STATE"
+    fi
+    koha_tool "$log" koha-preferences set OPACXSLTDetailsDisplay "$FICHA_DIR/{langcode}/opac-detail.xsl"
+    koha_tool "$log" koha-preferences set XSLTDetailsDisplay "$FICHA_DIR/{langcode}/staff-detail.xsl"
+    if [ "$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'XSLTDetailsDisplay';")" != "$FICHA_DIR/{langcode}/staff-detail.xsl" ]; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    log "tools: catalogue card enabled ($n languages)"
+    msg_ok "$(t '✔ The catalogue card is shown below each record (${n} language(s)).\n\nSafety backup: ${TOOLS_PRE}')" 11 72
+}
+
+_lt_br_ficha_off() {
+    local log opac_prev staff_prev
+    if [ ! -s "$FICHA_STATE" ]; then
+        msg_info "$(t "Cataloguing card")" "$(t "The card is not enabled. Nothing was changed.")" 9 64
+        return 0
+    fi
+    log=$(tools_log ficha)
+    opac_prev=$(sed -n 's/^OPACXSLTDetailsDisplay=//p' "$FICHA_STATE"); staff_prev=$(sed -n 's/^XSLTDetailsDisplay=//p' "$FICHA_STATE")
+    prompt_yes_no "$(t "Cataloguing card")" "$(t 'Restore the previous detail views?\n  OPACXSLTDetailsDisplay: ${opac_prev}\n  XSLTDetailsDisplay: ${staff_prev}\nA verified backup is made first.')" 12 76 defaultno || return 0
+    tools_safety_backup FICHA || return 1
+    koha_tool "$log" koha-preferences set OPACXSLTDetailsDisplay "${opac_prev:-default}"
+    koha_tool "$log" koha-preferences set XSLTDetailsDisplay "${staff_prev:-default}"
+    if [ "$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'XSLTDetailsDisplay';")" != "${staff_prev:-default}" ]; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    rm -f "$FICHA_STATE"
+    case "$FICHA_DIR" in /var/lib/koha/*/kei-xslt) rm -rf "$FICHA_DIR" ;; esac
+    log "tools: catalogue card disabled"
+    msg_ok "$(t "✔ Koha's default detail view is back.")" 8 64
+}
+
+# ----------------------------------------------------------------------
+# 3. Calendar: national holidays and the dates that depend on Easter.
+# ----------------------------------------------------------------------
+# Easter Sunday (Gregorian calendar), Meeus/Jones/Butcher: YYYY-MM-DD.
+br_easter() {
+    local y=$1 a b c d e f g h i k l m
+    a=$((y % 19)); b=$((y / 100)); c=$((y % 100)); d=$((b / 4)); e=$((b % 4))
+    f=$(((b + 8) / 25)); g=$(((b - f + 1) / 3)); h=$(((19 * a + b - d - g + 15) % 30))
+    i=$((c / 4)); k=$((c % 4)); l=$(((32 + 2 * e + 2 * i - h - k) % 7))
+    m=$(((a + 11 * h + 22 * l) / 451))
+    printf '%04d-%02d-%02d\n' "$y" $(((h + l - 7 * m + 114) / 31)) $(((h + l - 7 * m + 114) % 31 + 1))
+}
+
+# br_holidays YEAR: "YYYY-MM-DD|title|kind" sorted by date. National
+# holidays (Leis 662/1949, 6.802/1980, 14.759/2023) plus Carnival, Good
+# Friday and Corpus Christi (Easter - 48/-47, -2, +60 days).
+br_holidays() {
+    local y=$1 e
+    e=$(br_easter "$y")
+    {
+        printf '%s|%s|N\n' "$y-01-01" "Confraternização Universal" "$y-04-21" "Tiradentes" "$y-05-01" "Dia do Trabalho" \
+            "$y-09-07" "Independência do Brasil" "$y-10-12" "Nossa Senhora Aparecida" "$y-11-02" "Finados" \
+            "$y-11-15" "Proclamação da República" "$y-12-25" "Natal"
+        [ "$y" -ge 2024 ] && printf '%s|%s|N\n' "$y-11-20" "Dia Nacional de Zumbi e da Consciência Negra"
+        printf '%s|%s|P\n' "$(date -d "$e -48 days" +%F)" "Carnaval (segunda-feira)" "$(date -d "$e -47 days" +%F)" "Carnaval (terça-feira)" \
+            "$(date -d "$e +60 days" +%F)" "Corpus Christi"
+        printf '%s|%s|N\n' "$(date -d "$e -2 days" +%F)" "Sexta-feira Santa"
+    } | sort
+}
+
+# The calendar table: special_holidays up to Koha 26.05, library_single_closures after.
+br_calendar_table() {
+    local tb
+    for tb in special_holidays library_single_closures; do
+        [ -n "$(run_sql "SHOW TABLES FROM ${DB_NAME} LIKE '$tb';")" ] && { printf '%s' "$tb"; return 0; }
+    done
+    return 1
+}
+
+lt_br_holidays() {
+    require_database || return 0
+    local action year branch local_spec=""
+    action=$(ui_menu "$(t "Brazilian holidays")" "$(t "Days the library is closed in the Koha calendar:")" \
+        "add" "$(t "Add the holidays of a year")" "remove" "$(t "Remove the holidays added by the panel")") || return 0
+    year=$(ui_input "$(t "Brazilian holidays")" "$(t "Year (YYYY):")" "$(date +%Y)") || return 0
+    if ! [[ "$year" =~ ^20[0-9][0-9]$ ]]; then
+        msg_error "" "$(t "Invalid year. Nothing was changed.")" 8 60
+        return 1
+    fi
+    branch=$(tools_pick "$(t "Brazilian holidays")" "$(t "Library")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;" "*" "$(t "All libraries")") || return 0
+    if [ "$action" = "add" ]; then
+        local_spec=$(ui_input "$(t "Brazilian holidays")" "$(t "Local holiday (city anniversary, patron saint): DD/MM and the name, e.g. 20/01 São Sebastião.\nLeave it empty to skip.")" "") || return 0
+        if [ -n "$local_spec" ]; then
+            if ! [[ "$local_spec" =~ ^([0-3][0-9])/([01][0-9])\ +([^|]{2,40})$ ]] || ! date -d "$year-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}" >/dev/null 2>&1; then
+                msg_error "" "$(t "Invalid local holiday. Use DD/MM and the name.\nNothing was changed.")" 9 66
+                return 1
+            fi
+            local_spec="$year-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}|${BASH_REMATCH[3]}|M"
+        fi
+        tools_locked _lt_br_holidays_add "$year" "$branch" "$local_spec"
+    else
+        tools_locked _lt_br_holidays_remove "$year" "$branch"
+    fi
+}
+
+# Libraries chosen ("*" = all), quoted for SQL: 'CPL','MPL'
+br_branch_list() {
+    local b out=""
+    if [ "$1" = "*" ]; then
+        while IFS= read -r b; do [ -n "$b" ] && out+="${out:+,}$(sql_quote "$b")"; done < <(run_sql "SELECT branchcode FROM ${DB_NAME}.branches ORDER BY branchcode;")
+    else
+        out=$(sql_quote "$1")
+    fi
+    printf '%s' "$out"
+}
+
+_lt_br_holidays_add() {
+    local year="$1" branch="$2" extra="$3" log table branches sql day title kind desc before after added d m
+    log=$(tools_log holidays)
+    if ! table=$(br_calendar_table); then
+        msg_error "" "$(t "Koha's calendar table was not found. Nothing was changed.")" 9 66
+        return 1
+    fi
+    branches=$(br_branch_list "$branch")
+    sql="${TOOLS_WORK}/holidays.sql"
+    printf 'SET NAMES utf8mb4;\nSTART TRANSACTION;\n' > "$sql"
+    {
+        printf '%s: %s\n\n' "$(t "Libraries")" "${branches//\'/}"
+        { br_holidays "$year"; [ -n "$extra" ] && printf '%s\n' "$extra"; } | sort | while IFS='|' read -r day title kind; do
+            printf '  %s  %s  %s\n' "$day" "$(date -d "$day" +%a)" "$title"
+        done
+    } > "${TOOLS_WORK}/preview.txt"
+    { br_holidays "$year"; [ -n "$extra" ] && printf '%s\n' "$extra"; } | while IFS='|' read -r day title kind; do
+        case "$kind" in N) desc="Feriado nacional" ;; P) desc="Ponto facultativo nacional" ;; *) desc="Feriado municipal" ;; esac
+        desc="$desc [$BR_TAG]"
+        d=$((10#${day:8:2})); m=$((10#${day:5:2}))
+        if [ "$table" = "special_holidays" ]; then
+            printf "INSERT INTO special_holidays (branchcode, day, month, year, isexception, title, description) SELECT b.branchcode, %d, %d, %d, 0, %s, %s FROM branches b WHERE b.branchcode IN (%s) AND NOT EXISTS (SELECT 1 FROM special_holidays s WHERE s.branchcode = b.branchcode AND s.year = %d AND s.month = %d AND s.day = %d AND s.isexception = 0);\n" \
+                "$d" "$m" "$year" "$(sql_quote "$title")" "$(sql_quote "$desc")" "$branches" "$year" "$m" "$d"
+        else
+            printf "INSERT IGNORE INTO library_single_closures (library_id, date, title, description) SELECT b.branchcode, '%s', %s, %s FROM branches b WHERE b.branchcode IN (%s);\n" \
+                "$day" "$(sql_quote "$title")" "$(sql_quote "$desc")" "$branches"
+        fi
+    done >> "$sql"
+    printf 'COMMIT;\n' >> "$sql"
+    cat "${TOOLS_WORK}/preview.txt" >> "$log"
+    ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
+    prompt_yes_no "$(t "Brazilian holidays")" "$(t 'Add these closed days of ${year} to the Koha calendar? Days already in the calendar are skipped. A verified backup is made first.\n\nCarnival and Corpus Christi are optional days off (ponto facultativo): remove them in Tools > Calendar if the library opens.')" 14 76 defaultno || return 0
+    tools_safety_backup CALENDAR || return 1
+    before=$(br_holiday_count "$table" "$year")
+    if ! koha_sql_run "$log" "$sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    memcached_flush || log "tools: memcached flush failed (the calendar cache expires by itself)"
+    after=$(br_holiday_count "$table" "$year")
+    added=$((after - before))
+    log "tools: holidays $year added ($added rows, $table)"
+    msg_ok "$(t '✔ Closed days added to the calendar: ${added}\n\nIn Koha: Tools > Calendar.\nSafety backup: ${TOOLS_PRE}')" 11 72
+}
+
+# Rows the panel added for a year (all libraries).
+br_holiday_count() {
+    if [ "$1" = "special_holidays" ]; then
+        run_sql "SELECT COUNT(*) FROM ${DB_NAME}.special_holidays WHERE year = $2 AND description LIKE '%[${BR_TAG}]%';"
+    else
+        run_sql "SELECT COUNT(*) FROM ${DB_NAME}.library_single_closures WHERE YEAR(date) = $2 AND description LIKE '%[${BR_TAG}]%';"
+    fi
+}
+
+_lt_br_holidays_remove() {
+    local year="$1" branch="$2" log table branches sql n where
+    log=$(tools_log holidays)
+    table=$(br_calendar_table) || { msg_error "" "$(t "Koha's calendar table was not found. Nothing was changed.")" 9 66; return 1; }
+    branches=$(br_branch_list "$branch")
+    if [ "$table" = "special_holidays" ]; then
+        where="year = $year AND description LIKE '%[${BR_TAG}]%' AND branchcode IN ($branches)"
+    else
+        where="YEAR(date) = $year AND description LIKE '%[${BR_TAG}]%' AND library_id IN ($branches)"
+    fi
+    n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.${table} WHERE ${where};")
+    if [ "${n:-0}" = "0" ]; then
+        msg_info "$(t "Brazilian holidays")" "$(t "The panel added no holiday for this year. Nothing was changed.")" 9 70
+        return 0
+    fi
+    prompt_yes_no "$(t "Brazilian holidays")" "$(t 'Remove ${n} closed day(s) of ${year} added by the panel? Days added by hand are not touched. A verified backup is made first.')" 11 72 defaultno || return 0
+    tools_safety_backup CALENDAR || return 1
+    sql="${TOOLS_WORK}/holidays.sql"
+    printf 'SET NAMES utf8mb4;\nSTART TRANSACTION;\nDELETE FROM %s WHERE %s;\nCOMMIT;\n' "$table" "$where" > "$sql"
+    if ! koha_sql_run "$log" "$sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    memcached_flush || true
+    log "tools: holidays $year removed ($n rows)"
+    msg_ok "$(t '✔ Closed days removed: ${n}')" 8 60
+}
+
+# ----------------------------------------------------------------------
+# Brazil submenu (Library tools > 10)
+# ----------------------------------------------------------------------
+function_brazil_tools() {
+    require_koha || return 0
+    local opt
+    while true; do
+        opt=$(whiptail --title "$(t "◆  Brazil: localization & migration")" --cancel-button "$(t "Back")" \
+            --menu "$(t "Optional presets for Brazilian libraries. Nothing is applied until you choose it here.")" 0 0 0 \
+            "1" "$(t "⇩  Migrate MARC from Biblivre, SophiA, Pergamum...")" \
+            "2" "$(t "⇩  Import patrons from a legacy spreadsheet (CPF check)")" \
+            "3" "$(t "✔  Check patron CPFs (modulo 11)")" \
+            "4" "$(t "▤  Pimaco label templates")" \
+            "5" "$(t "▤  Cataloguing card (ficha catalográfica)")" \
+            "6" "$(t "◷  Brazilian holidays in the calendar")" 3>&1 1>&2 2>&3) || return 0
+        case "$opt" in
+            1) lt_br_migrate_marc ;;
+            2) lt_br_patrons ;;
+            3) lt_br_cpf_audit ;;
+            4) lt_br_labels ;;
+            5) lt_br_ficha ;;
+            6) lt_br_holidays ;;
         esac
         clear
     done
@@ -6303,6 +7305,8 @@ fi
 
 # Schedules written by older versions of the panel (see upgrade_cron_tasks).
 is_koha_installed && upgrade_cron_tasks
+# Catalogue card enabled (Library tools > Brazil): stylesheets for new languages.
+is_koha_installed && ficha_refresh
 
 # ======================================================================
 # PRIMEIRA EXECUÇÃO: IDIOMA OBRIGATÓRIO SE NÃO ESTIVER CONFIGURADO
