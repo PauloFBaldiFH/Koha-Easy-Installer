@@ -1163,19 +1163,80 @@ EOF
     return 0
 }
 
+# Stops Plack and waits until it is really gone before starting it again:
+# "koha-plack --start" does nothing while the old Plack is still running,
+# which would keep the old workers (and their missing cache) alive.
+plack_fresh_start() {
+    local i
+    koha_ctl /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        plack_running || break
+        sleep 1
+    done
+    koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+}
+
+# Memcached answering on its port is not enough: Koha uses it only if its
+# own Perl client (Cache::Memcached::Fast::Safe) loads and connects when
+# Plack starts. Otherwise About Koha says "Memcached: not running" with an
+# empty "Effective caching method". This asks Koha itself, as the instance
+# user, and prints one word:
+#   ok       Koha reads and writes its cache in Memcached
+#   module   the Perl client does not load (broken or missing package)
+#   connect  the client loads but cannot use Memcached
+#   unknown  Koha could not be asked
+# The details of a failure go to the panel log.
+koha_cache_state() {
+    local probe out state
+    probe=$(mktemp /tmp/kei-cache-probe.XXXXXX) || { echo unknown; return 1; }
+    cat > "$probe" << 'EOF'
+use strict;
+use warnings;
+my $err = eval { require Cache::Memcached::Fast::Safe; 1 } ? '' : ( $@ || 'load failed' );
+if ($err) { $err =~ s/\s+/ /g; print 'KEI-CACHE module ', substr( $err, 0, 300 ), "\n"; exit 0 }
+require Koha::Caches;
+my $cache = Koha::Caches->get_instance;
+my $ok = ref( $cache->cache ) =~ /Memcached/ && $cache->set_in_cache( 'kei_cache_probe', 1, { expiry => 60 } );
+print 'KEI-CACHE ', ( $ok ? 'ok' : 'connect' ), "\n";
+EOF
+    chmod 644 "$probe"
+    out=$(cd /tmp && timeout 60 /usr/sbin/koha-shell "$INSTANCE" -c "/usr/bin/perl $(kq "$probe")" 2>&1 </dev/null 7>&- 8>&- 9>&-)
+    rm -f "$probe"
+    state=$(printf '%s\n' "$out" | sed -n 's/^KEI-CACHE \([a-z]*\).*/\1/p' | head -n1)
+    [ -n "$state" ] || state=unknown
+    [ "$state" = ok ] || log "koha cache: $state: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-400)"
+    echo "$state"
+    [ "$state" = ok ]
+}
+
+# One line for the dialogs and the validation report.
+koha_cache_text() {
+    case "$1" in
+        ok)      t "Koha is using Memcached." ;;
+        module)  t "Koha cannot use Memcached: the Perl module Cache::Memcached::Fast::Safe does not load." ;;
+        connect) t "Koha cannot use Memcached: it does not answer to Koha on 127.0.0.1:11211." ;;
+        *)       t "Could not ask Koha whether it is using Memcached." ;;
+    esac
+}
+
 # Koha only uses Memcached if it answers when Plack starts: a Plack started
 # first (e.g. after a reboot) runs without cache until it is restarted
-# ("Memcached: not running" in About Koha). This makes Memcached answer,
-# makes koha-conf.xml point to it, orders the services at boot and then
-# restarts Plack and Apache. MariaDB is a hard dependency: without it Plack
-# is not started at all. Memcached is waited for, but Koha still starts
-# (without cache) if it never answers. Returns 1 if anything is not up.
+# ("Memcached: not running" in About Koha). This makes Memcached answer on
+# 127.0.0.1, makes koha-conf.xml point to it, orders the services at boot,
+# restarts Plack and Apache and then asks Koha itself whether it uses the
+# cache, reinstalling the Perl client if it does not load. MariaDB is a hard
+# dependency: without it Plack is not started at all. Memcached is waited
+# for, but Koha still starts (without cache) if it never answers. Returns 1
+# if anything is not up.
 ensure_koha_services() {
-    local i servers db_rc=0
+    local i servers db_rc=0 cache
     if ! command -v memcached >/dev/null 2>&1; then
         apt_install memcached libcache-memcached-fast-perl >/dev/null 2>&1
     fi
-    if [ -f /etc/memcached.conf ] && ! grep -qE '^-l[[:space:]]' /etc/memcached.conf; then
+    # Koha connects to 127.0.0.1:11211: Memcached must listen there, also
+    # when memcached.conf only lists other addresses (e.g. "-l ::1").
+    if [ -f /etc/memcached.conf ] \
+        && ! grep -E '^-l[[:space:]]' /etc/memcached.conf | grep -qE '127\.0\.0\.1|0\.0\.0\.0|localhost'; then
         echo '-l 127.0.0.1' >> /etc/memcached.conf
     fi
     systemctl enable memcached >/dev/null 2>&1
@@ -1197,9 +1258,7 @@ ensure_koha_services() {
     db_admin_check || db_rc=$?
     if [ "$db_rc" -ne 1 ]; then
         koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
-        koha_ctl /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
-        sleep 1
-        koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+        plack_fresh_start
     else
         log "MariaDB is down: Plack not started"
     fi
@@ -1209,7 +1268,19 @@ ensure_koha_services() {
         plack_running && break
         sleep 1
     done
-    [ "$db_rc" -ne 1 ] && memcached_alive && plack_running
+    [ "$db_rc" -ne 1 ] && memcached_alive && plack_running || return 1
+
+    # Koha's view. A Perl client that does not load (a broken or half
+    # upgraded package) is reinstalled once; then Plack is restarted so that
+    # it picks the cache up.
+    cache=$(koha_cache_state)
+    if [ "$cache" = module ]; then
+        log "reinstalling the Perl Memcached client for Koha"
+        apt_install --reinstall libcache-memcached-fast-safe-perl libcache-memcached-fast-perl libposix-atfork-perl >/dev/null 2>&1
+        plack_fresh_start
+        cache=$(koha_cache_state)
+    fi
+    case "$cache" in ok|unknown) return 0 ;; *) return 1 ;; esac
 }
 
 # Zebra is run by koha-zebra (koha-common has no systemd unit for it).
@@ -1692,6 +1763,14 @@ validate_complete_system() {
     else
         v_fail "Memcached: 127.0.0.1:11211 $(t "not responding (Koha runs without cache)")."
     fi
+    local cache_state=none
+    [ -x /usr/sbin/koha-shell ] && [ -f "$KOHA_CONF" ] && cache_state=$(koha_cache_state)
+    case "$cache_state" in
+        none)    ;;
+        ok)      v_ok   "$(koha_cache_text ok)" ;;
+        unknown) v_warn "$(koha_cache_text unknown)" ;;
+        *)       v_fail "$(koha_cache_text "$cache_state")" ;;
+    esac
     validate_service koha-common  "Koha common"
     validate_service cron         "Cron"
     if host_can fail2ban; then
@@ -3187,8 +3266,10 @@ function_install_koha() {
 
     a2enmod headers proxy proxy_http >/dev/null 2>&1
     a2ensite "$INSTANCE" >/dev/null 2>&1
-    systemctl enable --now memcached >/dev/null 2>&1
-    systemctl restart apache2 memcached koha-common >/dev/null 2>&1
+    # Memcached first: a Plack started before it runs without cache.
+    systemctl enable memcached >/dev/null 2>&1
+    systemctl restart memcached >/dev/null 2>&1
+    systemctl restart apache2 koha-common >/dev/null 2>&1
 
     # Automatic detection and installation of system language package in Koha
     local auto_lang
@@ -6318,15 +6399,21 @@ function_repair_services() {
     is_koha_zebra_running || zebra_start >/dev/null 2>&1
     ensure_search_indexing >/dev/null 2>&1
     ensure_koha_services >/dev/null 2>&1
-    local mc_state plack_state details=""
+    local mc_state plack_state details="" cache cache_line
     memcached_alive && mc_state="$(t "active")" || mc_state="$(t "inactive")"
     plack_running && plack_state="$(t "running")" || plack_state="$(t "stopped")"
-    log "services repaired: memcached=$mc_state plack=$plack_state"
-    if memcached_alive && plack_running; then
-        msg_ok "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')" 11 70
+    cache=$(koha_cache_state)
+    cache_line=$(koha_cache_text "$cache")
+    log "services repaired: memcached=$mc_state plack=$plack_state koha-cache=$cache"
+    if memcached_alive && plack_running && [ "$cache" != module ] && [ "$cache" != connect ]; then
+        msg_ok "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${cache_line}" 13 76
     else
-        details=$(tail -n 8 "/var/log/koha/${INSTANCE}/plack-error.log" 2>/dev/null | cut -c1-76)
-        msg_error "" "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${details}" 20 80
+        if ! memcached_alive; then
+            details=$(journalctl -u memcached -n 6 --no-pager 2>/dev/null | cut -c1-76)
+        else
+            details=$(tail -n 8 "/var/log/koha/${INSTANCE}/plack-error.log" 2>/dev/null | cut -c1-76)
+        fi
+        msg_error "" "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${cache_line}\n\n${details}" 22 80
     fi
 }
 
