@@ -276,8 +276,16 @@ function ConvertTo-KohaWslPath {
 # SHA-256 again on the Linux side.
 function Copy-KohaPanelIntoDistro {
     $src = ConvertTo-KohaWslPath (Get-KohaPath Bin)
-    $sh = 'set -e; d={0}; mkdir -p "$d/lang"; cp "{1}/installer" "{1}/installer.sha256" "$d/"; cp "{1}"/lang/*.cache "$d/lang/" 2>/dev/null || true; cd "$d" && sha256sum -c installer.sha256' -f $script:DistroDir, $src
-    $r = Invoke-KohaLinux -Command @('sh', '-c', $sh)
+    $sh = @(
+        'set -e'
+        ('d=''{0}''; s=''{1}''' -f $script:DistroDir, $src)
+        'mkdir -p "$d/lang"'
+        'cp "$s/installer" "$s/installer.sha256" "$d/"'
+        'cp "$s"/lang/*.cache "$d/lang/" 2>/dev/null || true'
+        'cd "$d"'
+        'sha256sum -c installer.sha256'
+    ) -join "`n"
+    $r = Invoke-KohaLinuxScript -Script $sh
     if ($r.ExitCode -ne 0) { throw ('copy: ' + $r.Output) }
 }
 

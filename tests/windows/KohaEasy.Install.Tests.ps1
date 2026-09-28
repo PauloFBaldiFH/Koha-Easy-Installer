@@ -178,6 +178,36 @@ Describe 'Install flow' {
     }
 }
 
+Describe 'Panel copy into Debian' {
+    It 'copies the installer and its dictionaries and checks the SHA-256 (script run by a real sh)' {
+        $src = Join-Path $TestDrive 'bin'
+        $dst = Join-Path $TestDrive 'distro/root/koha-easy-installer'
+        New-Item -ItemType Directory -Path (Join-Path $src 'lang') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $src 'installer') -Value 'echo panel' -NoNewline
+        Set-Content -LiteralPath (Join-Path $src 'lang/pt.cache') -Value 'x' -NoNewline
+        $sha = (Get-FileHash -LiteralPath (Join-Path $src 'installer') -Algorithm SHA256).Hash.ToLowerInvariant()
+        Set-Content -LiteralPath (Join-Path $src 'installer.sha256') -Value "$sha  installer"
+        Mock -ModuleName KohaEasy.Install Get-KohaPath { $src } -ParameterFilter { $Name -eq 'Bin' }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinuxScript {
+            $f = Join-Path $TestDrive 'script.sh'
+            [System.IO.File]::WriteAllText($f, $Script)
+            $out = & sh $f 2>&1
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+        }
+        InModuleScope KohaEasy.Install -Parameters @{ Dst = $dst } { param($Dst) $script:DistroDir = $Dst }
+        try {
+            Copy-KohaPanelIntoDistro
+            Test-Path -LiteralPath (Join-Path $dst 'installer') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $dst 'lang/pt.cache') | Should -BeTrue
+
+            Set-Content -LiteralPath (Join-Path $src 'installer') -Value 'tampered' -NoNewline
+            { Copy-KohaPanelIntoDistro } | Should -Throw '*copy:*'
+        } finally {
+            InModuleScope KohaEasy.Install { $script:DistroDir = '/root/koha-easy-installer' }
+        }
+    }
+}
+
 Describe 'Install flow output' {
     It 'returns one exit code even when a step writes values (the UAC exit codes of wsl --install)' {
         Remove-Item -LiteralPath (Get-KohaPath Root) -Recurse -Force -ErrorAction SilentlyContinue
