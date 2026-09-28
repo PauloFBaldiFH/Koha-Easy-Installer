@@ -1,0 +1,2 @@
+# Windows scripts: the .cmd must keep CRLF line endings.
+*.cmd text eol=crlf

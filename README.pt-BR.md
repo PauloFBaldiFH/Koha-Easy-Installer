@@ -102,23 +102,28 @@ O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para
 - **Vigia do disco**: avisa quando a unidade que guarda o disco virtual do Koha (`ext4.vhdx`) tem menos de 10 GB livres, e em nível crítico abaixo de 5 GB. Quando o disco virtual tem muito espaço sem uso, **Compactar** devolve esse espaço ao Windows (pede permissão de administrador).
 - **Idiomas**: as ferramentas do Windows usam os 22 idiomas do painel.
 
-### Como instalar no Windows hoje
+### Como instalar no Windows
 
-> **Em breve:** um instalador de um clique (`Install Koha.cmd`, um ZIP com um inicializador em PowerShell). Ele vai verificar a virtualização, instalar o WSL 2, criar o sistema Debian, instalar o Koha e criar os atalhos, tudo no idioma de quem instala. Vai vir com um guia para o aviso do SmartScreen do Windows, porque os scripts não são assinados. Até lá, os passos abaixo são para quem já tem familiaridade com o PowerShell.
+**Opção 1, um comando.** Abra o **PowerShell** (menu Iniciar, digite *PowerShell*; não precisa ser como administrador) e cole:
 
-1. No PowerShell como administrador: `wsl --install --no-distribution`, depois reinicie o Windows.
-2. Crie um sistema Debian chamado `KohaEasy` (as ferramentas do Windows procuram esse nome). Por exemplo, instale o Debian pela Microsoft Store, depois `wsl --export Debian debian.tar` e `wsl --import KohaEasy C:\KohaEasy\wsl debian.tar`.
-3. Dentro dele (`wsl -d KohaEasy -u root`), ative o systemd acrescentando `[boot]` e `systemd=true` ao `/etc/wsl.conf`. Depois rode `wsl --terminate KohaEasy` no PowerShell e abra-o de novo.
-4. Instale o Koha como no Linux ([Instalação](#instalação)).
-5. Copie a pasta `windows\` e a pasta `lang\` para `C:\KohaEasy\bin` e rode, com o seu usuário normal:
+```powershell
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
+```
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\KohaEasy\bin\KohaEasy.ps1 RegisterTasks -Mode logon
-   ```
+**Opção 2, dois cliques.** Baixe o ZIP do repositório (**Code > Download ZIP**), extraia e dê dois cliques em **`Install Koha.cmd`**. Se o Windows mostrar "O Windows protegeu o computador", clique em **Mais informações > Executar assim mesmo**: o script não é assinado, e você pode lê-lo antes de executar.
 
-   Isso cria as tarefas de inicialização, os atalhos no menu Iniciar e na área de trabalho e o ícone de status ao entrar no Windows. Use `-Mode manual` para o Koha iniciar só quando você clicar em *Koha - Iniciar*.
+O instalador faz todo o resto e mostra cada etapa em linguagem simples:
 
-O comportamento em um Windows real (notificações, ícone de status, Agendador de Tarefas e compactação do disco) ainda está sendo conferido em computadores físicos, então avise se algo parecer estranho.
+1. Verifica o computador: Windows 10 versão 2004 ou mais recente, ou Windows 11; 64 bits; pelo menos 4 GB de memória (8 GB recomendados); pelo menos 10 GB livres no C:; virtualização ativada na BIOS.
+2. Instala o WSL 2. O Windows pede permissão uma vez. Se o Windows precisar reiniciar, o instalador continua sozinho quando você entrar de novo.
+3. Baixa o Debian da lista oficial do WSL da Microsoft, confere o SHA-256 e o importa como `KohaEasy` em `C:\KohaEasy\wsl`.
+4. Ativa o systemd. No Windows 11 22H2 ou mais recente, também acrescenta a rede espelhada (mirrored) ao seu `.wslconfig`, mantendo as suas configurações e uma cópia de segurança.
+5. Abre o painel de controle do Koha. Escolha o idioma, depois **1 – Instalar servidor Koha**, e saia do painel com **Sair** quando terminar.
+6. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, inicia o Koha e abre a interface da equipe.
+
+Pode rodar de novo sem medo: ele continua da última etapa concluída. O usuário e a senha de primeiro acesso ficam no painel de controle, opção 2. Tudo fica em `C:\KohaEasy`, e o log do instalador em `C:\KohaEasy\logs`.
+
+O comportamento em um Windows real (o instalador, notificações, ícone de status, Agendador de Tarefas e compactação do disco) ainda está sendo conferido em computadores físicos, então avise se algo parecer estranho.
 
 ## Menu principal
 

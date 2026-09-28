@@ -102,23 +102,28 @@ Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux),
 - **Disk watchdog**: warns when the drive that holds Koha's virtual disk (`ext4.vhdx`) has less than 10 GB free, and critically below 5 GB. When the virtual disk holds a lot of unused space, **Compact** gives it back to Windows (needs administrator rights).
 - **Languages**: the Windows tools use the panel's 22 languages.
 
-### Installing on Windows today
+### Installing on Windows
 
-> **Coming soon:** a one-click installer (`Install Koha.cmd`, a ZIP with a PowerShell bootstrapper). It will check virtualization, install WSL 2, create the Debian system, install Koha and set up the shortcuts, all in the librarian's language. It will come with a guide for the Windows SmartScreen warning, because the scripts are not signed. Until then, the steps below are for people comfortable with PowerShell.
+**Option 1, one command.** Open **PowerShell** (Start menu, type *PowerShell*; no need to run it as administrator) and paste:
 
-1. In PowerShell as administrator: `wsl --install --no-distribution`, then restart Windows.
-2. Create a Debian system named `KohaEasy` (the Windows tools look for that name). For example, install Debian from the Microsoft Store, then `wsl --export Debian debian.tar` and `wsl --import KohaEasy C:\KohaEasy\wsl debian.tar`.
-3. Inside it (`wsl -d KohaEasy -u root`), enable systemd by adding `[boot]` and `systemd=true` to `/etc/wsl.conf`. Then run `wsl --terminate KohaEasy` in PowerShell and open it again.
-4. Install Koha as on Linux ([Installation](#installation)).
-5. Copy the `windows\` folder and `lang\` to `C:\KohaEasy\bin`, then run, as your normal user:
+```powershell
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
+```
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\KohaEasy\bin\KohaEasy.ps1 RegisterTasks -Mode logon
-   ```
+**Option 2, double-click.** Download the repository ZIP (**Code > Download ZIP**), extract it, and double-click **`Install Koha.cmd`**. If Windows shows "Windows protected your PC", click **More info > Run anyway**: the script is not signed, and you can read it before running it.
 
-   This creates the start tasks, the Start menu and desktop shortcuts, and the status icon at sign-in. Use `-Mode manual` to start Koha only when you click *Koha - Start*.
+The installer does everything else and shows each step in plain language:
 
-Real-Windows behaviour (notifications, the tray, Task Scheduler and disk compaction) is still being checked on physical machines, so please report anything odd.
+1. It checks the PC: Windows 10 version 2004 or later, or Windows 11; 64-bit; at least 4 GB of memory (8 GB recommended); at least 10 GB free on C:; virtualization turned on in the BIOS.
+2. It installs WSL 2. Windows asks for permission once. If Windows needs a restart, the installer continues by itself after you sign in again.
+3. It downloads Debian from Microsoft's own WSL list, checks its SHA-256, and imports it as `KohaEasy` in `C:\KohaEasy\wsl`.
+4. It enables systemd. On Windows 11 22H2 or later it also adds mirrored networking to your `.wslconfig`, keeping your own settings and a backup.
+5. It opens the Koha control panel. Choose your language, then **1 – Install Koha server**, and leave the panel with **Exit** when it finishes.
+6. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, starts Koha, and opens the staff interface.
+
+Running it again is safe: it continues from the last step it finished. The first-access user and password are in the control panel, option 2. Everything is kept in `C:\KohaEasy`, with the installer's log in `C:\KohaEasy\logs`.
+
+Real-Windows behaviour (the installer, notifications, the tray, Task Scheduler and disk compaction) is still being checked on physical machines, so please report anything odd.
 
 ## Main menu
 
