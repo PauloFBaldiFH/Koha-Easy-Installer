@@ -21,6 +21,7 @@ It was born from real-life experience facing technical barriers in collection ma
 - **Security**: Fail2ban, UFW firewall (with option to restrict the staff port 8080) and database password rotation.
 - **Koha settings**: server sizing profiles, e-mail notices (Koha's own schedule, enabled with `koha-email-enable`), super librarian creation, SIP2 and Z39.50, clock and timezone.
 - **Library tools**: guided MARC import with undo, essential SQL reports pack, patron import from CSV and school-year category turnover, catalog data-quality check, and privacy (LGPD) housekeeping. Every change is previewed first with Koha's own dry run and protected by a verified backup (see [Library tools](#library-tools)).
+- **Brazil: localization & migration** (opt-in, never applied by the installation or by a schedule): MARC migration from Biblivre, SophiA and Pergamum (UTF-8 conversion, items moved to Koha's 952), legacy patron spreadsheets with CPF check, CPF audit (modulo 11), Pimaco label templates, the Brazilian cataloguing card (ficha catalográfica) and Brazilian holidays in the Koha calendar (see [Brazil: localization & migration](#brazil-localization--migration)).
 - **Languages**: installs Koha language packs and translates the panel itself (22 languages).
 - **Self-update** from GitHub with SHA-256 verification.
 
@@ -78,7 +79,7 @@ sudo config.sh
 | 7 | Diagnostics & maintenance | Status, health check, logs, optimization |
 | 8 | Security center | Fail2ban, firewall, password rotation |
 | 9 | Koha settings & parameters | Sizing, e-mail, super librarian, SIP2/Z39.50, clock |
-| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD) |
+| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration |
 | 11 | General tools | htop/nethogs, terminal browser, file manager |
 | 12 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
 | 13 | Koha languages | Koha language packs and panel language |
@@ -106,6 +107,24 @@ Day-to-day tasks for the library staff, run with Koha's own command-line tools a
 
 Every run is logged in `/var/log/koha-easy-install/tools/` (readable by root only: the logs may contain patron names), also viewable from the menu.
 
+### Brazil: localization & migration
+
+**Library tools > Brazil: localization & migration**. Nothing here is applied during the installation or by a schedule: each option acts only when you choose it, follows the same steps as the other tools (lock, preview, confirmation, verified `PRE-*` backup) and can be undone.
+
+| Tool | How it works | Preview | Backup |
+|------|--------------|---------|--------|
+| Migrate MARC from Biblivre, SophiA, Pergamum or another system (field map typed by hand) | Characters converted to UTF-8 with `yaz-marcdump` (from Latin-1 or MARC-8; the `yaz` package is offered when missing); the item field (Biblivre 949, Pergamum 852, SophiA 990 or your own map) is moved to Koha's 952 (barcode, call number, copy, notes, library, item type) with Koha's own MARC::Record; then the normal MARC import (`stage_file.pl` / `commit_file.pl`, undo with `--revert`) | Counts and a sample of the converted items, then Koha's staging report | `PRE-IMPORT` |
+| Import patrons from a legacy spreadsheet | Finds the columns by their Portuguese or English names (Nome, Matrícula, CPF, E-mail, Nascimento...), Windows-1252 or UTF-8, `;` or `,`; checks the CPF (modulo 11, repeated digits, duplicates), uses it as card number when there is none and keeps it in a patron attribute with code `CPF` when that type exists; then `import_patrons.pl` | Rejected lines with the reason, then Koha's dry run | `PRE-PATRONS` |
+| Check patron CPFs (read-only) | Card number, username, sort1/sort2 or the `CPF` attribute: valid, invalid, shared by two patrons | — | — |
+| Pimaco label templates | Sheets 6180, 6181, 6287 (Letter) and A4256, A4251 (A4) plus 3 layouts (spine, barcode, title and barcode) in Koha's label creator; updates or removes only its own templates | Summary before the change | `PRE-LABELS` |
+| Cataloguing card (ficha catalográfica) | Stylesheets that wrap Koha's default detail view (OPAC and staff interface, one per installed language) and add the card below the record, with a print button; set in `OPACXSLTDetailsDisplay` / `XSLTDetailsDisplay`. The previous values are kept and **Hide the card** puts them back; the files are rewritten each time the panel starts, so they follow Koha updates | Old and new values | `PRE-FICHA` |
+| Brazilian holidays in the calendar | National holidays of a year, Carnival (Monday and Tuesday), Good Friday and Corpus Christi (Easter by the Meeus/Jones/Butcher algorithm) and an optional municipal holiday, for one library or all; days already in the calendar are skipped and **Remove** takes out only the days added by the panel | Dates with the weekday | `PRE-CALENDAR` |
+
+- The label sizes are the Avery equivalents of each Pimaco sheet: do a test print on plain paper first and adjust the template in Koha if your printer shifts the page.
+- The card follows the AACR2 layout used by Brazilian libraries (call number column, hanging indent, numbered subjects, roman-numbered added entries).
+- The Biblivre, SophiA and Pergamum presets follow their usual export layout. The preview shows the result before anything is written; **Other layout** accepts any item field.
+- Carnival and Corpus Christi are *ponto facultativo*, not national holidays: remove them in Tools > Calendar if the library opens. Consciência Negra (20/11) is added from 2024 on.
+
 ## Automated tasks
 
 Installed in `/etc/cron.d/koha_tasks`:
@@ -131,6 +150,7 @@ E-mail notices are left to Koha's own schedule (`koha-common`): overdue and adva
 | `/etc/koha-easy-install/` | Panel settings (language, backup) |
 | `/var/log/koha-easy-install/` | Panel, APT and validation logs (`tools/`: library tools, root only) |
 | `/root/koha_patrons_template.csv` | Empty CSV template for the patron import |
+| `/var/lib/koha/library/kei-xslt/` | Cataloguing card stylesheets (only while the card is enabled) |
 
 If the installation stops, the panel shows the failed step. The full package manager output is in `/var/log/koha-easy-install/apt.log`.
 
@@ -147,10 +167,10 @@ Copy your backups somewhere else before running it.
 
 ## Tests (for contributors)
 
-`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting) and the schedule upgrade.
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card) and the schedule upgrade.
 
 ```bash
-sudo apt-get install bats mariadb-server memcached whiptail
+sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl
 sudo KEI_TEST_SANDBOX=1 tests/run.sh
 ```
 

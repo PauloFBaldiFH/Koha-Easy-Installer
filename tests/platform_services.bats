@@ -126,7 +126,9 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
 }
 
 @test "P10 the runtime is pure Bash: no python/perl interpreters called by the panel" {
-    assert '! grep -nE "(^|[^-])\b(python3?|perl)\b +(-|<<|\")" "$KEI_REPO/installer" | grep -v "koha-shell\|hash_script\|sitemap"' "found interpreter calls"
+    # Perl only runs inside Koha's environment (koha-shell / koha_exec), with Koha's libraries.
+    assert '! grep -nE "(^|[^-])\b(python3?|perl)\b +(-|<<|\")" "$KEI_REPO/installer" | grep -v "koha-shell\|koha_exec\|hash_script\|sitemap"' "found interpreter calls"
+    assert '! grep -nE "(^|[;&|(]|[[:space:]])python3?[[:space:]]" "$KEI_REPO/installer" | grep -v "^[0-9]*: *#"' "no Python run by the panel (package names are fine)"
 }
 
 @test "P11 files are UTF-8 and every dictionary line decodes" {

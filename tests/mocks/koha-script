@@ -1,7 +1,8 @@
 #!/bin/bash
 # Test double for the Koha command-line scripts used by the library tools
 # (stage_file.pl, commit_file.pl, import_patrons.pl, update_patrons_category.pl,
-# delete_patrons.pl, batch_anonymise.pl, search_for_data_inconsistencies.pl).
+# delete_patrons.pl, batch_anonymise.pl, search_for_data_inconsistencies.pl,
+# koha-preferences).
 # Installed by tests/run.sh as symlinks under /usr/share/koha/bin, on
 # disposable test machines only. They change the test database the way Koha
 # would and print Koha's report lines, so the panel's dry-run / confirmation
@@ -17,6 +18,21 @@ printf '%s %s [pre=%s]\n' "$name" "$*" "$pre" >> "$S/calls.log"
 [ -e "$S/fail/$name" ] && { echo "$name: simulated failure" >&2; exit 1; }
 
 sql() { mysql -Nse "$1" "$DB"; }
+csv_row() {   # csv_row LINE: fields of a CSV line (quotes handled) in ROW
+    local line="$1" i c q=0 cur=""
+    ROW=()
+    for ((i = 0; i < ${#line}; i++)); do
+        c="${line:i:1}"
+        if [ "$q" = 1 ]; then
+            if [ "$c" = '"' ]; then
+                if [ "${line:i+1:1}" = '"' ]; then cur+='"'; i=$((i + 1)); else q=0; fi
+            else cur+="$c"; fi
+        elif [ "$c" = '"' ]; then q=1
+        elif [ "$c" = "," ]; then ROW+=("$cur"); cur=""
+        else cur+="$c"; fi
+    done
+    ROW+=("$cur")
+}
 opt() {   # opt NAME: value given to --NAME
     local a prev=""
     for a in "${ARGS[@]}"; do
@@ -31,6 +47,7 @@ case "$name" in
 stage_file.pl)
     f=$(opt file) || exit 0
     [ -r "$f" ] || { echo "$0: cannot open input file $f" >&2; exit 2; }
+    cp -f "$f" "$S/last-staged.mrc"
     if [ "$(opt format)" = "MARCXML" ]; then
         n=$(grep -o '<record[ >]' "$f" | wc -l)
     else
@@ -92,9 +109,10 @@ import_patrons.pl)
     prev=""
     for a in "${ARGS[@]}"; do [ "$prev" = "--default" ] && def[${a%%=*}]="${a#*=}"; prev="$a"; done
     has --confirm || echo "Running in dry-run mode, provide --confirm to apply the changes" >&2
-    IFS=, read -r -a head < "$f"
+    IFS= read -r line < "$f"; csv_row "${line%$'\r'}"; head=("${ROW[@]}")
     imported=0; overwritten=0; skipped=0; invalid=0
-    while IFS=, read -r -a row; do
+    while IFS= read -r line; do
+        csv_row "${line%$'\r'}"; row=("${ROW[@]}")
         declare -A r=()
         for i in "${!head[@]}"; do r[${head[i]}]="${row[i]:-}"; done
         key="${r[$m]:-}"
@@ -170,6 +188,17 @@ batch_anonymise.pl)
     holds=$(sql "UPDATE old_reserves r JOIN borrowers b ON b.borrowernumber = r.borrowernumber SET r.borrowernumber = NULL
                  WHERE b.privacy <> 0 AND r.timestamp < DATE_SUB(CURDATE(), INTERVAL $d DAY); SELECT ROW_COUNT();")
     has -v && { echo "$loans checkouts anonymised."; echo "$holds holds anonymised."; }
+    ;;
+koha-preferences)
+    cmd="${ARGS[0]:-}"; pref="${ARGS[1]:-}"; val="${ARGS[2]:-}"
+    [ -n "$(sql "SELECT 1 FROM systempreferences WHERE variable = '$pref';")" ] || { echo "No such preference $pref" >&2; exit 2; }
+    case "$cmd" in
+        get) sql "SELECT value FROM systempreferences WHERE variable = '$pref';" ;;
+        set)
+            [ "$(sql "SELECT value FROM systempreferences WHERE variable = '$pref';")" = "$val" ] && exit 3
+            sql "UPDATE systempreferences SET value = '$val' WHERE variable = '$pref';" ;;
+        *) echo "usage: koha-preferences get|set PREF [VALUE]" >&2; exit 1 ;;
+    esac
     ;;
 search_for_data_inconsistencies.pl)
     bad=$(sql "SELECT itemnumber FROM items WHERE homebranch IS NULL;")

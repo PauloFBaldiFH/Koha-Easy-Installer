@@ -13,11 +13,11 @@ MOCKS="$REPO/tests/mocks"
 LIBDIR=/usr/local/lib/kei-mock
 KOHA_TOOLS=(koha-plack koha-zebra koha-indexer koha-es-indexer koha-worker koha-list
             koha-rebuild-zebra koha-upgrade-schema koha-shell koha-elasticsearch
-            koha-create koha-remove koha-sip koha-z3950-responder koha-email-enable)
+            koha-create koha-remove koha-sip koha-z3950-responder koha-email-enable koha-mysql)
 # Koha's command-line scripts used by the library tools (tests/mocks/koha-script).
 KOHA_SCRIPTS=(stage_file.pl commit_file.pl import_patrons.pl cronjobs/update_patrons_category.pl
               cronjobs/delete_patrons.pl cronjobs/batch_anonymise.pl
-              maintenance/search_for_data_inconsistencies.pl)
+              maintenance/search_for_data_inconsistencies.pl admin/koha-preferences)
 
 die() { echo "tests/run.sh: $*" >&2; exit 1; }
 
@@ -26,9 +26,11 @@ die() { echo "tests/run.sh: $*" >&2; exit 1; }
 if dpkg-query -W -f='${Status}' koha-common 2>/dev/null | grep -q 'ok installed'; then
     die "a real koha-common is installed here; the tests would destroy it."
 fi
-for c in bats mysql mysqldump mariadbd memcached whiptail gzip flock setsid; do
-    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail)."
+for c in bats mysql mysqldump mariadbd memcached whiptail gzip flock setsid yaz-marcdump xsltproc; do
+    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl)."
 done
+# The MARC migration runs Koha's MARC::Record stack (koha-common depends on it).
+perl -MMARC::Record -e 1 2>/dev/null || die "missing MARC::Record (apt-get install libmarc-record-perl)."
 
 install_doubles() {
     mkdir -p "$LIBDIR" /usr/share/koha/bin /etc/koha/sites/library /run/kei-mock
@@ -40,7 +42,7 @@ install_doubles() {
     done
     install -m 644 "$MOCKS/koha-functions.sh" /usr/share/koha/bin/koha-functions.sh
     install -m 755 "$MOCKS/koha-script" "$LIBDIR/koha-script"
-    mkdir -p /usr/share/koha/bin/cronjobs /usr/share/koha/bin/maintenance
+    mkdir -p /usr/share/koha/bin/cronjobs /usr/share/koha/bin/maintenance /usr/share/koha/bin/admin
     for t in "${KOHA_SCRIPTS[@]}"; do
         if [ -e "/usr/share/koha/bin/$t" ] && [ ! -L "/usr/share/koha/bin/$t" ]; then die "/usr/share/koha/bin/$t is a real file; not overwriting."; fi
         ln -sfn "$LIBDIR/koha-script" "/usr/share/koha/bin/$t"
