@@ -1,0 +1,546 @@
+#!/usr/bin/env bats
+# Library tools 11-13 and the Biblioteca Fácil preset: WhatsApp / Telegram
+# messaging (the SMS::Send driver of the panel, run by the real SMS::Send
+# against tests/mocks/http-mock), cataloguing aids (author tables and CDD,
+# real MariaDB), collection spreadsheets (real MARC::Record and
+# yaz-marcdump) and marc_replace.pl (run as a CGI with the Koha doubles of
+# tests/mocks/perl5).
+
+setup() {
+    load lib/common
+    kei_reset_env
+    kei_reset_live_catalog
+    kei_tools_catalog
+    kei_br_catalog
+    kei_modules_catalog
+    unset KEI_SELECT_FILE KEI_DEFAULT_ANSWER KEI_EXTRA KOHA_INTRA_CGI
+    W="$BATS_TEST_TMPDIR"
+    CONF=/etc/koha/sites/library/kei-messaging.conf
+    PM=/usr/local/lib/site_perl
+}
+
+teardown() { kei_kill_daemons; }
+
+pre_backups() { find /var/backups/koha_sql -maxdepth 1 -name "PRE-${1:-}*" 2>/dev/null | wc -l; }
+extra()       { printf '%s\n' "$@" > "$W/extra.sh"; export KEI_EXTRA="$W/extra.sh"; }
+marc_dump()   { yaz-marcdump "$1" 2>/dev/null; }
+pref()        { tools_sql "SELECT value FROM systempreferences WHERE variable = '$1';"; }
+# Perl as the Koha instance would run it (settings found through KOHA_CONF).
+kperl()       { KOHA_CONF=/etc/koha/sites/library/koha-conf.xml perl -I "$PM" "$@"; }
+
+# WhatsApp through Evolution API on the HTTP double, numbers of Paraná (44).
+whatsapp_on() {
+    kei_http_mock_start
+    inputs setup evolution "http://127.0.0.1:18080" biblioteca "segredo-123456"
+    panel lt_msg_whatsapp
+    inputs 55 44
+    panel lt_msg_country
+}
+
+# --- Messaging -----------------------------------------------------------------
+
+@test "M01 phone sanitizer: country and area code, trunk and carrier prefixes, 9th mobile digit, DDD check" {
+    local v
+    while IFS='|' read -r num cc area want kind; do
+        panel phone_normalize "$num" "$cc" "$area"
+        assert '[ "$output" = "$(printf "%s\t%s" "$want" "$kind")" ]' "$num (+$cc $area): got '$output', want '$want $kind'"
+    done <<'EOF'
+(44) 99876-5432|55|44|+5544998765432|fixed
+44 9876-5432|55|44|+5544998765432|fixed
+9876-5432|55|44|+5544998765432|fixed
++55 44 98765-4321|55|44|+5544987654321|ok
+55 44 98765-4321|55||+5544987654321|fixed
+0 44 98765-4321|55||+5544987654321|fixed
+0 15 44 9876-5432|55||+5544998765432|fixed
+(44) 3524-1234|55||+554435241234|landline
++351 912 345 678|55|44|+351912345678|ok
+912 345 678|351||+351912345678|fixed
+00351912345678|55||+351912345678|fixed
+555 123 4567|1||+15551234567|fixed
+EOF
+    for v in "98765-4321|55|" "(10) 98765-4321|55|44" "(44) 1524-1234|55|44" "44 8765 432|55|" "abc|55|44" "(44) 89876-5432|55|44"; do
+        panel phone_normalize "${v%%|*}" "$(cut -d'|' -f2 <<< "$v")" "$(cut -d'|' -f3 <<< "$v")"
+        assert '[ "$status" -ne 0 ] && [ "$output" = "$(printf "\tinvalid")" ]' "'$v' must be invalid: $output"
+    done
+    panel phone_ddd_valid 44;  assert '[ "$status" -eq 0 ]'
+    panel phone_ddd_valid 20;  assert '[ "$status" -ne 0 ]' "DDD 20 does not exist"
+}
+
+@test "M02 WhatsApp (Evolution API): settings for Koha only, test message through SMS::Send with the corrected number" {
+    whatsapp_on
+    assert '[ -f "$CONF" ] && [ "$(stat -c %a "$CONF")" = "640" ]' "the settings hold the token: $(ls -l "$CONF")"
+    assert 'grep -qx "whatsapp=on" "$CONF" && grep -qx "wa_url=http://127.0.0.1:18080" "$CONF" && grep -qx "wa_instance=biblioteca" "$CONF" && grep -qx "country=55" "$CONF" && grep -qx "area=44" "$CONF"' "$(cat "$CONF")"
+    assert '[ -f "$PM/SMS/Send/KohaEasy/Gateway.pm" ] && [ -f "$PM/KohaEasy/Messaging.pm" ] && [ -x /usr/local/lib/koha-easy-installer/kei-telegram-link ]'
+    assert '[ "$(pref SMSSendDriver)" = "Email" ] && [ "$(pre_backups)" = "0" ]' "setting a channel up does not touch Koha"
+    inputs "(44) 9876-5432"
+    panel lt_msg_test
+    assert 'dialogs | grep -q "^OK .*whatsapp"' "$(dialogs | tail -3)"
+    assert 'grep -q "koha-shell library -c.*msg-test.pl" "$KEI_S/calls.log"' "sent as the instance user: $(calls | tail -3)"
+    assert 'http_log | grep -q "\"path\": \"/message/sendText/biblioteca\"" && http_log | grep -q "\"apikey\": \"segredo-123456\""' "$(http_log)"
+    assert 'http_log | grep -q "\"number\": \"5544998765432\""' "9th digit and country code added: $(http_log)"
+    assert 'http_log | grep -q "Test message from the library system"'
+}
+
+@test "M03 gateway errors and invalid numbers are reported; nothing is sent to a bad number" {
+    whatsapp_on
+    touch "$KEI_S/http-fail"
+    inputs "44 99876-5432"
+    panel lt_msg_test
+    assert 'dialogs | grep -q "^ERROR .*not sent"' "$(dialogs | tail -2)"
+    assert 'grep -q "Reason: WhatsApp: HTTP 500" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+    rm -f "$KEI_S/http-fail" "$KEI_S/http.log"
+    inputs "(10) 1234-5678"
+    panel lt_msg_test
+    assert 'dialogs | grep -q "Invalid phone number"' && assert '[ ! -s "$KEI_S/http.log" ]' "nothing sent: $(http_log)"
+    inputs setup evolution "ftp://gateway"
+    panel lt_msg_whatsapp
+    assert 'dialogs | grep -q "Invalid address" && grep -qx "wa_url=http://127.0.0.1:18080" "$CONF"' "a bad address changes nothing"
+}
+
+@test "M04 Telegram: token checked with getMe, patrons link their own number, notices go to the linked chat" {
+    kei_http_mock_start
+    panel msg_conf_set tg_api "http://127.0.0.1:18080"
+    inputs setup "123456:BADBADBADBADBADBADBADBADBADBADBADBAD"
+    panel lt_msg_telegram
+    assert 'dialogs | grep -q "^ERROR .*did not accept the token"' "$(dialogs | tail -2)"
+    assert '! grep -qx "telegram=on" "$CONF" && [ ! -f /etc/cron.d/koha_messaging ]' "a refused token keeps Telegram off"
+    inputs setup "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234"
+    panel lt_msg_telegram
+    assert 'grep -qx "telegram=on" "$CONF" && grep -qx "tg_bot=biblioteca_teste_bot" "$CONF"' "$(cat "$CONF")"
+    assert 'grep -q "koha-shell library -c \"/usr/bin/perl /usr/local/lib/koha-easy-installer/kei-telegram-link\"" /etc/cron.d/koha_messaging' "$(cat /etc/cron.d/koha_messaging 2>&1)"
+    assert '! grep -q process_message_queue /etc/cron.d/koha_messaging' "no notice queue before the notices are turned on"
+    cat > "$KEI_S/tg-updates.json" <<'JSON'
+[{"update_id": 1, "message": {"chat": {"id": 555, "type": "private"}, "from": {"id": 555}, "text": "/start"}},
+ {"update_id": 2, "message": {"chat": {"id": 555, "type": "private"}, "from": {"id": 555}, "contact": {"phone_number": "5544998765432", "user_id": 555}}},
+ {"update_id": 3, "message": {"chat": {"id": 777, "type": "private"}, "from": {"id": 777}, "contact": {"phone_number": "5544988887777", "user_id": 999}}},
+ {"update_id": 4, "message": {"chat": {"id": -100, "type": "group"}, "from": {"id": 1}, "text": "/start"}}]
+JSON
+    run kperl /usr/local/lib/koha-easy-installer/kei-telegram-link
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'grep -qx "+5544998765432 555" /var/lib/koha/library/kei-messaging/telegram.map && [ "$(wc -l < /var/lib/koha/library/kei-messaging/telegram.map)" = "1" ]' "only the own contact is linked: $(cat /var/lib/koha/library/kei-messaging/telegram.map)"
+    assert 'http_log | grep "sendMessage" | grep "\"chat_id\": 555" | grep -q "\"request_contact\": true"' "Start answers with the share button: $(http_log)"
+    assert 'http_log | grep "\"chat_id\": 777" | grep -q "your own phone number"'
+    assert '! http_log | grep -q "\"chat_id\": -100"' "groups are ignored"
+    assert '[ "$(cat /var/lib/koha/library/kei-messaging/telegram.offset)" = "5" ]'
+    local sent; sent=$(http_log | grep -c sendMessage)
+    run kperl /usr/local/lib/koha-easy-installer/kei-telegram-link
+    assert '[ "$(http_log | grep -c sendMessage)" = "$sent" ] && http_log | tail -1 | grep -q "\"offset\": 5"' "updates are read once"
+    inputs "(44) 99876-5432"
+    panel lt_msg_test
+    assert 'dialogs | grep -q "^OK .*telegram" && http_log | tail -1 | grep -q "\"chat_id\": 555"' "$(http_log | tail -1)"
+    printf '[{"update_id": 5, "message": {"chat": {"id": 555, "type": "private"}, "from": {"id": 555}, "text": "/stop"}}]' > "$KEI_S/tg-updates.json"
+    run kperl /usr/local/lib/koha-easy-installer/kei-telegram-link
+    assert '[ ! -s /var/lib/koha/library/kei-messaging/telegram.map ]' "/stop unlinks"
+}
+
+@test "M05 Koha notices on and off: SMSSendDriver saved and restored, verified backups, two-minute queue" {
+    panel lt_msg_notices
+    assert 'dialogs | grep -q "Turn on WhatsApp or Telegram first" && [ "$(pref SMSSendDriver)" = "Email" ]'
+    whatsapp_on
+    answer no
+    panel lt_msg_notices
+    assert '[ "$(pref SMSSendDriver)" = "Email" ] && [ "$(pre_backups)" = "0" ]' "declined: nothing changes"
+    answer yes
+    panel lt_msg_notices
+    assert '[ "$(pref SMSSendDriver)" = "KohaEasy::Gateway" ]' "$(dialogs | tail -3)"
+    assert '[ "$(pre_backups MESSAGING)" = "1" ] && grep -qx "prev_driver=Email" /etc/koha-easy-install/messaging.state'
+    assert 'grep -q "koha-shell library -c \"/usr/share/koha/bin/cronjobs/process_message_queue.pl -t sms\"" /etc/cron.d/koha_messaging' "$(cat /etc/cron.d/koha_messaging)"
+    assert 'grep -q "^koha-preferences set SMSSendDriver KohaEasy::Gateway \[pre=1\]" "$KEI_S/calls.log"' "changed only after the backup: $(calls)"
+    answer yes
+    panel lt_msg_notices
+    assert '[ "$(pref SMSSendDriver)" = "Email" ] && [ ! -f /etc/koha-easy-install/messaging.state ] && [ ! -f /etc/cron.d/koha_messaging ]' "$(pref SMSSendDriver)"
+    assert '[ "$(pre_backups MESSAGING)" = "2" ]'
+}
+
+@test "M06 what Koha needs: report, then short SMS notices only where there is none" {
+    answer yes
+    panel lt_msg_check
+    assert 'grep -q "\[✔\] CHECKOUT" "$KEI_S/textbox.last" && grep -q "\[ \] ODUE" "$KEI_S/textbox.last" && grep -q "\[✔\] HOLD" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+    assert 'grep -q "SMSSendDriver = Email" "$KEI_S/textbox.last" && grep -q "Patrons with an SMS number: 4" "$KEI_S/textbox.last" && grep -q "chose SMS in their messaging preferences: 2" "$KEI_S/textbox.last"'
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM letter WHERE message_transport_type = \"sms\";")" = "6" ] && [ "$(pre_backups NOTICES)" = "1" ]' "$(tools_sql "SELECT code FROM letter WHERE message_transport_type = 'sms';")"
+    assert '[ "$(tools_sql "SELECT content FROM letter WHERE code = \"CHECKOUT\" AND message_transport_type = \"sms\";")" = "The following items have been checked out: [% biblio.title %]" ]' "existing notices are kept"
+    local odue; odue=$(tools_sql "SELECT content FROM letter WHERE code = 'ODUE' AND message_transport_type = 'sms';")
+    assert '[[ "$odue" == "[%- USE KohaDates -%]"* ]] && [[ "$odue" == *"[% FOREACH overdue IN overdues %]- [% overdue.item.biblio.title %] ([% overdue.date_due | \$KohaDates %])"* ]]' "$odue"
+    assert '[ "$(tools_sql "SELECT name FROM letter WHERE code = \"ODUE\" AND message_transport_type = \"sms\";")" = "Overdue notice" ]' "the name of the email version is reused"
+    assert '[[ "$(tools_sql "SELECT content FROM letter WHERE code = \"CHECKIN\" AND message_transport_type = \"sms\";")" == "[% branch.branchname %]: [% biblio.title %] was returned."* ]]'
+    panel lt_msg_check
+    assert '[ "$(pre_backups NOTICES)" = "1" ] && ! dialogs | tail -2 | grep -q "PROMPT"' "nothing left to create"
+}
+
+@test "M07 patrons' SMS numbers: report with the driver rules, corrections written only on confirmation" {
+    panel msg_conf_set country 55 area 44
+    answer yes
+    panel lt_msg_phones
+    assert 'grep -q "Complete and correct: 1" "$KEI_S/textbox.last" && grep -q "Can be corrected: 1" "$KEI_S/textbox.last" && grep -q "Landlines.*: 1" "$KEI_S/textbox.last" && grep -q "Invalid (fix them by hand): 1" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+    assert 'grep -q "S1 .*(44) 9876-5432 .*-> +5544998765432" "$KEI_S/textbox.last" && grep -q "S3 .*-> ?" "$KEI_S/textbox.last"'
+    assert '[ "$(tools_sql "SELECT smsalertnumber FROM borrowers WHERE cardnumber = \"S1\";")" = "+5544998765432" ]'
+    assert '[ "$(tools_sql "SELECT smsalertnumber FROM borrowers WHERE cardnumber = \"S3\";")" = "(10) 1234-5678" ] && [ "$(tools_sql "SELECT smsalertnumber FROM borrowers WHERE cardnumber = \"E1\";")" = "0 15 44 3524-1234" ]' "invalid numbers and landlines are left as they are"
+    assert '[ "$(pre_backups PHONES)" = "1" ] && [ ! -d "$PM/KohaEasy" ]' "the report works without installing the module"
+}
+
+@test "M08 the driver as Koha calls it: regional numbers, Unicode text, failures die with the reason" {
+    whatsapp_on
+    run kperl -MSMS::Send -e 'use utf8; my $s = SMS::Send->new("KohaEasy::Gateway", _login => "", _password => ""); print $s->send_sms(to => "(44) 9876-5432", text => "Olá, a devolução é amanhã") ? "sent\n" : "no\n"'
+    assert '[ "$output" = "sent" ]' "$output"
+    assert 'http_log | tail -1 | grep -q "\"text\": \"Olá, a devolução é amanhã\"" && http_log | tail -1 | grep -q "\"number\": \"5544998765432\""' "$(http_log | tail -1)"
+    touch "$KEI_S/http-fail"
+    run kperl -MSMS::Send -e 'my $ok = eval { SMS::Send->new("KohaEasy::Gateway")->send_sms(to => "44998765432", text => "x") }; print $ok ? "sent\n" : "failed: $@"'
+    assert '[[ "$output" == "failed: WhatsApp: HTTP 500"* ]]' "$output"
+}
+
+@test "M09 removing the module restores SMSSendDriver and deletes the driver, settings, links and schedule" {
+    whatsapp_on
+    answer yes
+    panel lt_msg_notices
+    assert '[ "$(pref SMSSendDriver)" = "KohaEasy::Gateway" ]'
+    answer yes yes
+    panel lt_msg_remove
+    assert '[ "$(pref SMSSendDriver)" = "Email" ]' "$(pref SMSSendDriver)"
+    assert '[ ! -e "$CONF" ] && [ ! -e "$PM/SMS/Send/KohaEasy/Gateway.pm" ] && [ ! -e "$PM/KohaEasy/Messaging.pm" ] && [ ! -e /etc/cron.d/koha_messaging ] && [ ! -d /var/lib/koha/library/kei-messaging ]'
+}
+
+# --- Cataloguing aids -----------------------------------------------------------
+
+# Synthetic rows in the layout of the PHA book (left letter, number, right
+# letter), made around the examples of its explanation chapter.
+pha_rows() {
+    cat <<'EOF'
+L 1 M
+Laf 166 Macd
+Lag 167 Mace
+Len 588 Macj
+Lent 589 Mack
+Leo 59 Macl
+Lib 671 Macr
+Libr 672 Macs
+R 1 S
+Rat 183 Sampaio
+Rau 184 Sampaio M.
+Rav 185 Sampaio P.
+T 1 A
+Tap 175 Ale
+Tar 176 Alf
+D;1
+Dub;876
+Duc;877
+O 1 U
+Od 23 Ud
+Oe 24 Ue
+EOF
+}
+
+@test "C01 loading a table: rows of the book, Windows-1252, order and repeated entries checked before anything is kept" {
+    { pha_rows; printf 'Lz 2 Mz\nLent 590 Mack\nÁgua 17 Árvore\n'; } | iconv -f UTF-8 -t WINDOWS-1252 > "$W/pha.txt"
+    export KEI_SELECT_FILE="$W/pha.txt"
+    inputs pha
+    answer no
+    panel lt_cat_load
+    assert 'grep -q "^Entries: 43$" "$KEI_S/textbox.last" && grep -q "Numbers out of order.*: 3$" "$KEI_S/textbox.last" && grep -q "Repeated entries.*: 2$" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+    assert 'grep -q "line 22: Lz 2 < Libr 672" "$KEI_S/textbox.last" && grep -q "line 24: Árvore 17 < Alf 176" "$KEI_S/textbox.last" && grep -q "line 23: Lent (Lent 589)" "$KEI_S/textbox.last"' "the suspect lines are shown (Windows-1252 read)"
+    assert '[ ! -e /etc/koha-easy-install/tables/pha.tsv ]' "declined: nothing kept"
+    pha_rows > "$W/pha.txt"
+    inputs pha
+    answer yes
+    panel lt_cat_load
+    assert '[ "$(wc -l < /etc/koha-easy-install/tables/pha.tsv)" = "39" ] && dialogs | grep -q "^OK .*39 entries"' "$(dialogs | tail -2)"
+    assert 'grep -qP "^s\tsampaio m\t184\tSampaio M\.$" /etc/koha-easy-install/tables/pha.tsv'
+    assert '[ "$(pre_backups)" = "0" ]' "a table is not a database change"
+}
+
+@test "C02 author notation follows the rules of the PHA explanation" {
+    mkdir -p /etc/koha-easy-install/tables
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    local c
+    while IFS='|' read -r name title mode want; do
+        panel cat_notation pha "$name" "$title" "" "${mode:-person}"
+        assert '[ "$(cut -f1 <<< "$output")" = "$want" ]' "$name / $title: got $(cut -f1 <<< "$output"), want $want"
+    done <<'EOF'
+Lentino, Noêmia|Classificação decimal||L589c
+Libonato, José|Lendas do sul||L671L
+Sampaio, Francisco|O mar||S183m
+Sampaio, Mário|Poemas||S184p
+Sampaio, Paulo|Poemas||S185p
+Tapajós, Vicente|História do Brasil||T175h
+Alencar, José de|O tronco do ipê||A175t
+La Fonte, Antonio|Fábulas||L166f
+Du Bartas, Guillaume|La semaine||D876s
+O'Donnel, Léopold|The life||O23L
+McDown, John|Echoes||M166e
+M'Knight, Ann|An hour||M589h
+Rath|Arte||R183a
+Sampaio|Poemas||S183p
+Lent|Xadrez||L589x
+|Mil e uma noites|title|M672
+EOF
+    panel cat_notation pha "Lentino, Noêmia" "Classificação decimal"
+    assert '[ "$(cut -f2-5 <<< "$output")" = "$(printf "Lent\t589\t588\t59")" ]' "entry, number and neighbours: $output"
+    panel cat_notation pha "123 Editora" "Livro"
+    assert '[ "$status" -ne 0 ]' "a name must start with a letter"
+}
+
+@test "C03 notation of a catalogue record: 100, 245 ind2 and 082 read from MARCXML; numbers used by other authors in the class" {
+    mkdir -p /etc/koha-easy-install/tables
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    inputs 201
+    panel lt_cat_record
+    local r="$KEI_S/textbox.last"
+    assert 'grep -q "PHA table.*: L589c" "$r" && grep -q "Heading: Lentino, Noêmia$" "$r"' "$(cat "$r")"
+    assert 'grep -qx "      025.4" "$r" && grep -qx "      L589c" "$r"' "call number with the class of 082"
+    assert 'grep -q "025.4 L589o .*Lent, Carlos" "$r"' "another author already uses L589 in 025.4"
+    assert '! grep -q "L5891a" "$r" && ! grep -q "869.3 L589x" "$r" && ! grep -q "LENTINO" "$r"' "longer numbers, other classes and the record itself are not collisions"
+    assert 'grep -q "L588  (free)" "$r" && grep -q "L59  (free)" "$r"' "neighbouring numbers: $(cat "$r")"
+    inputs 999999
+    panel lt_cat_record
+    assert 'dialogs | grep -q "Record not found"'
+}
+
+@test "C04 CDD: main classes built in, the library's schedule by number or word, and how the catalogue uses it" {
+    inputs "869.3"
+    panel lt_cat_cdd
+    assert 'grep -q "800 .*Literature" "$KEI_S/textbox.last" && grep -q "869.3 .*1$" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+    printf '800\tLiteratura (teste)\n860;Literaturas ibéricas (teste)\n869 Literatura em português (teste)\n869.3\tFicção (teste)\nxyz\n' > "$W/cdd.txt"
+    export KEI_SELECT_FILE="$W/cdd.txt"
+    inputs cdd
+    answer yes
+    panel lt_cat_load
+    assert '[ "$(wc -l < /etc/koha-easy-install/tables/cdd.tsv)" = "4" ]' "$(cat "$KEI_S/textbox.last")"
+    inputs "869.3"
+    panel lt_cat_cdd
+    local r="$KEI_S/textbox.last"
+    assert 'grep -q "^  800 .*Literature" "$r" && grep -q "^  860 .*Literaturas ibéricas" "$r" && grep -q "^  869 .*Literatura em português" "$r" && grep -q "^  869.3 .*Ficção" "$r"' "$(cat "$r")"
+    inputs "FICCAO"
+    panel lt_cat_cdd
+    assert 'grep -q "869.3 .*Ficção (teste)" "$KEI_S/textbox.last"' "search without accents or case: $(cat "$KEI_S/textbox.last")"
+    inputs "title 1 "
+    panel lt_cat_cdd
+    assert 'grep -q "^  000\.[0-9]* " "$KEI_S/textbox.last"' "classes used by titles with the word: $(cat "$KEI_S/textbox.last")"
+    inputs cdd
+    answer yes
+    panel lt_cat_remove
+    assert '[ ! -e /etc/koha-easy-install/tables/cdd.tsv ]'
+}
+
+@test "C05 the cataloguing aids never write to the catalogue" {
+    local before after
+    before=$(mysqldump --skip-dump-date "$DB" | md5sum)
+    mkdir -p /etc/koha-easy-install/tables
+    pha_rows > "$W/pha.txt"
+    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
+    inputs "Lentino, Noêmia" "Classificação" "025.4"
+    panel lt_cat_notation
+    inputs 201
+    panel lt_cat_record
+    inputs "poesia"
+    panel lt_cat_cdd
+    after=$(mysqldump --skip-dump-date "$DB" | md5sum)
+    assert '[ "$before" = "$after" ] && [ "$(pre_backups)" = "0" ]'
+    inputs "Lentino" "x" "025.4; DROP TABLE items"
+    panel lt_cat_notation
+    assert 'dialogs | grep -q "Invalid class number"'
+}
+
+# --- Collection spreadsheets (Biblioteca Fácil) -----------------------------------
+
+biblioteca_facil_csv() {
+    cat <<'EOF' | iconv -f UTF-8 -t WINDOWS-1252 > "$W/acervo.csv"
+Tombo;Título;Subtítulo;Autor;Editora;Local;Ano;Edição;ISBN;CDD;Cutter;Assunto;Exemplar;Tipo;Data de aquisição;Valor;Observação da escola
+0001;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";1;Livro;05/03/2020;R$ 25,90;x
+0002;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";2;Livro;05/03/2020;;
+0003;Revista Ciência Hoje;n. 300;;SBPC;Rio de Janeiro;2013;;;505;;Ciência;;revista;;;
+0001;Duplicado;;Autor, Teste;;;;;;;;;;;;;
+;;;Sem título;;;;;;;;;;;;;
+EOF
+}
+
+@test "F01 Biblioteca Fácil: Windows-1252 spreadsheet becomes UTF-8 MARC with one record per title and its items in 952" {
+    biblioteca_facil_csv
+    export KEI_SELECT_FILE="$W/acervo.csv"
+    inputs CPL LIVRO new
+    answer yes yes
+    panel lt_br_migrate_sheet
+    assert '[ "$status" -eq 0 ]' "$output"
+    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
+    assert 'grep -q "Título *-> title" "$p" && grep -q "Tombo *-> barcode" "$p" && grep -q "Observação da escola *-> -" "$p" && grep -q "Encoding: Windows-1252" "$p"' "$(cat "$p")"
+    assert 'grep -q "Records: 3" "$p" && grep -q "Items created: 4" "$p" && grep -q "Rows without title: 1" "$p" && grep -q "Repeated barcodes (kept on the first row only): 1" "$p"'
+    assert '[ -s "$f" ] && iconv -f UTF-8 -t UTF-8 "$f" >/dev/null && [ "$(head -c 10 "$f" | tail -c 1)" = "a" ]' "UTF-8 with leader/09 a"
+    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "3" ]' "$(marc_dump "$f")"
+    assert 'marc_dump "$f" | grep -qx "245 12 \$a O cortiço"' "nonfiling article: $(marc_dump "$f" | grep ^245)"
+    assert 'marc_dump "$f" | grep -qx "260    \$a São Paulo : \$b Ática, \$c 1997" && marc_dump "$f" | grep -qx "250    \$a 2. ed."'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0001 \$t 1 \$d 2020-03-05 \$g 25.90"' "$(marc_dump "$f" | grep ^952)"
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0002 \$t 2 \$d 2020-03-05"'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y REV \$o 505 \$p 0003"' "item type from its description"
+    assert 'marc_dump "$f" | grep -qx "020    \$a 9788508000013" && marc_dump "$f" | grep -qx "090    \$a 869.3 \$b A994c" && marc_dump "$f" | grep -qx "650  4 \$a Naturalismo"'
+    assert 'marc_dump "$f" | grep -A12 "Duplicado" | grep -q "^952    \$a CPL \$b CPL \$y LIVRO$"' "the repeated tombo is dropped, the item kept"
+    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \".*sheet2marc.pl\".*--dry-run" "$KEI_S/calls.log" && grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
+}
+
+@test "F02 spreadsheet without a title column, or declined after the preview: nothing staged" {
+    printf 'Tombo;Autor\n1;Fulano\n' > "$W/semtitulo.csv"
+    export KEI_SELECT_FILE="$W/semtitulo.csv"
+    inputs CPL LIVRO new
+    panel lt_br_migrate_sheet
+    assert 'dialogs | grep -q "needs a title column"' "$(dialogs | tail -2)"
+    biblioteca_facil_csv
+    export KEI_SELECT_FILE="$W/acervo.csv"
+    inputs CPL LIVRO keep
+    answer no
+    panel lt_br_migrate_sheet
+    assert 'grep -q "sheet2marc.pl.*--dry-run" "$KEI_S/calls.log" && ! grep -q "sheet2marc.pl.*--out" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
+    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
+}
+
+# --- marc_replace.pl ---------------------------------------------------------------
+
+KS=/run/kei-mock/koha
+mr_setup() {
+    mkdir -p "$KS/biblio" /var/lib/koha/library/kei-marc-replace
+    "$KEI_SH" "$PANEL" marc_replace_script > "$W/marc_replace.pl"
+    cat > "$KS/biblio/7.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00200nam a2200100 a 4500</leader><controlfield tag="001">7</controlfield>
+<datafield tag="245" ind1="0" ind2="0"><subfield code="a">Título provisório</subfield></datafield></record>
+XML
+    echo 3 > "$KS/biblio/7.items"; echo FA > "$KS/biblio/7.fw"
+    cp "$KS/biblio/7.xml" "$W/old7.xml"
+}
+cgi() { run env PERL5LIB="$KEI_REPO/tests/mocks/perl5" "$KEI_REPO/tests/lib/cgi-run" "$W/marc_replace.pl" "$@"; }
+field() { grep -o "name=\"$1\" value=\"[^\"]*\"" <<< "$output" | sed 's/.*value="//; s/"$//'; }
+BN_TEXT=$'000    00942nam a2200265 a 4500\n001    9085\n100 1_ |a Assis, Machado de,|d 1839-1908.\n245 10 |a Dom Casmurro /|c Machado de Assis.\n260 __ |a São Paulo :|b Ática,|c 1997.\n650  4 |a Romance brasileiro.\n952 __ |a CPL |p 999'
+
+@test "R01 marc_replace.pl: staff login with edit_catalogue, CSRF token and cud- operation in the form, Koha item types escaped" {
+    mr_setup
+    cgi GET biblionumber=7
+    assert 'grep -qx "checkauth intranet editcatalogue=edit_catalogue" "$KS/calls.log"' "$(cat "$KS/calls.log")"
+    assert '[ "$(field csrf_token)" = "tok-SESSID1" ] && [ "$(field op)" = "cud-preview" ] && [ "$(field biblionumber)" = "7" ]' "$output"
+    assert 'grep -q "Revista &lt;b&gt; (REV)" <<< "$output" && ! grep -q "Revista <b>" <<< "$output"' "item types from Koha, escaped"
+    assert 'grep -q "Content-Type: text/html; charset=utf-8" <<< "$output"'
+}
+
+@test "R02 preview of pasted Biblioteca Nacional text: item fields left out, item type set, nothing replaced yet" {
+    mr_setup
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marctext=$BN_TEXT" itemtype=LIVRO
+    assert 'grep -q "Item fields found in the file and left out: 1" <<< "$output" && grep -q "Items of the record (kept as they are): 3" <<< "$output"' "$output"
+    assert 'grep -q "650  4 _aRomance brasileiro." <<< "$output" && grep -q "942    _cLIVRO" <<< "$output" && grep -q "_aSão Paulo :" <<< "$output"' "indicators, 942 and accents"
+    assert '! grep -q "^952" <<< "$(sed -n "/<pre>/,/<\/pre>/p" <<< "$output")"'
+    assert '[ "$(field op)" = "cud-replace" ] && [ -n "$(field record)" ] && [ "${#output}" -gt 0 ] && [ "$(field digest)" = "$(sha1sum < "$W/old7.xml" | cut -d" " -f1)" ]' "digest of the record now in the catalogue"
+    assert '! grep -q ModBiblio "$KS/calls.log" && [ -z "$(ls /var/lib/koha/library/kei-marc-replace)" ]' "nothing replaced by the preview"
+}
+
+@test "R03 replacement: one transaction, record locked and compared, previous version saved, items never touched" {
+    mr_setup
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marctext=$BN_TEXT"
+    local rec dig
+    rec=$(field record); dig=$(field digest)
+    : > "$KS/calls.log"
+    cgi POST op=cud-replace csrf_token=tok-SESSID1 biblionumber=7 "record=$rec" "digest=$dig"
+    assert 'grep -q "Record replaced. (7)" <<< "$output"' "$output"
+    assert '[ "$(sed -n 2,5p "$KS/calls.log" | tr "\n" "|")" = "txn-begin|select-metadata 7 FOR-UPDATE|ModBiblio 7 fw=FA tags=001,100,245,260,650|txn-commit|" ]' "$(cat "$KS/calls.log")"
+    local saved; saved=$(ls /var/lib/koha/library/kei-marc-replace/7-*.xml)
+    assert 'cmp -s "$saved" "$W/old7.xml" && [ "$(stat -c %a "$saved")" = "640" ]' "the previous version is saved as it was"
+    assert 'grep -q "Dom Casmurro" "$KS/biblio/7.xml" && ! grep -q "tag=\"952\"" "$KS/biblio/7.xml"'
+    local v; v=$(basename "$saved" .xml); v=${v#7-}
+    assert 'grep -q "op=download&amp;biblionumber=7&amp;version=$v" <<< "$output"'
+    cgi GET op=download biblionumber=7 "version=$v"
+    assert 'grep -q "attachment; filename=\"biblio-7-$v.xml\"" <<< "$output" && grep -q "Título provisório" <<< "$output"' "$output"
+    cgi GET op=download biblionumber=7 "version=../../../etc/passwd"
+    assert 'grep -q "404" <<< "$output" && ! grep -q "root:" <<< "$output"' "only saved versions can be downloaded"
+}
+
+@test "R04 refused: wrong token, stale preview, unknown record, missing input; no write in any case" {
+    mr_setup
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marctext=$BN_TEXT"
+    local rec dig
+    rec=$(field record); dig=$(field digest)
+    cgi POST op=cud-replace csrf_token=tok-OTHER biblionumber=7 "record=$rec" "digest=$dig"
+    assert 'grep -q "Invalid or expired security token" <<< "$output"'
+    echo '<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00100nam a2200100 a 4500</leader><datafield tag="245" ind1="0" ind2="0"><subfield code="a">Changed by a colleague</subfield></datafield></record>' > "$KS/biblio/7.xml"
+    cgi POST op=cud-replace csrf_token=tok-SESSID1 biblionumber=7 "record=$rec" "digest=$dig"
+    assert 'grep -q "The record was changed after the preview" <<< "$output" && grep -q "txn-rollback" "$KS/calls.log"' "$output"
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=8 "marctext=$BN_TEXT"
+    assert 'grep -q "There is no record with this biblionumber" <<< "$output"'
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7
+    assert 'grep -q "Paste the text of the record or choose" <<< "$output"'
+    assert '! grep -q ModBiblio "$KS/calls.log" && grep -q "Changed by a colleague" "$KS/biblio/7.xml" && [ -z "$(ls /var/lib/koha/library/kei-marc-replace)" ]'
+}
+
+@test "R05 input formats: Latin-1 .mrc through MarcToUTF8Record, MARCXML, MarcEdit text; several records or bad lines refused, text escaped" {
+    mr_setup
+    cat > "$W/one.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam  2200000 a 4500</leader><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Memórias póstumas</subfield></datafield><datafield tag="952" ind1=" " ind2=" "><subfield code="p">1</subfield></datafield></record>
+XML
+    kei_marc "$W/latin1.mrc" ISO-8859-1 "$W/one.xml"
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marcfile=@$W/latin1.mrc"
+    assert 'grep -q "_aMemórias póstumas" <<< "$output" && grep -q "Characters read as: ISO-8859-1" <<< "$output" && grep -q "left out: 1" <<< "$output"' "$output"
+    assert 'grep -q "MarcToUTF8Record MARC21" "$KS/calls.log"' "Koha converts the characters"
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marcfile=@$W/one.xml"
+    assert 'grep -q "_aMemórias póstumas" <<< "$output" && grep -q "UTF-8 (MARCXML)" <<< "$output"'
+    cat "$W/latin1.mrc" "$W/latin1.mrc" > "$W/two.mrc"
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marcfile=@$W/two.mrc"
+    assert 'grep -q "The file has more than one record" <<< "$output"'
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 $'marctext==LDR  00000nam\\\\2200000\\a\\4500\n=245  14$aThe {dollar}100 book$cAnon.\n=650  \\4$aTest'
+    assert 'grep -q "245 14 _aThe \$100 book" <<< "$output" && grep -q "650  4 _aTest" <<< "$output"' "MarcEdit: $output"
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 $'marctext=245 10 |a Ok\nthis is <script>alert(1)</script>\n300 garbage'
+    assert 'grep -q "were not understood: 2, 3" <<< "$output" && ! grep -q "<script>" <<< "$output"' "$output"
+}
+
+@test "R06 ModBiblio failure: the transaction is rolled back and the record stays as it was" {
+    mr_setup
+    cgi POST op=cud-preview csrf_token=tok-SESSID1 biblionumber=7 "marctext=$BN_TEXT"
+    local rec dig
+    rec=$(field record); dig=$(field digest)
+    touch "$KS/modbiblio.fail"
+    cgi POST op=cud-replace csrf_token=tok-SESSID1 biblionumber=7 "record=$rec" "digest=$dig"
+    assert 'grep -q "Koha could not replace the record" <<< "$output" && grep -q "txn-rollback" "$KS/calls.log"' "$output"
+    assert 'cmp -s "$KS/biblio/7.xml" "$W/old7.xml"'
+}
+
+@test "R07 panel: the page is compiled with Koha's modules, installed read-only, linked in the Edit menu and removed cleanly" {
+    export KOHA_INTRA_CGI="$W/cgi"
+    mkdir -p "$W/cgi/tools"
+    local js_before; js_before=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB" | md5sum)
+    answer yes
+    panel lt_mr_install
+    local page="$W/cgi/tools/marc_replace.pl"
+    assert '[ -f "$page" ] && [ "$(stat -c "%a %U" "$page")" = "755 root" ]' "$(ls -l "$page" 2>&1) $(dialogs | tail -2)"
+    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \"-c\" \".*marc_replace.pl\"" "$KEI_S/calls.log"' "compiled as the instance user first: $(calls)"
+    assert '[ -d /var/lib/koha/library/kei-marc-replace ] && [ "$(pre_backups MARC-REPLACE)" = "1" ]'
+    local js; js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
+    assert '[[ "$js" == "/* the library'"'"'s own code */"$'"'"'\n'"'"'"\$(document).ready(function () { var re = /a\\b/; });"* ]]' "the library code is kept as it was: $js"
+    assert 'grep -q "tools/marc_replace.pl?biblionumber=" <<< "$js" && grep -q "Replace the record (MARC file)" <<< "$js"'
+    answer yes
+    panel lt_mr_install
+    js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
+    assert '[ "$(grep -c "marc_replace begin" <<< "$js")" = "1" ] && grep -q "^koha-plack --restart library" "$KEI_S/calls.log"' "updated once, Plack restarted"
+    answer yes
+    panel lt_mr_remove
+    assert '[ ! -e "$page" ] && [ -d /var/lib/koha/library/kei-marc-replace ]'
+    assert '[ "$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = '"'"'IntranetUserJS'"'"';" "$DB" | md5sum)" = "$js_before" ]' "IntranetUserJS back to the original"
+}
+
+@test "R08 panel: a page that does not compile is never installed" {
+    export KOHA_INTRA_CGI="$W/cgi"
+    mkdir -p "$W/cgi/tools"
+    extra 'marc_replace_script() { printf "use strict;\nthis is not perl(\n"; }'
+    answer no
+    panel lt_mr_install
+    assert 'dialogs | grep -q "does not compile" && [ ! -e "$W/cgi/tools/marc_replace.pl" ] && [ "$(pre_backups)" = "0" ]' "$(dialogs | tail -2)"
+}
+
+# --- Opt-in ------------------------------------------------------------------------
+
+@test "X01 opt-in: loading the panel installs nothing; the modules only act from their menus" {
+    panel true
+    assert '[ ! -e /usr/local/lib/site_perl/KohaEasy ] && [ ! -e /etc/cron.d/koha_messaging ] && [ ! -e /etc/koha-easy-install/tables ] && [ "$(pref SMSSendDriver)" = "Email" ]'
+    local f callers
+    for f in msg_install_files _lt_msg_notices_set _lt_msg_letters _lt_msg_phones_fix cat_table_import _lt_br_migrate_sheet_run _lt_mr_install _lt_mr_remove; do
+        callers=$(grep -nE "(^|[^_a-z])${f}( |$|\))" "$KEI_REPO/installer" | grep -vE "^[0-9]+:${f}\(\) \{" | grep -vE "^[0-9]+:\s*#" | cut -d: -f1)
+        assert '[ -n "$callers" ]' "$f is used"
+        local l
+        for l in $callers; do
+            assert 'awk -v l="$l" "NR <= l && /^[a-z_]+\\(\\) \\{/ { fn = \$1 } NR == l { print fn }" "$KEI_REPO/installer" | grep -qE "^(lt_|_lt_|function_|msg_|cat_)"' "$f at line $l must be reached from a menu"
+        done
+    done
+}

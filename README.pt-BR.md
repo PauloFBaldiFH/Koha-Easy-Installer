@@ -21,7 +21,9 @@ Nasceu da experiência real com as barreiras técnicas da gestão de acervos e f
 - **Segurança**: Fail2ban, firewall UFW (com opção de restringir a porta 8080 do Staff) e troca da senha do banco de dados.
 - **Configurações do Koha**: perfis de dimensionamento, avisos por e-mail (agenda do próprio Koha, ativada com `koha-email-enable`), criação de superbibliotecário, SIP2 e Z39.50, relógio e fuso horário.
 - **Ferramentas da biblioteca**: importação MARC guiada com opção de desfazer, pacote de relatórios SQL essenciais, importação de leitores por CSV e virada do ano letivo (troca de categorias), verificação da qualidade do catálogo e rotinas de privacidade (LGPD). Toda alteração mostra antes uma prévia com a simulação do próprio Koha e é protegida por um backup verificado (veja [Ferramentas da biblioteca](#ferramentas-da-biblioteca)).
-- **Brasil: localização e migração** (opcional, nunca aplicado pela instalação nem por agendamento): migração MARC do Biblivre, SophiA e Pergamum (conversão para UTF-8, exemplares levados para o 952 do Koha), planilhas de leitores do sistema antigo com verificação do CPF, auditoria de CPF (módulo 11), modelos de etiquetas Pimaco, ficha catalográfica e feriados brasileiros no calendário do Koha (veja [Brasil: localização e migração](#brasil-localização-e-migração)).
+- **Brasil: localização e migração** (opcional, nunca aplicado pela instalação nem por agendamento): migração MARC do Biblivre, SophiA e Pergamum (conversão para UTF-8, exemplares levados para o 952 do Koha), planilhas do acervo (Biblioteca Fácil), planilhas de leitores do sistema antigo com verificação do CPF, auditoria de CPF (módulo 11), modelos de etiquetas Pimaco, ficha catalográfica e feriados brasileiros no calendário do Koha (veja [Brasil: localização e migração](#brasil-localização-e-migração)).
+- **Mensagens: WhatsApp e Telegram** (opcional): os próprios avisos do Koha (empréstimo, devolução, atraso, vencimento, reserva) entregues por um gateway de WhatsApp próprio (Evolution API ou similar) ou por um bot do Telegram, com os números dos leitores completados e corrigidos no caminho (veja [Mensagens](#mensagens-whatsapp-e-telegram)).
+- **Auxílio à catalogação**: notação de autor com a tabela PHA ou Cutter-Sanborn carregada pela biblioteca, consulta à CDD e uma página da interface da equipe que substitui um registro pelo biblionumber sem mexer nos exemplares (veja [Auxílio à catalogação](#auxílio-à-catalogação-pha-cutter-sanborn-cdd) e [Substituir um registro MARC](#substituir-um-registro-marc-interface-da-equipe)).
 - **Idiomas**: instala os pacotes de idioma do Koha e traduz o próprio painel (22 idiomas).
 - **Autoatualização** pelo GitHub com verificação SHA-256.
 
@@ -79,7 +81,7 @@ sudo config.sh
 | 7 | Diagnóstico e manutenção | Status, verificação, logs, otimização |
 | 8 | Central de segurança | Fail2ban, firewall, troca de senha |
 | 9 | Configurações e parâmetros do Koha | Dimensionamento, e-mail, superbibliotecário, SIP2/Z39.50, relógio |
-| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração |
+| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração, mensagens por WhatsApp / Telegram, auxílio à catalogação, substituir um registro MARC |
 | 11 | Ferramentas gerais | htop/nethogs, navegador de terminal, gerenciador de arquivos |
 | 12 | Agendamentos e tarefas (cron) | Ver, entender, regenerar ou editar as tarefas automáticas |
 | 13 | Idiomas do Koha e do painel | Pacotes de idioma do Koha e idioma do painel |
@@ -115,6 +117,7 @@ Cada execução fica registrada em `/var/log/koha-easy-install/tools/` (só o ro
 |------------|---------------|--------|--------|
 | Migrar MARC do Biblivre, SophiA, Pergamum ou de outro sistema (mapa de campos digitado) | Os caracteres são convertidos para UTF-8 com o `yaz-marcdump` (de Latin-1 ou MARC-8; o pacote `yaz` é oferecido se faltar); o campo de exemplar (Biblivre 949, Pergamum 852, SophiA 990 ou o seu próprio mapa) vai para o 952 do Koha (código de barras, número de chamada, exemplar, notas, biblioteca, tipo de material) com o MARC::Record do próprio Koha; depois vem a importação MARC normal (`stage_file.pl` / `commit_file.pl`, desfazer com `--revert`) | Contagens e uma amostra dos exemplares convertidos, depois o relatório de preparação do Koha | `PRE-IMPORT` |
 | Importar leitores de uma planilha do sistema antigo | Encontra as colunas pelo nome em português ou inglês (Nome, Matrícula, CPF, E-mail, Nascimento...), Windows-1252 ou UTF-8, `;` ou `,`; verifica o CPF (módulo 11, dígitos repetidos, duplicados), usa o CPF como número do cartão quando não há um e o guarda em um atributo de leitor com código `CPF` quando esse tipo existe; depois roda o `import_patrons.pl` | Linhas rejeitadas com o motivo, depois a simulação do Koha | `PRE-PATRONS` |
+| Migrar uma planilha do acervo (Biblioteca Fácil e outros programas que exportam o acervo para Excel / CSV) | Colunas encontradas pelos nomes usuais (Tombo, Título, Autor, Editora, Ano, ISBN, CDD, Cutter, Assunto, Exemplar, Tipo, Data de aquisição, Valor...), Windows-1252 ou UTF-8; linhas com o mesmo título, autor, edição, ano e ISBN viram um registro MARC 21 (montado com o MARC::Record) com um exemplar no 952 por linha (tombo como código de barras, CDD + Cutter como número de chamada, tipo de material pelo código ou pela descrição); códigos de barras repetidos são descartados; depois vem a importação MARC normal (desfazer com `--revert`) | Colunas usadas e ignoradas, contagens e uma amostra dos registros, depois o relatório de preparação do Koha | `PRE-IMPORT` |
 | Verificar CPFs dos leitores (somente leitura) | Número do cartão, usuário, sort1/sort2 ou o atributo `CPF`: válidos, inválidos, compartilhados por dois leitores | — | — |
 | Modelos de etiquetas Pimaco | Folhas 6180, 6181, 6287 (Carta) e A4256, A4251 (A4) mais 3 leiautes (lombada, código de barras, título e código de barras) no criador de etiquetas do Koha; atualiza ou remove só os próprios modelos | Resumo antes da alteração | `PRE-LABELS` |
 | Ficha catalográfica | Folhas de estilo que envolvem a visualização de detalhes padrão do Koha (OPAC e interface da equipe, uma por idioma instalado) e acrescentam a ficha abaixo do registro, com botão de impressão; configuradas em `OPACXSLTDetailsDisplay` / `XSLTDetailsDisplay`. Os valores anteriores são guardados e **Ocultar a ficha** os devolve; os arquivos são regravados sempre que o painel abre, acompanhando as atualizações do Koha | Valores antigos e novos | `PRE-FICHA` |
@@ -124,6 +127,41 @@ Cada execução fica registrada em `/var/log/koha-easy-install/tools/` (só o ro
 - A ficha segue o leiaute AACR2 usado nas bibliotecas brasileiras (coluna do número de chamada, recuo francês, assuntos numerados, entradas secundárias em algarismos romanos).
 - As predefinições do Biblivre, SophiA e Pergamum seguem o leiaute de exportação mais comum desses sistemas. A prévia mostra o resultado antes de qualquer gravação; **Outro formato** aceita qualquer campo de exemplar.
 - Carnaval e Corpus Christi são ponto facultativo, não feriados nacionais: remova-os em Ferramentas > Calendário se a biblioteca abrir. O Dia da Consciência Negra (20/11) entra a partir de 2024.
+- A predefinição do Biblioteca Fácil lê uma planilha exportada; ela foi escrita a partir dos nomes de coluna usuais, não de uma exportação real desse programa. A prévia lista as colunas usadas e as ignoradas antes de qualquer gravação.
+
+### Mensagens: WhatsApp e Telegram
+
+**Ferramentas da biblioteca > Mensagens: WhatsApp e Telegram**. O Koha já escreve os avisos (empréstimo, devolução, atraso, vencimento, reserva) e entrega os do tipo SMS ao driver SMS::Send indicado na preferência `SMSSendDriver`. O painel instala um driver assim (`SMS::Send::KohaEasy::Gateway`): cada aviso vai pelo Telegram quando o leitor vinculou o bot da biblioteca, senão pelo WhatsApp. Nada muda no Koha até **Enviar os avisos do Koha** ser ligado, e desligar devolve o `SMSSendDriver` anterior (backup `PRE-MESSAGING` verificado nos dois sentidos).
+
+| Opção | O que faz |
+|-------|-----------|
+| Gateway de WhatsApp | Um gateway próprio da biblioteca: Evolution API v2 (`POST /message/sendText/<instância>`, cabeçalho `apikey`) ou outro que aceite `{"number", "to", "text"}` com token Bearer |
+| Bot do Telegram | O token do @BotFather é verificado com o Telegram (`getMe`). Os leitores abrem o bot, tocam em Iniciar e compartilham o próprio contato; uma tarefa a cada dois minutos vincula a conversa ao número (`/stop` desfaz) |
+| Código do país e DDD | Os números são completados e corrigidos antes do envio: código do país (Brasil por padrão, ou qualquer outro), DDD para números sem ele, prefixos de operadora e o 0 retirados, e o 9º dígito dos celulares brasileiros acrescentado |
+| Enviar uma mensagem de teste | Pelo mesmo caminho SMS::Send que o Koha usa, como o usuário da instância |
+| O que o Koha precisa | Verifica o `SMSSendDriver`, as versões SMS dos avisos, as regras de atraso com SMS e os leitores com número e preferências de SMS; oferece criar versões SMS curtas dos avisos que não têm (`PRE-NOTICES`) |
+| Verificar os telefones dos leitores | Relatório somente de leitura com as mesmas regras; os números corrigidos só são gravados após confirmação (`PRE-PHONES`) |
+
+As configurações (com os tokens) ficam em `/etc/koha/sites/library/kei-messaging.conf`, legível só pelo root e pelo Koha. Com os avisos ligados, a fila de SMS também é enviada a cada dois minutos (`/etc/cron.d/koha_messaging`).
+
+### Auxílio à catalogação: PHA, Cutter-Sanborn, CDD
+
+**Ferramentas da biblioteca > Auxílio à catalogação**, somente leitura para o catálogo.
+
+- **Notação de autor**: a entrada imediatamente anterior ao nome na tabela, a inicial do sobrenome, o número e a inicial do título (o artigo inicial nunca conta, e título começando com "l" leva L maiúsculo); prefixos lidos como uma só palavra (La Fonte, O'Donnel) e M' / Mc como Mac; instituições pela primeira palavra e obras anônimas pela primeira palavra do título, como na explicação da tabela PHA. A partir de um registro do catálogo, lê o 100 / 110 / 111, o 245 (com o indicador de caracteres a desprezar) e o 082, e lista os números de chamada que já usam o mesmo número naquela classe, com os números livres imediatamente antes e depois.
+- **As tabelas não são distribuídas com o painel**: a Tabela PHA (Heloísa de Almeida Prado, T. A. Queiroz) e as tabelas Cutter-Sanborn têm direitos autorais. Cada biblioteca carrega o próprio exemplar como arquivo de texto (uma entrada e o número por linha; as linhas da PHA podem ser digitadas como estão impressas, entrada - número - entrada). O arquivo é conferido antes de ser guardado: entradas por letra, números fora de ordem (erros de digitação) e entradas repetidas.
+- **CDD**: as dez classes principais vêm embutidas; a biblioteca pode carregar a própria tabela (número e descrição por linha) para pesquisar por número ou por palavra, e toda consulta mostra também como o catálogo já usa o número.
+
+### Substituir um registro MARC (interface da equipe)
+
+**Ferramentas da biblioteca > Substituir um registro MARC** instala o `marc_replace.pl` na interface da equipe do Koha (`/cgi-bin/koha/tools/marc_replace.pl`, e se quiser no menu Editar de cada registro). Ele substitui um registro, encontrado pelo biblionumber, por um arquivo `.mrc` ou `.xml` ou por texto colado (linhas da Biblioteca Nacional `245 10 |a`, do MarcEdit ou do yaz-marcdump):
+
+- login com a permissão `edit_catalogue` e token CSRF (operações `cud-` do Koha 24.05+);
+- primeiro uma prévia; depois, numa única transação, o registro atual é travado e comparado com a prévia (nada é substituído se ele mudou), guardado em MARCXML em `/var/lib/koha/library/kei-marc-replace/` (pode ser baixado pela página e reenviado para desfazer) e substituído com o `ModBiblio` do Koha;
+- os campos de exemplar do arquivo são sempre deixados de fora: os exemplares nunca são tocados;
+- arquivos em MARC-8 / Latin-1 são convertidos pelo `MarcToUTF8Record` do próprio Koha.
+
+A página é verificada com os módulos Perl do Koha antes de ser instalada; removê-la mantém as versões guardadas.
 
 ## Tarefas automáticas
 
@@ -151,6 +189,10 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 | `/var/log/koha-easy-install/` | Logs do painel, do APT e das validações (`tools/`: ferramentas da biblioteca, só root) |
 | `/root/koha_patrons_template.csv` | Modelo CSV vazio para a importação de leitores |
 | `/var/lib/koha/library/kei-xslt/` | Folhas de estilo da ficha catalográfica (só enquanto a ficha estiver ativada) |
+| `/etc/koha/sites/library/kei-messaging.conf` | Configurações e tokens de WhatsApp / Telegram (só root e Koha) |
+| `/usr/local/lib/site_perl/SMS/Send/KohaEasy/Gateway.pm` | O driver de mensagens do Koha (com `KohaEasy/Messaging.pm`) |
+| `/etc/koha-easy-install/tables/` | Tabelas de autor e tabela da CDD carregadas pela biblioteca |
+| `/var/lib/koha/library/kei-marc-replace/` | Registros como estavam antes de cada substituição |
 
 Se a instalação parar, o painel mostra a etapa que falhou. A saída completa do gerenciador de pacotes fica em `/var/log/koha-easy-install/apt.log`.
 
@@ -167,10 +209,11 @@ Copie seus backups para outro lugar antes de executá-lo.
 
 ## Testes (para quem contribui)
 
-A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica) e a atualização dos agendamentos.
+A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o `marc_replace.pl` (executado como CGI) e a atualização dos agendamentos.
 
 ```bash
-sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl
+sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \
+     libmarc-record-perl libmarc-xml-perl libsms-send-perl libcgi-pm-perl libmodern-perl-perl
 sudo KEI_TEST_SANDBOX=1 tests/run.sh
 ```
 

@@ -74,7 +74,7 @@ shield_signals() { trap '' INT TERM HUP; SIGNALS_SHIELDED=1; }
 trap on_exit EXIT
 unshield_signals
 
-PANEL_VERSION=" 1.3.0"
+PANEL_VERSION=" 1.4.0"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -5746,7 +5746,11 @@ tools_locked() {
 # Verified PRE-<TAG> dump taken right before a tool writes (the caller holds
 # the lock). Sets TOOLS_PRE; returns 1, with nothing changed, if it failed.
 tools_safety_backup() {
-    TOOLS_PRE="${DIR_SQL}/PRE-${1}_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+    local base n=1
+    base="${DIR_SQL}/PRE-${1}_$(date +%Y-%m-%d_%Hh%M%S)"
+    TOOLS_PRE="${base}.sql.gz"
+    # Two changes in the same second never share (and overwrite) a backup.
+    while [ -e "$TOOLS_PRE" ]; do n=$((n + 1)); TOOLS_PRE="${base}-${n}.sql.gz"; done
     display_explanation "Generating the backup..."
     CLEANUP_FILE="$TOOLS_PRE"
     if ! create_safety_backup "$TOOLS_PRE"; then
@@ -6293,7 +6297,10 @@ function_library_tools() {
             "7" "$(t "◌  Privacy (LGPD): anonymise old history")" \
             "8" "$(t "✖  Privacy (LGPD): delete old patrons")" \
             "9" "$(t "▤  View tool logs")" \
-            "10" "$(t "◆  Brazil: localization & migration")" 3>&1 1>&2 2>&3) || return 0
+            "10" "$(t "◆  Brazil: localization & migration")" \
+            "11" "$(t "✉  Messaging: WhatsApp and Telegram")" \
+            "12" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
+            "13" "$(t "⇄  Replace a MARC record (staff tool)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_marc_import ;;
             2) lt_marc_undo ;;
@@ -6305,6 +6312,9 @@ function_library_tools() {
             8) lt_privacy_delete ;;
             9) lt_view_logs ;;
             10) function_brazil_tools ;;
+            11) function_messaging ;;
+            12) function_cataloguing ;;
+            13) function_marc_replace ;;
         esac
         clear
     done
@@ -6586,11 +6596,305 @@ _lt_br_migrate_run() {
 }
 
 # ----------------------------------------------------------------------
+# Collection spreadsheets (Biblioteca Fácil and other programs that export
+# the collection to Excel / CSV) -> MARC 21 records with their items in 952
+# (MARC::Record, as the instance user) -> Koha's staged import (undo with
+# Library tools > Undo a MARC import). Columns are recognised by their
+# usual names; rows with the same title, author, edition, year and ISBN
+# become one record with one item per row (tombo).
+# ----------------------------------------------------------------------
+SHEET_COLS="title subtitle author coauthors edition place publisher year isbn pages series volume cdd cdu cutter callnumber subjects notes barcode copy acqdate price itemtype language quantity"
+
+# sheet_prepare SRC DST: DST is SRC in UTF-8 without the Excel byte order
+# mark; prints "<encoding><TAB><separator>".
+sheet_prepare() {
+    local src="$1" dst="$2" enc="UTF-8" semi comma tab sep=","
+    if file_is_utf8 "$src"; then
+        cp -f -- "$src" "$dst" || return 1
+    else
+        iconv -f WINDOWS-1252 -t UTF-8 "$src" > "$dst" 2>/dev/null || return 1
+        enc="Windows-1252"
+    fi
+    sed -i '1s/^\xEF\xBB\xBF//; 1s/^\xC3\xAF\xC2\xBB\xC2\xBF//' "$dst"
+    semi=$(head -n 1 "$dst" | tr -cd ';' | wc -c); comma=$(head -n 1 "$dst" | tr -cd ',' | wc -c); tab=$(head -n 1 "$dst" | tr -cd '\t' | wc -c)
+    [ "$semi" -gt "$comma" ] && sep=";"
+    [ "$tab" -gt "$semi" ] && [ "$tab" -gt "$comma" ] && sep=$'\t'
+    printf '%s\t%s' "$enc" "$sep"
+}
+
+bf_sheet_awk() {
+    csv_awk_lib
+    cat <<'BFAWK'
+BEGIN {
+    ncols = split(cols, COL, " ")
+    a["titulo"] = "title"; a["title"] = "title"; a["titulo da obra"] = "title"; a["obra"] = "title"; a["nome do livro"] = "title"; a["livro"] = "title"; a["titulo principal"] = "title"
+    a["subtitulo"] = "subtitle"; a["subtitle"] = "subtitle"; a["complemento do titulo"] = "subtitle"
+    a["autor"] = "author"; a["autores"] = "author"; a["author"] = "author"; a["autor principal"] = "author"; a["autor es"] = "author"; a["nome do autor"] = "author"
+    a["coautor"] = "coauthors"; a["coautores"] = "coauthors"; a["outros autores"] = "coauthors"; a["autor secundario"] = "coauthors"; a["autores secundarios"] = "coauthors"
+    a["tradutor"] = "coauthors"; a["organizador"] = "coauthors"; a["ilustrador"] = "coauthors"
+    a["edicao"] = "edition"; a["edition"] = "edition"; a["ed"] = "edition"
+    a["local"] = "place"; a["local de publicacao"] = "place"; a["local da publicacao"] = "place"; a["cidade da editora"] = "place"; a["place"] = "place"
+    a["editora"] = "publisher"; a["publisher"] = "publisher"; a["nome da editora"] = "publisher"
+    a["ano"] = "year"; a["ano de publicacao"] = "year"; a["ano publicacao"] = "year"; a["ano da edicao"] = "year"; a["data de publicacao"] = "year"; a["year"] = "year"
+    a["isbn"] = "isbn"
+    a["paginas"] = "pages"; a["pag"] = "pages"; a["n de paginas"] = "pages"; a["numero de paginas"] = "pages"; a["pages"] = "pages"; a["paginacao"] = "pages"
+    a["colecao"] = "series"; a["serie"] = "series"; a["series"] = "series"; a["collection"] = "series"
+    a["volume"] = "volume"; a["vol"] = "volume"; a["v"] = "volume"
+    a["cdd"] = "cdd"; a["classificacao"] = "cdd"; a["classificacao cdd"] = "cdd"; a["dewey"] = "cdd"; a["n classificacao"] = "cdd"
+    a["cdu"] = "cdu"; a["classificacao cdu"] = "cdu"
+    a["cutter"] = "cutter"; a["notacao de autor"] = "cutter"; a["notacao do autor"] = "cutter"; a["cutter sanborn"] = "cutter"; a["pha"] = "cutter"; a["codigo cutter"] = "cutter"; a["tabela pha"] = "cutter"
+    a["numero de chamada"] = "callnumber"; a["n de chamada"] = "callnumber"; a["chamada"] = "callnumber"; a["localizacao"] = "callnumber"; a["cota"] = "callnumber"; a["call number"] = "callnumber"
+    a["assunto"] = "subjects"; a["assuntos"] = "subjects"; a["palavras chave"] = "subjects"; a["palavra chave"] = "subjects"; a["descritores"] = "subjects"; a["subject"] = "subjects"; a["subjects"] = "subjects"
+    a["observacao"] = "notes"; a["observacoes"] = "notes"; a["obs"] = "notes"; a["notas"] = "notes"; a["nota"] = "notes"; a["notes"] = "notes"; a["resumo"] = "notes"
+    a["tombo"] = "barcode"; a["n tombo"] = "barcode"; a["numero de tombo"] = "barcode"; a["numero do tombo"] = "barcode"; a["registro"] = "barcode"; a["n registro"] = "barcode"
+    a["numero de registro"] = "barcode"; a["codigo de barras"] = "barcode"; a["codigo barras"] = "barcode"; a["barcode"] = "barcode"; a["patrimonio"] = "barcode"; a["n patrimonio"] = "barcode"
+    a["exemplar"] = "copy"; a["ex"] = "copy"; a["n exemplar"] = "copy"; a["copia"] = "copy"
+    a["data de aquisicao"] = "acqdate"; a["aquisicao"] = "acqdate"; a["data aquisicao"] = "acqdate"; a["data de entrada"] = "acqdate"; a["data do tombo"] = "acqdate"; a["data de tombamento"] = "acqdate"; a["data de cadastro"] = "acqdate"
+    a["valor"] = "price"; a["preco"] = "price"; a["price"] = "price"; a["custo"] = "price"
+    a["tipo"] = "itemtype"; a["tipo de material"] = "itemtype"; a["material"] = "itemtype"; a["tipo de obra"] = "itemtype"; a["suporte"] = "itemtype"; a["tipo de item"] = "itemtype"
+    a["idioma"] = "language"; a["lingua"] = "language"; a["language"] = "language"
+    a["quantidade"] = "quantity"; a["qtd"] = "quantity"; a["qtde"] = "quantity"; a["exemplares"] = "quantity"; a["n de exemplares"] = "quantity"; a["quantidade de exemplares"] = "quantity"
+    rows = 0; skipped = 0
+}
+NR == 1 {
+    sub(/^\357\273\277/, ""); sub(/\r$/, "")
+    nh = csv_split($0, h, sep)
+    for (i = 1; i <= nh; i++) {
+        k = norm(h[i])
+        if ((k in a) && !(a[k] in used)) { col[i] = a[k]; used[a[k]] = i; printf "  %-26s -> %s\n", trim(h[i]), a[k] > map }
+        else printf "  %-26s -> -\n", trim(h[i]) > map
+    }
+    if (!("title" in used)) exit 3
+    next
+}
+{
+    sub(/\r$/, "")
+    if ($0 ~ /^[ \t,;]*$/) next
+    csv_split($0, f, sep)
+    split("", v)
+    for (i in col) { x = f[i]; gsub(/[\t\r\n]+/, " ", x); v[col[i]] = trim(x) }
+    if (v["title"] == "") { skipped++; next }
+    v["acqdate"] = iso_date(v["acqdate"])
+    line = ""
+    for (i = 1; i <= ncols; i++) line = line (i > 1 ? "\t" : "") v[COL[i]]
+    print line > out
+    rows++
+}
+END {
+    if (NR == 0) exit 5
+    printf "Rows read: %d\nRows without title: %d\n", rows, skipped
+}
+BFAWK
+}
+
+# The MARC::Record program that builds the records (written next to the file).
+bf_write_builder() {
+    cat > "$1" <<'BFPL'
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long;
+use Encode qw( encode );
+use MARC::Record;
+use MARC::Field;
+use POSIX qw( strftime );
+
+# koha-easy-installer: MARC 21 records from a collection spreadsheet (one
+# row per item). Rows with the same title, subtitle, author, edition, year
+# and ISBN become one record; every row (or every copy of the quantity
+# column) becomes an item in 952 with --branch and the item type of the
+# row (code or description of a Koha item type) or --itype.
+my %o = ( sample => 2, lang => 'por', country => 'bl ' );
+GetOptions( \%o, 'in=s', 'out=s', 'branch=s', 'itype=s', 'itypes=s', 'cols=s', 'dry-run', 'sample=i' ) or exit 2;
+my @cols = split / /, $o{cols};
+sub norm { my $s = lc( shift // '' ); $s =~ tr/áàâãäéèêëíìîïóòôõöúùûüçñ/aaaaaeeeeiiiiooooouuuucn/; $s =~ s/[^a-z0-9]+/ /g; $s =~ s/^ | $//g; return $s }
+my %itype;
+if ( $o{itypes} && open( my $t, '<:encoding(UTF-8)', $o{itypes} ) ) {
+    while (<$t>) { chomp; my ( $code, $desc ) = split /\t/; next unless $code; $itype{ norm($code) } = $code; $itype{ norm($desc) } = $code if defined $desc }
+    close $t;
+}
+my %langs = ( portugues => 'por', portuguese => 'por', ingles => 'eng', english => 'eng', espanhol => 'spa', spanish => 'spa', castelhano => 'spa',
+    frances => 'fre', french => 'fre', italiano => 'ita', italian => 'ita', alemao => 'ger', german => 'ger', latim => 'lat' );
+my @articles = qw( o a os as um uma uns umas the an el la los las lo le les un une il gli der die das ein eine );
+my %is_article = map { $_ => 1 } @articles;
+
+open( my $in, '<:encoding(UTF-8)', $o{in} ) or die "cannot read $o{in}\n";
+my ( %rec, @order, %barcode_seen );
+my ( $rows, $items, $no_barcode, $dup_barcode ) = ( 0, 0, 0, 0 );
+while ( my $line = <$in> ) {
+    chomp $line;
+    my @v = split /\t/, $line, -1;
+    my %r;
+    @r{@cols} = map { defined $_ ? $_ : '' } @v[ 0 .. $#cols ];
+    next if $r{title} eq '';
+    $rows++;
+    ( my $isbn = $r{isbn} ) =~ s/[^0-9Xx]//g;
+    my $key = join '|', ( map { norm( $r{$_} ) } qw( title subtitle author edition year ) ), uc $isbn;
+    unless ( $rec{$key} ) { push @order, $key; $rec{$key} = { %r, isbn => uc $isbn, items => [] } }
+    my $n = ( $r{quantity} =~ /^\s*(\d{1,3})\s*$/ && $1 > 1 && $r{barcode} eq '' ) ? $1 : 1;
+    for my $i ( 1 .. $n ) {
+        my %it = %r;
+        $it{copy} = $i if $n > 1;
+        if ( $it{barcode} ne '' && $barcode_seen{ $it{barcode} }++ ) { $dup_barcode++; $it{barcode} = '' }
+        $no_barcode++ if $it{barcode} eq '';
+        push @{ $rec{$key}{items} }, \%it;
+        $items++;
+    }
+}
+close $in;
+
+sub split_list { my $s = shift // ''; my $sep = $s =~ /;/ ? qr/\s*;\s*/ : qr/\s*\|\s*/; return grep { $_ ne '' } split $sep, $s }
+sub nonfiling { my $t = shift; my ($w) = $t =~ /^(\S+)\s/; return ( $w && $is_article{ lc $w } ) ? length($w) + 1 : ( $t =~ /^l'/i ? 2 : 0 ) }
+
+my $today = strftime( '%y%m%d', localtime );
+my @records;
+for my $key (@order) {
+    my $r = $rec{$key};
+    my $m = MARC::Record->new();
+    $m->leader('00000nam a22000007a 4500');
+    my ($year) = $r->{year} =~ /(\d{4})/;
+    my $lang = $langs{ norm( $r->{language} ) } || $o{lang};
+    $m->append_fields( MARC::Field->new( '008', $today . ( $year ? "s$year" : 'nuuuu' ) . '    ' . $o{country} . ( '|' x 17 ) . $lang . ' d' ) );
+    my @f;
+    push @f, MARC::Field->new( '020', ' ', ' ', a => $r->{isbn} ) if $r->{isbn} =~ /^(\d{9}[\dX]|\d{13})$/;
+    push @f, MARC::Field->new( '080', ' ', ' ', a => $r->{cdu} ) if $r->{cdu} ne '';
+    push @f, MARC::Field->new( '082', '0', '4', a => $r->{cdd} ) if $r->{cdd} ne '';
+    my $class = $r->{cdd} ne '' ? $r->{cdd} : $r->{cdu};
+    push @f, MARC::Field->new( '090', ' ', ' ', a => $class, ( $r->{cutter} ne '' ? ( b => $r->{cutter} ) : () ) ) if $class ne '';
+    my @authors = split_list( $r->{author} );
+    my $main = shift @authors;
+    push @f, MARC::Field->new( '100', '1', ' ', a => $main ) if defined $main;
+    my @t = ( a => $r->{title} . ( $r->{subtitle} ne '' ? ' :' : '' ) );
+    push @t, ( b => $r->{subtitle} ) if $r->{subtitle} ne '';
+    push @f, MARC::Field->new( '245', ( defined $main ? '1' : '0' ), nonfiling( $r->{title} ), @t );
+    push @f, MARC::Field->new( '250', ' ', ' ', a => ( $r->{edition} =~ /^\d+$/ ? "$r->{edition}. ed." : $r->{edition} ) ) if $r->{edition} ne '';
+    my @imp;
+    push @imp, ( a => $r->{place} . ( $r->{publisher} ne '' ? ' :' : ( $r->{year} ne '' ? ',' : '' ) ) ) if $r->{place} ne '';
+    push @imp, ( b => $r->{publisher} . ( $r->{year} ne '' ? ',' : '' ) ) if $r->{publisher} ne '';
+    push @imp, ( c => $r->{year} ) if $r->{year} ne '';
+    push @f, MARC::Field->new( '260', ' ', ' ', @imp ) if @imp;
+    push @f, MARC::Field->new( '300', ' ', ' ', a => ( $r->{pages} =~ /^\d+$/ ? "$r->{pages} p." : $r->{pages} ) ) if $r->{pages} ne '';
+    push @f, MARC::Field->new( '490', '0', ' ', a => $r->{series} ) if $r->{series} ne '';
+    push @f, MARC::Field->new( '500', ' ', ' ', a => $r->{notes} ) if $r->{notes} ne '';
+    push @f, MARC::Field->new( '650', ' ', '4', a => $_ ) for split_list( $r->{subjects} );
+    push @f, MARC::Field->new( '700', '1', ' ', a => $_ ) for @authors, split_list( $r->{coauthors} );
+    push @f, MARC::Field->new( '942', ' ', ' ', c => $o{itype} );
+    for my $it ( @{ $r->{items} } ) {
+        my $type = $itype{ norm( $it->{itemtype} ) } || $o{itype};
+        my $cn = $it->{callnumber} ne '' ? $it->{callnumber} : join( ' ', grep { $_ ne '' } $class, $it->{cutter} );
+        my @s = ( a => $o{branch}, b => $o{branch}, y => $type );
+        push @s, ( o => $cn ) if $cn ne '';
+        push @s, ( p => $it->{barcode} ) if $it->{barcode} ne '';
+        push @s, ( t => $it->{copy} ) if $it->{copy} ne '';
+        push @s, ( h => $it->{volume} ) if $it->{volume} ne '';
+        push @s, ( d => $it->{acqdate} ) if $it->{acqdate} ne '';
+        ( my $price = $it->{price} ) =~ s/[^\d,.]//g;
+        $price =~ s/\.(?=.*[.,])//g;
+        $price =~ tr/,/./;
+        push @s, ( g => $price ) if $price =~ /^\d+(\.\d+)?$/;
+        push @f, MARC::Field->new( '952', ' ', ' ', @s );
+    }
+    $m->append_fields( sort { $a->tag cmp $b->tag } @f );
+    push @records, $m;
+}
+
+print "Rows with a title: $rows\n";
+print "Records: ", scalar(@records), "\n";
+print "Items created: $items\n";
+print "Items without barcode: $no_barcode\n";
+print "Repeated barcodes (kept on the first row only): $dup_barcode\n";
+if ( $o{'dry-run'} ) {
+    my $n = 0;
+    for my $m (@records) {
+        last if $n++ >= $o{sample};
+        print "\n--- Sample ---\n" if $n == 1;
+        print encode( 'UTF-8', $m->as_formatted ), "\n\n";
+    }
+    exit 0;
+}
+open( my $out, '>:raw', $o{out} ) or die "cannot write $o{out}\n";
+print {$out} encode( 'UTF-8', $_->as_usmarc ) for @records;
+close($out) or die "cannot write $o{out}\n";
+BFPL
+}
+
+lt_br_migrate_sheet() {
+    require_database || return 0
+    local file branch itype mode
+    file=$(select_file "/root" "csv txt" "$(t "Pick the collection spreadsheet (Biblioteca Fácil or other program, saved as .csv):")" "$(t "CSV file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    branch=$(tools_pick "$(t "Legacy migration")" "$(t "Library of the items:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    itype=$(tools_pick "$(t "Legacy migration")" "$(t "Item type for the rows without one:")" "SELECT itemtype, description FROM ${DB_NAME}.itemtypes ORDER BY description;") || return 0
+    mode=$(ui_menu "$(t "Records already in the catalog")" "$(t "When an incoming record matches one in the catalog (ISBN and title):")" \
+        "keep"    "$(t "Keep the catalog record, add only new items")" \
+        "replace" "$(t "Replace the catalog record with the incoming one")" \
+        "new"     "$(t "Do not compare: every record becomes a new title")") || return 0
+    tools_workdir || return 1
+    _lt_br_migrate_sheet_run "$file" "$branch" "$itype" "$mode"
+}
+
+_lt_br_migrate_sheet_run() {
+    local file="$1" branch="$2" itype="$3" mode="$4" log utf8 rows map types script out prep enc sep rc=0 recs items
+    local args=()
+    log=$(tools_log migrate-sheet)
+    utf8="$TOOLS_WORK/sheet-utf8.csv"; rows="$TOOLS_WORK/sheet-rows.tsv"; map="$TOOLS_WORK/sheet-columns.txt"
+    types="$TOOLS_WORK/itemtypes.tsv"; script="$TOOLS_WORK/sheet2marc.pl"; out="$TOOLS_WORK/sheet-koha.mrc"
+    display_explanation "Converting the characters to UTF-8..."
+    if ! prep=$(sheet_prepare "$file" "$utf8"); then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    enc="${prep%%$'\t'*}"; sep="${prep#*$'\t'}"
+    : > "$rows"; : > "$map"
+    awk -v sep="$sep" -v out="$rows" -v map="$map" -v cols="$SHEET_COLS" "$(bf_sheet_awk)" "$utf8" >> "$log" 2>&1 || rc=$?
+    case "$rc" in
+        0) ;;
+        3) msg_error "" "$(t "The spreadsheet needs a title column (Título).\nNothing was changed.")" 9 72; return 1 ;;
+        *) msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74; return 1 ;;
+    esac
+    run_sql "SELECT itemtype, description FROM ${DB_NAME}.itemtypes;" > "$types"
+    bf_write_builder "$script"
+    chown "${INSTANCE}-koha:" "$rows" "$types" 2>/dev/null || true
+    chmod 600 "$rows" "$types"
+    args=(--in "$rows" --cols "$SHEET_COLS" --branch "$branch" --itype "$itype" --itypes "$types")
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_exec "$log" sheet2marc /usr/bin/perl "$script" "${args[@]}" --dry-run; then
+        ui_textbox "$(t "Legacy migration")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    recs=$(tools_num "$log" "Records:"); items=$(tools_num "$log" "Items created:")
+    {
+        printf '%s: %s    %s: "%s"\n\n%s\n' "$(t "Encoding")" "$enc" "$(t "Separator")" "${sep/$'\t'/TAB}" "$(t "Columns:")"
+        cat "$map"; printf '\n'
+        grep -E '^Rows (read|without title):' "$log"
+        tools_output "$log"
+    } > "$TOOLS_WORK/sheet-preview.txt"
+    ui_textbox "$(t "Preview (dry run)")" "$TOOLS_WORK/sheet-preview.txt"
+    if [ "${recs:-0}" = "0" ]; then
+        msg_info "$(t "Legacy migration")" "$(t 'No record could be built. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 0
+    fi
+    prompt_yes_no "$(t "Legacy migration")" "$(t 'Records: ${recs}\nItems: ${items}\n\nBuild the MARC file and go on to the MARC import? Nothing enters the catalog before you confirm the import.')" 13 72 defaultno || return 0
+    if ! koha_exec "$log" sheet2marc /usr/bin/perl "$script" "${args[@]}" --out "$out" || [ ! -s "$out" ]; then
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    log "tools: collection spreadsheet converted ($recs records, $items items)"
+    tools_locked _lt_marc_import_run "$out" "ISO2709" "UTF-8" "$mode"
+}
+
+# ----------------------------------------------------------------------
 # Legacy patron spreadsheets -> import_patrons.pl CSV (with CPF checks).
 # Columns are recognised by their usual Portuguese or English names.
 # ----------------------------------------------------------------------
-br_patrons_awk() {
-    cat <<'PATAWK'
+# awk functions for spreadsheets: CSV fields (quotes handled), column
+# names without accents or punctuation, dd/mm/yyyy dates.
+csv_awk_lib() {
+    cat <<'CSVAWK'
 function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
 function csvq(s) { gsub(/"/, "\"\"", s); return "\"" s "\"" }
 function csv_split(line, f, sep,   n, i, c, q, cur, len) {
@@ -6621,6 +6925,12 @@ function iso_date(s,   d) {
     if (s ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return s
     return ""
 }
+CSVAWK
+}
+
+br_patrons_awk() {
+    csv_awk_lib
+    cat <<'PATAWK'
 BEGIN {
     alias["cardnumber"] = "cardnumber"; alias["matricula"] = "cardnumber"; alias["cartao"] = "cardnumber"
     alias["carteirinha"] = "cardnumber"; alias["n cartao"] = "cardnumber"; alias["numero do cartao"] = "cardnumber"
@@ -6711,7 +7021,7 @@ PATAWK
 
 lt_br_patrons() {
     require_database || return 0
-    local file log src utf8 out rej map sep semi comma tab cpf_attr rc branch cat over="no" ready match="cardnumber"
+    local file log src utf8 out rej map sep prep cpf_attr rc branch cat over="no" ready match="cardnumber"
     file=$(select_file "/root" "csv txt" "$(t "Pick the spreadsheet exported by the old system (.csv):")" "$(t "CSV file")") || return 0
     if [ ! -r "$file" ] || [ ! -s "$file" ]; then
         msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
@@ -6722,16 +7032,11 @@ lt_br_patrons() {
     utf8="${TOOLS_WORK}/legacy-utf8.csv"; out="${TOOLS_WORK}/legacy-patrons.csv"
     rej="${TOOLS_WORK}/legacy-rejected.txt"; map="${TOOLS_WORK}/legacy-columns.txt"
     # Spreadsheets saved by Excel in Brazil are usually Windows-1252.
-    if file_is_utf8 "$file"; then
-        cp -f -- "$file" "$utf8"; src="UTF-8"
-    else
-        iconv -f WINDOWS-1252 -t UTF-8 "$file" > "$utf8" 2>> "$log" || { msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70; return 1; }
-        src="Windows-1252"
+    if ! prep=$(sheet_prepare "$file" "$utf8"); then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
     fi
-    # Byte order mark written by Excel (raw, or already read as Windows-1252).
-    sed -i '1s/^\xEF\xBB\xBF//; 1s/^\xC3\xAF\xC2\xBB\xC2\xBF//' "$utf8"
-    semi=$(head -n 1 "$utf8" | tr -cd ';' | wc -c); comma=$(head -n 1 "$utf8" | tr -cd ',' | wc -c); tab=$(head -n 1 "$utf8" | tr -cd '\t' | wc -c)
-    sep=","; [ "$semi" -gt "$comma" ] && sep=";"; [ "$tab" -gt "$semi" ] && [ "$tab" -gt "$comma" ] && sep=$'\t'
+    src="${prep%%$'\t'*}"; sep="${prep#*$'\t'}"
     cpf_attr=0
     [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.borrower_attribute_types WHERE code = 'CPF';")" = "1" ] && cpf_attr=1
     : > "$rej"; : > "$map"
@@ -7273,7 +7578,8 @@ function_brazil_tools() {
             "3" "$(t "✔  Check patron CPFs (modulo 11)")" \
             "4" "$(t "▤  Pimaco label templates")" \
             "5" "$(t "▤  Cataloguing card (ficha catalográfica)")" \
-            "6" "$(t "◷  Brazilian holidays in the calendar")" 3>&1 1>&2 2>&3) || return 0
+            "6" "$(t "◷  Brazilian holidays in the calendar")" \
+            "7" "$(t "⇩  Migrate a collection spreadsheet (Biblioteca Fácil)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_br_migrate_marc ;;
             2) lt_br_patrons ;;
@@ -7281,9 +7587,1950 @@ function_brazil_tools() {
             4) lt_br_labels ;;
             5) lt_br_ficha ;;
             6) lt_br_holidays ;;
+            7) lt_br_migrate_sheet ;;
         esac
         clear
     done
+}
+
+# ======================================================================
+# 31. MESSAGING: WHATSAPP AND TELEGRAM (opt-in)
+# ----------------------------------------------------------------------
+# Koha already produces the notices (checkout, check-in, overdue, due,
+# hold) and queues the "sms" ones for the SMS::Send driver named in the
+# SMSSendDriver preference. The panel adds such a driver
+# (SMS::Send::KohaEasy::Gateway): each message goes to Telegram when the
+# patron linked the library's bot, otherwise to a WhatsApp gateway
+# (Evolution API or another self-hosted one). Numbers are completed and
+# corrected on the way (country and area code, 9th mobile digit). Nothing
+# changes in Koha until "Send Koha notices" is chosen, and turning it off
+# puts the previous driver back. Settings: kei-messaging.conf next to
+# koha-conf.xml (root and the instance user only: it holds the tokens).
+# ======================================================================
+KEI_PERL_DIR="${KEI_PERL_DIR:-/usr/local/lib/site_perl}"
+KEI_LIBEXEC="${KEI_LIBEXEC:-/usr/local/lib/koha-easy-installer}"
+MSG_DRIVER="KohaEasy::Gateway"
+MSG_CONF="/etc/koha/sites/${INSTANCE}/kei-messaging.conf"
+MSG_DATA="/var/lib/koha/${INSTANCE}/kei-messaging"
+MSG_STATE="${CONF_DIR}/messaging.state"
+CRON_MSG="/etc/cron.d/koha_messaging"
+
+# The Perl module shared by the driver, the Telegram link job and the
+# phone report (one implementation of the phone rules).
+msg_pm_messaging() {
+    cat <<'MSGPM'
+package KohaEasy::Messaging;
+
+# koha-easy-installer: WhatsApp and Telegram delivery for Koha's notices.
+# Koha hands every "sms" notice (checkout, check-in, overdue, due, hold...)
+# to the SMS::Send driver named in SMSSendDriver; the driver of the panel
+# (SMS::Send::KohaEasy::Gateway) calls send_message() below. Settings come
+# from kei-messaging.conf next to koha-conf.xml (written by the panel).
+
+use strict;
+use warnings;
+use Encode qw( decode );
+use File::Basename qw( dirname );
+use HTTP::Tiny;
+use JSON::PP;
+
+our $VERSION = '1';
+our $LAST_CHANNEL = '';
+
+# Brazilian area codes (DDD) in use.
+my %DDD = map { $_ => 1 } qw(
+    11 12 13 14 15 16 17 18 19 21 22 24 27 28 31 32 33 34 35 37 38
+    41 42 43 44 45 46 47 48 49 51 53 54 55 61 62 63 64 65 66 67 68 69
+    71 73 74 75 77 79 81 82 83 84 85 86 87 88 89 91 92 93 94 95 96 97 98 99
+);
+
+sub conf_path {
+    return $ENV{KEI_MESSAGING_CONF} if $ENV{KEI_MESSAGING_CONF};
+    return $ENV{KOHA_CONF} ? dirname( $ENV{KOHA_CONF} ) . '/kei-messaging.conf' : '';
+}
+
+# key=value lines; "\n" in a value is a line break.
+sub load_conf {
+    my ($path) = @_;
+    $path ||= conf_path();
+    open( my $fh, '<:encoding(UTF-8)', $path ) or die "kei-messaging: cannot read the settings ($path)\n";
+    my %c;
+    while ( my $line = <$fh> ) {
+        chomp $line;
+        next if $line =~ /^\s*(#|$)/;
+        my ( $k, $v ) = split /=/, $line, 2;
+        next unless defined $v;
+        $v =~ s/\\n/\n/g;
+        $c{$k} = $v;
+    }
+    close $fh;
+    return \%c;
+}
+
+# normalize_phone(NUMBER, COUNTRY_CODE, AREA_CODE)
+# Returns (E.164 number, kind) or (undef, 'invalid'). kind: "ok" (already
+# complete), "fixed" (completed or corrected: country or area code added,
+# trunk or carrier prefix removed, 9th mobile digit added) or "landline".
+sub normalize_phone {
+    my ( $raw, $cc, $area ) = @_;
+    return ( undef, 'invalid' ) unless defined $raw && $raw =~ /\d/;
+    $cc   = defined $cc   ? $cc   : '';
+    $area = defined $area ? $area : '';
+    $cc   =~ s/\D//g;
+    $area =~ s/\D//g;
+    $cc = '55' if $cc eq '';    # the default of the panel
+    my $intl = $raw =~ /^\s*(\+|00)/ ? 1 : 0;
+    ( my $d = $raw ) =~ s/\D//g;
+    $d =~ s/^00// if $raw =~ /^\s*00/;
+    ( my $given = $raw ) =~ s/[^\d+]//g;
+
+    if ( $intl && $d !~ /^55/ ) {
+        return ( undef, 'invalid' ) if length($d) < 8 || length($d) > 15 || $d =~ /^0/;
+        return ( "+$d", $given eq "+$d" ? 'ok' : 'fixed' );
+    }
+    if ( $intl || $cc eq '55' ) {
+        my $n = $d;
+        if    ($intl)                                                                    { $n = substr( $n, 2 ) }
+        elsif ( length($n) >= 12 && length($n) <= 13 && $n =~ /^55(\d\d)/ && $DDD{$1} ) { $n = substr( $n, 2 ) }
+        elsif ( $n =~ /^0/ && ( length($n) == 13 || length($n) == 14 ) )               { $n = substr( $n, 3 ) }    # 0 + carrier + DDD
+        elsif ( $n =~ /^0/ && ( length($n) == 11 || length($n) == 12 ) )               { $n = substr( $n, 1 ) }    # 0 + DDD
+        if ( length($n) == 8 || length($n) == 9 ) {
+            return ( undef, 'invalid' ) unless $DDD{$area};
+            $n = $area . $n;
+        }
+        return ( undef, 'invalid' ) unless length($n) == 10 || length($n) == 11;
+        my ( $ddd, $local ) = ( substr( $n, 0, 2 ), substr( $n, 2 ) );
+        return ( undef, 'invalid' ) unless $DDD{$ddd};
+        my $kind = '';
+        if ( length($local) == 9 ) {
+            return ( undef, 'invalid' ) unless $local =~ /^9/;
+        } elsif ( $local =~ /^[6-9]/ ) {
+            $local = "9$local";    # mobile numbers have 9 digits since 2016
+        } elsif ( $local =~ /^[2-5]/ ) {
+            $kind = 'landline';
+        } else {
+            return ( undef, 'invalid' );
+        }
+        my $e164 = "+55$ddd$local";
+        return ( $e164, $kind || ( $given eq $e164 ? 'ok' : 'fixed' ) );
+    }
+
+    # Other countries: international prefix or trunk zero, then the country code.
+    return ( undef, 'invalid' ) if $cc eq '';
+    my $n = $d;
+    if ( $n =~ /^\Q$cc\E/ && length($n) - length($cc) >= 7 ) {
+        $n = substr( $n, length($cc) );
+    } else {
+        $n =~ s/^0+//;
+        $n = $area . $n if $area ne '' && length($n) <= 8;
+    }
+    my $e164 = "+$cc$n";
+    return ( undef, 'invalid' ) if length($e164) < 9 || length($e164) > 16;
+    return ( $e164, $given eq $e164 ? 'ok' : 'fixed' );
+}
+
+sub _post_json {
+    my ( $c, $url, $headers, $body ) = @_;
+    my $http = HTTP::Tiny->new( timeout => $c->{timeout} || 15, verify_SSL => 1, agent => "koha-easy-installer/$VERSION" );
+    my $res  = $http->request(
+        'POST', $url,
+        {
+            headers => { 'Content-Type' => 'application/json', %$headers },
+            content => JSON::PP->new->utf8->canonical->encode($body),
+        }
+    );
+    my $data = eval { JSON::PP->new->utf8->decode( $res->{content} // '' ) };
+    return ( $res, $data );
+}
+
+sub _short { my $s = shift // ''; $s =~ s/\s+/ /g; $s =~ s/ at \S+ line \d+\.?//g; return substr( $s, 0, 200 ) }
+
+sub send_whatsapp {
+    my ( $c, $e164, $text ) = @_;
+    ( my $number = $e164 ) =~ s/^\+//;
+    my $url = $c->{wa_url} // '';
+    $url =~ s{/+$}{};
+    return ( 0, 'WhatsApp: gateway address missing' ) unless $url =~ m{^https?://};
+    my ( $res, $data );
+    if ( ( $c->{wa_type} // 'evolution' ) eq 'evolution' ) {
+        # Evolution API v2: POST /message/sendText/{instance}, header apikey.
+        ( $res, $data ) = _post_json( $c, "$url/message/sendText/" . ( $c->{wa_instance} // '' ),
+            { apikey => $c->{wa_token} // '' }, { number => $number, text => $text } );
+    } else {
+        # Other gateways (Baileys-based and similar): one documented JSON body.
+        ( $res, $data ) = _post_json( $c, $url, { Authorization => 'Bearer ' . ( $c->{wa_token} // '' ) },
+            { number => $number, to => $e164, text => $text } );
+    }
+    return ( 1, 'whatsapp' ) if $res->{success};
+    return ( 0, "WhatsApp: HTTP $res->{status} " . _short( $res->{content} ) );
+}
+
+sub telegram_map_path { my ($c) = @_; return ( $c->{data_dir} || '.' ) . '/telegram.map' }
+
+sub telegram_map {
+    my ($c) = @_;
+    my %m;
+    if ( open( my $fh, '<', telegram_map_path($c) ) ) {
+        while (<$fh>) { $m{$1} = $2 if /^(\+\d+)\s+(-?\d+)$/ }
+        close $fh;
+    }
+    return \%m;
+}
+
+sub _write_atomic {
+    my ( $path, $content ) = @_;
+    my $tmp = "$path.tmp$$";
+    open( my $fh, '>', $tmp ) or die "kei-messaging: cannot write $tmp\n";
+    print {$fh} $content;
+    close($fh) or die "kei-messaging: cannot write $tmp\n";
+    chmod 0640, $tmp;
+    rename( $tmp, $path ) or die "kei-messaging: cannot replace $path\n";
+    return 1;
+}
+
+sub telegram_map_save {
+    my ( $c, $m ) = @_;
+    return _write_atomic( telegram_map_path($c), join( '', map { "$_ $m->{$_}\n" } sort keys %$m ) );
+}
+
+sub telegram_call {
+    my ( $c, $method, $body ) = @_;
+    my $api = $c->{tg_api} || 'https://api.telegram.org';
+    $api =~ s{/+$}{};
+    my ( $res, $data ) = _post_json( $c, "$api/bot" . ( $c->{tg_token} // '' ) . "/$method", {}, $body || {} );
+    return $data if $res->{success} && ref $data eq 'HASH' && $data->{ok};
+    die 'Telegram: HTTP ' . $res->{status} . ' ' . _short( ref $data eq 'HASH' ? $data->{description} : $res->{content} ) . "\n";
+}
+
+sub send_telegram {
+    my ( $c, $e164, $text ) = @_;
+    my $chat = telegram_map($c)->{$e164};
+    return ( 0, 'Telegram: number not linked to the bot' ) unless defined $chat;
+    my $ok = eval { telegram_call( $c, 'sendMessage', { chat_id => $chat + 0, text => $text } ); 1 };
+    return $ok ? ( 1, 'telegram' ) : ( 0, _short($@) );
+}
+
+# send_message(CONF, NUMBER, TEXT): Telegram when the patron linked the bot,
+# otherwise WhatsApp. Returns (1, channel) or (0, reason).
+sub send_message {
+    my ( $c, $to, $text ) = @_;
+    $LAST_CHANNEL = '';
+    my ($e164) = normalize_phone( $to, $c->{country}, $c->{area} );
+    return ( 0, "invalid phone number: $to" ) unless $e164;
+    $text = decode( 'UTF-8', $text ) unless utf8::is_utf8($text);
+    my @why;
+    for my $ch (qw( telegram whatsapp )) {
+        next unless ( $c->{$ch} // '' ) eq 'on';
+        my ( $ok, $info ) = $ch eq 'telegram' ? send_telegram( $c, $e164, $text ) : send_whatsapp( $c, $e164, $text );
+        if ($ok) { $LAST_CHANNEL = $info; return ( 1, $info ) }
+        push @why, $info;
+    }
+    push @why, 'no channel is on' unless @why;
+    return ( 0, join( '; ', @why ) );
+}
+
+# Links Telegram chats to phone numbers: a patron opens the bot, taps Start
+# and shares the contact (only their own contact is accepted); /stop undoes
+# it. Run every two minutes from cron (kei-telegram-link).
+sub telegram_poll {
+    my ($c) = @_;
+    my $offset_file = ( $c->{data_dir} || '.' ) . '/telegram.offset';
+    my $offset = 0;
+    if ( open( my $fh, '<', $offset_file ) ) { $offset = ( <$fh> // 0 ) + 0; close $fh }
+    my $data = telegram_call( $c, 'getUpdates', { offset => $offset, timeout => 0, allowed_updates => ['message'] } );
+    my $map = telegram_map($c);
+    my ( $linked, $changed, $last ) = ( 0, 0, $offset - 1 );
+    my $say = sub { my ( $chat, $text, $markup ) = @_; eval { telegram_call( $c, 'sendMessage', { chat_id => $chat, text => $text, ( $markup ? ( reply_markup => $markup ) : () ) } ) } };
+    for my $u ( @{ $data->{result} || [] } ) {
+        $last = $u->{update_id} if $u->{update_id} > $last;
+        my $m = $u->{message} or next;
+        next unless ref $m->{chat} eq 'HASH' && ( $m->{chat}{type} // '' ) eq 'private';
+        my $chat = $m->{chat}{id};
+        if ( my $ct = $m->{contact} ) {
+            my ($e164) = normalize_phone( '+' . ( ( $ct->{phone_number} // '' ) =~ s/\D//gr ), $c->{country}, $c->{area} );
+            if ( $e164 && defined $ct->{user_id} && ref $m->{from} eq 'HASH' && $ct->{user_id} == $m->{from}{id} ) {
+                delete $map->{$_} for grep { $map->{$_} == $chat } keys %$map;
+                $map->{$e164} = $chat;
+                $changed = 1;
+                $linked++;
+                $say->( $chat, $c->{tg_linked} || 'OK', { remove_keyboard => JSON::PP::true } );
+            } else {
+                $say->( $chat, $c->{tg_not_own} || '?' );
+            }
+            next;
+        }
+        if ( ( $m->{text} // '' ) =~ m{^/stop} ) {
+            my @gone = grep { $map->{$_} == $chat } keys %$map;
+            delete @{$map}{@gone};
+            $changed = 1 if @gone;
+            $say->( $chat, $c->{tg_stopped} || 'OK', { remove_keyboard => JSON::PP::true } );
+            next;
+        }
+        $say->( $chat, $c->{tg_start} || 'Share your phone number',
+            { keyboard => [ [ { text => $c->{tg_button} || 'Share', request_contact => JSON::PP::true } ] ], resize_keyboard => JSON::PP::true, one_time_keyboard => JSON::PP::true } );
+    }
+    telegram_map_save( $c, $map ) if $changed;
+    _write_atomic( $offset_file, ( $last + 1 ) . "\n" ) if $last + 1 > $offset;
+    return $linked;
+}
+
+1;
+MSGPM
+}
+
+msg_pm_driver() {
+    cat <<'MSGDRV'
+package SMS::Send::KohaEasy::Gateway;
+
+# koha-easy-installer: SMS::Send driver for Koha (SMSSendDriver =
+# KohaEasy::Gateway). The notice goes to Telegram or WhatsApp; a failure
+# dies with the reason, which Koha keeps with the failed message.
+
+use strict;
+use warnings;
+use parent 'SMS::Send::Driver';
+use KohaEasy::Messaging;
+
+sub new {
+    my ( $class, %args ) = @_;
+    return bless { conf => KohaEasy::Messaging::load_conf() }, $class;
+}
+
+sub send_sms {
+    my ( $self, %args ) = @_;
+    my ( $ok, $info ) = KohaEasy::Messaging::send_message( $self->{conf}, $args{to}, $args{text} );
+    die "$info\n" unless $ok;
+    return 1;
+}
+
+1;
+MSGDRV
+}
+
+msg_link_script() {
+    cat <<'MSGLINK'
+#!/usr/bin/perl
+# koha-easy-installer: links patrons' Telegram chats to their phone numbers
+# (cron, every two minutes, as the Koha instance user).
+use strict;
+use warnings;
+use KohaEasy::Messaging;
+my $c = KohaEasy::Messaging::load_conf();
+exit 0 unless ( $c->{telegram} // '' ) eq 'on' && $c->{tg_token};
+my $n = KohaEasy::Messaging::telegram_poll($c);
+print "Linked: $n\n" if -t STDOUT;
+MSGLINK
+}
+
+msg_installed() { [ -f "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm" ] && [ -f "$KEI_PERL_DIR/KohaEasy/Messaging.pm" ]; }
+
+# Writes (or refreshes) the driver, the shared module and the link job.
+msg_install_files() {
+    mkdir -p "$KEI_PERL_DIR/KohaEasy" "$KEI_PERL_DIR/SMS/Send/KohaEasy" "$KEI_LIBEXEC" "$MSG_DATA" || return 1
+    msg_pm_messaging > "$KEI_PERL_DIR/KohaEasy/Messaging.pm.new" \
+        && msg_pm_driver > "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm.new" \
+        && msg_link_script > "$KEI_LIBEXEC/kei-telegram-link.new" || return 1
+    chmod 644 "$KEI_PERL_DIR/KohaEasy/Messaging.pm.new" "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm.new"
+    chmod 755 "$KEI_LIBEXEC/kei-telegram-link.new"
+    mv -f "$KEI_PERL_DIR/KohaEasy/Messaging.pm.new" "$KEI_PERL_DIR/KohaEasy/Messaging.pm"
+    mv -f "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm.new" "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm"
+    mv -f "$KEI_LIBEXEC/kei-telegram-link.new" "$KEI_LIBEXEC/kei-telegram-link"
+    chown "${INSTANCE}-koha:${INSTANCE}-koha" "$MSG_DATA" 2>/dev/null || true
+    chmod 750 "$MSG_DATA"
+}
+
+# msg_conf KEY: value in the settings file (empty when missing).
+msg_conf() {
+    [ -r "$MSG_CONF" ] || return 0
+    awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { printf "%s", v }' "$MSG_CONF"
+}
+
+# msg_conf_set KEY VALUE [KEY VALUE...]: rewrites the settings file (one
+# line per key; line breaks kept as "\n"), readable by root and Koha only.
+msg_conf_set() {
+    local tmp k v args=()
+    while [ $# -ge 2 ]; do
+        v="${2//$'\n'/\\n}"
+        args+=("$1=${v//$'\r'/}")
+        shift 2
+    done
+    mkdir -p "${MSG_CONF%/*}" || return 1
+    tmp=$(mktemp "${MSG_CONF}.XXXXXX") || return 1
+    {
+        if [ -s "$MSG_CONF" ]; then
+            awk -v keys="$(printf '%s\n' "${args[@]%%=*}")" 'BEGIN { n = split(keys, a, "\n"); for (i = 1; i <= n; i++) skip[a[i]] = 1 }
+                { k = $0; sub(/=.*/, "", k); if (!(k in skip)) print }' "$MSG_CONF"
+        else
+            printf '# koha-easy-installer: messaging settings (Library tools > Messaging)\n'
+        fi
+        for k in "${args[@]}"; do printf '%s\n' "$k"; done
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chown "root:${INSTANCE}-koha" "$tmp" 2>/dev/null || true
+    chmod 640 "$tmp"
+    mv -f "$tmp" "$MSG_CONF"
+}
+
+# Defaults, bot texts in the panel language and the data folder.
+msg_conf_init() {
+    local k v defaults=(whatsapp off telegram off country 55 area "" wa_type evolution tg_api "https://api.telegram.org" timeout 15)
+    set --
+    while [ ${#defaults[@]} -gt 0 ]; do
+        k="${defaults[0]}"; v="${defaults[1]}"; defaults=("${defaults[@]:2}")
+        grep -q "^${k}=" "$MSG_CONF" 2>/dev/null || set -- "$@" "$k" "$v"
+    done
+    [ $# -gt 0 ] && { msg_conf_set "$@" || return 1; }
+    msg_conf_set data_dir "$MSG_DATA" \
+        tg_start "$(t "Hello! To receive the notices of the library here (loans, returns, due dates and holds), tap the button below to share your phone number. It must be the mobile number registered at the library.")" \
+        tg_button "$(t "Share my phone number")" \
+        tg_linked "$(t "Done! The notices of the library will arrive in this chat. Send /stop to stop them.")" \
+        tg_not_own "$(t "Please use the button to share your own phone number.")" \
+        tg_stopped "$(t "You will not receive the notices of the library here anymore.")"
+}
+
+msg_notices_on() { [ "$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'SMSSendDriver';")" = "$MSG_DRIVER" ]; }
+
+# Two-minute schedule: SMS-type notices (the Koha schedule sends the queue
+# every 15 minutes) and the Telegram link job. Removed when nothing is on.
+msg_cron_write() {
+    local lines=()
+    msg_notices_on && lines+=("*/2 * * * * root /usr/sbin/koha-shell ${INSTANCE} -c \"$(koha_script process_message_queue.pl || echo "$KOHA_BIN/cronjobs/process_message_queue.pl") -t sms\" >/dev/null 2>&1")
+    [ "$(msg_conf telegram)" = "on" ] && lines+=("*/2 * * * * root /usr/sbin/koha-shell ${INSTANCE} -c \"/usr/bin/perl ${KEI_LIBEXEC}/kei-telegram-link\" >/dev/null 2>&1")
+    if [ ${#lines[@]} -eq 0 ]; then
+        rm -f "$CRON_MSG"
+        return 0
+    fi
+    {
+        printf '# koha-easy-installer: WhatsApp / Telegram notices (Library tools > Messaging)\n'
+        printf 'SHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n'
+        printf '%s\n' "${lines[@]}"
+    } > "${CRON_MSG}.new" && chmod 644 "${CRON_MSG}.new" && mv -f "${CRON_MSG}.new" "$CRON_MSG"
+}
+
+# msg_perl LOG LABEL SCRIPT [ARGS]: a Perl program of the panel run as the
+# instance user, with the module folder on @INC.
+msg_perl() {
+    local log="$1" label="$2"
+    shift 2
+    koha_exec "$log" "$label" /usr/bin/perl -I "$KEI_PERL_DIR" "$@"
+}
+
+msg_status_text() {
+    local wa tg notices linked=0 cc area
+    wa=$(msg_conf whatsapp); tg=$(msg_conf telegram)
+    cc=$(msg_conf country); area=$(msg_conf area)
+    [ -r "$MSG_DATA/telegram.map" ] && linked=$(grep -c '^+' "$MSG_DATA/telegram.map")
+    notices="$(t "off")"; msg_notices_on && notices="$(t "on")"
+    printf '%s\n' "$(t "Koha notices (checkout, check-in, overdue, due, hold) sent through WhatsApp or Telegram. Nothing changes in Koha until you turn the notices on.")"
+    printf '\n  WhatsApp: %s    Telegram: %s (%s: %s)\n' "$([ "$wa" = on ] && t "on" || t "off")" "$([ "$tg" = on ] && t "on" || t "off")" "$(t "linked patrons")" "$linked"
+    printf '  %s: %s    %s: +%s %s\n' "$(t "Koha notices")" "$notices" "$(t "Numbers")" "${cc:-55}" "$area"
+}
+
+function_messaging() {
+    require_database || return 0
+    local opt
+    while true; do
+        opt=$(ui_menu "$(t "✉  Messaging: WhatsApp and Telegram")" "$(msg_status_text)" \
+            "1" "$(t "WhatsApp gateway (Evolution API or other)")" \
+            "2" "$(t "Telegram bot")" \
+            "3" "$(t "Country and area code of the phone numbers")" \
+            "4" "$(t "Send a test message")" \
+            "5" "$(t "Send Koha notices through these channels (on / off)")" \
+            "6" "$(t "What Koha needs to send the notices")" \
+            "7" "$(t "Check the patrons' phone numbers")" \
+            "8" "$(t "Remove the messaging module")") || return 0
+        case "$opt" in
+            1) lt_msg_whatsapp ;;
+            2) lt_msg_telegram ;;
+            3) lt_msg_country ;;
+            4) lt_msg_test ;;
+            5) lt_msg_notices ;;
+            6) lt_msg_check ;;
+            7) lt_msg_phones ;;
+            8) lt_msg_remove ;;
+        esac
+        clear
+    done
+}
+
+lt_msg_whatsapp() {
+    local act type url inst token
+    act=$(ui_menu "WhatsApp" "$(t "WhatsApp needs a gateway of your own (for example Evolution API, which uses Baileys), installed on this or another server and connected to the WhatsApp account of the library.")" \
+        "setup" "$(t "Set up or change")" \
+        "off"   "$(t "Turn off")") || return 0
+    if [ "$act" = "off" ]; then
+        msg_conf_set whatsapp off || return 1
+        msg_cron_write
+        log "messaging: WhatsApp off"
+        msg_ok "$(t "✔ WhatsApp is off.")"
+        return 0
+    fi
+    type=$(ui_menu "WhatsApp" "$(t "Gateway type:")" \
+        "evolution" "Evolution API (v2)" \
+        "generic"   "$(t "Other gateway (JSON: number, to, text; Bearer token)")") || return 0
+    url=$(ui_input "WhatsApp" "$(t "Address of the gateway (e.g. http://127.0.0.1:8080):")" "$(msg_conf wa_url)") || return 0
+    url="${url%/}"
+    if ! [[ "$url" =~ ^https?://[A-Za-z0-9._:-]+(/[A-Za-z0-9._~/%-]*)?$ ]]; then
+        msg_error "" "$(t "Invalid address. Use http:// or https:// followed by the server.\nNothing was changed.")" 9 72
+        return 1
+    fi
+    inst=""
+    if [ "$type" = "evolution" ]; then
+        inst=$(ui_input "WhatsApp" "$(t "Name of the Evolution API instance:")" "$(msg_conf wa_instance)") || return 0
+        if ! [[ "$inst" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+            msg_error "" "$(t "Invalid instance name (letters, digits, dot, dash and underscore).\nNothing was changed.")" 9 72
+            return 1
+        fi
+    fi
+    token=$(ui_input "WhatsApp" "$(t "Token (API key) of the gateway:")" "$(msg_conf wa_token)") || return 0
+    if ! [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]{8,512}$ ]]; then
+        msg_error "" "$(t "Invalid token.\nNothing was changed.")" 9 72
+        return 1
+    fi
+    msg_install_files && msg_conf_init && msg_conf_set whatsapp on wa_type "$type" wa_url "$url" wa_instance "$inst" wa_token "$token" || {
+        msg_error "" "$(t "The settings could not be saved.\nNothing was changed.")" 9 70; return 1; }
+    msg_cron_write
+    log "messaging: WhatsApp on ($type $url)"
+    msg_ok "$(t "✔ WhatsApp is on. Send a test message to check the gateway.")" 9 72
+}
+
+lt_msg_telegram() {
+    local act token log bot
+    act=$(ui_menu "Telegram" "$(t "Create a bot with @BotFather in Telegram and paste its token here. Patrons open the bot, tap Start and share their phone number (the one registered in Koha).")" \
+        "setup" "$(t "Set up or change")" \
+        "off"   "$(t "Turn off")") || return 0
+    if [ "$act" = "off" ]; then
+        msg_conf_set telegram off || return 1
+        msg_cron_write
+        log "messaging: Telegram off"
+        msg_ok "$(t "✔ Telegram is off.")"
+        return 0
+    fi
+    token=$(ui_input "Telegram" "$(t "Bot token (from @BotFather):")" "$(msg_conf tg_token)") || return 0
+    if ! [[ "$token" =~ ^[0-9]{5,12}:[A-Za-z0-9_-]{30,64}$ ]]; then
+        msg_error "" "$(t "Invalid bot token (it looks like 123456789:ABC...).\nNothing was changed.")" 9 72
+        return 1
+    fi
+    msg_install_files && msg_conf_init && msg_conf_set tg_token "$token" || {
+        msg_error "" "$(t "The settings could not be saved.\nNothing was changed.")" 9 70; return 1; }
+    tools_workdir || return 1
+    log=$(tools_log messaging-telegram)
+    cat > "$TOOLS_WORK/tg-check.pl" <<'TGCHECK'
+use strict; use warnings; use KohaEasy::Messaging;
+my $c = KohaEasy::Messaging::load_conf();
+my $d = eval { KohaEasy::Messaging::telegram_call( $c, 'getMe' ) };
+if ($d) { print "Bot: \@$d->{result}{username}\n"; exit 0 }
+print "Error: $@"; exit 1;
+TGCHECK
+    chmod 644 "$TOOLS_WORK/tg-check.pl"
+    display_explanation "Checking the bot with Telegram..."
+    if ! msg_perl "$log" telegram-check "$TOOLS_WORK/tg-check.pl"; then
+        ui_textbox "Telegram" "$log"
+        msg_error "" "$(t 'Telegram did not accept the token (or could not be reached). Telegram stays off.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    bot=$(tools_output "$log" | sed -n 's/^Bot: @//p' | head -n 1)
+    msg_conf_set telegram on tg_bot "$bot" || return 1
+    msg_cron_write
+    log "messaging: Telegram on (@$bot)"
+    msg_ok "$(t '✔ Telegram is on: @${bot}\n\nTell the patrons to open https://t.me/${bot}, tap Start and share their phone number. The link is made within two minutes.')" 12 74
+}
+
+# Country menu: common calling codes, or any other code.
+lt_msg_country() {
+    local cc area
+    cc=$(ui_menu "$(t "Phone numbers")" "$(t "Country of the numbers typed without a country code:")" \
+        "55"  "Brasil" "351" "Portugal" "244" "Angola" "258" "Moçambique" "238" "Cabo Verde" \
+        "54"  "Argentina" "595" "Paraguay" "598" "Uruguay" "56" "Chile" "57" "Colombia" \
+        "52"  "México" "34" "España" "1" "USA / Canada" "other" "$(t "Other code")") || return 0
+    if [ "$cc" = "other" ]; then
+        cc=$(ui_input "$(t "Phone numbers")" "$(t "Country calling code (digits only):")" "") || return 0
+    fi
+    if ! [[ "$cc" =~ ^[1-9][0-9]{0,2}$ ]]; then
+        msg_error "" "$(t "Invalid country code.\nNothing was changed.")" 9 70
+        return 1
+    fi
+    area=$(ui_input "$(t "Phone numbers")" "$(t "Area code used when a number has none (in Brazil, the DDD, e.g. 44). Leave it empty to reject such numbers.")" "$(msg_conf area)") || return 0
+    if [ -n "$area" ] && ! [[ "$area" =~ ^[0-9]{1,4}$ ]]; then
+        msg_error "" "$(t "Invalid area code.\nNothing was changed.")" 9 70
+        return 1
+    fi
+    if [ "$cc" = "55" ] && [ -n "$area" ] && ! phone_ddd_valid "$area"; then
+        msg_error "" "$(t "This DDD does not exist in Brazil.\nNothing was changed.")" 9 70
+        return 1
+    fi
+    msg_install_files && msg_conf_init && msg_conf_set country "$cc" area "$area" || return 1
+    log "messaging: numbers +$cc area $area"
+    msg_ok "$(t '✔ Numbers without a country code are read as +${cc} ${area}.')" 9 72
+}
+
+# Brazilian area codes (DDD) in use.
+BR_DDD=" 11 12 13 14 15 16 17 18 19 21 22 24 27 28 31 32 33 34 35 37 38 41 42 43 44 45 46 47 48 49 51 53 54 55 61 62 63 64 65 66 67 68 69 71 73 74 75 77 79 81 82 83 84 85 86 87 88 89 91 92 93 94 95 96 97 98 99 "
+phone_ddd_valid() { [[ "$1" =~ ^[0-9]{2}$ ]] && [[ "$BR_DDD" == *" $1 "* ]]; }
+
+# phone_normalize NUMBER [COUNTRY] [AREA]: "E164<TAB>kind" (kind: ok, fixed,
+# landline, invalid), with the rules of the Perl module used by Koha (run
+# as the instance user, like the other Perl of the panel).
+phone_normalize() {
+    local lib log rc=0
+    tools_workdir || return 1
+    lib=$(msg_perl_lib) || return 1
+    log="$TOOLS_WORK/phone.log"; : > "$log"
+    cat > "$TOOLS_WORK/phone.pl" <<'PHONEPL'
+use strict; use warnings; use KohaEasy::Messaging;
+my ( $e, $k ) = KohaEasy::Messaging::normalize_phone(@ARGV);
+printf "%s\t%s\n", $e // '', $k;
+exit( $e ? 0 : 1 );
+PHONEPL
+    koha_exec "$log" phone /usr/bin/perl -I "$lib" "$TOOLS_WORK/phone.pl" "$1" "${2:-$(msg_conf country)}" "${3:-$(msg_conf area)}" || rc=$?
+    if [ "$rc" -eq 2 ] && ! grep -q . <<< "$(tools_output "$log")"; then printf '\tinvalid\n'; return 1; fi
+    tools_output "$log"
+    return "$rc"
+}
+
+# Folder with KohaEasy/Messaging.pm for the Perl of the panel: the
+# installed one, or a copy in the work folder (made by the caller).
+msg_perl_lib() {
+    if msg_installed; then printf '%s' "$KEI_PERL_DIR"; return 0; fi
+    [ -d "$TOOLS_WORK" ] || return 1
+    mkdir -p "$TOOLS_WORK/perl/KohaEasy" && msg_pm_messaging > "$TOOLS_WORK/perl/KohaEasy/Messaging.pm" || return 1
+    chmod -R a+rX "$TOOLS_WORK/perl"
+    printf '%s' "$TOOLS_WORK/perl"
+}
+
+lt_msg_test() {
+    local to log text
+    if ! msg_installed || { [ "$(msg_conf whatsapp)" != "on" ] && [ "$(msg_conf telegram)" != "on" ]; }; then
+        msg_info "$(t "Send a test message")" "$(t "Turn on WhatsApp or Telegram first.")" 9 60
+        return 0
+    fi
+    to=$(ui_input "$(t "Send a test message")" "$(t "Phone number (as registered in Koha):")" "") || return 0
+    if ! phone_normalize "$to" >/dev/null; then
+        msg_error "" "$(t "Invalid phone number.\nNothing was sent.")" 9 60
+        return 1
+    fi
+    tools_workdir || return 1
+    log=$(tools_log messaging-test)
+    text="$(t "Test message from the library system (Koha). If you received it, the notices will arrive here.")"
+    printf '%s' "$text" > "$TOOLS_WORK/msg-test.txt"
+    cat > "$TOOLS_WORK/msg-test.pl" <<'MSGTEST'
+use strict; use warnings; use SMS::Send; use KohaEasy::Messaging;
+my ( $to, $file ) = @ARGV;
+open( my $fh, '<', $file ) or die "cannot read $file\n";
+my $text = do { local $/; <$fh> };
+close $fh;
+my $ok = eval { SMS::Send->new('KohaEasy::Gateway')->send_sms( to => $to, text => $text ) };
+if ($ok) { print "Sent: yes\nChannel: $KohaEasy::Messaging::LAST_CHANNEL\n"; exit 0 }
+my $e = $@ || 'failed'; $e =~ s/ at \S+ line \d+.*//s;
+print "Sent: no\nReason: $e\n"; exit 1;
+MSGTEST
+    chmod 644 "$TOOLS_WORK/msg-test.pl" "$TOOLS_WORK/msg-test.txt"
+    chown "${INSTANCE}-koha:" "$TOOLS_WORK/msg-test.txt" 2>/dev/null || true
+    display_explanation "Sending..."
+    if msg_perl "$log" messaging-test "$TOOLS_WORK/msg-test.pl" "$to" "$TOOLS_WORK/msg-test.txt"; then
+        local channel
+        channel=$(tools_output "$log" | sed -n 's/^Channel: //p')
+        log "messaging: test message sent ($channel)"
+        msg_ok "$(t '✔ Test message sent through ${channel}.')" 9 70
+    else
+        ui_textbox "$(t "Send a test message")" "$log"
+        msg_error "" "$(t 'The message was not sent. The reason is in the log:\n${log}')" 10 74
+    fi
+}
+
+lt_msg_notices() {
+    local prev
+    if msg_notices_on; then
+        prev=$(awk -F= '$1 == "prev_driver" { v = substr($0, index($0, "=") + 1) } END { printf "%s", v }' "$MSG_STATE" 2>/dev/null)
+        [ "$prev" = "$MSG_DRIVER" ] && prev=""
+        local shown="${prev:-—}"
+        prompt_yes_no "$(t "Koha notices")" "$(t 'Stop sending the Koha notices through WhatsApp and Telegram? SMSSendDriver goes back to its previous value (${shown}). A verified backup is made first.')" 11 74 defaultno || return 0
+        tools_locked _lt_msg_notices_set "$prev" off
+        return
+    fi
+    if ! msg_installed || { [ "$(msg_conf whatsapp)" != "on" ] && [ "$(msg_conf telegram)" != "on" ]; }; then
+        msg_info "$(t "Koha notices")" "$(t "Turn on WhatsApp or Telegram first.")" 9 60
+        return 0
+    fi
+    prev=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'SMSSendDriver';")
+    local shown="${prev:-—}"
+    prompt_yes_no "$(t "Koha notices")" "$(t 'Send the Koha notices of the SMS type through WhatsApp and Telegram? The system preference SMSSendDriver changes from ${shown} to KohaEasy::Gateway (the previous value is kept to be restored). A verified backup is made first.')" 13 76 defaultno || return 0
+    tools_locked _lt_msg_notices_set "$MSG_DRIVER" on "$prev"
+}
+
+_lt_msg_notices_set() {
+    local value="$1" mode="$2" prev="${3:-}" log rc=0
+    log=$(tools_log messaging-notices)
+    tools_safety_backup MESSAGING || return 1
+    [ "$mode" = "on" ] && { printf 'prev_driver=%s\n' "$prev" > "$MSG_STATE"; chmod 600 "$MSG_STATE"; }
+    koha_tool "$log" koha-preferences set SMSSendDriver "$value" || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+        ui_textbox "$(t "Koha notices")" "$log"
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    [ "$mode" = "off" ] && rm -f "$MSG_STATE"
+    msg_cron_write
+    log "messaging: Koha notices $mode (SMSSendDriver=$value)"
+    if [ "$mode" = "on" ]; then
+        msg_ok "$(t '✔ The Koha notices of the SMS type now go through WhatsApp and Telegram (queue sent every two minutes).\n\nSee What Koha needs to send the notices.\nSafety backup: ${TOOLS_PRE}')" 13 76
+    else
+        msg_ok "$(t '✔ The Koha notices are no longer sent through WhatsApp and Telegram.\n\nSafety backup: ${TOOLS_PRE}')" 11 72
+    fi
+}
+
+# Short SMS versions of the circulation notices, in the panel language.
+# {library}, {title}, {name}, {items} become Koha template tags.
+msg_letter_content() {
+    local s
+    case "$1" in
+        CHECKOUT) s="$(t "{library}: you borrowed {title}. Thank you for your visit!")" ;;
+        CHECKIN)  s="$(t "{library}: {title} was returned. Thank you!")" ;;
+        ODUE)     s="$(t "{name}, these items are overdue at {library}: {items}Please return or renew them.")" ;;
+        PREDUE)   s="$(t "{name}, {title} is due soon. {library}")" ;;
+        DUE)      s="$(t "{name}, {title} is due today. {library}")" ;;
+        HOLD)     s="$(t "{name}, your hold {title} is waiting for you at {library}.")" ;;
+    esac
+    local nl=$'\n' lib="[% branch.branchname %]" name="[% borrower.firstname %]" title="[% biblio.title %]" items
+    items="${nl}[% FOREACH overdue IN overdues %]- [% overdue.item.biblio.title %] ([% overdue.date_due | \$KohaDates %])${nl}[% END %]"
+    s="${s//\{library\}/$lib}"
+    s="${s//\{name\}/$name}"
+    s="${s//\{title\}/$title}"
+    s="${s//\{items\}/$items}"
+    [ "$1" = "ODUE" ] && s="[%- USE KohaDates -%]${s}"
+    printf '%s' "$s"
+}
+MSG_LETTERS="CHECKOUT:circulation CHECKIN:circulation ODUE:circulation PREDUE:circulation DUE:circulation HOLD:reserves"
+
+lt_msg_check() {
+    local report missing=() code module n pref v
+    tools_workdir || return 1
+    report="$TOOLS_WORK/messaging-check.txt"
+    {
+        printf '%s\n\n' "$(t "What Koha needs to send the notices through WhatsApp and Telegram:")"
+        v=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'SMSSendDriver';")
+        printf '  %s SMSSendDriver = %s\n' "$([ "$v" = "$MSG_DRIVER" ] && echo "[✔]" || echo "[ ]")" "${v:-—}"
+        for pref in EnhancedMessagingPreferences EnhancedMessagingPreferencesOPAC; do
+            v=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = '${pref}';")
+            [ -n "$v" ] && printf '  %s %s = %s\n' "$([ "$v" = "1" ] && echo "[✔]" || echo "[ ]")" "$pref" "$v"
+        done
+        printf '\n%s\n' "$(t "Notices with an SMS version (used for WhatsApp and Telegram):")"
+        for code in $MSG_LETTERS; do
+            module="${code#*:}"; code="${code%%:*}"
+            n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.letter WHERE module = '${module}' AND code = '${code}' AND message_transport_type = 'sms';")
+            printf '  %s %s\n' "$([ "${n:-0}" -gt 0 ] 2>/dev/null && echo "[✔]" || echo "[ ]")" "$code"
+        done
+        n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.overduerules_transport_types WHERE message_transport_type = 'sms';")
+        printf '\n  %s %s: %s\n' "$([ "${n:-0}" -gt 0 ] 2>/dev/null && echo "[✔]" || echo "[ ]")" "$(t "Overdue rules with SMS (Tools > Overdue notice/status triggers)")" "${n:-0}"
+        n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.borrowers WHERE smsalertnumber IS NOT NULL AND smsalertnumber <> '';")
+        printf '  %s: %s\n' "$(t "Patrons with an SMS number")" "${n:-0}"
+        n=$(run_sql "SELECT COUNT(DISTINCT p.borrowernumber) FROM ${DB_NAME}.borrower_message_preferences p JOIN ${DB_NAME}.borrower_message_transport_preferences t ON t.borrower_message_preference_id = p.borrower_message_preference_id WHERE t.message_transport_type = 'sms' AND p.borrowernumber IS NOT NULL;")
+        printf '  %s: %s\n' "$(t "Patrons who chose SMS in their messaging preferences")" "${n:-0}"
+        printf '\n%s\n' "$(t "Checkout and check-in notices follow the messaging preferences of each patron (default: Administration > Patron categories). Overdue notices follow the overdue rules.")"
+    } > "$report"
+    ui_textbox "$(t "What Koha needs to send the notices")" "$report"
+    for code in $MSG_LETTERS; do
+        module="${code#*:}"; code="${code%%:*}"
+        n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.letter WHERE module = '${module}' AND code = '${code}' AND message_transport_type = 'sms';")
+        [ "${n:-1}" = "0" ] && missing+=("$code")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    local codes="${missing[*]}"
+    prompt_yes_no "$(t "Koha notices")" "$(t 'Create short SMS versions (for WhatsApp and Telegram) of the notices that have none: ${codes}? They can be edited later in Tools > Notices and slips. A verified backup is made first.')" 12 76 defaultno || return 0
+    tools_locked _lt_msg_letters "${missing[@]}"
+}
+
+_lt_msg_letters() {
+    local log sql code module added
+    log=$(tools_log messaging-notices)
+    sql="$TOOLS_WORK/letters.sql"
+    {
+        printf 'START TRANSACTION;\n'
+        for code in "$@"; do
+            module=$(printf '%s\n' $MSG_LETTERS | awk -F: -v c="$code" '$1 == c { print $2 }')
+            [ -n "$module" ] || continue
+            printf "INSERT INTO letter (module, code, branchcode, name, is_html, title, content, message_transport_type, lang) SELECT '%s', '%s', '', COALESCE((SELECT l.name FROM letter l WHERE l.module = '%s' AND l.code = '%s' AND l.branchcode = '' LIMIT 1), '%s'), 0, %s, %s, 'sms', 'default' FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM letter WHERE module = '%s' AND code = '%s' AND branchcode = '' AND message_transport_type = 'sms' AND lang = 'default');\n" \
+                "$module" "$code" "$module" "$code" "$code" "$(sql_quote "$code")" "$(sql_quote "$(msg_letter_content "$code")")" "$module" "$code"
+        done
+        printf 'COMMIT;\n'
+    } > "$sql"
+    cat "$sql" >> "$log"
+    tools_safety_backup NOTICES || return 1
+    if ! koha_sql_run "$log" "$sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    added=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.letter WHERE message_transport_type = 'sms' AND lang = 'default' AND branchcode = '' AND code IN ($(printf "'%s'," "$@" | sed 's/,$//'));")
+    log "messaging: SMS notices created ($*)"
+    msg_ok "$(t '✔ SMS notices ready: ${added}\n\nIn Koha: Tools > Notices and slips.\nSafety backup: ${TOOLS_PRE}')" 11 72
+}
+
+# Patrons' SMS numbers checked with the same rules as the driver (read-only
+# report; the corrected numbers can then be written, with a backup).
+lt_msg_phones() {
+    local lib data out log fixed
+    tools_workdir || return 1
+    lib=$(msg_perl_lib) || return 1
+    data="$TOOLS_WORK/phones.tsv"; out="$TOOLS_WORK/phones-report.txt"; log=$(tools_log messaging-phones)
+    run_sql "SELECT borrowernumber, cardnumber, smsalertnumber FROM ${DB_NAME}.borrowers WHERE smsalertnumber IS NOT NULL AND smsalertnumber <> '';" > "$data"
+    printf '%s\n' "$(t "SMS numbers of the patrons (country and area code from the messaging settings):")" "$(t "Complete and correct")" \
+        "$(t "Can be corrected")" "$(t "Landlines (WhatsApp only if the number has it)")" "$(t "Invalid (fix them by hand)")" > "$TOOLS_WORK/phones-labels.txt"
+    cat > "$TOOLS_WORK/phones.pl" <<'PHONESPL'
+use strict; use warnings; use KohaEasy::Messaging;
+# phones.pl DATA SQL REPORT LABELS COUNTRY AREA: the patrons' SMS numbers
+# checked with the rules of the driver; corrections go to SQL.
+my ( $data, $sql, $report, $labels, $cc, $area ) = @ARGV;
+open( my $l, '<:encoding(UTF-8)', $labels ) or die "$labels: $!\n";
+chomp( my @l = <$l> );
+close $l;
+my %n = ( ok => 0, fixed => 0, landline => 0, invalid => 0 );
+my @lines;
+open( my $in, '<:encoding(UTF-8)', $data ) or die "$data: $!\n";
+open( my $s, '>', $sql ) or die "$sql: $!\n";
+print {$s} "START TRANSACTION;\n";
+while ( my $row = <$in> ) {
+    chomp $row;
+    my ( $bn, $card, $num ) = split /\t/, $row, 3;
+    next unless defined $bn && $bn =~ /^\d+$/;
+    my ( $e, $k ) = KohaEasy::Messaging::normalize_phone( $num, $cc, $area );
+    $n{$k}++;
+    if ( $k eq 'fixed' ) {
+        push @lines, sprintf( "  %-16s %-22s -> %s", $card // '', $num, $e );
+        print {$s} "UPDATE borrowers SET smsalertnumber = '$e' WHERE borrowernumber = $bn;\n";
+    } elsif ( $k eq 'invalid' ) {
+        push @lines, sprintf( "  %-16s %-22s -> ?", $card // '', $num );
+    }
+}
+print {$s} "COMMIT;\n";
+close $s;
+open( my $r, '>:encoding(UTF-8)', $report ) or die "$report: $!\n";
+printf {$r} "%s\n\n  %s: %d\n  %s: %d\n  %s: %d\n  %s: %d\n\n", $l[0], $l[1], $n{ok}, $l[2], $n{fixed}, $l[3], $n{landline}, $l[4], $n{invalid};
+print {$r} "$_\n" for @lines[ 0 .. ( $#lines < 299 ? $#lines : 299 ) ];
+close $r;
+print "Fixed: $n{fixed}\n";
+PHONESPL
+    chmod 644 "$data" "$TOOLS_WORK/phones.pl" "$TOOLS_WORK/phones-labels.txt"
+    if ! koha_exec "$log" phones /usr/bin/perl -I "$lib" "$TOOLS_WORK/phones.pl" "$data" "$TOOLS_WORK/phones.sql" "$out" \
+            "$TOOLS_WORK/phones-labels.txt" "$(msg_conf country)" "$(msg_conf area)" || [ ! -s "$out" ]; then
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    fixed=$(tools_num "$log" "Fixed:")
+    ui_textbox "$(t "Check the patrons' phone numbers")" "$out"
+    [ "${fixed:-0}" -gt 0 ] 2>/dev/null || return 0
+    prompt_yes_no "$(t "Check the patrons' phone numbers")" "$(t 'Write the ${fixed} corrected number(s) to the SMS number of the patrons (international format, e.g. +5544998765432)? A verified backup is made first.')" 11 74 defaultno || return 0
+    tools_locked _lt_msg_phones_fix "$fixed"
+}
+
+_lt_msg_phones_fix() {
+    local log
+    log=$(tools_log messaging-phones)
+    cat "$TOOLS_WORK/phones.sql" >> "$log"
+    tools_safety_backup PHONES || return 1
+    if ! koha_sql_run "$log" "$TOOLS_WORK/phones.sql"; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    local fixed="$1"
+    log "messaging: $fixed SMS number(s) corrected"
+    msg_ok "$(t '✔ Numbers corrected: ${fixed}\n\nSafety backup: ${TOOLS_PRE}')" 10 70
+}
+
+lt_msg_remove() {
+    msg_installed || [ -e "$MSG_CONF" ] || { msg_info "$(t "Remove the messaging module")" "$(t "The messaging module is not installed.")" 8 60; return 0; }
+    prompt_yes_no "$(t "Remove the messaging module")" "$(t "Remove the WhatsApp and Telegram module (driver, settings with the tokens, Telegram links and schedule)? If the Koha notices go through it, SMSSendDriver gets its previous value back first.")" 12 76 defaultno || return 0
+    if msg_notices_on; then
+        local prev
+        prev=$(awk -F= '$1 == "prev_driver" { v = substr($0, index($0, "=") + 1) } END { printf "%s", v }' "$MSG_STATE" 2>/dev/null)
+        [ "$prev" = "$MSG_DRIVER" ] && prev=""
+        tools_locked _lt_msg_notices_set "$prev" off || return 1
+    fi
+    rm -f "$CRON_MSG" "$MSG_CONF" "$MSG_STATE" "$KEI_PERL_DIR/SMS/Send/KohaEasy/Gateway.pm" "$KEI_PERL_DIR/KohaEasy/Messaging.pm" "$KEI_LIBEXEC/kei-telegram-link"
+    rmdir "$KEI_PERL_DIR/SMS/Send/KohaEasy" 2>/dev/null
+    rm -rf "$MSG_DATA"
+    log "messaging: module removed"
+    msg_ok "$(t "✔ The messaging module was removed.")"
+}
+
+# ======================================================================
+# 32. CATALOGUING AIDS: AUTHOR NOTATION (PHA, CUTTER-SANBORN) AND CDD
+# ----------------------------------------------------------------------
+# Read-only helpers for the cataloguers. The author tables (Tabela PHA of
+# Heloísa de Almeida Prado, Cutter-Sanborn) and the Dewey schedules are
+# copyrighted and are not distributed with the panel: each library loads
+# its own copy as a text file (one entry and its number per line; the PHA
+# rows as printed, entry - number - entry, are read as they are). The notation
+# follows the rules of the PHA explanation: the entry that comes right
+# before the name in alphabetical order, the initial of the surname, the
+# number and the initial of the title (the initial article never counts;
+# a title starting with "l" gets a capital L), prefixes read as one word
+# (La Fonte, O'Donnel) and M' / Mc read as Mac.
+# ======================================================================
+CAT_DIR="${CONF_DIR}/tables"
+
+# awk functions shared by the table import and the lookup.
+cat_awk_lib() {
+    cat <<'CATAWK'
+function trim(s) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", s); return s }
+function unaccent(s) {
+    gsub(/á|à|â|ã|ä|Á|À|Â|Ã|Ä/, "a", s); gsub(/é|è|ê|ë|É|È|Ê|Ë/, "e", s); gsub(/í|ì|î|ï|Í|Ì|Î|Ï/, "i", s)
+    gsub(/ó|ò|ô|õ|ö|Ó|Ò|Ô|Õ|Ö/, "o", s); gsub(/ú|ù|û|ü|Ú|Ù|Û|Ü/, "u", s); gsub(/ç|Ç/, "c", s); gsub(/ñ|Ñ/, "n", s)
+    gsub(/ý|ÿ|Ý/, "y", s)
+    return s
+}
+# Name as the tables sort it: lower case, no accents, M' and Mc as Mac,
+# a prefix joined to the word after it, only letters and single spaces.
+function name_key(s) {
+    s = tolower(unaccent(trim(s)))
+    if (s ~ /^m'/) s = "mac" substr(s, 3)
+    else if (s ~ /^mc/) s = "mac" substr(s, 3)
+    gsub(/’|'/, "", s)
+    gsub(/[^a-z0-9 ]/, " ", s); gsub(/  +/, " ", s); s = trim(s)
+    if (s ~ /^(van der|van den|van de|de la|de las|de los|von der|von) [a-z]/) { sub(/ /, "", s); sub(/ /, "", s) }
+    else if (s ~ /^(la|le|les|du|des|van|ten|ter|del|della|delle|di|da|de|dos|das|do|lo|el|al) [a-z]/) sub(/ /, "", s)
+    return s
+}
+# "Surname, Forename" -> key of the surname plus the forename.
+function author_key(s,   p, sur, fore) {
+    p = index(s, ",")
+    if (p == 0) return name_key(s)
+    sur = name_key(substr(s, 1, p - 1)); fore = name_key(substr(s, p + 1))
+    return fore == "" ? sur : sur " " fore
+}
+function is_article(w) {
+    return w ~ /^(o|a|os|as|um|uma|uns|umas|the|an|el|la|los|las|lo|le|les|un|une|il|gli|der|die|das|ein|eine)$/
+}
+# Title without its initial article (or without the first IND2 characters).
+function title_rest(t, ind2,   w) {
+    t = trim(t)
+    if (ind2 ~ /^[1-9]$/) return trim(substr(t, ind2 + 1))
+    if (tolower(t) ~ /^l'/) return trim(substr(t, 3))
+    w = tolower(unaccent(t)); sub(/[ \t].*/, "", w)
+    if (is_article(w) && index(t, " ")) return trim(substr(t, index(t, " ") + 1))
+    return t
+}
+function work_mark(t, ind2,   c) {
+    t = tolower(unaccent(title_rest(t, ind2)))
+    gsub(/[^a-z0-9]/, "", t)
+    c = substr(t, 1, 1)
+    return c == "l" ? "L" : c
+}
+CATAWK
+}
+
+# cat_table_import KIND SOURCE OUT: author table (pha, cutter) or CDD
+# schedule (cdd) in the panel format; the report goes to stdout.
+cat_table_import() {
+    local kind="$1" src="$2" out="$3"
+    LC_ALL=C awk -v kind="$kind" -v out="$out" \
+        -v l_lines="$(t "Lines read")" -v l_entries="$(t "Entries")" -v l_skipped="$(t "Lines not understood")" \
+        -v l_order="$(t "Numbers out of order (check these lines against the book)")" -v l_dup="$(t "Repeated entries (the first one is kept)")" \
+        -v l_letter="$(t "Entries per letter")" -v l_line="$(t "line")" \
+        "$(cat_awk_lib)"'
+function add(e, num,   k, L) {
+    e = trim(e); if (e == "") return
+    k = name_key(e); L = substr(k, 1, 1)
+    if (L !~ /[a-z]/) { skipped++; if (nsk < 30) sk[++nsk] = l_line " " NR ": " $0; return }
+    if ((L SUBSEP k) in seen) { dup++; if (ndu < 30) du[++ndu] = l_line " " NR ": " e " (" seen[L, k] ")"; return }
+    seen[L, k] = e " " num
+    n++; LET[n] = L; KEY[n] = k; NUM[n] = num; ENT[n] = e; LN[n] = NR
+    cnt[L]++
+}
+{
+    line = $0; sub(/\r$/, "", line)
+    if (NR == 1) sub(/^\357\273\277/, "", line)
+    if (line ~ /^[ \t]*(#|$)/) next
+    lines++
+    if (kind == "cdd") {
+        if (match(line, /^[ \t]*[0-9][0-9][0-9](\.[0-9]+)?/)) {
+            num = trim(substr(line, RSTART, RLENGTH)); cap = trim(substr(line, RSTART + RLENGTH))
+            sub(/^[\t;,:-]+[ \t]*/, "", cap); cap = trim(cap)
+            if (cap != "" && !(num in cdd)) { cdd[num] = cap; order[++n] = num; next }
+        }
+        skipped++; if (nsk < 30) sk[++nsk] = l_line " " NR ": " line
+        next
+    }
+    # "Entry<sep>number", "number<sep>entry" or the row of the book "Entry number Entry".
+    nf = split(line, f, /[\t;]/)
+    if (nf < 2 && index(line, ",")) nf = split(line, f, /,/)
+    if (nf < 2) {
+        nw = split(line, w, /[ ]+/); left = ""; right = ""; num = ""
+        for (i = 1; i <= nw; i++) {
+            if (num == "" && w[i] ~ /^[0-9]+$/) num = w[i]
+            else if (num == "") left = left (left == "" ? "" : " ") w[i]
+            else right = right (right == "" ? "" : " ") w[i]
+        }
+    } else {
+        left = ""; right = ""; num = ""
+        for (i = 1; i <= nf; i++) {
+            v = trim(f[i])
+            if (num == "" && v ~ /^[0-9]+$/) num = v
+            else if (num == "") left = left (left == "" ? "" : " ") v
+            else right = right (right == "" ? "" : " ") v
+        }
+    }
+    if (num == "" || (left == "" && right == "")) { skipped++; if (nsk < 30) sk[++nsk] = l_line " " NR ": " line; next }
+    add(left, num); add(right, num)
+}
+END {
+    if (kind == "cdd") {
+        for (i = 1; i <= n; i++) printf "%s\t%s\n", order[i], cdd[order[i]] > out
+        printf "%s: %d\n%s: %d\n%s: %d\n", l_lines, lines, l_entries, n, l_skipped, skipped
+        for (i = 1; i <= nsk; i++) print "  " sk[i]
+        printf "@@entries %d\n@@problems %d\n", n, skipped
+        exit
+    }
+    # Sort by letter and key (insertion sort per letter keeps it simple and stable).
+    for (i = 1; i <= n; i++) { L = LET[i]; m = ++per[L]; IDX[L, m] = i }
+    bad = 0
+    for (L in per) {
+        for (a = 2; a <= per[L]; a++) {
+            x = IDX[L, a]; b = a - 1
+            while (b >= 1 && KEY[IDX[L, b]] > KEY[x]) { IDX[L, b + 1] = IDX[L, b]; b-- }
+            IDX[L, b + 1] = x
+        }
+        for (a = 1; a <= per[L]; a++) {
+            x = IDX[L, a]
+            printf "%s\t%s\t%s\t%s\n", L, KEY[x], NUM[x], ENT[x] > out
+            # Decimal numbering (1, 11, 111, 112 ... 12): compared as text.
+            if (a > 1 && (NUM[x] "") < (NUM[IDX[L, a - 1]] "")) { bad++; if (nba < 50) ba[++nba] = l_line " " LN[x] ": " ENT[x] " " NUM[x] " < " ENT[IDX[L, a - 1]] " " NUM[IDX[L, a - 1]] }
+        }
+    }
+    printf "%s: %d\n%s: %d\n%s: %d\n", l_lines, lines, l_entries, n, l_skipped, skipped
+    printf "%s:", l_letter
+    for (c = 97; c <= 122; c++) { L = sprintf("%c", c); if (L in cnt) printf " %s=%d", toupper(L), cnt[L] }
+    printf "\n"
+    if (skipped) { print l_skipped ":"; for (i = 1; i <= nsk; i++) print "  " sk[i] }
+    if (bad) { printf "%s: %d\n", l_order, bad; for (i = 1; i <= nba; i++) print "  " ba[i] }
+    if (dup) { printf "%s: %d\n", l_dup, dup; for (i = 1; i <= ndu; i++) print "  " du[i] }
+    printf "@@entries %d\n@@problems %d\n", n, skipped + bad
+}' "$src"
+}
+
+cat_table_path() { printf '%s/%s.tsv' "$CAT_DIR" "$1"; }
+cat_table_name() {
+    case "$1" in
+        pha) printf '%s' "$(t "PHA table (Heloísa de Almeida Prado)")" ;;
+        cutter) printf 'Cutter-Sanborn' ;;
+        cdd) printf '%s' "$(t "CDD (Dewey) schedule")" ;;
+    esac
+}
+cat_table_count() { [ -s "$(cat_table_path "$1")" ] && wc -l < "$(cat_table_path "$1")" || echo 0; }
+
+# cat_notation KIND "Surname, Forename" TITLE [IND2] [MODE]: prints
+# "NOTATION<TAB>ENTRY<TAB>NUMBER<TAB>PREVIOUS<TAB>NEXT" (numbers of the
+# neighbouring entries). MODE: person (default), corporate (first word of
+# the name) or title (anonymous work: first word of the title, no mark).
+cat_notation() {
+    local kind="$1" name="$2" title="${3:-}" ind2="${4:-}" mode="${5:-person}" table
+    table=$(cat_table_path "$kind")
+    [ -s "$table" ] || return 2
+    LC_ALL=C awk -F'\t' -v name="$name" -v title="$title" -v ind2="$ind2" -v mode="$mode" "$(cat_awk_lib)"'
+BEGIN {
+    if (mode == "title") { key = title_rest(title, ind2); sub(/[ \t].*/, "", key); key = name_key(key); mark = "" }
+    else if (mode == "corporate") { key = name; sub(/[ \t,].*/, "", key); key = name_key(key); mark = work_mark(title, ind2) }
+    else { key = author_key(name); mark = work_mark(title, ind2) }
+    L = substr(key, 1, 1)
+    if (L !~ /[a-z]/) exit 3
+}
+$1 == L {
+    if ($2 <= key) { prev = hit; hit = $3; ent = $4; next_n = ""; found = 1; next }
+    if (found && next_n == "") next_n = $3
+    if (!found && first == "") { first = $3; firstent = $4 }
+}
+END {
+    if (L !~ /[a-z]/) exit 3
+    if (!found) { if (first == "") exit 4; hit = first; ent = firstent }
+    printf "%s%s%s\t%s\t%s\t%s\t%s\n", toupper(L), hit, mark, ent, hit, prev, next_n
+}' "$table"
+}
+
+# Call numbers of the catalogue that already use the letter and number
+# BASE (e.g. A848, not A8481) in CLASS: "callnumber<TAB>author<TAB>title".
+cat_used() {
+    local class="$1" base="$2" skip="${3:-0}" re
+    [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]] && [[ "$base" =~ ^[A-Z][0-9]+$ ]] && [[ "$skip" =~ ^[0-9]+$ ]] || return 0
+    if [ -n "$class" ]; then re="^${class//./\\.}[[:space:]]+${base}([^0-9]|\$)"; else re="(^|[[:space:]])${base}([^0-9]|\$)"; fi
+    run_sql "SELECT DISTINCT i.itemcallnumber, COALESCE(b.author, ''), COALESCE(b.title, '') FROM ${DB_NAME}.items i JOIN ${DB_NAME}.biblio b ON b.biblionumber = i.biblionumber WHERE i.itemcallnumber REGEXP $(sql_quote "$re") AND i.biblionumber <> ${skip} ORDER BY i.itemcallnumber LIMIT 20;"
+}
+
+# Report of one notation: the entry used, the call number and the uses of
+# the same number in the class (a different author needs another number).
+cat_notation_report() {
+    local kind="$1" name="$2" title="$3" ind2="$4" mode="$5" class="$6" skip="${7:-0}" out="$8"
+    local res rc=0 nota ent num prev nxt base used
+    res=$(cat_notation "$kind" "$name" "$title" "$ind2" "$mode") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' "$(t "No notation: the name must start with a letter (write it as Surname, Forename).")" > "$out"
+        return 1
+    fi
+    IFS=$'\037' read -r nota ent num prev nxt <<< "${res//$'\t'/$'\037'}"
+    base="${nota:0:1}${num}"
+    {
+        printf '%s: %s\n' "$(cat_table_name "$kind")" "$nota"
+        printf '\n  %s: %s\n  %s: %s (%s)\n' "$(t "Heading")" "$name" "$(t "Table entry used")" "$ent" "$num"
+        [ -n "$title" ] && printf '  %s: %s\n' "$(t "Title")" "$title"
+        [ -n "$class" ] && printf '\n  %s:\n      %s\n      %s\n' "$(t "Call number")" "$class" "$nota"
+        used=$(cat_used "$class" "$base" "$skip")
+        if [ -n "$used" ]; then
+            printf '\n%s\n' "$(t "Already used in the catalogue (in the same class, two different authors cannot have the same number):")"
+            printf '%s\n' "$used" | awk -F'\t' '{ printf "  %-22s %-28s %s\n", $1, substr($2, 1, 28), substr($3, 1, 40) }'
+            printf '\n%s\n' "$(t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):")"
+            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free")"
+            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free")"
+        elif [ -n "$class" ]; then
+            printf '\n%s\n' "$(t "Not used yet in this class in the catalogue.")"
+        fi
+    } > "$out"
+}
+
+cat_pick_kind() {   # author table to use (only the loaded ones)
+    local items=() k
+    for k in pha cutter; do [ -s "$(cat_table_path "$k")" ] && items+=("$k" "$(cat_table_name "$k")"); done
+    if [ ${#items[@]} -eq 0 ]; then
+        msg_info "$(t "Author notation")" "$(t "Load the PHA or Cutter-Sanborn table of your library first (Load a table).")" 9 70
+        return 1
+    fi
+    [ ${#items[@]} -eq 2 ] && { printf '%s' "${items[0]}"; return 0; }
+    ui_menu "$(t "Author notation")" "$(t "Table:")" "${items[@]}"
+}
+
+lt_cat_notation() {
+    local kind name title class out
+    kind=$(cat_pick_kind) || return 0
+    name=$(ui_input "$(t "Author notation")" "$(t "Author as in the heading: Surname, Forename (e.g. Assis, Machado de). For an institution, its name.")" "") || return 0
+    [ -n "${name// /}" ] || return 0
+    title=$(ui_input "$(t "Author notation")" "$(t "Title of the work (for the initial after the number):")" "") || return 0
+    class=$(ui_input "$(t "Author notation")" "$(t "Class number (CDD), to check the numbers already used (optional):")" "") || return 0
+    class="${class// /}"
+    if ! [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]]; then
+        msg_error "" "$(t "Invalid class number.")" 8 60
+        return 1
+    fi
+    tools_workdir || return 1
+    out="$TOOLS_WORK/notation.txt"
+    cat_notation_report "$kind" "$name" "$title" "" person "${class// /}" 0 "$out"
+    ui_textbox "$(t "Author notation")" "$out"
+}
+
+# From a catalogue record: 100 (person), 110/111 (institution, first word)
+# or the title (anonymous work); class from 082.
+lt_cat_record() {
+    local kind bn row a100 a110 a111 t245 ind2 c082 name mode out
+    kind=$(cat_pick_kind) || return 0
+    bn=$(ui_input "$(t "Author notation")" "$(t "Record number (biblionumber):")" "") || return 0
+    if ! [[ "$bn" =~ ^[0-9]{1,10}$ ]]; then
+        msg_error "" "$(t "Invalid record number.")" 8 60
+        return 1
+    fi
+    row=$(run_sql "SELECT CONCAT_WS(CHAR(31), ExtractValue(metadata, '//datafield[@tag=\"100\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"110\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"111\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"245\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"245\"]/@ind2'), ExtractValue(metadata, '//datafield[@tag=\"082\"]/subfield[@code=\"a\"]'), '') FROM ${DB_NAME}.biblio_metadata WHERE biblionumber = ${bn} AND format = 'marcxml' LIMIT 1;")
+    if [ -z "$row" ]; then
+        msg_error "" "$(t "Record not found.")" 8 60
+        return 1
+    fi
+    # Unit separator, not tab: empty fields must keep their place.
+    IFS=$'\037' read -r a100 a110 a111 t245 ind2 c082 _ <<< "$row"
+    t245="${t245%[ /:;=]}"; t245="${t245%[ /:;=]}"
+    if [ -n "$a100" ]; then name="${a100%[,.]}"; mode=person
+    elif [ -n "${a110}${a111}" ]; then name="${a110:-$a111}"; mode=corporate
+    else name="$t245"; mode=title
+    fi
+    tools_workdir || return 1
+    out="$TOOLS_WORK/notation.txt"
+    cat_notation_report "$kind" "$name" "$t245" "$ind2" "$mode" "${c082%% *}" "$bn" "$out"
+    ui_textbox "$(t "Author notation")" "$out"
+}
+
+# Main classes of the DDC (first summary); the rest comes from the
+# schedule loaded by the library.
+cat_ddc_classes() {
+    printf '000\t%s\n' "$(t "Computer science, information and general works")"
+    printf '100\t%s\n' "$(t "Philosophy and psychology")"
+    printf '200\t%s\n' "$(t "Religion")"
+    printf '300\t%s\n' "$(t "Social sciences")"
+    printf '400\t%s\n' "$(t "Language")"
+    printf '500\t%s\n' "$(t "Science")"
+    printf '600\t%s\n' "$(t "Technology")"
+    printf '700\t%s\n' "$(t "Arts and recreation")"
+    printf '800\t%s\n' "$(t "Literature")"
+    printf '900\t%s\n' "$(t "History and geography")"
+}
+
+# cat_cdd_lookup QUERY OUT: by number (the chain of classes above it and
+# the entries below it) or by word (captions containing it), plus how the
+# catalogue already uses the number or the word.
+cat_cdd_lookup() {
+    local q="$1" out="$2" table like
+    table=$(cat_table_path cdd)
+    {
+        if [[ "$q" =~ ^[0-9]{1,3}(\.[0-9]*)?$ ]]; then
+            q="${q%.}"
+            printf '%s %s\n\n' "$(t "CDD number")" "$q"
+            { cat_ddc_classes; [ -s "$table" ] && cat "$table"; } | LC_ALL=C awk -F'\t' -v q="$q" '
+                function sig(n) { if (n ~ /\./) return n; sub(/0+$/, "", n); return n == "" ? "0" : n }
+                !($1 in seen) { seen[$1] = 1; p = sig($1)
+                    if (index(q, p) == 1) up[$1] = $2
+                    else if (index($1, q) == 1 && length($1) <= length(q) + 2 && $1 != q) down[$1] = $2 }
+                END {
+                    n = 0; for (k in up) keys[++n] = k
+                    for (i = 2; i <= n; i++) { x = keys[i]; for (j = i - 1; j >= 1 && keys[j] > x; j--) keys[j + 1] = keys[j]; keys[j + 1] = x }
+                    for (i = 1; i <= n; i++) printf "  %-10s %s\n", keys[i], up[keys[i]]
+                    m = 0; for (k in down) d[++m] = k
+                    for (i = 2; i <= m; i++) { x = d[i]; for (j = i - 1; j >= 1 && d[j] > x; j--) d[j + 1] = d[j]; d[j + 1] = x }
+                    if (m) print ""
+                    for (i = 1; i <= m && i <= 60; i++) printf "      %-10s %s\n", d[i], down[d[i]]
+                }'
+            like=$(sql_quote "${q}%")
+            printf '\n%s\n' "$(t "In the catalogue (items by class number):")"
+            run_sql "SELECT SUBSTRING_INDEX(TRIM(itemcallnumber), ' ', 1) AS c, COUNT(*) FROM ${DB_NAME}.items WHERE itemcallnumber LIKE ${like} GROUP BY c ORDER BY c LIMIT 40;" \
+                | awk -F'\t' '{ printf "  %-12s %s\n", $1, $2 } END { if (NR == 0) print "  -" }'
+        else
+            printf '%s: %s\n\n' "$(t "Subject")" "$q"
+            { cat_ddc_classes; [ -s "$table" ] && cat "$table"; } | awk -F'\t' -v q="$q" "$(cat_awk_lib)"'
+                BEGIN { w = tolower(unaccent(q)) }
+                { c = tolower(unaccent($2)); if (index(c, w)) { printf "  %-10s %s\n", $1, $2; n++ } if (n >= 60) exit }
+                END { if (!n) print "  -" }'
+            [ -s "$table" ] || printf '\n%s\n' "$(t "Only the main classes are built in: load the CDD schedule of your library to search all of it.")"
+            like=$(sql_quote "%$(printf '%s' "$q" | sed 's/[%_\\]/\\&/g')%")
+            printf '\n%s\n' "$(t "How the catalogue classified titles with this word:")"
+            run_sql "SELECT SUBSTRING_INDEX(TRIM(i.itemcallnumber), ' ', 1) AS c, COUNT(*) AS n FROM ${DB_NAME}.items i JOIN ${DB_NAME}.biblio b ON b.biblionumber = i.biblionumber WHERE b.title LIKE ${like} AND i.itemcallnumber REGEXP '^[0-9]{3}' GROUP BY c ORDER BY n DESC, c LIMIT 15;" \
+                | awk -F'\t' '{ printf "  %-12s %s\n", $1, $2 } END { if (NR == 0) print "  -" }'
+        fi
+    } > "$out"
+}
+
+lt_cat_cdd() {
+    local q out
+    q=$(ui_input "$(t "CDD")" "$(t "Class number (e.g. 869.3) or a word of the subject (e.g. poetry):")" "") || return 0
+    q="${q#"${q%%[![:space:]]*}"}"; q="${q%"${q##*[![:space:]]}"}"
+    [ -n "$q" ] || return 0
+    if [ "${#q}" -gt 60 ]; then
+        msg_error "" "$(t "The text is too long.")" 8 60
+        return 1
+    fi
+    tools_workdir || return 1
+    out="$TOOLS_WORK/cdd.txt"
+    cat_cdd_lookup "$q" "$out"
+    ui_textbox "$(t "CDD")" "$out"
+}
+
+lt_cat_load() {
+    local kind file utf8 new report problems entries
+    kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
+        "pha"    "$(cat_table_name pha)" \
+        "cutter" "Cutter-Sanborn" \
+        "cdd"    "$(t "CDD (Dewey) schedule: number and caption per line")") || return 0
+    file=$(select_file "/root" "txt csv tsv" "$(t "Pick the table file (.txt, .csv or .tsv):")" "$(t "Table")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    tools_workdir || return 1
+    utf8="$TOOLS_WORK/table-utf8.txt"; new="$TOOLS_WORK/table.tsv"; report="$TOOLS_WORK/table-report.txt"
+    if file_is_utf8 "$file"; then cp -f -- "$file" "$utf8"; else iconv -f WINDOWS-1252 -t UTF-8 "$file" > "$utf8" 2>/dev/null || return 1; fi
+    : > "$new"
+    cat_table_import "$kind" "$utf8" "$new" > "$report" 2>&1
+    entries=$(sed -n 's/^@@entries //p' "$report"); problems=$(sed -n 's/^@@problems //p' "$report")
+    sed -i '/^@@/d' "$report"
+    { printf '%s\n\n' "$(cat_table_name "$kind")"; cat "$report"; } > "$report.2" && mv -f "$report.2" "$report"
+    ui_textbox "$(t "Load a table")" "$report"
+    if [ "${entries:-0}" = "0" ]; then
+        msg_error "" "$(t "No entry was understood. Nothing was changed.")" 8 64
+        return 1
+    fi
+    if [ "${problems:-0}" != "0" ]; then
+        prompt_yes_no "$(t "Load a table")" "$(t 'The file has ${problems} problem(s) listed in the report. Load the ${entries} entries anyway? You can correct the file and load it again later.')" 11 74 defaultno || return 0
+    else
+        prompt_yes_no "$(t "Load a table")" "$(t 'Load the ${entries} entries? A table loaded before is replaced.')" 9 70 || return 0
+    fi
+    mkdir -p "$CAT_DIR" && chmod 755 "$CAT_DIR"
+    install -m 644 "$new" "$(cat_table_path "$kind").new" && mv -f "$(cat_table_path "$kind").new" "$(cat_table_path "$kind")" || return 1
+    log "cataloguing: $kind table loaded ($entries entries from $file)"
+    msg_ok "$(t '✔ Table loaded: ${entries} entries.')" 8 60
+}
+
+lt_cat_remove() {
+    local items=() k kind
+    for k in pha cutter cdd; do [ -s "$(cat_table_path "$k")" ] && items+=("$k" "$(cat_table_name "$k") ($(cat_table_count "$k"))"); done
+    if [ ${#items[@]} -eq 0 ]; then
+        msg_info "$(t "Remove a table")" "$(t "No table is loaded.")" 8 60
+        return 0
+    fi
+    kind=$(ui_menu "$(t "Remove a table")" "$(t "Table to remove from this server:")" "${items[@]}") || return 0
+    prompt_yes_no "$(t "Remove a table")" "$(t "Remove this table from the server? The catalogue is not changed.")" 9 70 defaultno || return 0
+    rm -f "$(cat_table_path "$kind")"
+    log "cataloguing: $kind table removed"
+    msg_ok "$(t "✔ Table removed.")"
+}
+
+function_cataloguing() {
+    require_database || return 0
+    local opt status
+    while true; do
+        status="$(t "Loaded tables"): PHA $(cat_table_count pha), Cutter-Sanborn $(cat_table_count cutter), CDD $(cat_table_count cdd)"
+        opt=$(ui_menu "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" "$(t "Read-only helpers: nothing in the catalogue is changed.")"$'\n'"$status" \
+            "1" "$(t "Author notation (PHA or Cutter-Sanborn)")" \
+            "2" "$(t "Author notation of a catalogue record")" \
+            "3" "$(t "CDD: look up a number or a subject")" \
+            "4" "$(t "Load a table (PHA, Cutter-Sanborn, CDD)")" \
+            "5" "$(t "Remove a table")") || return 0
+        case "$opt" in
+            1) lt_cat_notation ;;
+            2) lt_cat_record ;;
+            3) lt_cat_cdd ;;
+            4) lt_cat_load ;;
+            5) lt_cat_remove ;;
+        esac
+        clear
+    done
+}
+
+# ======================================================================
+# 33. REPLACE A MARC RECORD (staff interface tool, opt-in)
+# ----------------------------------------------------------------------
+# marc_replace.pl, the page the library already used to replace a record
+# by its biblionumber with a record downloaded from another catalogue
+# (e.g. Biblioteca Nacional), installed in Koha's staff CGI folder. Same
+# flow as the original (checkauth with editcatalogue, Koha::Token CSRF
+# check, ModBiblio, the item fields left out) plus: a preview before the
+# change, the record locked and compared inside one transaction (nothing
+# is replaced if someone changed it after the preview), the previous
+# version saved as MARCXML (downloadable, and accepted back to undo),
+# MARC-8 / Latin-1 files converted by Koha's own MarcToUTF8Record, the
+# item types read from Koha, and every text shown escaped. The page is
+# in the language of the panel. Removing it deletes only the page (the
+# saved versions stay in ${MR_DIR}).
+# ======================================================================
+KOHA_INTRA_CGI="${KOHA_INTRA_CGI:-/usr/share/koha/intranet/cgi-bin}"
+MR_FILE="${KOHA_INTRA_CGI}/tools/marc_replace.pl"
+MR_DIR="/var/lib/koha/${INSTANCE}/kei-marc-replace"
+MR_STATE="${CONF_DIR}/marc_replace.state"
+MR_JS_BEGIN="/* koha-easy-installer marc_replace begin */"
+MR_JS_END="/* koha-easy-installer marc_replace end */"
+
+# The page: Perl code around the strings of the panel language.
+marc_replace_script() {
+    cat <<'MRPL1'
+#!/usr/bin/perl
+
+# marc_replace.pl (koha-easy-installer)
+# Replaces an existing bibliographic record, found by its biblionumber,
+# with a record from an .mrc (ISO 2709) or .xml (MARCXML) file or from
+# pasted text (Biblioteca Nacional "245 10 |a", MarcEdit "=245  10$a" or
+# "245 10 $a" lines), without the staged import of Koha. Based on the
+# script of the library; installed and removed by the panel (Library
+# tools > Replace a MARC record).
+#
+# Safety: login with the editcatalogue permission; POST only with a valid
+# CSRF token (Koha::Token, and the Koha 24.05+ "cud-" operations); a
+# preview first; then, in one transaction, the current record is locked
+# (SELECT ... FOR UPDATE) and compared with the preview, saved as MARCXML
+# and replaced with ModBiblio. The item fields (952, or the field of
+# items.itemnumber) are always left out: the items are never touched.
+#
+# Technical note (kept from the original): no named sub captures
+# file-scope lexical variables, because under Koha's persistent Plack the
+# Perl process lives between requests and that causes "Variable is not
+# available" errors. The settings below are package variables.
+
+use Modern::Perl;
+use CGI qw ( -utf8 );
+use C4::Auth qw( checkauth );
+use C4::Biblio qw( ModBiblio GetFrameworkCode GetMarcFromKohaField );
+use C4::Charset qw( MarcToUTF8Record );
+use C4::Context;
+use Koha::Biblios;
+use Koha::Database;
+use Koha::ItemTypes;
+use Koha::Token;
+use Digest::SHA qw( sha1_hex );
+use Encode qw( decode encode );
+use MIME::Base64 qw( decode_base64 encode_base64 );
+use MARC::Record;
+use MARC::Field;
+use MARC::File::USMARC;
+use MARC::File::XML ( BinaryEncoding => 'utf8', RecordFormat => 'USMARC' );
+use POSIX qw( strftime );
+
+sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
+MRPL1
+    local k
+    printf "our \$BACKUP_DIR = '%s';\nour %%T = (\n" "$MR_DIR"
+    for k in title intro paste paste_hint file bn itype keep preview replace cancel err_csrf err_bn err_nobib \
+             err_input err_parse err_many err_lines err_title err_changed err_backup err_mod current new items_kept \
+             items_dropped charset confirm ok view prev_dl undo_hint warnings not_found; do
+        printf '    %s => _d(q{%s}),\n' "$k" "$(mr_text "$k" | base64 -w0)"
+    done
+    printf ');\n'
+    cat <<'MRPL2'
+
+run();
+
+sub h {
+    my $s = shift // '';
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    $s =~ s/'/&#39;/g;
+    return $s;
+}
+
+sub short_error {
+    my $e = shift // '';
+    $e =~ s/ at \S+ line \d+.*//s;
+    return substr( $e, 0, 300 );
+}
+
+# Pasted text: Biblioteca Nacional "245 10 |a Title" ("_" is a blank
+# indicator), MarcEdit "=245  10$aTitle" ("\" is a blank indicator) or
+# "245 10 $a Title" lines; the leader as 000, LDR or a line on its own.
+sub parse_mnemonic_marc {
+    my ($text) = @_;
+    my $record = MARC::Record->new();
+    my ( $leader, @bad );
+    my $n = 0;
+
+    for my $line ( split /\r?\n/, $text ) {
+        $n++;
+        next unless $line =~ /\S/;
+        $line =~ s/\s+$//;
+        my ( $tag, $rest, $mrk );
+        if ( $line =~ /^=(LDR|\d{3})  ?(.*)$/ ) {
+            ( $tag, $rest, $mrk ) = ( $1, $2, 1 );
+        } elsif ( $line =~ /^(LDR|\d{3}) (.*)$/ ) {
+            ( $tag, $rest ) = ( $1, $2 );
+        } elsif ( !defined $leader && $line =~ /^\s*(\d{5}[a-z ]{3}[a-z ][a ]\d\d.{12})$/ ) {
+            $leader = $1;
+            next;
+        } else {
+            push @bad, $n;
+            next;
+        }
+
+        if ( $tag eq '000' || $tag eq 'LDR' ) {
+            $rest =~ s/^\s+//;
+            $rest =~ s/\\/ /g if $mrk;
+            $leader = substr( $rest . ( ' ' x 24 ), 0, 24 );
+            next;
+        }
+
+        if ( $tag lt '010' ) {
+            my $data = $rest;
+            $data =~ s/^\s+//;
+            $data =~ s/\\/ /g if $mrk;
+            $record->append_fields( MARC::Field->new( $tag, $data ) );
+            next;
+        }
+
+        my ( $ind1, $ind2, $sf );
+        if ($mrk) {
+            ( $ind1, $ind2, $sf ) = ( substr( $rest, 0, 1 ), substr( $rest, 1, 1 ), substr( $rest, 2 ) );
+        } elsif ( $rest =~ /^([0-9 _#\\])([0-9 _#\\])\s*([|\$].*)$/ ) {
+            ( $ind1, $ind2, $sf ) = ( $1, $2, $3 );
+        } elsif ( $rest =~ /^\s*([|\$].*)$/ ) {
+            ( $ind1, $ind2, $sf ) = ( ' ', ' ', $1 );
+        } else {
+            push @bad, $n;
+            next;
+        }
+        for ( $ind1, $ind2 ) { $_ = ' ' if !defined $_ || $_ eq '_' || $_ eq '#' || $_ eq '\\' || $_ eq '' }
+
+        my $delim = $mrk ? '$' : substr( $sf, 0, 1 );
+        my @subfields;
+        for my $part ( split /\Q$delim\E/, $sf ) {
+            next unless length $part;
+            my $code  = substr( $part, 0, 1 );
+            my $value = substr( $part, 1 );
+            $value =~ s/\{dollar\}/\$/g if $mrk;
+            $value =~ s/^\s+//;
+            $value =~ s/\s+$//;
+            push @subfields, ( $code, $value ) if $code =~ /^[a-z0-9]$/ && length $value;
+        }
+        if ( !@subfields ) { push @bad, $n; next }
+        $record->append_fields( MARC::Field->new( $tag, $ind1, $ind2, @subfields ) );
+    }
+
+    $leader //= '00000nam a2200000 a 4500';
+    substr( $leader, 9, 1 ) = 'a';    # pasted text is Unicode
+    $record->leader($leader);
+    return ( $record, \@bad );
+}
+
+# ( record, charset, [warnings] ) from the pasted text or the uploaded
+# file; dies with the message to show.
+sub read_record {
+    my ($cgi) = @_;
+    my $pasted_text = $cgi->param('marctext');
+    if ( defined $pasted_text && $pasted_text =~ /\S/ ) {
+        my ( $record, $bad ) = parse_mnemonic_marc($pasted_text);
+        die $T{err_lines} . ' ' . join( ', ', @$bad ) . "\n" if @$bad;
+        die $T{err_parse} . "\n" unless $record->fields;
+        return ( $record, 'UTF-8', [] );
+    }
+
+    my $fh = $cgi->upload('marcfile');
+    die $T{err_input} . "\n" unless $fh;
+    binmode $fh;
+    my $raw = do { local $/; <$fh> };
+    die $T{err_input} . "\n" unless defined $raw && length $raw;
+
+    if ( $raw =~ /^\s*(<\?xml|<)/ ) {
+        my $count = () = $raw =~ /<(?:\w+:)?record[\s>]/g;
+        die $T{err_many} . "\n" if $count > 1;
+        my $record = eval { MARC::Record->new_from_xml( $raw, 'UTF-8', 'MARC21' ) };
+        die $T{err_parse} . ' ' . short_error($@) . "\n" unless $record;
+        return ( $record, 'UTF-8 (MARCXML)', [] );
+    }
+
+    my $count = () = $raw =~ /\x1D/g;
+    die $T{err_many} . "\n" if $count > 1;
+    my $flavour = C4::Context->preference('marcflavour') || 'MARC21';
+    my ( $record, $charset, $errors ) = eval { MarcToUTF8Record( $raw, $flavour ) };
+    die $T{err_parse} . ' ' . short_error($@) . "\n" unless $record && $record->fields;
+    return ( $record, $charset, ref $errors eq 'ARRAY' ? $errors : [] );
+}
+
+# Koha's field for the items (952 in MARC 21) is always left out.
+sub strip_items {
+    my ($record) = @_;
+    my ($itemtag) = GetMarcFromKohaField('items.itemnumber');
+    $itemtag ||= '952';
+    my @items = $record->field($itemtag);
+    $record->delete_fields(@items) if @items;
+    return scalar @items;
+}
+
+sub set_itemtype {
+    my ( $record, $itemtype ) = @_;
+    return unless defined $itemtype && $itemtype ne '';
+    my $field942 = $record->field('942');
+    if ($field942) {
+        if ( $field942->subfield('c') ) {
+            $field942->update( c => $itemtype );
+        } else {
+            $field942->add_subfields( c => $itemtype );
+        }
+    } else {
+        $record->insert_fields_ordered( MARC::Field->new( '942', ' ', ' ', c => $itemtype ) );
+    }
+    return;
+}
+
+sub current_metadata {
+    my ( $biblionumber, $lock ) = @_;
+    my ($xml) = C4::Context->dbh->selectrow_array(
+        "SELECT metadata FROM biblio_metadata WHERE biblionumber = ? AND format = 'marcxml'" . ( $lock ? ' FOR UPDATE' : '' ),
+        undef, $biblionumber );
+    return $xml;
+}
+
+sub digest { my $s = shift // ''; return sha1_hex( utf8::is_utf8($s) ? encode( 'UTF-8', $s ) : $s ) }
+
+# The previous version as MARCXML; returns its stamp (dies on failure).
+sub save_version {
+    my ( $biblionumber, $xml ) = @_;
+    my $stamp = strftime( '%Y%m%d-%H%M%S', localtime );
+    my $file  = "$BACKUP_DIR/$biblionumber-$stamp.xml";
+    die "exists: $file\n" if -e $file;
+    open( my $fh, '>:raw', "$file.tmp" ) or die "$file.tmp: $!\n";
+    print {$fh} utf8::is_utf8($xml) ? encode( 'UTF-8', $xml ) : $xml;
+    close($fh) or die "$file.tmp: $!\n";
+    chmod 0640, "$file.tmp";
+    rename( "$file.tmp", $file ) or die "$file: $!\n";
+    return $stamp;
+}
+
+sub run {
+    my $cgi = CGI->new;
+
+    # Staff login with permission to edit the catalogue (the session of
+    # the staff interface is reused: no new login).
+    my ( $user, $cookie, $sessionID ) = checkauth( $cgi, 0, { editcatalogue => 'edit_catalogue' }, 'intranet' );
+    my $op = $cgi->param('op') // '';
+
+    if ( $cgi->request_method eq 'GET' && $op eq 'download' ) {
+        send_version( $cgi, $cookie );
+        return;
+    }
+
+    print $cgi->header( -cookie => $cookie, -charset => 'utf-8' );
+
+    if ( $cgi->request_method eq 'POST' ) {
+        handle_post( $cgi, $op );
+    } else {
+        render_form( $cgi, '' );
+    }
+
+    return;
+}
+
+sub send_version {
+    my ( $cgi, $cookie ) = @_;
+    my $biblionumber = $cgi->param('biblionumber') // '';
+    my $stamp        = $cgi->param('version')      // '';
+    my $file         = "$BACKUP_DIR/$biblionumber-$stamp.xml";
+    if ( $biblionumber =~ /^\d+$/ && $stamp =~ /^\d{8}-\d{6}$/ && -f $file && open( my $fh, '<:raw', $file ) ) {
+        my $data = do { local $/; <$fh> };
+        close $fh;
+        print $cgi->header( -type => 'application/xml', -charset => 'utf-8', -attachment => "biblio-$biblionumber-$stamp.xml", -cookie => $cookie );
+        print $data;
+        return;
+    }
+    print $cgi->header( -status => '404 Not Found', -cookie => $cookie, -charset => 'utf-8' );
+    render_form( $cgi, '<div class="msg err">' . h( $T{not_found} ) . '</div>' );
+    return;
+}
+
+sub handle_post {
+    my ( $cgi, $op ) = @_;
+
+    my $csrf_ok = Koha::Token->new->check_csrf(
+        {
+            session_id => scalar $cgi->cookie('CGISESSID'),
+            token      => scalar $cgi->param('csrf_token'),
+        }
+    );
+    if ( !$csrf_ok ) {
+        render_form( $cgi, '<div class="msg err">' . h( $T{err_csrf} ) . '</div>' );
+        return;
+    }
+
+    my $biblionumber = $cgi->param('biblionumber');
+    $biblionumber =~ s/\D//g if defined $biblionumber;
+    if ( !$biblionumber ) {
+        render_form( $cgi, '<div class="msg err">' . h( $T{err_bn} ) . '</div>' );
+        return;
+    }
+    my $biblio = Koha::Biblios->find($biblionumber);
+    if ( !$biblio ) {
+        render_form( $cgi, '<div class="msg err">' . h( $T{err_nobib} ) . " ($biblionumber)</div>" );
+        return;
+    }
+
+    if ( $op eq 'cud-replace' ) {
+        do_replace( $cgi, $biblionumber );
+    } else {
+        do_preview( $cgi, $biblionumber, $biblio );
+    }
+    return;
+}
+
+sub do_preview {
+    my ( $cgi, $biblionumber, $biblio ) = @_;
+    my ( $record, $charset, $warnings ) = eval { read_record($cgi) };
+    if ( !$record ) {
+        render_form( $cgi, '<div class="msg err">' . h( short_error($@) ) . '</div>' );
+        return;
+    }
+    set_itemtype( $record, scalar $cgi->param('itemtype') );
+    my $dropped = strip_items($record);
+    if ( !$record->field('245') ) {
+        render_form( $cgi, '<div class="msg err">' . h( $T{err_title} ) . '</div>' );
+        return;
+    }
+
+    my $xml     = encode( 'UTF-8', $record->as_xml_record('MARC21') );
+    my $current = current_metadata($biblionumber);
+    my $token   = Koha::Token->new->generate_csrf( { session_id => scalar $cgi->cookie('CGISESSID') } );
+    my $items   = $biblio->items->count;
+
+    my $body = '<h2>' . h( $T{title} ) . '</h2>';
+    $body .= '<div class="msg warn"><b>' . h( $T{warnings} ) . '</b><br>' . join( '<br>', map { h($_) } @$warnings ) . '</div>' if @$warnings;
+    $body .= '<p>' . h( $T{confirm} ) . '</p>';
+    $body .= '<h3>' . h( $T{current} ) . " ($biblionumber)</h3><p><b>" . h( $biblio->title ) . '</b> ' . h( $biblio->author // '' ) . '</p>';
+    $body .= '<p>' . h( $T{items_kept} ) . " $items</p>";
+    $body .= '<p>' . h( $T{items_dropped} ) . " $dropped</p>" if $dropped;
+    $body .= '<p>' . h( $T{charset} ) . ' ' . h($charset) . '</p>';
+    $body .= '<h3>' . h( $T{new} ) . '</h3><pre>' . h( $record->as_formatted ) . '</pre>';
+    $body .= '<form method="post">'
+        . '<input type="hidden" name="op" value="cud-replace">'
+        . '<input type="hidden" name="csrf_token" value="' . h($token) . '">'
+        . '<input type="hidden" name="biblionumber" value="' . h($biblionumber) . '">'
+        . '<input type="hidden" name="record" value="' . encode_base64( $xml, '' ) . '">'
+        . '<input type="hidden" name="digest" value="' . digest($current) . '">'
+        . '<input type="submit" value="' . h( $T{replace} ) . '"> '
+        . '<a href="marc_replace.pl?biblionumber=' . h($biblionumber) . '">' . h( $T{cancel} ) . '</a></form>';
+    render_page($body);
+    return;
+}
+
+sub do_replace {
+    my ( $cgi, $biblionumber ) = @_;
+    my $record = eval { MARC::Record->new_from_xml( decode_base64( scalar $cgi->param('record') // '' ), 'UTF-8', 'MARC21' ) };
+    if ( !$record || !$record->field('245') ) {
+        render_form( $cgi, '<div class="msg err">' . h( $T{err_parse} ) . '</div>' );
+        return;
+    }
+    strip_items($record);
+    my $expected      = $cgi->param('digest') // '';
+    my $frameworkcode = GetFrameworkCode($biblionumber);
+    my $stamp;
+
+    my $success = eval {
+        Koha::Database->new->schema->txn_do(
+            sub {
+                my $current = current_metadata( $biblionumber, 1 );
+                die "CHANGED\n" unless defined $current && digest($current) eq $expected;
+                $stamp = eval { save_version( $biblionumber, $current ) };
+                die 'BACKUP ' . short_error($@) . "\n" unless $stamp;
+                ModBiblio( $record, $biblionumber, $frameworkcode ) or die "MODBIBLIO\n";
+            }
+        );
+        1;
+    };
+
+    if ($success) {
+        render_page( '<h2>' . h( $T{title} ) . '</h2><div class="msg ok">' . h( $T{ok} ) . " ($biblionumber) "
+                . qq{<a href="/cgi-bin/koha/catalogue/detail.pl?biblionumber=$biblionumber" target="_blank">} . h( $T{view} ) . '</a></div>'
+                . qq{<p><a href="marc_replace.pl?op=download&amp;biblionumber=$biblionumber&amp;version=$stamp">} . h( $T{prev_dl} ) . '</a><br>'
+                . h( $T{undo_hint} ) . '</p><p><a href="marc_replace.pl">' . h( $T{title} ) . '</a></p>' );
+        return;
+    }
+    my $err = $@ // '';
+    my $msg =
+          $err =~ /^CHANGED/   ? $T{err_changed}
+        : $err =~ /^BACKUP (.*)/ ? "$T{err_backup} $1"
+        :                        $T{err_mod} . ' ' . short_error( $err =~ /^MODBIBLIO/ ? 'ModBiblio' : $err );
+    render_form( $cgi, '<div class="msg err">' . h($msg) . '</div>' );
+    return;
+}
+
+sub render_page {
+    my ($body) = @_;
+    my $html = <<"HTML";
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>@{[ h( $T{title} ) ]}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 12px; }
+    label { display: block; margin-top: 16px; font-weight: bold; }
+    input[type=text], select { width: 100%; padding: 8px; box-sizing: border-box; }
+    input[type=submit] { margin-top: 20px; padding: 10px 20px; }
+    pre { background: #f6f6f6; padding: 10px; overflow-x: auto; white-space: pre-wrap; }
+    .msg { margin-top: 16px; padding: 10px; border-radius: 4px; }
+    .ok { background: #dff0d8; color: #3c763d; }
+    .err { background: #f2dede; color: #a94442; }
+    .warn { background: #fcf8e3; color: #8a6d3b; }
+  </style>
+</head>
+<body>
+$body
+</body>
+</html>
+HTML
+    print encode( 'UTF-8', $html );
+    return;
+}
+
+sub render_form {
+    my ( $cgi, $message ) = @_;
+
+    my $csrf_token   = Koha::Token->new->generate_csrf( { session_id => scalar $cgi->cookie('CGISESSID') } );
+    my $biblionumber = $cgi->param('biblionumber') // '';
+    $biblionumber =~ s/\D//g;
+    my $options = '<option value="">' . h( $T{keep} ) . '</option>';
+    for my $it ( Koha::ItemTypes->search( {}, { order_by => 'description' } )->as_list ) {
+        $options .= '<option value="' . h( $it->itemtype ) . '">' . h( $it->description ) . ' (' . h( $it->itemtype ) . ')</option>';
+    }
+
+    render_page( '<h2>' . h( $T{title} ) . '</h2><p>' . h( $T{intro} ) . "</p>$message"
+            . '<form method="post" enctype="multipart/form-data">'
+            . '<input type="hidden" name="op" value="cud-preview">'
+            . '<input type="hidden" name="csrf_token" value="' . h($csrf_token) . '">'
+            . '<label for="marctext">' . h( $T{paste} ) . '</label>'
+            . '<textarea id="marctext" name="marctext" rows="10" style="width:100%; font-family: monospace; box-sizing: border-box;" placeholder="000    00942nam a2200265 a 4500&#10;001    9085&#10;100 1_ |a Autor, Nome&#10;245 10 |a Titulo do livro"></textarea>'
+            . '<p style="font-size: 0.85em; color: #666;">' . h( $T{paste_hint} ) . '</p>'
+            . '<label for="marcfile">' . h( $T{file} ) . '</label>'
+            . '<input type="file" id="marcfile" name="marcfile" accept=".mrc,.marc,.iso,.xml">'
+            . '<label for="biblionumber">' . h( $T{bn} ) . '</label>'
+            . '<input type="text" id="biblionumber" name="biblionumber" value="' . h($biblionumber) . '" placeholder="12345" inputmode="numeric">'
+            . '<label for="itemtype">' . h( $T{itype} ) . ' (942$c)</label>'
+            . qq{<select id="itemtype" name="itemtype">$options</select>}
+            . '<input type="submit" value="' . h( $T{preview} ) . '">'
+            . '</form>' );
+    return;
+}
+MRPL2
+}
+
+# English texts of the page (translated with the panel).
+mr_text() {
+    case "$1" in
+        title)         t "Replace a MARC record by biblionumber" ;;
+        intro)         t "Choose the .mrc (ISO 2709) or .xml (MARCXML) file, or paste the record as text, and type the biblionumber of the record to replace. A preview comes first. The items of the record are never changed: item fields in the file are left out." ;;
+        paste)         t "Paste the record as text (optional)" ;;
+        paste_hint)    t "Accepted text: lines like 245 10 |a Title (Biblioteca Nacional), MarcEdit lines (=245) or yaz-marcdump lines. When text is pasted, the file below is ignored." ;;
+        file)          t "Or choose a MARC file (.mrc or .xml)" ;;
+        bn)            t "Biblionumber" ;;
+        itype)         t "Item type, optional" ;;
+        keep)          t "-- do not change --" ;;
+        preview)       t "Preview" ;;
+        replace)       t "Replace the record" ;;
+        cancel)        t "Cancel" ;;
+        err_csrf)      t "Invalid or expired security token. Reload the page and try again." ;;
+        err_bn)        t "No biblionumber given: no record was replaced." ;;
+        err_nobib)     t "There is no record with this biblionumber: nothing was replaced." ;;
+        err_input)     t "Paste the text of the record or choose a .mrc or .xml file." ;;
+        err_parse)     t "The MARC record could not be read." ;;
+        err_many)      t "The file has more than one record. Send a file with only the record to replace." ;;
+        err_lines)     t "These lines of the pasted text were not understood:" ;;
+        err_title)     t "The new record has no title (field 245): nothing was replaced." ;;
+        err_changed)   t "The record was changed after the preview. Nothing was replaced: make a new preview." ;;
+        err_backup)    t "The previous version could not be saved, so nothing was replaced:" ;;
+        err_mod)       t "Koha could not replace the record. Nothing was changed:" ;;
+        current)       t "Record now in the catalogue" ;;
+        new)           t "New record (as it will be saved)" ;;
+        items_kept)    t "Items of the record (kept as they are):" ;;
+        items_dropped) t "Item fields found in the file and left out:" ;;
+        charset)       t "Characters read as:" ;;
+        confirm)       t "Replace the record with the one below? The current version is saved first and can be downloaded afterwards." ;;
+        ok)            t "Record replaced." ;;
+        view)          t "View the record" ;;
+        prev_dl)       t "Download the previous version (MARCXML)" ;;
+        undo_hint)     t "To undo, send that file here with the same biblionumber." ;;
+        warnings)      t "Warnings:" ;;
+        not_found)     t "This saved version does not exist." ;;
+    esac
+}
+
+# Link in the staff interface: "Replace the record (MARC file)" in the Edit
+# menu of the record page (a marked block in IntranetUserJS).
+mr_js_block() {
+    local label
+    label=$(t "Replace the record (MARC file)")
+    label=${label//\\/\\\\}; label=${label//\"/\\\"}; label=${label//</\\u003c}
+    cat <<MRJS
+${MR_JS_BEGIN}
+\$(document).ready(function () {
+    var m = location.pathname.match(/\/cgi-bin\/koha\/catalogue\/(detail|MARCdetail|ISBDdetail|labeledMARCdetail|moredetail)\.pl\$/);
+    var bn = new URLSearchParams(location.search).get("biblionumber");
+    if (!m || !bn || !/^[0-9]+\$/.test(bn)) return;
+    var menu = \$("#editbiblio").closest(".dropdown-menu");
+    if (!menu.length) return;
+    var a = \$("<a class=\"dropdown-item\"></a>").attr("href", "/cgi-bin/koha/tools/marc_replace.pl?biblionumber=" + bn).text("${label}");
+    menu.append(\$("<li></li>").append(a));
+});
+${MR_JS_END}
+MRJS
+}
+
+# IntranetUserJS as stored (--raw: line breaks and backslashes unescaped).
+mr_js_current() {
+    mysql --default-character-set=utf8mb4 -N -B --raw -e "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'IntranetUserJS';" 2>/dev/null
+}
+
+mr_js_sql() {   # mr_js_sql add|remove FILE: SQL that rewrites IntranetUserJS
+    local cur new
+    cur=$(mr_js_current)
+    cur=$(printf '%s\n' "$cur" | awk -v b="$MR_JS_BEGIN" -v e="$MR_JS_END" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }')
+    new="$cur"
+    if [ "$1" = "add" ]; then new="${cur:+${cur}$'\n'}$(mr_js_block)"; fi
+    printf "START TRANSACTION;\nUPDATE systempreferences SET value = %s WHERE variable = 'IntranetUserJS';\nCOMMIT;\n" "$(sql_quote "$new")" > "$2"
+}
+
+mr_installed() { [ -f "$MR_FILE" ]; }
+mr_js_on() { mr_js_current | grep -qxF "$MR_JS_BEGIN"; }
+
+function_marc_replace() {
+    require_database || return 0
+    local opt status
+    while true; do
+        if mr_installed; then status="$(t "Installed"): /cgi-bin/koha/tools/marc_replace.pl"; else status="$(t "Not installed.")"; fi
+        opt=$(ui_menu "$(t "⇄  Replace a MARC record (staff tool)")" "$(t "A page of the staff interface that replaces a record by its biblionumber with a .mrc or .xml file or pasted text, showing a preview first. The items are never changed and the previous version is saved.")"$'\n\n'"$status" \
+            "1" "$(t "Install or update the page")" \
+            "2" "$(t "Remove the page")" \
+            "3" "$(t "Versions saved by the page")") || return 0
+        case "$opt" in
+            1) lt_mr_install ;;
+            2) lt_mr_remove ;;
+            3) lt_mr_versions ;;
+        esac
+        clear
+    done
+}
+
+lt_mr_install() {
+    if [ ! -d "${KOHA_INTRA_CGI}/tools" ]; then
+        msg_error "" "$(t "The staff interface folder of Koha was not found. Nothing was changed.")" 9 72
+        return 1
+    fi
+    local link="no"
+    prompt_yes_no "$(t "Replace a MARC record")" "$(t "Also add Replace the record (MARC file) to the Edit menu of the record page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 11 76 && link="yes"
+    tools_locked _lt_mr_install "$link"
+}
+
+_lt_mr_install() {
+    local link="$1" log new sql updating=0 url
+    log=$(tools_log marc-replace)
+    new="$TOOLS_WORK/marc_replace.pl"
+    marc_replace_script > "$new"
+    chmod 644 "$new"
+    display_explanation "Checking the page with the Perl modules of Koha..."
+    # Compiled as the instance user with Koha's libraries before it is installed.
+    if ! koha_exec "$log" perl-check /usr/bin/perl -c "$new"; then
+        ui_textbox "$(t "Replace a MARC record")" "$log"
+        msg_error "" "$(t 'The page does not compile with this version of Koha. Nothing was changed.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    mr_installed && updating=1
+    mkdir -p "$MR_DIR" && chown "${INSTANCE}-koha:${INSTANCE}-koha" "$MR_DIR" 2>/dev/null
+    chmod 750 "$MR_DIR"
+    if [ "$link" = "yes" ] && ! mr_js_on; then
+        tools_safety_backup MARC-REPLACE || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        mr_js_sql add "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    install -o root -g root -m 755 "$new" "${MR_FILE}.new" && mv -f "${MR_FILE}.new" "$MR_FILE" || {
+        msg_error "" "$(t "The page could not be installed. Nothing was changed.")" 8 64; return 1; }
+    printf 'installed=%s\nlink=%s\n' "$(date +%F)" "$link" > "$MR_STATE"
+    # Plack keeps compiled pages in memory: an updated page needs a restart.
+    [ "$updating" = "1" ] && plack_restart
+    url="/cgi-bin/koha/tools/marc_replace.pl"
+    log "marc_replace: page installed (link=$link)"
+    msg_ok "$(t '✔ Page installed. In the staff interface: ${url}\n\nPrevious versions of the replaced records: ${MR_DIR}')" 11 76
+}
+
+lt_mr_remove() {
+    mr_installed || mr_js_on || { msg_info "$(t "Replace a MARC record")" "$(t "Not installed.")" 8 60; return 0; }
+    prompt_yes_no "$(t "Replace a MARC record")" "$(t 'Remove the page (and its link in the Edit menu)? The versions saved in ${MR_DIR} are kept.')" 10 74 defaultno || return 0
+    tools_locked _lt_mr_remove
+}
+
+_lt_mr_remove() {
+    local log sql
+    log=$(tools_log marc-replace)
+    if mr_js_on; then
+        tools_safety_backup MARC-REPLACE || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        mr_js_sql remove "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    rm -f "$MR_FILE" "$MR_STATE"
+    plack_restart
+    log "marc_replace: page removed"
+    msg_ok "$(t "✔ The page was removed.")"
+}
+
+lt_mr_versions() {
+    local out
+    tools_workdir || return 1
+    out="$TOOLS_WORK/versions.txt"
+    {
+        printf '%s\n%s\n\n' "$(t "Versions saved before each replacement (biblionumber-date-time.xml):")" "$MR_DIR"
+        find "$MR_DIR" -maxdepth 1 -name '*.xml' -printf '%TY-%Tm-%Td %TH:%TM  %f\n' 2>/dev/null | sort -r | head -n 200
+    } > "$out"
+    ui_textbox "$(t "Versions saved by the page")" "$out"
 }
 
 # Loaded with "source installer" (tests/): functions only, no menu.
