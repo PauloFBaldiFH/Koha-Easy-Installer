@@ -21,7 +21,9 @@ It was born from real-life experience facing technical barriers in collection ma
 - **Security**: Fail2ban, UFW firewall (with option to restrict the staff port 8080) and database password rotation.
 - **Koha settings**: server sizing profiles, e-mail notices (Koha's own schedule, enabled with `koha-email-enable`), super librarian creation, SIP2 and Z39.50, clock and timezone.
 - **Library tools**: guided MARC import with undo, essential SQL reports pack, patron import from CSV and school-year category turnover, catalog data-quality check, and privacy (LGPD) housekeeping. Every change is previewed first with Koha's own dry run and protected by a verified backup (see [Library tools](#library-tools)).
-- **Brazil: localization & migration** (opt-in, never applied by the installation or by a schedule): MARC migration from Biblivre, SophiA and Pergamum (UTF-8 conversion, items moved to Koha's 952), legacy patron spreadsheets with CPF check, CPF audit (modulo 11), Pimaco label templates, the Brazilian cataloguing card (ficha catalográfica) and Brazilian holidays in the Koha calendar (see [Brazil: localization & migration](#brazil-localization--migration)).
+- **Brazil: localization & migration** (opt-in, never applied by the installation or by a schedule): MARC migration from Biblivre, SophiA and Pergamum (UTF-8 conversion, items moved to Koha's 952), collection spreadsheets (Biblioteca Fácil), legacy patron spreadsheets with CPF check, CPF audit (modulo 11), Pimaco label templates, the Brazilian cataloguing card (ficha catalográfica) and Brazilian holidays in the Koha calendar (see [Brazil: localization & migration](#brazil-localization--migration)).
+- **Messaging: WhatsApp and Telegram** (opt-in): Koha's own notices (checkout, check-in, overdue, due, hold) delivered through a self-hosted WhatsApp gateway (Evolution API or similar) or a Telegram bot, with the patrons' numbers completed and corrected on the way (see [Messaging](#messaging-whatsapp-and-telegram)).
+- **Cataloguing aids**: author notation with the PHA or Cutter-Sanborn table loaded by the library, Dewey (CDD) lookup, and a staff-interface page that replaces a record by its biblionumber without touching its items (see [Cataloguing aids](#cataloguing-aids-pha-cutter-sanborn-cdd) and [Replace a MARC record](#replace-a-marc-record-staff-interface)).
 - **Languages**: installs Koha language packs and translates the panel itself (22 languages).
 - **Self-update** from GitHub with SHA-256 verification.
 
@@ -79,7 +81,7 @@ sudo config.sh
 | 7 | Diagnostics & maintenance | Status, health check, logs, optimization |
 | 8 | Security center | Fail2ban, firewall, password rotation |
 | 9 | Koha settings & parameters | Sizing, e-mail, super librarian, SIP2/Z39.50, clock |
-| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration |
+| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration, WhatsApp / Telegram messaging, cataloguing aids, replace a MARC record |
 | 11 | General tools | htop/nethogs, terminal browser, file manager |
 | 12 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
 | 13 | Koha languages | Koha language packs and panel language |
@@ -115,6 +117,7 @@ Every run is logged in `/var/log/koha-easy-install/tools/` (readable by root onl
 |------|--------------|---------|--------|
 | Migrate MARC from Biblivre, SophiA, Pergamum or another system (field map typed by hand) | Characters converted to UTF-8 with `yaz-marcdump` (from Latin-1 or MARC-8; the `yaz` package is offered when missing); the item field (Biblivre 949, Pergamum 852, SophiA 990 or your own map) is moved to Koha's 952 (barcode, call number, copy, notes, library, item type) with Koha's own MARC::Record; then the normal MARC import (`stage_file.pl` / `commit_file.pl`, undo with `--revert`) | Counts and a sample of the converted items, then Koha's staging report | `PRE-IMPORT` |
 | Import patrons from a legacy spreadsheet | Finds the columns by their Portuguese or English names (Nome, Matrícula, CPF, E-mail, Nascimento...), Windows-1252 or UTF-8, `;` or `,`; checks the CPF (modulo 11, repeated digits, duplicates), uses it as card number when there is none and keeps it in a patron attribute with code `CPF` when that type exists; then `import_patrons.pl` | Rejected lines with the reason, then Koha's dry run | `PRE-PATRONS` |
+| Migrate a collection spreadsheet (Biblioteca Fácil and other programs that export the collection to Excel / CSV) | Columns found by their usual names (Tombo, Título, Autor, Editora, Ano, ISBN, CDD, Cutter, Assunto, Exemplar, Tipo, Data de aquisição, Valor...), Windows-1252 or UTF-8; rows with the same title, author, edition, year and ISBN become one MARC 21 record (built with MARC::Record) with one item in 952 per row (tombo as barcode, CDD + Cutter as call number, item type by code or description); repeated barcodes are dropped; then the normal MARC import (undo with `--revert`) | Columns used and ignored, counts and a sample of the records, then Koha's staging report | `PRE-IMPORT` |
 | Check patron CPFs (read-only) | Card number, username, sort1/sort2 or the `CPF` attribute: valid, invalid, shared by two patrons | — | — |
 | Pimaco label templates | Sheets 6180, 6181, 6287 (Letter) and A4256, A4251 (A4) plus 3 layouts (spine, barcode, title and barcode) in Koha's label creator; updates or removes only its own templates | Summary before the change | `PRE-LABELS` |
 | Cataloguing card (ficha catalográfica) | Stylesheets that wrap Koha's default detail view (OPAC and staff interface, one per installed language) and add the card below the record, with a print button; set in `OPACXSLTDetailsDisplay` / `XSLTDetailsDisplay`. The previous values are kept and **Hide the card** puts them back; the files are rewritten each time the panel starts, so they follow Koha updates | Old and new values | `PRE-FICHA` |
@@ -124,6 +127,41 @@ Every run is logged in `/var/log/koha-easy-install/tools/` (readable by root onl
 - The card follows the AACR2 layout used by Brazilian libraries (call number column, hanging indent, numbered subjects, roman-numbered added entries).
 - The Biblivre, SophiA and Pergamum presets follow their usual export layout. The preview shows the result before anything is written; **Other layout** accepts any item field.
 - Carnival and Corpus Christi are *ponto facultativo*, not national holidays: remove them in Tools > Calendar if the library opens. Consciência Negra (20/11) is added from 2024 on.
+- The Biblioteca Fácil preset reads a spreadsheet export; it was written from the usual column names, not from a real export of that program. The preview lists the columns it used and the ones it ignored before anything is written.
+
+### Messaging: WhatsApp and Telegram
+
+**Library tools > Messaging: WhatsApp and Telegram**. Koha already writes the notices (checkout, check-in, overdue, due, hold) and hands those of the SMS type to the SMS::Send driver named in the `SMSSendDriver` preference. The panel installs such a driver (`SMS::Send::KohaEasy::Gateway`): each notice goes to Telegram when the patron linked the library's bot, otherwise to WhatsApp. Nothing changes in Koha until **Send Koha notices** is turned on, and turning it off puts the previous `SMSSendDriver` back (verified `PRE-MESSAGING` backup both ways).
+
+| Option | What it does |
+|--------|--------------|
+| WhatsApp gateway | A gateway of the library's own: Evolution API v2 (`POST /message/sendText/<instance>`, `apikey` header) or another one that accepts `{"number", "to", "text"}` with a Bearer token |
+| Telegram bot | The token from @BotFather is checked with Telegram (`getMe`). Patrons open the bot, tap Start and share their own contact; a job every two minutes links the chat to the number (`/stop` undoes it) |
+| Country and area code | Numbers are completed and corrected before sending: country code (Brazil by default, or any other), area code (DDD) for numbers without one, trunk and carrier prefixes removed, and the 9th digit of Brazilian mobiles added |
+| Send a test message | Through the same SMS::Send path Koha uses, as the instance user |
+| What Koha needs | Checks `SMSSendDriver`, the SMS versions of the notices, overdue rules with SMS and patrons with SMS numbers and preferences; offers to create short SMS versions of the notices that have none (`PRE-NOTICES`) |
+| Check the patrons' phone numbers | Read-only report with the same rules; the corrected numbers are written only on confirmation (`PRE-PHONES`) |
+
+The settings (with the tokens) are in `/etc/koha/sites/library/kei-messaging.conf`, readable by root and Koha only. When the notices are on, the SMS queue is also sent every two minutes (`/etc/cron.d/koha_messaging`).
+
+### Cataloguing aids: PHA, Cutter-Sanborn, CDD
+
+**Library tools > Cataloguing aids**, read-only for the catalogue.
+
+- **Author notation**: the entry right before the name in the table, the initial of the surname, the number and the initial of the title (the initial article never counts, and a title starting with "l" gets a capital L); prefixes read as one word (La Fonte, O'Donnel) and M' / Mc as Mac; institutions by the first word and anonymous works by the first word of the title, as in the PHA explanation. From a catalogue record it reads 100 / 110 / 111, 245 (with its nonfiling indicator) and 082, and lists the call numbers that already use the same number in that class, with the free numbers right before and after it.
+- **The tables are not distributed with the panel**: the PHA table (Heloísa de Almeida Prado, T. A. Queiroz) and the Cutter-Sanborn tables are copyrighted. Each library loads its own copy as a text file (one entry and its number per line; the PHA rows can be typed as printed, entry - number - entry). The file is checked before it is kept: entries per letter, numbers out of order (typing mistakes) and repeated entries.
+- **CDD**: the ten main classes are built in; the library can load its own schedule (number and caption per line) to search by number or by word, and every lookup also shows how the catalogue already uses the number.
+
+### Replace a MARC record (staff interface)
+
+**Library tools > Replace a MARC record** installs `marc_replace.pl` in Koha's staff interface (`/cgi-bin/koha/tools/marc_replace.pl`, and optionally in the Edit menu of each record). It replaces a record, found by its biblionumber, with an `.mrc` or `.xml` file or pasted text (Biblioteca Nacional `245 10 |a`, MarcEdit or yaz-marcdump lines):
+
+- login with the `edit_catalogue` permission and a CSRF token (Koha 24.05+ `cud-` operations);
+- a preview first; then, in one transaction, the current record is locked and compared with the preview (nothing is replaced if it changed), saved as MARCXML in `/var/lib/koha/library/kei-marc-replace/` (downloadable from the page, and accepted back to undo) and replaced with Koha's `ModBiblio`;
+- item fields in the file are always left out: the items are never touched;
+- MARC-8 / Latin-1 files are converted by Koha's own `MarcToUTF8Record`.
+
+The page is checked with Koha's Perl modules before it is installed; removing it keeps the saved versions.
 
 ## Automated tasks
 
@@ -151,6 +189,10 @@ E-mail notices are left to Koha's own schedule (`koha-common`): overdue and adva
 | `/var/log/koha-easy-install/` | Panel, APT and validation logs (`tools/`: library tools, root only) |
 | `/root/koha_patrons_template.csv` | Empty CSV template for the patron import |
 | `/var/lib/koha/library/kei-xslt/` | Cataloguing card stylesheets (only while the card is enabled) |
+| `/etc/koha/sites/library/kei-messaging.conf` | WhatsApp / Telegram settings and tokens (root and Koha only) |
+| `/usr/local/lib/site_perl/SMS/Send/KohaEasy/Gateway.pm` | The messaging driver of Koha (with `KohaEasy/Messaging.pm`) |
+| `/etc/koha-easy-install/tables/` | Author tables and CDD schedule loaded by the library |
+| `/var/lib/koha/library/kei-marc-replace/` | Records as they were before each replacement |
 
 If the installation stops, the panel shows the failed step. The full package manager output is in `/var/log/koha-easy-install/apt.log`.
 
@@ -167,10 +209,11 @@ Copy your backups somewhere else before running it.
 
 ## Tests (for contributors)
 
-`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card) and the schedule upgrade.
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card, collection spreadsheets), the messaging driver (against a WhatsApp / Telegram test double), the author notation and CDD lookup, `marc_replace.pl` (run as a CGI) and the schedule upgrade.
 
 ```bash
-sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl
+sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \
+     libmarc-record-perl libmarc-xml-perl libsms-send-perl libcgi-pm-perl libmodern-perl-perl
 sudo KEI_TEST_SANDBOX=1 tests/run.sh
 ```
 

@@ -16,7 +16,7 @@ KOHA_TOOLS=(koha-plack koha-zebra koha-indexer koha-es-indexer koha-worker koha-
             koha-create koha-remove koha-sip koha-z3950-responder koha-email-enable koha-mysql)
 # Koha's command-line scripts used by the library tools (tests/mocks/koha-script).
 KOHA_SCRIPTS=(stage_file.pl commit_file.pl import_patrons.pl cronjobs/update_patrons_category.pl
-              cronjobs/delete_patrons.pl cronjobs/batch_anonymise.pl
+              cronjobs/delete_patrons.pl cronjobs/batch_anonymise.pl cronjobs/process_message_queue.pl
               maintenance/search_for_data_inconsistencies.pl admin/koha-preferences)
 
 die() { echo "tests/run.sh: $*" >&2; exit 1; }
@@ -26,11 +26,13 @@ die() { echo "tests/run.sh: $*" >&2; exit 1; }
 if dpkg-query -W -f='${Status}' koha-common 2>/dev/null | grep -q 'ok installed'; then
     die "a real koha-common is installed here; the tests would destroy it."
 fi
-for c in bats mysql mysqldump mariadbd memcached whiptail gzip flock setsid yaz-marcdump xsltproc; do
-    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail yaz xsltproc libmarc-record-perl)."
+for c in bats mysql mysqldump mariadbd memcached whiptail gzip flock setsid yaz-marcdump xsltproc python3; do
+    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 libmarc-record-perl)."
 done
-# The MARC migration runs Koha's MARC::Record stack (koha-common depends on it).
-perl -MMARC::Record -e 1 2>/dev/null || die "missing MARC::Record (apt-get install libmarc-record-perl)."
+# The MARC tools, the messaging driver and marc_replace.pl run on Koha's own
+# Perl stack (koha-common depends on these packages).
+perl -MMARC::Record -MMARC::File::XML -MSMS::Send -MCGI -MModern::Perl -e 1 2>/dev/null \
+    || die "missing Perl modules (apt-get install libmarc-record-perl libmarc-xml-perl libsms-send-perl libcgi-pm-perl libmodern-perl-perl)."
 
 install_doubles() {
     mkdir -p "$LIBDIR" /usr/share/koha/bin /etc/koha/sites/library /run/kei-mock
@@ -42,6 +44,9 @@ install_doubles() {
     done
     install -m 644 "$MOCKS/koha-functions.sh" /usr/share/koha/bin/koha-functions.sh
     install -m 755 "$MOCKS/koha-script" "$LIBDIR/koha-script"
+    # Koha's Perl modules used by marc_replace.pl, and the WhatsApp / Telegram API.
+    rm -rf "$LIBDIR/perl5" && cp -r "$MOCKS/perl5" "$LIBDIR/perl5"
+    install -m 755 "$MOCKS/http-mock" "$LIBDIR/http-mock"
     mkdir -p /usr/share/koha/bin/cronjobs /usr/share/koha/bin/maintenance /usr/share/koha/bin/admin
     for t in "${KOHA_SCRIPTS[@]}"; do
         if [ -e "/usr/share/koha/bin/$t" ] && [ ! -L "/usr/share/koha/bin/$t" ]; then die "/usr/share/koha/bin/$t is a real file; not overwriting."; fi

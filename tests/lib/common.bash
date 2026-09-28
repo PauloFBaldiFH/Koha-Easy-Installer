@@ -163,6 +163,11 @@ kei_reset_env() {
     rm -rf /var/backups/koha_sql /var/backups/koha_marc /run/koha-easy-install
     rm -f /etc/cron.d/koha_* /var/lock/koha_backup.lock /var/run/koha_backup.pid
     rm -f /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-es-watchdog.sh /usr/local/bin/koha-wait-services.sh
+    # Modules of Library tools 11-13 (messaging, cataloguing tables, marc_replace.pl).
+    rm -rf /usr/local/lib/site_perl/KohaEasy /usr/local/lib/site_perl/SMS/Send/KohaEasy /usr/local/lib/koha-easy-installer \
+           /etc/koha/sites/library/kei-messaging.conf /var/lib/koha/library/kei-messaging /var/lib/koha/library/kei-marc-replace \
+           /etc/koha-easy-install/messaging.state /etc/koha-easy-install/marc_replace.state /etc/koha-easy-install/tables \
+           "$KEI_S/koha" "$KEI_S/http.log" "$KEI_S/http-fail" "$KEI_S/tg-updates.json"
     rm -f /etc/systemd/system/koha-common.service.d/koha-easy-install.conf /etc/systemd/system/apache2.service.d/koha-easy-install.conf
     cp -f "$KEI_REPO/tests/mocks/koha-conf.xml" /etc/koha/sites/library/koha-conf.xml
     printf 'USE_INDEXER_DAEMON="yes"\n' > /etc/default/koha-common
@@ -313,3 +318,56 @@ SQL
 # kei_marc FILE ENCODING MARCXML: ISO 2709 file written by yaz-marcdump
 # (leader/09 blank, like the exports of older systems).
 kei_marc() { yaz-marcdump -i marcxml -o marc -f UTF-8 -t "$2" -l 9=32 "$3" > "$1"; }
+
+# ---------------------------------------------------------------------
+# Library tools 11-13 (messaging, cataloguing aids, marc_replace.pl), on
+# top of kei_tools_catalog and kei_br_catalog: notices (with Koha's SMS
+# versions of CHECKOUT and HOLD only), messaging preferences, SMS numbers
+# in several shapes, a real MARCXML record (biblionumber 201) and call
+# numbers already using L589 in class 025.4.
+# ---------------------------------------------------------------------
+kei_modules_catalog() {
+    mysql "$DB" <<'SQL'
+CREATE TABLE letter (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, module varchar(20) NOT NULL DEFAULT '', code varchar(20) NOT NULL DEFAULT '',
+  branchcode varchar(10) NOT NULL DEFAULT '', name varchar(100) NOT NULL DEFAULT '', is_html tinyint(1) DEFAULT 0, title varchar(200) NOT NULL DEFAULT '',
+  content mediumtext, message_transport_type varchar(20) NOT NULL DEFAULT 'email', lang varchar(25) NOT NULL DEFAULT 'default',
+  UNIQUE KEY letter_uniq_1 (module, code, branchcode, message_transport_type, lang)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO letter (module, code, name, title, content, message_transport_type) VALUES
+  ('circulation', 'CHECKOUT', 'Item check-out (digest)', 'Checkouts', 'email text', 'email'),
+  ('circulation', 'CHECKOUT', 'Item check-out (digest)', 'Checkouts', 'The following items have been checked out: [% biblio.title %]', 'sms'),
+  ('circulation', 'ODUE', 'Overdue notice', 'Item overdue', 'email text', 'email'),
+  ('reserves', 'HOLD', 'Hold available for pickup', 'Hold', 'Your hold [% biblio.title %] is waiting', 'sms');
+CREATE TABLE overduerules_transport_types (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, letternumber int(1) NOT NULL DEFAULT 1,
+  message_transport_type varchar(20) NOT NULL DEFAULT 'email', overduerules_id int(11) NOT NULL);
+INSERT INTO overduerules_transport_types (message_transport_type, overduerules_id) VALUES ('email', 1), ('sms', 1);
+CREATE TABLE borrower_message_preferences (borrower_message_preference_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  borrowernumber int(11), categorycode varchar(10), message_attribute_id int(11) DEFAULT 0, days_in_advance int(11), wants_digest tinyint(1) NOT NULL DEFAULT 0);
+CREATE TABLE borrower_message_transport_preferences (borrower_message_preference_id int(11) NOT NULL, message_transport_type varchar(20) NOT NULL);
+INSERT INTO borrower_message_preferences (borrowernumber, message_attribute_id) SELECT borrowernumber, 6 FROM borrowers WHERE cardnumber IN ('S1', 'S2');
+INSERT INTO borrower_message_transport_preferences SELECT borrower_message_preference_id, 'sms' FROM borrower_message_preferences;
+ALTER TABLE borrowers ADD COLUMN smsalertnumber varchar(50), ADD COLUMN mobile varchar(50);
+UPDATE borrowers SET smsalertnumber = '(44) 9876-5432' WHERE cardnumber = 'S1';
+UPDATE borrowers SET smsalertnumber = '+5544998765432' WHERE cardnumber = 'S2';
+UPDATE borrowers SET smsalertnumber = '(10) 1234-5678' WHERE cardnumber = 'S3';
+UPDATE borrowers SET smsalertnumber = '0 15 44 3524-1234' WHERE cardnumber = 'E1';
+INSERT INTO systempreferences (variable, value, type) VALUES ('SMSSendDriver', 'Email', 'Free'), ('EnhancedMessagingPreferences', '1', 'YesNo'),
+  ('IntranetUserJS', '/* the library''s own code */\n$(document).ready(function () { var re = /a\\b/; });', 'Textarea');
+INSERT INTO biblio VALUES (201, 'Classificação decimal', 'Lentino, Noêmia', '2024-01-01'), (202, 'Outra obra', 'Lent, Carlos', '2024-01-01');
+INSERT INTO biblio_metadata (biblionumber, format, `schema`, metadata) VALUES (201, 'marcxml', 'MARC21',
+  '<?xml version="1.0" encoding="UTF-8"?>\n<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00300nam a2200100 a 4500</leader><datafield tag="082" ind1="0" ind2="4"><subfield code="a">025.4</subfield></datafield><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Lentino, Noêmia,</subfield></datafield><datafield tag="245" ind1="1" ind2="2"><subfield code="a">A classificação decimal /</subfield></datafield></record>');
+INSERT INTO items (biblionumber, barcode, homebranch, itemcallnumber) VALUES (202, 'LENT-1', 'CPL', '025.4 L589o'), (201, 'LENTINO-1', 'CPL', '025.4 L589c'),
+  (202, 'OTHER-1', 'CPL', '025.4 L5891a'), (202, 'OTHER-2', 'CPL', '869.3 L589x');
+SQL
+}
+
+# The WhatsApp / Telegram test double on 127.0.0.1:PORT (default 18080).
+kei_http_mock_start() {
+    local port="${1:-18080}" i
+    kei_detached /usr/local/lib/kei-mock/http-mock "$port" "$KEI_S"
+    for i in $(seq 1 40); do
+        (exec 5<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { pgrep -f "http-mock $port" >> "$KEI_S/daemons.pids"; return 0; }
+        sleep 0.25
+    done
+    return 1
+}
+http_log() { cat "$KEI_S/http.log" 2>/dev/null; }
