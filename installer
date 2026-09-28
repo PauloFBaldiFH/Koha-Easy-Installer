@@ -644,7 +644,7 @@ PANEL_LOCK_FILE="/var/run/koha_panel.lock"
 # Read-only commands for the Windows tools (section 21.5) run next to an
 # open panel: no lock, no dependency install, no menu.
 KEI_CLI_MODE=""
-case "${1:-}" in --status-json|--export-diagnostics) KEI_CLI_MODE="$1" ;; esac
+case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat) KEI_CLI_MODE="$1" ;; esac
 
 if [ -z "$KEI_CLI_MODE" ]; then
     exec 9> "$PANEL_LOCK_FILE"
@@ -2751,10 +2751,9 @@ write_banner() {
     
     # Detecta URLs do Cloudflare Tunnel se configurado
     local cf_opac="" cf_staff=""
-    if [ -f /etc/cloudflared/config.yml ]; then
-        cf_opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        cf_staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-    fi
+    read -r cf_opac cf_staff < <(tunnel_public_hosts)
+    [ "$cf_opac" = "-" ] && cf_opac=""
+    [ "$cf_staff" = "-" ] && cf_staff=""
 
     local staff_cf_text opac_cf_text
     staff_cf_text="$(t "(Configure in panel)")"
@@ -3334,14 +3333,13 @@ function_view_credentials() {
     ip=$(get_server_ip)
     ssh_login=$(get_ssh_login "$ip")
 
-    if [ -f /etc/cloudflared/config.yml ]; then
-        cf_opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        cf_staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        if [ -n "$cf_opac" ] || [ -n "$cf_staff" ]; then
-            cf_section="$(t "\n[ INTERNET / CLOUDFLARE TUNNEL ]\n")"
-            [ -n "$cf_opac" ] && cf_section+="  $(t "OPAC  (catalog)       :") https://${cf_opac}\n"
-            [ -n "$cf_staff" ] && cf_section+="  $(t "Staff (administration):") https://${cf_staff}\n"
-        fi
+    read -r cf_opac cf_staff < <(tunnel_public_hosts)
+    [ "$cf_opac" = "-" ] && cf_opac=""
+    [ "$cf_staff" = "-" ] && cf_staff=""
+    if [ -n "$cf_opac" ] || [ -n "$cf_staff" ]; then
+        cf_section="$(t "\n[ INTERNET / CLOUDFLARE TUNNEL ]\n")"
+        [ -n "$cf_opac" ] && cf_section+="  $(t "OPAC  (catalog)       :") https://${cf_opac}\n"
+        [ -n "$cf_staff" ] && cf_section+="  $(t "Staff (administration):") https://${cf_staff}\n"
     fi
 
     local body
@@ -4969,17 +4967,18 @@ SQLEOF
 # 14. CLOUDFLARE MANAGER
 # ======================================================================
 function_cloudflare_status() {
-    if [ ! -f /etc/cloudflared/config.yml ]; then
+    if [ ! -f /etc/cloudflared/config.yml ] && ! tunnel_mode_is broker; then
         msg_error "" "$(t "The tunnel is not configured yet.\nUse the installation option first.")" 9 70
         return
     fi
 
     local opac_host staff_host c_status
-    opac_host=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-    staff_host=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-
-    [ -z "$opac_host" ] && opac_host="$(t "Not configured")"
-    [ -z "$staff_host" ] && staff_host="$(t "Not configured")"
+    read -r opac_host staff_host < <(tunnel_public_hosts)
+    [ "$opac_host" = "-" ] && opac_host="$(t "Not configured")"
+    if [ "$staff_host" = "-" ]; then
+        staff_host="$(t "Not configured")"
+        tunnel_mode_is broker && staff_host="$(t "local network only (remote staff access is off)")"
+    fi
 
     c_status="OFFLINE"
     systemctl is-active --quiet cloudflared && c_status="ONLINE"
@@ -5011,33 +5010,71 @@ EOF
     rm -f "$tmp_cf"
 }
 
+# set_koha_public_urls OPAC_URL [STAFF_URL]: OPACBaseURL / staffClientBaseURL
+# and the defaults for new instances. An empty STAFF_URL leaves it as is.
+set_koha_public_urls() {
+    local opac="$1" staff="${2:-}" k_sites="/etc/koha/koha-sites.conf"
+    [[ "$opac" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || return 1
+    [ -z "$staff" ] || [[ "$staff" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || return 1
+    is_database_ready || return 0
+    display_explanation "Setting Koha URL system preferences..."
+    mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('OPACBaseURL', '${opac}', 'Free') ON DUPLICATE KEY UPDATE value='${opac}';" >/dev/null 2>&1 || true
+    [ -n "$staff" ] && { mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('staffClientBaseURL', '${staff}', 'Free') ON DUPLICATE KEY UPDATE value='${staff}';" >/dev/null 2>&1 || true; }
+    if [ -f "$k_sites" ]; then
+        sed -i -E "s|^[[:space:]]*DEFAULTSOPACURL=.*|DEFAULTSOPACURL=\"${opac}\"|" "$k_sites" 2>/dev/null || true
+        [ -n "$staff" ] && { sed -i -E "s|^[[:space:]]*DEFAULTSINTRAURL=.*|DEFAULTSINTRAURL=\"${staff}\"|" "$k_sites" 2>/dev/null || true; }
+    fi
+    systemctl restart memcached >/dev/null 2>&1 || true
+    plack_restart || true
+}
+
+# cloudflare_route_dns TUNNEL HOST: points HOST at the tunnel. An existing
+# DNS record is never replaced silently: it may be another site of the same
+# domain, so the person is asked first.
+cloudflare_route_dns() {
+    local tunnel="$1" host="$2"
+    cloudflared tunnel route dns "$tunnel" "$host" && return 0
+    if prompt_yes_no "$(t "DNS record exists")" "$(t "The address \$host already exists in your Cloudflare DNS.\n\nReplace it so it points to this Koha? Answer No if it belongs to another site.")" 11 74 defaultno; then
+        cloudflared tunnel route dns -f "$tunnel" "$host" || true
+    fi
+    return 0
+}
+
+# Installs cloudflared from Cloudflare's signed APT repository (once).
+cloudflared_install() {
+    command -v cloudflared >/dev/null 2>&1 && return 0
+    display_explanation "Installing cloudflared..."
+    if ! wait_for_apt_locks; then return 1; fi
+    mkdir -p /etc/apt/keyrings && chmod 0755 /etc/apt/keyrings
+    if ! curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg; then
+        restore_apt_timers
+        msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
+        return 1
+    fi
+    apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
+    if ! apt_update_indices; then
+        rm -f /etc/apt/sources.list.d/cloudflared.list
+        restore_apt_timers
+        msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72
+        return 1
+    fi
+    if ! apt_install cloudflared; then
+        restore_apt_timers
+        return 1
+    fi
+    restore_apt_timers
+}
+
 function_cloudflare_setup() {
     msg_info "$(t "Step 1: Domain & Nameservers")" \
 "$(t "HOW TO LINK YOUR DOMAIN TO CLOUDFLARE:\n\n1. GET A FREE DOMAIN:\n    - Digital Plat (fast/automated): https://domain.digitalplat.org/\n    - nic.eu.org (manual, takes 14 to 45 days): https://nic.eu.org\n    - Or ask local IT for an official CNAME (e.g. catalog.palotina.pr.gov.br)\n\n2. ADD TO CLOUDFLARE (dash.cloudflare.com):\n    - Click 'Add a site/domain', type your domain and select Free.\n    - Cloudflare provides TWO Nameservers. Copy both.\n\n3. UPDATE AT YOUR DOMAIN REGISTRAR:\n    - Replace existing servers with the TWO from Cloudflare.\n    - In Cloudflare, click 'Check nameservers' until status is Active.\n\nThis part can't be automated, but everything from here on is fully automatic.")" 22 78
 
-    clear
-    display_explanation "Installing cloudflared..."
-    if ! command -v cloudflared >/dev/null 2>&1; then
-        if ! wait_for_apt_locks; then return 1; fi
-        mkdir -p /etc/apt/keyrings && chmod 0755 /etc/apt/keyrings
-        if ! curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg; then
-            restore_apt_timers
-            msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
-            return 1
-        fi
-        apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
-        if ! apt_update_indices; then
-            rm -f /etc/apt/sources.list.d/cloudflared.list
-            restore_apt_timers
-            msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72
-            return 1
-        fi
-        if ! apt_install cloudflared; then
-            restore_apt_timers
-            return 1
-        fi
-        restore_apt_timers
+    if tunnel_mode_is broker; then
+        msg_error "" "$(t "This server uses a free address. Leave it first (Free address menu), then set up your own domain.")" 10 74
+        return 0
     fi
+    clear
+    cloudflared_install || return 1
 
     if [ ! -f "$REAL_HOME/.cloudflared/cert.pem" ] && [ ! -f "/root/.cloudflared/cert.pem" ]; then
         msg_info "$(t "Cloudflare Tunnel")" \
@@ -5119,8 +5156,8 @@ ingress:
 EOF
 
     display_explanation "Registering subdomains in DNS..."
-    cloudflared tunnel route dns -f "$tunnel_name" "${opac_sub}.${dominio}" || true
-    cloudflared tunnel route dns -f "$tunnel_name" "${staff_sub}.${dominio}" || true
+    cloudflare_route_dns "$tunnel_name" "${opac_sub}.${dominio}"
+    cloudflare_route_dns "$tunnel_name" "${staff_sub}.${dominio}"
 
     display_explanation "Installing tunnel as a service..."
     cloudflared service uninstall >/dev/null 2>&1 || true
@@ -5130,28 +5167,633 @@ EOF
     sleep 3
 
     if systemctl is-active --quiet cloudflared; then
-        if is_database_ready; then
-            display_explanation "Setting Koha URL system preferences..."
-            local full_opac="https://${opac_sub}.${dominio}"
-            local full_staff="https://${staff_sub}.${dominio}"
-
-            mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('OPACBaseURL', '${full_opac}', 'Free') ON DUPLICATE KEY UPDATE value='${full_opac}';" >/dev/null 2>&1 || true
-            mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('staffClientBaseURL', '${full_staff}', 'Free') ON DUPLICATE KEY UPDATE value='${full_staff}';" >/dev/null 2>&1 || true
-
-            local k_sites="/etc/koha/koha-sites.conf"
-            if [ -f "$k_sites" ]; then
-                sed -i -E "s|^[[:space:]]*DEFAULTSOPACURL=.*|DEFAULTSOPACURL=\"${full_opac}\"|" "$k_sites" 2>/dev/null || true
-                sed -i -E "s|^[[:space:]]*DEFAULTSINTRAURL=.*|DEFAULTSINTRAURL=\"${full_staff}\"|" "$k_sites" 2>/dev/null || true
-            fi
-
-            systemctl restart memcached >/dev/null 2>&1 || true
-            plack_restart || true
-        fi
+        set_koha_public_urls "https://${opac_sub}.${dominio}" "https://${staff_sub}.${dominio}"
 
         function_cloudflare_status
     else
         msg_error "" "$(t "The service is not active. Check: journalctl -u cloudflared -n 30")" 9 74
     fi
+}
+
+# ----------------------------------------------------------------------
+# 14.1 FREE ADDRESS (SUBDOMAIN BROKER)
+# ----------------------------------------------------------------------
+# A library without its own domain asks the Koha broker (broker/ in this
+# repository, a Cloudflare Worker) for an address such as
+# palotina-pr.<central domain>. The request is approved on the broker's
+# side; the panel only ever receives the token of its own tunnel, never a
+# Cloudflare API credential. Every call after the request is signed with
+# an Ed25519 key that never leaves this server (same format as
+# broker/scripts/kei-sign.sh).
+#
+#   tunnel.conf        mode, library id and public hostnames (no secrets)
+#   broker.key         Ed25519 private key (0600)
+#   broker-enroll.conf request waiting for approval (0600: holds its code)
+#   koha-broker.env    TUNNEL_TOKEN for the cloudflared service (0600)
+# ----------------------------------------------------------------------
+KEI_BROKER_URL="${KEI_BROKER_URL:-https://koha-broker.bibliotecamunicipalpalotina.org}"
+TUNNEL_CONF="${CONF_DIR}/tunnel.conf"
+BROKER_KEY="${CONF_DIR}/broker.key"
+BROKER_ENROLL="${CONF_DIR}/broker-enroll.conf"
+BROKER_ENV="${KEI_BROKER_ENV:-/etc/cloudflared/koha-broker.env}"
+CLOUDFLARED_UNIT="${KEI_CLOUDFLARED_UNIT:-/etc/systemd/system/cloudflared.service}"
+CRON_BROKER="/etc/cron.d/koha_broker"
+BROKER_STATUS="" BROKER_BODY=""
+
+# KEY=value files written by the panel. Read line by line, never sourced;
+# only known keys and plain values are accepted.
+kv_get() {    # kv_get FILE KEY -> value
+    local line
+    [ -f "$1" ] || return 1
+    line=$(grep -E "^$2=" "$1" 2>/dev/null | tail -n1) || return 1
+    line="${line#*=}"
+    [[ "$line" =~ ^[A-Za-z0-9._:/@+=?-]*$ ]] || return 1
+    printf '%s' "$line"
+}
+
+kv_write() {  # kv_write FILE MODE KEY VALUE [KEY VALUE ...]: merges into FILE
+    local file="$1" mode="$2" tmp k v
+    shift 2
+    declare -A kv=()
+    if [ -f "$file" ]; then
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ ^[A-Z_]+$ ]] && kv[$k]="$v"
+        done < "$file"
+    fi
+    while [ $# -ge 2 ]; do
+        [[ "$1" =~ ^[A-Z_]+$ && "$2" =~ ^[A-Za-z0-9._:/@+=?-]*$ ]] || return 1
+        kv[$1]="$2"
+        shift 2
+    done
+    mkdir -p "$(dirname "$file")"
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    chmod "$mode" "$tmp"
+    for k in $(printf '%s\n' "${!kv[@]}" | sort); do
+        printf '%s=%s\n' "$k" "${kv[$k]}"
+    done > "$tmp"
+    mv -f "$tmp" "$file"
+}
+
+tunnel_conf_get() { kv_get "$TUNNEL_CONF" "$1"; }
+tunnel_mode_is() { [ "$(tunnel_conf_get TUNNEL_MODE 2>/dev/null)" = "$1" ]; }
+broker_url() { tunnel_conf_get BROKER_URL 2>/dev/null || printf '%s' "$KEI_BROKER_URL"; }
+
+# Public hostnames: "OPAC STAFF" (either may be "-"). The free address
+# publishes the staff interface only while remote staff access is on.
+tunnel_public_hosts() {
+    local opac="" staff=""
+    if tunnel_mode_is broker; then
+        opac=$(tunnel_conf_get OPAC_HOST 2>/dev/null)
+        [ "$(tunnel_conf_get STAFF_REMOTE 2>/dev/null)" = "yes" ] && staff=$(tunnel_conf_get STAFF_HOST 2>/dev/null)
+    elif [ -f /etc/cloudflared/config.yml ]; then
+        opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
+        staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
+    fi
+    printf '%s %s\n' "${opac:--}" "${staff:--}"
+}
+
+# json_field FILE KEY [KEY ...]: string, number or boolean at that path of a
+# small JSON document (the broker's answers). Pure Bash, like the rest of
+# the panel; prints nothing and returns 1 when the path is missing.
+json_field() {
+    local _j _i=0 _k _JS=""
+    [ -r "$1" ] || return 1
+    _j=$(<"$1")
+    shift
+    for _k in "$@"; do
+        _json_ws
+        [ "${_j:_i:1}" = "{" ] || return 1
+        _i=$((_i + 1))
+        _json_find_key "$_k" || return 1
+    done
+    _json_ws
+    case "${_j:_i:1}" in
+        '"') _json_string || return 1; printf '%s' "$_JS" ;;
+        '{'|'['|'') return 1 ;;
+        *)
+            _k="${_j:_i}"
+            _k="${_k%%[,\}\] $'\t\r\n']*}"
+            [[ "$_k" =~ ^(true|false|-?[0-9][0-9.eE+-]*)$ ]] || return 1
+            printf '%s' "$_k"
+            ;;
+    esac
+}
+# Helpers of json_field: they work on its _j (text) and _i (position).
+_json_ws() {
+    while [[ "${_j:_i:1}" == [$' \t\r\n'] ]]; do _i=$((_i + 1)); done
+}
+_json_string() {    # the string at _i, decoded, into _JS
+    local rest part c
+    [ "${_j:_i:1}" = '"' ] || return 1
+    _i=$((_i + 1))
+    _JS=""
+    while true; do
+        rest="${_j:_i}"
+        part="${rest%%[\"\\]*}"
+        [ ${#part} -lt ${#rest} ] || return 1
+        _JS+="$part"
+        _i=$((_i + ${#part}))
+        c="${_j:_i:1}"
+        _i=$((_i + 1))
+        [ "$c" = '"' ] && return 0
+        c="${_j:_i:1}"
+        _i=$((_i + 1))
+        case "$c" in
+            n) _JS+=$'\n' ;;
+            t) _JS+=$'\t' ;;
+            r) _JS+=$'\r' ;;
+            b|f) ;;
+            u) [[ "${_j:_i:4}" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+               printf -v c "\\u${_j:_i:4}"; _JS+="$c"; _i=$((_i + 4)) ;;
+            *) _JS+="$c" ;;
+        esac
+    done
+}
+_json_skip() {      # any value at _i
+    local depth=0 c
+    while true; do
+        _json_ws
+        c="${_j:_i:1}"
+        case "$c" in
+            '') return 1 ;;
+            '"') _json_string || return 1; [ "$depth" -eq 0 ] && return 0 ;;
+            '{'|'[') depth=$((depth + 1)); _i=$((_i + 1)) ;;
+            '}'|']')
+                [ "$depth" -eq 0 ] && return 0
+                depth=$((depth - 1)); _i=$((_i + 1))
+                [ "$depth" -eq 0 ] && return 0
+                ;;
+            ',') [ "$depth" -eq 0 ] && return 0; _i=$((_i + 1)) ;;
+            *) _i=$((_i + 1)) ;;
+        esac
+    done
+}
+_json_find_key() {  # inside an object: moves _i to the value of key $1
+    local key
+    while true; do
+        _json_ws
+        _json_string || return 1
+        key="$_JS"
+        _json_ws
+        [ "${_j:_i:1}" = ":" ] || return 1
+        _i=$((_i + 1))
+        _json_ws
+        [ "$key" = "$1" ] && return 0
+        _json_skip || return 1
+        _json_ws
+        [ "${_j:_i:1}" = "," ] || return 1
+        _i=$((_i + 1))
+    done
+}
+
+broker_ensure_key() {
+    [ -s "$BROKER_KEY" ] && return 0
+    mkdir -p "$CONF_DIR"
+    ( umask 077 && openssl genpkey -algorithm ed25519 -out "$BROKER_KEY" ) >/dev/null 2>&1 || return 1
+    chmod 600 "$BROKER_KEY"
+}
+
+broker_public_key() {
+    openssl pkey -in "$BROKER_KEY" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n'
+}
+
+# broker_sign_headers METHOD PATH BODYFILE: the four X-KEI-* headers.
+broker_sign_headers() {
+    local method="$1" path="$2" body="$3" lib ts nonce hash msg sig
+    lib=$(tunnel_conf_get LIBRARY_ID) || return 1
+    ts=$(date +%s)
+    nonce=$(openssl rand -hex 16)
+    hash=$(sha256sum < "$body" | cut -d' ' -f1)
+    msg=$(mktemp) || return 1
+    printf 'KEI-SIG-v1\n%s\n%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$nonce" "$hash" > "$msg"
+    sig=$(openssl pkeyutl -sign -inkey "$BROKER_KEY" -rawin -in "$msg" 2>/dev/null | base64 | tr -d '\n')
+    rm -f "$msg"
+    [ -n "$sig" ] || return 1
+    printf 'X-KEI-Library: %s\nX-KEI-Timestamp: %s\nX-KEI-Nonce: %s\nX-KEI-Signature: %s\n' "$lib" "$ts" "$nonce" "$sig"
+}
+
+# broker_request METHOD PATH yes|no [JSON]: calls the broker (signed or
+# not). The answer goes to BROKER_BODY, a 0600 file (it may hold the tunnel
+# token), and the HTTP code to BROKER_STATUS. Returns 0 on 2xx.
+broker_request() {
+    local method="$1" path="$2" signed="$3" json="${4:-}" req h args=()
+    broker_cleanup
+    req=$(umask 077; mktemp /root/.kei-broker-req.XXXXXX) || return 1
+    BROKER_BODY=$(umask 077; mktemp /root/.kei-broker-res.XXXXXX) || { rm -f "$req"; return 1; }
+    printf '%s' "$json" > "$req"
+    if [ "$signed" = "yes" ]; then
+        while IFS= read -r h; do args+=(-H "$h"); done < <(broker_sign_headers "$method" "$path" "$req")
+        [ ${#args[@]} -eq 8 ] || { rm -f "$req"; BROKER_STATUS=000; return 1; }
+    fi
+    [ -n "$json" ] && args+=(-H "Content-Type: application/json" --data-binary "@$req")
+    BROKER_STATUS=$(curl -sS --max-time 30 -X "$method" "${args[@]}" -o "$BROKER_BODY" -w '%{http_code}' \
+        "$(broker_url)$path" 2>/dev/null) || BROKER_STATUS=000
+    rm -f "$req"
+    [[ "$BROKER_STATUS" == 2[0-9][0-9] ]]
+}
+
+broker_cleanup() {
+    [ -n "$BROKER_BODY" ] && rm -f "$BROKER_BODY"
+    BROKER_BODY=""
+}
+
+# Error text of the last answer, for the dialogs.
+broker_error() {
+    local e=""
+    [ -n "$BROKER_BODY" ] && e=$(json_field "$BROKER_BODY" error)
+    [ "$BROKER_STATUS" = "000" ] && e="$(t "The address service could not be reached. Check the internet connection.")"
+    printf '%s' "${e:-HTTP $BROKER_STATUS}"
+}
+
+# Runs in the background while the request link is on screen: ends with 0
+# once the request is approved, 1 when it is denied or expired.
+broker_wait_approval() {
+    local code="$1" st
+    while true; do
+        if broker_request POST /v1/device/poll no "{\"device_code\":$(json_str "$code")}"; then
+            st=$(json_field "$BROKER_BODY" status)
+            case "$st" in
+                approved) broker_cleanup; exit 0 ;;
+                denied|expired|consumed) broker_cleanup; exit 1 ;;
+            esac
+        elif [ "$BROKER_STATUS" = "404" ]; then
+            broker_cleanup; exit 1
+        fi
+        broker_cleanup
+        sleep "${KEI_BROKER_POLL:-10}"
+    done
+}
+
+# Asks for a new address. Leaves the request in BROKER_ENROLL.
+broker_new_request() {
+    local inst email name body
+    inst=$(ui_input "$(t "Free address")" "$(t "Name of the library or institution:")") || return 1
+    inst=$(printf '%s' "$inst" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ ${#inst} -ge 3 ] || { msg_error "" "$(t "Type the name of the library (at least 3 characters).")" 8 66; return 1; }
+    email=$(ui_input "$(t "Free address")" "$(t "Contact e-mail of the library (preferably the institutional one):")") || return 1
+    email=$(printf '%s' "$email" | tr -d '[:space:]')
+    [[ "$email" =~ ^[^@]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { msg_error "" "$(t "Invalid e-mail address.")" 8 60; return 1; }
+    name=$(ui_input "$(t "Free address")" "$(t "Name wanted for the address (letters, numbers and hyphens, e.g. palotina-pr). Leave blank to use the library name:")") || return 1
+    name=$(printf '%s' "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    clear
+    display_explanation "Sending the request..."
+    body="{\"institution_name\":$(json_str "$inst"),\"contact_email\":$(json_str "$email"),\"requested_name\":$(json_str "$name")}"
+    if ! broker_request POST /v1/device/start no "$body"; then
+        msg_error "" "$(t "The request was not accepted:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    local device user url slug
+    device=$(json_field "$BROKER_BODY" device_code)
+    user=$(json_field "$BROKER_BODY" user_code)
+    url=$(json_field "$BROKER_BODY" verification_uri)
+    slug=$(json_field "$BROKER_BODY" suggested_slug)
+    broker_cleanup
+    if [ -z "$device" ] || ! is_auth_url "$url"; then
+        msg_error "" "$(t "The address service gave an unexpected answer. Try again later.")" 8 70
+        return 1
+    fi
+    kv_write "$BROKER_ENROLL" 600 DEVICE_CODE "$device" USER_CODE "$user" VERIFY_URL "$url" SLUG "$slug" \
+        BROKER_URL "$(broker_url)" CREATED "$(date +%s)" || return 1
+    log "broker: request $user sent for '$slug'"
+}
+
+# Shows the request link (QR code, browser or link) and waits for the
+# approval. The request stays saved when the person leaves: approval may
+# take a while, and this menu picks it up again.
+broker_wait_request() {
+    local user url pid rc
+    user=$(kv_get "$BROKER_ENROLL" USER_CODE)
+    url=$(kv_get "$BROKER_ENROLL" VERIFY_URL)
+    ( KEI_BROKER_URL="$(kv_get "$BROKER_ENROLL" BROKER_URL)" broker_wait_approval "$(kv_get "$BROKER_ENROLL" DEVICE_CODE)" ) \
+        >/dev/null 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+    pid=$!
+    ALLOW_CTRL_C_RETURN=1
+    auth_link_session "$pid" "$url" yes "$(t "Request code: \$user\nThe page shows the status of the request. It is reviewed by the address service; this screen continues on its own once it is approved.\nYou can leave with [C] and come back to this menu later: the request stays saved.")"
+    rc=$?
+    ALLOW_CTRL_C_RETURN=0
+    return "$rc"
+}
+
+# After approval: registers this server's key, waits for the tunnel and
+# installs it.
+broker_complete_request() {
+    local device pub lib job opac staff st i
+    broker_ensure_key || { msg_error "" "$(t "Could not create the key of this server (openssl).")" 8 66; return 1; }
+    pub=$(broker_public_key)
+    device=$(kv_get "$BROKER_ENROLL" DEVICE_CODE)
+    KEI_BROKER_URL="$(kv_get "$BROKER_ENROLL" BROKER_URL)"
+    clear
+    display_explanation "Registering this server..."
+    if ! broker_request POST /v1/enroll no "{\"device_code\":$(json_str "$device"),\"public_key\":$(json_str "$pub")}"; then
+        msg_error "" "$(t "The registration was not accepted:")\n\n$(broker_error)" 10 74
+        [ "$BROKER_STATUS" = "409" ] && rm -f "$BROKER_ENROLL"
+        broker_cleanup
+        return 1
+    fi
+    lib=$(json_field "$BROKER_BODY" library_id)
+    job=$(json_field "$BROKER_BODY" job_id)
+    opac=$(json_field "$BROKER_BODY" hostnames opac)
+    staff=$(json_field "$BROKER_BODY" hostnames staff)
+    broker_cleanup
+    kv_write "$TUNNEL_CONF" 644 TUNNEL_MODE broker BROKER_URL "$KEI_BROKER_URL" LIBRARY_ID "$lib" \
+        OPAC_HOST "$opac" STAFF_HOST "$staff" STAFF_REMOTE no JOB_ID "$job" || return 1
+    rm -f "$BROKER_ENROLL"
+    log "broker: library $lib registered ($opac)"
+
+    display_explanation "Creating the tunnel and the address..."
+    st=""
+    for i in $(seq 1 "${KEI_BROKER_WAIT:-90}"); do
+        if broker_request GET "/v1/jobs/$job" yes; then
+            st=$(json_field "$BROKER_BODY" state)
+            [ "$st" = "done" ] || [ "$st" = "failed" ] && break
+        fi
+        sleep 2
+    done
+    broker_cleanup
+    if [ "$st" != "done" ]; then
+        msg_error "" "$(t "The address is not ready yet. Try again later with the same menu option.")" 9 70
+        return 1
+    fi
+    broker_connect share
+}
+
+# broker_connect [share]: fetches the tunnel token and runs cloudflared as a
+# service with it. The token goes to a 0600 environment file, never to the
+# command line. "share" (first connection) then offers the sharing menu.
+broker_connect() {
+    local token opac staff_url="" bin
+    cloudflared_install || return 1
+    display_explanation "Connecting the tunnel..."
+    if ! broker_request GET /v1/tunnel-token yes; then
+        msg_error "" "$(t "Could not get the tunnel of this library:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    token=$(json_field "$BROKER_BODY" tunnel_token)
+    broker_cleanup
+    [[ "$token" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]] || { msg_error "" "$(t "The address service gave an unexpected answer. Try again later.")" 8 70; return 1; }
+
+    # One cloudflared service per server: the own-domain setup steps aside.
+    if [ -f /etc/cloudflared/config.yml ]; then
+        cloudflared service uninstall >/dev/null 2>&1 || true
+        mv -f /etc/cloudflared/config.yml /etc/cloudflared/config.yml.own-domain 2>/dev/null || true
+    fi
+    mkdir -p "$(dirname "$BROKER_ENV")"
+    ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" > "$BROKER_ENV" )
+    chmod 600 "$BROKER_ENV"
+    bin=$(command -v cloudflared)
+    cat > "$CLOUDFLARED_UNIT" <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Koha (free address)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=${BROKER_ENV}
+ExecStart=${bin} --no-autoupdate tunnel run
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable cloudflared >/dev/null 2>&1 || true
+    systemctl restart cloudflared >/dev/null 2>&1 || true
+    broker_install_cron
+
+    read -r opac _ < <(tunnel_public_hosts)
+    [ "$(tunnel_conf_get STAFF_REMOTE 2>/dev/null)" = "yes" ] && staff_url="https://$(tunnel_conf_get STAFF_HOST)"
+    set_koha_public_urls "https://${opac}" "$staff_url"
+
+    display_explanation "Checking the address from the internet..."
+    if tunnel_check_url "https://${opac}"; then
+        if [ "${1:-}" = "share" ]; then
+            msg_ok "$(t "Your catalog is online:")\n\n  https://${opac}\n\n$(t "Next, choose how to share the link.")" 12 70
+            function_share_catalog_link
+        else
+            msg_ok "$(t "Your catalog is online:")\n\n  https://${opac}" 10 70
+        fi
+    else
+        msg_info "$(t "Free address")" "$(t "The tunnel is installed, but the address does not answer yet:")\n\n  https://${opac}\n\n$(t "It can take a few minutes. Check again with \"View Public Links and Security Status\".")" 13 74
+    fi
+}
+
+# tunnel_check_url URL: waits until the address answers through Cloudflare.
+tunnel_check_url() {
+    local code i
+    for i in $(seq 1 "${KEI_TUNNEL_CHECKS:-12}"); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null)
+        [[ "$code" == [23][0-9][0-9] ]] && return 0
+        sleep "${KEI_TUNNEL_CHECK_DELAY:-5}"
+    done
+    return 1
+}
+
+# Daily signed heartbeat: tells the address service the library is alive
+# (unused addresses are released after months without one).
+broker_install_cron() {
+    local panel="/usr/local/bin/config.sh"
+    [ -x "$panel" ] || panel="$(readlink -f "$_SCRIPT_PATH")"
+    printf 'SHELL=/bin/bash\n%d %d * * * root %s --broker-heartbeat >/dev/null 2>&1\n' \
+        "$((RANDOM % 60))" "$((RANDOM % 5 + 1))" "$panel" > "$CRON_BROKER"
+    chmod 644 "$CRON_BROKER"
+}
+
+# config.sh --broker-heartbeat (cron)
+broker_heartbeat() {
+    tunnel_mode_is broker || return 0
+    local koha
+    koha=$(dpkg-query -W -f='${Version}' koha-common 2>/dev/null | cut -c1-32)
+    broker_request POST /v1/heartbeat yes \
+        "{\"koha_version\":$(json_str "$koha"),\"installer_version\":$(json_str "${PANEL_VERSION# }")}"
+    local rc=$?
+    broker_cleanup
+    return "$rc"
+}
+
+function_cloudflare_free_address() {
+    if tunnel_mode_is broker; then
+        function_broker_manage
+        return 0
+    fi
+    local tool
+    require_koha || return 0
+    for tool in openssl perl curl; do
+        command -v "$tool" >/dev/null 2>&1 || { msg_error "" "$(t "Missing tool:") $tool" 8 60; return 0; }
+    done
+
+    if [ ! -f "$BROKER_ENROLL" ]; then
+        if [ -f /etc/cloudflared/config.yml ]; then
+            prompt_yes_no "$(t "Free address")" "$(t "This server already publishes Koha with your own domain. A free address replaces it (your domain's tunnel is switched off).\n\nContinue?")" 11 74 defaultno || return 0
+        fi
+        msg_info "$(t "Free address")" "$(t "GET A FREE ADDRESS FOR YOUR CATALOG\n\nNo domain or Cloudflare account is needed. You send a short request\n(library name, contact e-mail and the name you want); the address service\nreviews it and this server then connects on its own.\n\nThe public catalog (OPAC) goes online. The staff interface stays on the\nlocal network until you turn on remote staff access, which adds a password\nchecked before anyone reaches Koha.")" 17 78
+        broker_new_request || return 0
+    fi
+
+    broker_wait_request
+    case $? in
+        0) broker_complete_request ;;
+        130) msg_info "$(t "Free address")" "$(t "The request stays saved. Come back to this menu to continue once it is approved.")" 9 70 ;;
+        *)
+            rm -f "$BROKER_ENROLL"
+            msg_error "" "$(t "The request was not approved or has expired. You can send a new one.")" 9 70
+            ;;
+    esac
+}
+
+# Menu of a server that already has a free address.
+function_broker_manage() {
+    local choice opac staff remote
+    while true; do
+        opac=$(tunnel_conf_get OPAC_HOST)
+        remote="$(t "off")"
+        [ "$(tunnel_conf_get STAFF_REMOTE)" = "yes" ] && remote="$(t "on")"
+        choice=$(ui_menu "$(t "Free address")" "$(t "Catalog address: https://\$opac\nRemote staff access: \$remote")" \
+            "1" "$(t "Remote staff access (password at the edge)")" \
+            "2" "$(t "Reconnect the tunnel (fetch the token again)")" \
+            "3" "$(t "Renew the tunnel token")" \
+            "4" "$(t "Give up the free address")") || return 0
+        case "$choice" in
+            1) function_broker_staff_access ;;
+            2) clear; broker_connect ;;
+            3)
+                clear
+                display_explanation "Renewing the tunnel token..."
+                if broker_request POST /v1/rotate yes "{}"; then
+                    broker_cleanup
+                    broker_connect
+                else
+                    msg_error "" "$(broker_error)" 9 70
+                    broker_cleanup
+                fi
+                ;;
+            4) function_broker_leave && return 0 ;;
+        esac
+    done
+}
+
+# Remote staff access: the staff hostname answers only after a user and
+# password checked by the broker at Cloudflare's edge (then Koha's own login).
+function_broker_staff_access() {
+    local user pass pass2 cidrs c list="" staff
+    staff=$(tunnel_conf_get STAFF_HOST)
+    local choice
+    choice=$(ui_menu "$(t "Remote staff access")" "$(t "Staff interface from outside the library: https://\$staff\n\nBefore Koha's own login, the browser asks for a user and password that only the library knows. Optionally, only some networks are allowed.")" \
+        "on" "$(t "Turn on or change the password")" \
+        "off" "$(t "Turn off (staff interface only on the local network)")") || return 0
+
+    if [ "$choice" = "off" ]; then
+        if broker_request DELETE /v1/staff-credentials yes; then
+            broker_cleanup
+            kv_write "$TUNNEL_CONF" 644 STAFF_REMOTE no
+            set_koha_public_urls "https://$(tunnel_conf_get OPAC_HOST)" "http://$(get_server_ip):8080"
+            msg_ok "$(t "Remote staff access is off.")" 8 60
+        else
+            msg_error "" "$(broker_error)" 9 70
+            broker_cleanup
+        fi
+        return 0
+    fi
+
+    user=$(ui_input "$(t "Remote staff access")" "$(t "User for the remote access (not a Koha user):")" "biblioteca") || return 0
+    [[ "$user" =~ ^[A-Za-z0-9._@-]{3,64}$ ]] || { msg_error "" "$(t "Use 3 to 64 letters, numbers or . _ @ -")" 8 60; return 0; }
+    pass=$(whiptail --title "$(t "Password")" --passwordbox "$(t "Password for the remote access (at least 12 characters):")" 9 70 3>&1 1>&2 2>&3) || return 0
+    [ ${#pass} -ge 12 ] || { msg_error "" "$(t "The password must have at least 12 characters.")" 8 60; return 0; }
+    pass2=$(whiptail --title "$(t "Confirm Password")" --passwordbox "$(t "Type the password again:")" 9 64 3>&1 1>&2 2>&3) || return 0
+    [ "$pass" = "$pass2" ] || { msg_error "" "$(t "The passwords do not match.")" 8 60; return 0; }
+    cidrs=$(ui_input "$(t "Remote staff access")" "$(t "Allowed networks (optional), e.g. 200.10.0.0/16, separated by spaces. Leave blank to allow any network:")") || return 0
+    for c in $cidrs; do
+        [[ "$c" =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ ]] || { msg_error "" "$(t "Invalid network:") $c" 8 60; return 0; }
+        list+="${list:+,}$(json_str "$c")"
+    done
+
+    clear
+    display_explanation "Saving the remote access..."
+    if broker_request PUT /v1/staff-credentials yes \
+        "{\"username\":$(json_str "$user"),\"password\":$(json_str "$pass"),\"allow_cidrs\":[${list}]}"; then
+        broker_cleanup
+        kv_write "$TUNNEL_CONF" 644 STAFF_REMOTE yes
+        set_koha_public_urls "https://$(tunnel_conf_get OPAC_HOST)" "https://${staff}"
+        msg_ok "$(t "Remote staff access is on:")\n\n  https://${staff}\n\n$(t "The browser asks for the remote access user and password first, then shows Koha's login.")" 13 74
+    else
+        msg_error "" "$(t "The remote access was not saved:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+    fi
+    unset pass pass2
+}
+
+function_broker_leave() {
+    local opac
+    opac=$(tunnel_conf_get OPAC_HOST)
+    prompt_yes_no "$(t "Give up the free address")" "$(t "The address https://\$opac is released and the catalog goes offline to the internet (it stays on the local network).\n\nContinue?")" 11 74 defaultno || return 1
+    clear
+    display_explanation "Releasing the address..."
+    if ! broker_request DELETE /v1/library yes && [ "$BROKER_STATUS" != "401" ]; then
+        msg_error "" "$(t "The address service did not confirm:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    broker_cleanup
+    systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    rm -f "$CLOUDFLARED_UNIT" "$BROKER_ENV" "$CRON_BROKER" "$TUNNEL_CONF" "$BROKER_KEY"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    set_koha_public_urls "http://$(get_server_ip)" "http://$(get_server_ip):8080"
+    log "broker: address $opac released"
+    msg_ok "$(t "The free address was released.\nKoha is now only accessible on the local network.")" 10 70
+    return 0
+}
+
+# Share the catalog link: QR code on this screen, a QR code image to print,
+# the browser of this computer, or the link to copy.
+function_share_catalog_link() {
+    local opac url items=() choice png
+    read -r opac _ < <(tunnel_public_hosts)
+    if [ "$opac" = "-" ]; then
+        msg_error "" "$(t "The catalog has no internet address yet. Set up the tunnel first.")" 9 70
+        return 0
+    fi
+    url="https://${opac}"
+    is_auth_url "$url" || return 0
+    while true; do
+        items=("qr" "$(t "QR code on this screen")" "png" "$(t "Save a QR code image to print")")
+        browser_opener >/dev/null && items+=("browser" "$(t "Open in the browser of this computer")")
+        items+=("link" "$(t "Show the link to copy")")
+        choice=$(ui_menu "$(t "Share the catalog")" "$url" "${items[@]}") || return 0
+        case "$choice" in
+            qr)
+                clear
+                ensure_qrencode && qrencode -t ANSIUTF8 -l M -m 2 "$url"
+                printf '\n  %s\n\n' "$url"
+                pause_terminal
+                ;;
+            png)
+                png="${REAL_HOME:-/root}/koha-catalog-qr.png"
+                if ensure_qrencode && qrencode -t PNG -l M -s 12 -m 4 -o "$png" "$url"; then
+                    [ -n "${REAL_USER:-}" ] && chown "$REAL_USER" "$png" 2>/dev/null
+                    msg_ok "$(t "QR code image saved:")\n\n  $png" 10 70
+                else
+                    msg_error "" "$(t "Could not create the image.")" 8 60
+                fi
+                ;;
+            browser) open_in_browser "$url" ;;
+            link)
+                clear
+                printf '%s\n\n  %s\n\n' "$(t "Link of the catalog:")" "$url"
+                pause_terminal
+                ;;
+        esac
+    done
+}
+
+ensure_qrencode() {
+    command -v qrencode >/dev/null 2>&1 && return 0
+    echo "$(t "Installing the QR code generator (qrencode)...")"
+    apt_install qrencode >/dev/null 2>&1
+    command -v qrencode >/dev/null 2>&1
 }
 
 function_configure_cloudflare() {
@@ -5163,24 +5805,32 @@ function_configure_cloudflare() {
         local choice
         choice=$(whiptail --title "$(t "Cloudflare Tunnel Manager")" \
             --cancel-button "$(t "Back")" \
-            --menu "$(t "Tunnel Status: \$tunnel_active\n\nCloudflare Tunnel safely exposes Koha without opening ports.\n\nWhat do you want to do?")" 18 78 4 \
-            "1" "$(t "⚙  Install and Configure Tunnel (First Use)")" \
-            "2" "$(t "ℹ  View Public Links and Security Status")" \
-            "3" "$(t "↻  Restart Tunnel Service")" \
-            "4" "$(t "✖  Disable and Remove Tunnel (Go Offline)")" \
+            --menu "$(t "Tunnel Status: \$tunnel_active\n\nCloudflare Tunnel safely exposes Koha without opening ports.\n\nWhat do you want to do?")" 20 78 6 \
+            "1" "$(t "★  Free Address (no domain needed)")" \
+            "2" "$(t "⚙  Use My Own Domain (Cloudflare account)")" \
+            "3" "$(t "ℹ  View Public Links and Security Status")" \
+            "4" "$(t "▣  Share the Catalog Link (QR code, link)")" \
+            "5" "$(t "↻  Restart Tunnel Service")" \
+            "6" "$(t "✖  Disable and Remove Tunnel (Go Offline)")" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && break
 
         case "$choice" in
-            1) function_cloudflare_setup ;;
-            2) function_cloudflare_status ;;
-            3)
+            1) function_cloudflare_free_address ;;
+            2) function_cloudflare_setup ;;
+            3) function_cloudflare_status ;;
+            4) function_share_catalog_link ;;
+            5)
                 clear
                 display_explanation "Restarting Cloudflare Tunnel..."
                 systemctl restart cloudflared >/dev/null 2>&1
                 msg_ok "$(t "Service restarted successfully.")" 8 60
                 ;;
-            4)
+            6)
+                if tunnel_mode_is broker; then
+                    function_broker_leave
+                    continue
+                fi
                 if prompt_yes_no "$(t "Disable Tunnel")" "$(t "This will stop the service and remove auto-start.\nYour catalog will go offline to the internet.\n\nContinue?")" 10 70; then
                     clear
                     display_explanation "Uninstalling service..."
@@ -11877,6 +12527,7 @@ if [ -n "$KEI_CLI_MODE" ]; then
     case "$KEI_CLI_MODE" in
         --status-json) kei_status_json ;;
         --export-diagnostics) kei_export_diagnostics "${2:-}" ;;
+        --broker-heartbeat) broker_heartbeat ;;
     esac
     exit $?
 fi

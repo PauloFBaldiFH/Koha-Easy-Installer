@@ -26,8 +26,8 @@ routes = [
 ]
 
 [vars]
-CF_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"   # account that holds the zone (not secret)
-CF_ZONE_ID = "REPLACE_WITH_ZONE_ID"         # zone id of bibliotecamunicipalpalotina.org (not secret)
+CF_ACCOUNT_ID = "f83c00aacc5df31f0f68867a84119072"   # account that holds the zone (not secret)
+CF_ZONE_ID = "aed272371f5da83f84fd05f1109dc91e"      # zone id of bibliotecamunicipalpalotina.org (not secret)
 ZONE_NAME = "bibliotecamunicipalpalotina.org"
 BROKER_HOST = "koha-broker.bibliotecamunicipalpalotina.org"
 NAME_PREFIX = "t-"          # test zone: every library name starts with t- so real records are never touched
