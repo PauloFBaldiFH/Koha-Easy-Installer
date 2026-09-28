@@ -89,7 +89,7 @@ O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para
   - O systemd precisa estar ativado no WSL.
   - O lado Windows conversa com o painel pelo arquivo `/etc/koha-easy-install/windows.conf`. Ele é lido com uma lista fechada de chaves e nunca é executado.
 - **Rede**: no Windows 11, a rede espelhada (mirrored) do WSL deixa os outros computadores da rede acessarem o Koha. No Windows 10 (NAT), use o **Túnel Cloudflare** do painel para publicá-lo.
-- **Ícone e atalhos do Koha**: uma pasta *Koha* no menu Iniciar, com os links da interface da equipe e do catálogo também na área de trabalho, todos com o ícone oficial `koha.ico`. Ela traz:
+- **Ícone e atalhos do Koha**: um ícone **Koha** na área de trabalho, que liga o Koha se estiver desligado e abre a interface da equipe, e uma pasta *Koha* no menu Iniciar, todos com o ícone oficial `koha.ico`. A pasta traz:
   - Interface da equipe, Catálogo público, Painel de controle e Pasta de backups
   - **Iniciar**, **Parar** e **Reiniciar**
   - Status, Exportar diagnóstico e Ícone de status
@@ -105,13 +105,13 @@ O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para
 
 ### Como instalar no Windows
 
-**Opção 1, um comando.** Abra o **PowerShell** (menu Iniciar, digite *PowerShell*; não precisa ser como administrador) e cole:
+Abra o **PowerShell** (menu Iniciar, digite *PowerShell*; não precisa ser como administrador), cole esta linha e tecle Enter:
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
 ```
 
-**Opção 2, dois cliques.** Baixe o ZIP do repositório (**Code > Download ZIP**), extraia e dê dois cliques em **`Install Koha.cmd`**. Se o Windows mostrar "O Windows protegeu o computador", clique em **Mais informações > Executar assim mesmo**: o script não é assinado, e você pode lê-lo antes de executar.
+Se preferir dois cliques, o **`Install Koha.cmd`** do repositório roda exatamente a mesma linha. Se o Windows mostrar "O Windows protegeu o computador" para ele, clique em **Mais informações > Executar assim mesmo**: o script não é assinado, e você pode lê-lo antes de executar.
 
 O instalador faz todo o resto e mostra cada etapa em linguagem simples:
 
@@ -120,7 +120,7 @@ O instalador faz todo o resto e mostra cada etapa em linguagem simples:
 3. Baixa o Debian da lista oficial do WSL da Microsoft, confere o SHA-256 e o importa como `KohaEasy` em `C:\KohaEasy\wsl`.
 4. Ativa o systemd. No Windows 11 22H2 ou mais recente, também acrescenta a rede espelhada (mirrored) ao seu `.wslconfig`, mantendo as suas configurações e uma cópia de segurança.
 5. Abre o painel de controle do Koha. Escolha o idioma, depois **1 – Instalar servidor Koha**, e saia do painel com **Sair** quando terminar.
-6. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, inicia o Koha e abre a interface da equipe.
+6. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, inicia o Koha e abre a interface da equipe. A partir daí, o ícone **Koha** na área de trabalho liga o Koha se estiver desligado e abre a interface da equipe.
 
 Pode rodar de novo sem medo: ele continua da última etapa concluída. O usuário e a senha de primeiro acesso ficam no painel de controle, opção 2. Tudo fica em `C:\KohaEasy`, e o log do instalador em `C:\KohaEasy\logs`.
 

@@ -82,8 +82,8 @@ function Test-KohaWslReady {
 # One UAC prompt: "wsl --install --no-distribution" enables the Windows
 # features and installs WSL from the Store package; then "wsl --update".
 function Install-KohaWslPlatform {
-    Start-KohaElevated -FilePath 'wsl.exe' -Arguments '--install --no-distribution'
-    Start-KohaElevated -FilePath 'wsl.exe' -Arguments '--update'
+    Start-KohaElevated -FilePath 'wsl.exe' -Arguments '--install --no-distribution' | Out-Null
+    Start-KohaElevated -FilePath 'wsl.exe' -Arguments '--update' | Out-Null
 }
 
 function Start-KohaElevated {
@@ -262,10 +262,13 @@ function Test-KohaInstalledInDistro {
 }
 
 # The panel runs in this window: the librarian picks the language and
-# "1 - Install Koha server", then leaves the panel with Exit.
+# "1 - Install Koha server", then leaves the panel with Exit. Start-Process
+# -NoNewWindow hands it the console itself; "& wsl.exe" here would send its
+# screens into Install-Koha's return value, and the panel could not draw.
 function Invoke-KohaPanel {
-    $env:WSL_UTF8 = '1'
-    & wsl.exe -d (Get-KohaConfig).Distro -u root --cd $script:DistroDir -- bash ./installer
+    $a = '-d {0} -u root --cd {1} -- bash ./installer' -f (Get-KohaConfig).Distro, $script:DistroDir
+    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $a -NoNewWindow -Wait -PassThru
+    return [int]$p.ExitCode
 }
 
 # ----------------------------------------------------------------------
@@ -340,7 +343,7 @@ function Install-Koha {
             Write-Host ''
             Write-KohaStep (T 'The Koha control panel opens now. Choose your language, then 1 - Install Koha server. When it finishes, leave the panel with Exit.')
             Read-Host (T 'Press Enter to continue') | Out-Null
-            Invoke-KohaPanel
+            Invoke-KohaPanel | Out-Null
             if (-not (Test-KohaInstalledInDistro)) {
                 Write-KohaStep (T 'Koha was not installed. Run the installer again to continue from here.') 'error'
                 return 1

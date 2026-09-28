@@ -290,11 +290,14 @@ Describe 'Start, Stop and automatic start' {
 }
 
 Describe 'Shortcuts' {
-    It 'gives every shortcut the Koha icon and puts only the two web pages on the desktop' {
+    It 'gives every shortcut the Koha icon and puts one Koha icon on the desktop' {
         $list = Get-KohaShortcutList
         $list.Count | Should -BeGreaterThan 8
         foreach ($s in $list) { $s.Icon | Should -BeLike '*koha.ico' }
-        @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop }).Count | Should -Be 2
+        $desk = @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop })
+        $desk.Count | Should -Be 1
+        $desk[0].Name | Should -Be 'Koha'
+        $desk[0].Arguments | Should -BeLike '* Open'
         ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
     }
 
@@ -305,11 +308,12 @@ Describe 'Shortcuts' {
         New-Item -ItemType Directory -Path $dt -Force | Out-Null
         $made = New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico')
         Test-Path -LiteralPath (Get-KohaIconPath) | Should -BeTrue
-        $url = Get-ChildItem -LiteralPath $dt -Filter '*.url' | Select-Object -First 1
-        @(Get-ChildItem -LiteralPath $dt).Count | Should -Be 2
+        $url = Get-ChildItem -LiteralPath $sm -Filter '*.url' | Select-Object -First 1
+        @(Get-ChildItem -LiteralPath $sm -Filter '*.url').Count | Should -Be 2
         Get-Content -Raw -LiteralPath $url.FullName | Should -Match ('IconFile=' + [regex]::Escape((Get-KohaIconPath)))
-        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 8 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
-        $made.Count | Should -Be 12
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 9 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 1 -Exactly -ParameterFilter { $Path -eq [System.IO.Path]::Combine($dt, 'Koha.lnk') }
+        $made.Count | Should -Be 11
     }
 
     It 'ships koha.ico as a real Windows icon with a 16x16 image' {

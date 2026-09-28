@@ -58,16 +58,22 @@ function Install-KohaEasyBootstrap {
     Copy-Item -Path (Join-Path $src 'lang\*.cache') -Destination (Join-Path $bin 'lang') -Force
     if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
-    # The tray and toasts need Windows PowerShell 5.1, even when this ran in PowerShell 7.
+    # The tray and toasts need Windows PowerShell 5.1, even when this ran in
+    # PowerShell 7. Start-Process -NoNewWindow gives the install the console
+    # itself: its messages, questions and the Koha panel appear here. (Calling
+    # it with & inside this function would capture its output as the return
+    # value, so the librarian would see nothing and the panel could not draw.)
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $env:KOHAEASY_ROOT = $root
-    & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'KohaEasy.ps1') Install
-    return $LASTEXITCODE
+    $arg = '-NoProfile -ExecutionPolicy Bypass -File "{0}" Install' -f (Join-Path $bin 'KohaEasy.ps1')
+    $p = Start-Process -FilePath $ps -ArgumentList $arg -NoNewWindow -Wait -PassThru
+    return [int]$p.ExitCode
 }
 
 try {
     $code = Install-KohaEasyBootstrap
     if ($code -eq 3) { Write-Host 'Restart Windows now. The installation continues after you sign in again.' -ForegroundColor Yellow }
+    elseif ($code -ne 0) { Write-Host ('The installation stopped (code {0}). Run the same command again to continue. Log: C:\KohaEasy\logs' -f $code) -ForegroundColor Red }
 } catch {
     Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red
 }

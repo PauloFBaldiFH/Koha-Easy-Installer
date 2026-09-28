@@ -794,8 +794,10 @@ function Get-KohaShortcutList {
     $cmd = { param($a, $style) '-NoProfile -WindowStyle {0} -ExecutionPolicy Bypass -File "{1}" {2}' -f $style, $ps1, $a }
     $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
     $list = @(
-        @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl; Desktop = $true }
-        @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl; Desktop = $true }
+        # The one desktop icon: starts Koha when it is off, then opens the staff interface.
+        @{ Name = 'Koha'; Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Open' 'Hidden'); Desktop = $true; StartMenu = $false }
+        @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
+        @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
         @{ Name = (T 'Koha - Control panel'); Kind = 'lnk'; Target = $wsl; Arguments = ('-d {0} -u root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) }
         @{ Name = (T 'Koha - Backups folder'); Kind = 'lnk'; Target = [System.IO.Path]::Combine([string]$env:SystemRoot, 'explorer.exe'); Arguments = ('"{0}"' -f (Get-KohaPath Backups)) }
         @{ Name = (T 'Koha - Start'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Start' 'Hidden') }
@@ -845,7 +847,8 @@ function New-KohaShortcuts {
     New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null
     $made = New-Object System.Collections.ArrayList
     foreach ($s in Get-KohaShortcutList) {
-        $dirs = @($StartMenu)
+        $dirs = @()
+        if (-not $s.ContainsKey('StartMenu') -or $s.StartMenu) { $dirs += $StartMenu }
         if ($s.ContainsKey('Desktop') -and $s.Desktop -and $Desktop) { $dirs += $Desktop }
         foreach ($d in $dirs) {
             $file = [System.IO.Path]::Combine($d, (ConvertTo-KohaFileName $s.Name) + '.' + $s.Kind)

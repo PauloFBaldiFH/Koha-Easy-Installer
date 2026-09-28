@@ -143,11 +143,32 @@ Describe 'Install flow' {
         $script:calls.Count | Should -Be 0
     }
 
+    It 'gives the Koha panel the console itself, never a captured pipe' {
+        Mock -ModuleName KohaEasy.Install Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        Invoke-KohaPanel | Should -Be 0
+        Should -Invoke -ModuleName KohaEasy.Install Start-Process -Times 1 -Exactly -ParameterFilter {
+            $FilePath -eq 'wsl.exe' -and $NoNewWindow -and $Wait -and $ArgumentList -like '-d KohaEasy -u root --cd /root/koha-easy-installer -- bash ./installer'
+        }
+    }
+
     It 'stops when systemd does not start in WSL' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroConfig { $false }
         Install-Koha -Facts $good -NonInteractive | Should -Be 1
         (Get-KohaState).phase | Should -Be 'systemd'
+    }
+}
+
+Describe 'Install flow output' {
+    It 'returns one exit code even when a step writes values (the UAC exit codes of wsl --install)' {
+        Remove-Item -LiteralPath (Get-KohaPath Root) -Recurse -Force -ErrorAction SilentlyContinue
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+        Mock -ModuleName KohaEasy.Install Register-KohaResume { }
+        Mock -ModuleName KohaEasy.Install Start-KohaElevated { 0 }
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $false }
+        $out = @(Install-Koha -Facts $good -NonInteractive)
+        $out.Count | Should -Be 1
+        $out[0] | Should -Be 3
     }
 }
 
@@ -163,10 +184,16 @@ Describe 'Bootstrapper and Install Koha.cmd' {
         @($tokens | Where-Object { $ps7 -contains [string]$_.Kind }) | Should -BeNullOrEmpty
     }
 
-    It 'Install Koha.cmd has Windows line endings, runs the local copy or the same one-liner as the README' {
+    It 'install.ps1 hands the console to the install instead of capturing its output' {
+        $text = [System.IO.File]::ReadAllText((Join-Path $repo 'windows/install.ps1'))
+        $text | Should -Match 'Start-Process -FilePath \$ps -ArgumentList \$arg -NoNewWindow -Wait -PassThru'
+        $text | Should -Not -Match '(?m)^\s*&\s*\$ps\b'
+    }
+
+    It 'Install Koha.cmd has Windows line endings and runs the same one-liner as the README' {
         $cmd = [System.IO.File]::ReadAllText((Join-Path $repo 'Install Koha.cmd'))
         ($cmd -replace "`r`n", '') | Should -Not -Match "`n"
-        $cmd | Should -Match 'windows\\install\.ps1'
+        $cmd | Should -Not -Match '-File'
         $url = 'https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1'
         $cmd | Should -Match ([regex]::Escape($url))
         Get-Content -Raw (Join-Path $repo 'README.md') | Should -Match ([regex]::Escape("irm $url | iex"))
