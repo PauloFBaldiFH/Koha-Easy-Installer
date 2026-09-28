@@ -5948,31 +5948,40 @@ reports_define() {
         "SELECT i.barcode AS \`$(t "Barcode")\`, b.title AS \`$(t "Title")\`, i.itemcallnumber AS \`$(t "Call number")\`, COALESCE(av.lib, i.itemlost) AS \`$(t "Status")\`, i.itemlost_on AS \`$(t "Since")\`, i.homebranch AS \`$(t "Library")\` FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber LEFT JOIN authorised_values av ON av.category = 'LOST' AND av.authorised_value = i.itemlost WHERE i.itemlost <> 0 ORDER BY i.itemlost_on DESC"
 }
 
+# Query of a report with a sample value in each of Koha's run-time
+# parameters (<<Label>>), for the dry run with EXPLAIN.
+reports_sample_params() { sed -E "s/<<[^<>]*>>/'2000'/g" <<< "$1"; }
+
 # SQL string literal.
 sql_quote() { local s="${1//\\/\\\\}"; s="${s//\'/\\\'}"; printf "'%s'" "$s"; }
 
 lt_reports() {
     require_database || return 0
-    local choice
-    choice=$(ui_menu "$(t "Essential reports pack")" "$(t "Read-only SQL reports for Koha (Reports > Saved reports):")" \
+    local choice title
+    title="$(t "Essential reports pack")"
+    choice=$(ui_menu "$title" "$(t "Read-only SQL reports for Koha (Reports > Saved reports):")" \
         "1" "$(t "Install or update the pack")" \
         "2" "$(t "Remove the pack")") || return 0
     case "$choice" in
-        1) tools_locked _lt_reports_install ;;
-        2) tools_locked _lt_reports_remove ;;
+        1) tools_locked _lt_reports_install reports_define "$REPORTS_TAG" "$title" REPORTS ;;
+        2) tools_locked _lt_reports_remove "$REPORTS_TAG" "$title" REPORTS ;;
     esac
 }
 
+# _lt_reports_install DEFINE TAG TITLE BACKUP: saves the reports listed by
+# the DEFINE function, each one marked "[TAG:<key>]" in its notes. Koha's
+# run-time parameters (<<Label>>) get a sample value for the dry run.
 _lt_reports_install() {
+    local define="$1" tag="$2" title="$3" backup="$4"
     local i key mark state log script ok=0 created=0 updated=0 notes
-    reports_define
+    "$define"
     log=$(tools_log reports)
     script="${TOOLS_WORK}/reports.sql"
     printf 'START TRANSACTION;\nSET @owner := (SELECT borrowernumber FROM borrowers WHERE flags %% 2 = 1 ORDER BY borrowernumber LIMIT 1);\n' > "$script"
     # Dry run: every query must compile against this Koha's schema (EXPLAIN runs nothing).
     for i in "${!RP_KEY[@]}"; do
-        key="${RP_KEY[i]}"; mark="[${REPORTS_TAG}:${key}]"
-        if ! mysql --default-character-set=utf8mb4 "$DB_NAME" -e "EXPLAIN ${RP_SQL[i]}" >/dev/null 2>> "$log"; then
+        key="${RP_KEY[i]}"; mark="[${tag}:${key}]"
+        if ! mysql --default-character-set=utf8mb4 "$DB_NAME" -e "EXPLAIN $(reports_sample_params "${RP_SQL[i]}")" >/dev/null 2>> "$log"; then
             printf '⚠ %s — %s\n' "${RP_NAME[i]}" "$(t "skipped: not compatible with this Koha version")" >> "$log"
             continue
         fi
@@ -5993,40 +6002,40 @@ _lt_reports_install() {
     done
     printf 'COMMIT;\n' >> "$script"
     if [ "$ok" -eq 0 ]; then
-        ui_textbox "$(t "Essential reports pack")" "$log"
+        ui_textbox "$title" "$log"
         msg_error "" "$(t 'None of the reports is compatible with this Koha version. Nothing was changed.\n\nLog: ${log}')" 11 74
         return 1
     fi
     { printf '\n'; grep -E '^(●|⚠) ' "$log"; } > "${TOOLS_WORK}/preview.txt"
     ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
-    prompt_yes_no "$(t "Essential reports pack")" "$(t 'New reports: ${created}\nReports to update: ${updated}\n\nInstall them now? A verified backup is made first.')" 12 70 defaultno || return 0
-    tools_safety_backup REPORTS || return 1
+    prompt_yes_no "$title" "$(t 'New reports: ${created}\nReports to update: ${updated}\n\nInstall them now? A verified backup is made first.')" 12 70 defaultno || return 0
+    tools_safety_backup "$backup" || return 1
     if ! mysql --default-character-set=utf8mb4 "$DB_NAME" < "$script" >> "$log" 2>&1; then
         msg_error "" "$(t 'The reports could not be saved (no change was kept).\n\nLog: ${log}')" 11 74
         return 1
     fi
-    log "tools: reports pack installed (new=$created updated=$updated)"
+    log "tools: reports pack $tag installed (new=$created updated=$updated)"
     msg_ok "$(t '✔ Reports installed: ${ok}\n\nIn Koha: Reports > Saved reports.\nSafety backup: ${TOOLS_PRE}')" 12 74
 }
 
-_lt_reports_remove() {
-    local n log mark_all="[${REPORTS_TAG}:"
+_lt_reports_remove() {   # _lt_reports_remove TAG TITLE BACKUP
+    local tag="$1" title="$2" backup="$3" n log mark_all="[${1}:"
     log=$(tools_log reports)
     n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0;")
     if [ "${n:-0}" = "0" ]; then
-        msg_info "$(t "Essential reports pack")" "$(t "The pack is not installed. Nothing was changed.")" 9 70
+        msg_info "$title" "$(t "The pack is not installed. Nothing was changed.")" 9 70
         return 0
     fi
     run_sql "SELECT CONCAT('● ', report_name) FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0 ORDER BY id;" > "${TOOLS_WORK}/preview.txt"
     cat "${TOOLS_WORK}/preview.txt" >> "$log"
     ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
-    prompt_yes_no "$(t "Essential reports pack")" "$(t 'Remove the ${n} report(s) of the pack? Other saved reports are not touched. A verified backup is made first.')" 11 72 defaultno || return 0
-    tools_safety_backup REPORTS || return 1
+    prompt_yes_no "$title" "$(t 'Remove the ${n} report(s) of the pack? Other saved reports are not touched. A verified backup is made first.')" 11 72 defaultno || return 0
+    tools_safety_backup "$backup" || return 1
     if ! run_sql "DELETE FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0;" >/dev/null; then
         msg_error "" "$(t 'The reports could not be removed.\n\nLog: ${log}')" 10 72
         return 1
     fi
-    log "tools: reports pack removed ($n)"
+    log "tools: reports pack $tag removed ($n)"
     msg_ok "$(t '✔ Reports removed: ${n}')" 8 60
 }
 
@@ -6325,9 +6334,10 @@ function_library_tools() {
 # ----------------------------------------------------------------------
 # Presets for Brazilian libraries: migration from Biblivre, SophiA and
 # Pergamum, CPF checks, Pimaco label templates, the catalogue card (ficha
-# catalográfica) and the national holidays. Nothing here runs during the
-# installation or by itself: every tool is started from Library tools >
-# Brazil and follows the rules of the other tools (Koha's own programs
+# catalográfica), the national holidays, the government census reports
+# (MEC/INEP/IBGE) and references by ABNT NBR 6023. Nothing here runs
+# during the installation or by itself: every tool is started from Library
+# tools > Brazil and follows the rules of the other tools (Koha's own programs
 # through koha-shell, the backup/restore lock, a preview, an explicit
 # confirmation and a verified PRE-* backup before any write).
 # ======================================================================
@@ -7196,19 +7206,23 @@ _lt_br_labels_remove() {
 }
 
 # Catalogue card (ficha catalográfica, AACR2): an XSLT that imports Koha's
-# default detail view of the same language and adds the card below it.
+# default detail view of the same language and adds the card below it,
+# followed by the reference of the record by ABNT NBR 6023 (essential
+# elements; the complete formatter is Library tools > Brazil > ABNT).
 # Koha picks the file per language ({langcode} in the system preference).
-ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL
+ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
     printf '<?xml version="1.0" encoding="UTF-8"?>\n'
     printf '<!-- Koha Easy Installer: Koha'"'"'s default detail view plus the Brazilian catalogue card (ficha catalografica, AACR2). Generated file. -->\n'
     printf '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:marc="http://www.loc.gov/MARC21/slim" exclude-result-prefixes="marc">\n'
     printf '  <xsl:import href="%s"/>\n' "$(xml_escape "$1")"
     printf '  <xsl:variable name="kei-title">%s</xsl:variable>\n' "$(xml_escape "$2")"
     printf '  <xsl:variable name="kei-print">%s</xsl:variable>\n' "$(xml_escape "$3")"
+    printf '  <xsl:variable name="kei-abnt-label">%s</xsl:variable>\n' "$(xml_escape "$4")"
     cat <<'FICHA'
   <xsl:template match="marc:record">
     <xsl:apply-imports/>
     <xsl:call-template name="kei-ficha"/>
+    <xsl:call-template name="kei-abnt"/>
   </xsl:template>
 
   <xsl:template name="kei-sub">
@@ -7312,6 +7326,101 @@ ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL
       <button type="button" class="btn btn-default btn-sm kei-ficha-print" onclick="document.body.classList.add('kei-print'); window.print(); document.body.classList.remove('kei-print');"><xsl:value-of select="$kei-print"/></button>
     </div>
   </xsl:template>
+  <!-- Reference by ABNT NBR 6023:2018 (essential elements) under the card. -->
+  <xsl:variable name="kei-lc" select="'abcdefghijklmnopqrstuvwxyzàáâãäåçèéêëìíîïñòóôõöùúûüý'"/>
+  <xsl:variable name="kei-uc" select="'ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝ'"/>
+
+  <!-- ISBD punctuation at the end: "Dom Casmurro /", "São Paulo :", "Ática,". -->
+  <xsl:template name="kei-bare">
+    <xsl:param name="s"/>
+    <xsl:variable name="v" select="normalize-space($s)"/>
+    <xsl:variable name="last" select="substring($v, string-length($v))"/>
+    <xsl:choose>
+      <xsl:when test="$v != '' and contains('/:;,=', $last)">
+        <xsl:call-template name="kei-bare"><xsl:with-param name="s" select="substring($v, 1, string-length($v) - 1)"/></xsl:call-template>
+      </xsl:when>
+      <xsl:when test="$last = '.' and not(contains(' .', substring($v, string-length($v) - 2, 1)))"><xsl:value-of select="substring($v, 1, string-length($v) - 1)"/></xsl:when>
+      <xsl:otherwise><xsl:value-of select="$v"/></xsl:otherwise>
+    </xsl:choose>
+  </xsl:template>
+
+  <!-- "Assis, Machado de," -> "ASSIS, Machado de" -->
+  <xsl:template name="kei-person">
+    <xsl:variable name="a"><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="marc:subfield[@code='a']"/></xsl:call-template></xsl:variable>
+    <xsl:choose>
+      <xsl:when test="contains($a, ',')"><xsl:value-of select="concat(translate(substring-before($a, ','), $kei-lc, $kei-uc), ', ', normalize-space(substring-after($a, ',')))"/></xsl:when>
+      <xsl:otherwise><xsl:value-of select="translate($a, $kei-lc, $kei-uc)"/></xsl:otherwise>
+    </xsl:choose>
+  </xsl:template>
+
+  <xsl:template name="kei-abnt">
+    <xsl:variable name="f245" select="marc:datafield[@tag='245'][1]"/>
+    <xsl:variable name="title"><xsl:call-template name="kei-bare"><xsl:with-param name="s"><xsl:for-each select="$f245"><xsl:call-template name="kei-sub"><xsl:with-param name="codes">anp</xsl:with-param></xsl:call-template></xsl:for-each></xsl:with-param></xsl:call-template></xsl:variable>
+    <xsl:variable name="subtitle"><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="$f245/marc:subfield[@code='b']"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="coauthors" select="marc:datafield[@tag='700'][@ind1 != '3'][not(marc:subfield[@code='e'] or marc:subfield[@code='4'])]"/>
+    <xsl:variable name="imp" select="(marc:datafield[@tag='260'] | marc:datafield[@tag='264'][@ind2='1'])[1]"/>
+    <xsl:variable name="place"><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="$imp/marc:subfield[@code='a'][1]"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="publisher"><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="$imp/marc:subfield[@code='b'][1]"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="c" select="normalize-space($imp/marc:subfield[@code='c'][1])"/>
+    <xsl:variable name="date"><xsl:call-template name="kei-bare"><xsl:with-param name="s"><xsl:choose><xsl:when test="starts-with($c, 'c') or starts-with($c, '©') or starts-with($c, 'p')"><xsl:value-of select="substring($c, 2)"/></xsl:when><xsl:otherwise><xsl:value-of select="$c"/></xsl:otherwise></xsl:choose></xsl:with-param></xsl:call-template></xsl:variable>
+    <xsl:if test="$title != ''">
+      <div class="kei-abnt" id="kei-abnt" style="margin: 1em 0 1.5em;">
+        <h3 class="kei-abnt-title"><xsl:value-of select="$kei-abnt-label"/></h3>
+        <p style="font-family: 'Times New Roman', Times, serif; font-size: 12pt; text-align: left;">
+          <xsl:choose>
+            <xsl:when test="marc:datafield[@tag='100' or @tag='110' or @tag='111']">
+              <xsl:for-each select="marc:datafield[@tag='100'][1]"><xsl:call-template name="kei-person"/></xsl:for-each>
+              <xsl:for-each select="marc:datafield[@tag='110' or @tag='111'][1]">
+                <xsl:variable name="name"><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="marc:subfield[@code='a']"/></xsl:call-template></xsl:variable>
+                <xsl:value-of select="translate($name, $kei-lc, $kei-uc)"/>
+                <xsl:for-each select="marc:subfield[@code='b']"><xsl:text>. </xsl:text><xsl:call-template name="kei-bare"><xsl:with-param name="s" select="."/></xsl:call-template></xsl:for-each>
+              </xsl:for-each>
+              <xsl:if test="marc:datafield[@tag='100']">
+                <xsl:choose>
+                  <xsl:when test="count($coauthors) &gt; 2"><xsl:text> et al</xsl:text></xsl:when>
+                  <xsl:otherwise><xsl:for-each select="$coauthors"><xsl:text>; </xsl:text><xsl:call-template name="kei-person"/></xsl:for-each></xsl:otherwise>
+                </xsl:choose>
+              </xsl:if>
+              <xsl:text>. </xsl:text>
+              <strong><xsl:value-of select="$title"/></strong>
+            </xsl:when>
+            <xsl:otherwise>
+              <!-- Entry by title: the first word (with a leading article) in capitals, no bold. -->
+              <xsl:variable name="w1" select="substring-before(concat($title, ' '), ' ')"/>
+              <xsl:variable name="rest" select="substring-after($title, ' ')"/>
+              <xsl:choose>
+                <xsl:when test="$rest != '' and contains('|o|a|os|as|um|uma|uns|umas|the|an|el|la|los|las|le|les|', concat('|', translate($w1, $kei-uc, $kei-lc), '|'))">
+                  <xsl:variable name="w2" select="substring-before(concat($rest, ' '), ' ')"/>
+                  <xsl:value-of select="translate(concat($w1, ' ', $w2), $kei-lc, $kei-uc)"/>
+                  <xsl:if test="substring-after($rest, ' ') != ''"><xsl:value-of select="concat(' ', substring-after($rest, ' '))"/></xsl:if>
+                </xsl:when>
+                <xsl:otherwise>
+                  <xsl:value-of select="translate($w1, $kei-lc, $kei-uc)"/>
+                  <xsl:if test="$rest != ''"><xsl:value-of select="concat(' ', $rest)"/></xsl:if>
+                </xsl:otherwise>
+              </xsl:choose>
+            </xsl:otherwise>
+          </xsl:choose>
+          <xsl:if test="$subtitle != ''"><xsl:value-of select="concat(': ', $subtitle)"/></xsl:if>
+          <xsl:text>. </xsl:text>
+          <xsl:for-each select="marc:datafield[@tag='250'][1]"><xsl:call-template name="kei-dot"><xsl:with-param name="s" select="marc:subfield[@code='a']"/></xsl:call-template><xsl:text> </xsl:text></xsl:for-each>
+          <xsl:choose>
+            <xsl:when test="$place != '' and $publisher != ''"><xsl:value-of select="concat($place, ': ', $publisher)"/></xsl:when>
+            <xsl:when test="$place != ''"><xsl:value-of select="concat($place, ': [s. n.]')"/></xsl:when>
+            <xsl:when test="$publisher != ''"><xsl:value-of select="concat('[S. l.]: ', $publisher)"/></xsl:when>
+            <xsl:otherwise>[S. l.: s. n.]</xsl:otherwise>
+          </xsl:choose>
+          <xsl:text>, </xsl:text>
+          <xsl:choose>
+            <xsl:when test="$date != ''"><xsl:value-of select="$date"/></xsl:when>
+            <xsl:when test="translate(substring(marc:controlfield[@tag='008'], 8, 4), '0123456789', '') = '' and string-length(marc:controlfield[@tag='008']) &gt; 10"><xsl:value-of select="substring(marc:controlfield[@tag='008'], 8, 4)"/></xsl:when>
+            <xsl:otherwise>[s. d.]</xsl:otherwise>
+          </xsl:choose>
+          <xsl:text>.</xsl:text>
+        </p>
+      </div>
+    </xsl:if>
+  </xsl:template>
 </xsl:stylesheet>
 FICHA
 }
@@ -7320,8 +7429,8 @@ FICHA
 # each one importing the default view of its own language (English when a
 # side lacks that language). Prints the number of languages.
 ficha_write() {
-    local langs=() l d opac staff title print_label
-    title="$(t "Cataloguing card")"; print_label="$(t "Print the card")"
+    local langs=() l d opac staff title print_label abnt_label
+    title="$(t "Cataloguing card")"; print_label="$(t "Print the card")"; abnt_label="$(t "Reference (ABNT NBR 6023)")"
     for d in "$KOHA_OPAC_TMPL"/*/xslt/MARC21slim2OPACDetail.xsl "$KOHA_INTRA_TMPL"/*/xslt/MARC21slim2intranetDetail.xsl; do
         [ -f "$d" ] || continue
         l="${d%/xslt/*}"; l="${l##*/}"
@@ -7332,8 +7441,8 @@ ficha_write() {
         opac="$KOHA_OPAC_TMPL/$l/xslt/MARC21slim2OPACDetail.xsl"; [ -f "$opac" ] || opac="$KOHA_OPAC_TMPL/en/xslt/MARC21slim2OPACDetail.xsl"
         staff="$KOHA_INTRA_TMPL/$l/xslt/MARC21slim2intranetDetail.xsl"; [ -f "$staff" ] || staff="$KOHA_INTRA_TMPL/en/xslt/MARC21slim2intranetDetail.xsl"
         mkdir -p "$FICHA_DIR/$l" || return 1
-        ficha_xsl "$opac" "$title" "$print_label" > "$FICHA_DIR/$l/opac-detail.xsl" || return 1
-        ficha_xsl "$staff" "$title" "$print_label" > "$FICHA_DIR/$l/staff-detail.xsl" || return 1
+        ficha_xsl "$opac" "$title" "$print_label" "$abnt_label" > "$FICHA_DIR/$l/opac-detail.xsl" || return 1
+        ficha_xsl "$staff" "$title" "$print_label" "$abnt_label" > "$FICHA_DIR/$l/staff-detail.xsl" || return 1
     done
     chown -R "root:${INSTANCE}-koha" "$FICHA_DIR" 2>/dev/null || true
     chmod -R u=rwX,g=rX,o= "$FICHA_DIR"
@@ -7565,6 +7674,508 @@ _lt_br_holidays_remove() {
 }
 
 # ----------------------------------------------------------------------
+# 4. Government census reports (MEC / INEP / IBGE / SNBP): read-only SQL
+#    reports saved in Koha, like the essential pack (Library tools > 3) but
+#    with their own tag, so each pack is installed and removed on its own.
+# ----------------------------------------------------------------------
+# The figures asked by the INEP School and Higher Education censuses, the
+# IBGE surveys, the SNBP registry of public libraries and the MEC course
+# evaluations: collection (titles and volumes by item type, library and
+# CDD class), growth, circulation, readers (category, sex, age group),
+# losses and the age of the collection. Koha asks for the year when the
+# report runs (<<...>>, used once per query through the derived table p).
+CENSUS_TAG="koha-easy-installer-censo"
+# _census_yr COLUMN: COLUMN falls in the year p.y.
+_census_yr() { printf "%s >= CONCAT(p.y, '-01-01') AND %s < CONCAT(p.y + 1, '-01-01')" "$1" "$1"; }
+census_reports_define() {
+    local p ai area sex age unknown
+    RP_KEY=(); RP_GROUP=(); RP_NAME=(); RP_SQL=()
+    unknown=$(sql_quote "$(t "Not informed")")
+    p="(SELECT <<$(t "Census year (YYYY)")>> AS y) p"
+    # Items still in the collection (not lost, not withdrawn), with the item
+    # type of the item or, without one, of the record (item-level_itypes off).
+    ai="(SELECT i.itemnumber, i.biblionumber, i.barcode, i.homebranch, i.notforloan, i.itemcallnumber, i.datelastborrowed, i.issues, COALESCE(NULLIF(i.itype, ''), bi.itemtype) AS itype, NULLIF(b.copyrightdate, 0) AS copyrightdate FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber LEFT JOIN biblioitems bi ON bi.biblionumber = i.biblionumber WHERE i.itemlost = 0 AND i.withdrawn = 0) x"
+    # Main class of the CDD: the first digit of the first 3-digit group of the call number.
+    area="CASE LEFT(REGEXP_SUBSTR(COALESCE(x.itemcallnumber, ''), '[0-9]{3}'), 1)"
+    area+=" WHEN '0' THEN $(sql_quote "000 $(t "Computer science, information and general works")")"
+    area+=" WHEN '1' THEN $(sql_quote "100 $(t "Philosophy and psychology")")"
+    area+=" WHEN '2' THEN $(sql_quote "200 $(t "Religion")")"
+    area+=" WHEN '3' THEN $(sql_quote "300 $(t "Social sciences")")"
+    area+=" WHEN '4' THEN $(sql_quote "400 $(t "Language")")"
+    area+=" WHEN '5' THEN $(sql_quote "500 $(t "Natural sciences and mathematics")")"
+    area+=" WHEN '6' THEN $(sql_quote "600 $(t "Technology (applied sciences)")")"
+    area+=" WHEN '7' THEN $(sql_quote "700 $(t "Arts and recreation")")"
+    area+=" WHEN '8' THEN $(sql_quote "800 $(t "Literature")")"
+    area+=" WHEN '9' THEN $(sql_quote "900 $(t "History and geography")")"
+    area+=" ELSE $(sql_quote "$(t "Not classified")") END"
+    sex="CASE UPPER(COALESCE(b.sex, '')) WHEN 'F' THEN $(sql_quote "$(t "Female")") WHEN 'M' THEN $(sql_quote "$(t "Male")") ELSE ${unknown} END"
+    age="TIMESTAMPDIFF(YEAR, b.dateofbirth, CONCAT(p.y, '-12-31'))"
+
+    _rp censo-summary CIRC "$(t "Census: summary of the year (INEP, IBGE, SNBP)")" \
+        "SELECT p.y AS \`$(t "Year")\`, (SELECT COUNT(DISTINCT i.biblionumber) FROM items i WHERE i.itemlost = 0 AND i.withdrawn = 0) AS \`$(t "Titles in the collection (today)")\`, (SELECT COUNT(*) FROM items i WHERE i.itemlost = 0 AND i.withdrawn = 0) AS \`$(t "Volumes in the collection (today)")\`, (SELECT COUNT(*) FROM items i WHERE $(_census_yr i.dateaccessioned)) AS \`$(t "Volumes added in the year")\`, (SELECT COUNT(*) FROM items i WHERE i.itemlost <> 0 AND $(_census_yr i.itemlost_on)) AS \`$(t "Volumes lost in the year")\`, (SELECT COUNT(*) FROM items i WHERE i.withdrawn <> 0 AND $(_census_yr i.withdrawn_on)) AS \`$(t "Volumes withdrawn in the year")\`, (SELECT COUNT(*) FROM deleteditems d WHERE $(_census_yr d.timestamp)) AS \`$(t "Items deleted in the year")\`, (SELECT COUNT(*) FROM borrowers b WHERE b.dateenrolled < CONCAT(p.y + 1, '-01-01') AND (b.dateexpiry IS NULL OR b.dateexpiry >= CONCAT(p.y, '-01-01'))) AS \`$(t "Registered patrons")\`, (SELECT COUNT(*) FROM borrowers b WHERE $(_census_yr b.dateenrolled)) AS \`$(t "New patrons in the year")\`, (SELECT COUNT(DISTINCT s.borrowernumber) FROM statistics s WHERE s.type IN ('issue', 'renew') AND $(_census_yr s.datetime)) AS \`$(t "Active readers in the year")\`, (SELECT COUNT(*) FROM statistics s WHERE s.type = 'issue' AND $(_census_yr s.datetime)) AS \`$(t "Loans")\`, (SELECT COUNT(*) FROM statistics s WHERE s.type = 'renew' AND $(_census_yr s.datetime)) AS \`$(t "Renewals")\`, (SELECT COUNT(*) FROM statistics s WHERE s.type = 'localuse' AND $(_census_yr s.datetime)) AS \`$(t "In-library use")\` FROM ${p}"
+    _rp censo-collection-type CAT "$(t "Census: active collection by item type and library")" \
+        "SELECT COALESCE(t.description, x.itype, ${unknown}) AS \`$(t "Item type")\`, x.homebranch AS \`$(t "Library")\`, COUNT(DISTINCT x.biblionumber) AS \`$(t "Titles")\`, COUNT(*) AS \`$(t "Volumes")\`, SUM(COALESCE(x.notforloan, 0) = 0) AS \`$(t "For loan")\`, SUM(COALESCE(x.notforloan, 0) <> 0) AS \`$(t "Not for loan (reference)")\` FROM ${ai} LEFT JOIN itemtypes t ON t.itemtype = x.itype GROUP BY 1, 2 ORDER BY 1, 2"
+    _rp censo-collection-area CAT "$(t "Census: active collection by knowledge area (CDD)")" \
+        "SELECT ${area} AS \`$(t "Knowledge area (CDD)")\`, COUNT(DISTINCT x.biblionumber) AS \`$(t "Titles")\`, COUNT(*) AS \`$(t "Volumes")\` FROM ${ai} GROUP BY 1 ORDER BY 1"
+    _rp censo-acquisitions CAT "$(t "Census: volumes added in the year by item type and area")" \
+        "SELECT COALESCE(t.description, COALESCE(NULLIF(x.itype, ''), bi.itemtype), ${unknown}) AS \`$(t "Item type")\`, ${area} AS \`$(t "Knowledge area (CDD)")\`, COUNT(DISTINCT x.biblionumber) AS \`$(t "Titles")\`, COUNT(*) AS \`$(t "Volumes")\` FROM ${p} JOIN items x ON $(_census_yr x.dateaccessioned) LEFT JOIN biblioitems bi ON bi.biblionumber = x.biblionumber LEFT JOIN itemtypes t ON t.itemtype = COALESCE(NULLIF(x.itype, ''), bi.itemtype) GROUP BY 1, 2 ORDER BY 1, 2"
+    _rp censo-circulation CIRC "$(t "Census: circulation of the year by month")" \
+        "SELECT DATE_FORMAT(s.datetime, '%Y-%m') AS \`$(t "Month")\`, SUM(s.type = 'issue') AS \`$(t "Loans")\`, SUM(s.type = 'renew') AS \`$(t "Renewals")\`, SUM(s.type = 'return') AS \`$(t "Returns")\`, SUM(s.type = 'localuse') AS \`$(t "In-library use")\`, COUNT(DISTINCT CASE WHEN s.type IN ('issue', 'renew') THEN s.borrowernumber END) AS \`$(t "Active readers")\` FROM ${p} JOIN statistics s ON $(_census_yr s.datetime) GROUP BY 1 ORDER BY 1"
+    _rp censo-loans-type CIRC "$(t "Census: loans of the year by item type and patron category")" \
+        "SELECT COALESCE(t.description, COALESCE(NULLIF(s.itemtype, ''), i.itype), ${unknown}) AS \`$(t "Item type")\`, COALESCE(c.description, b.categorycode, ${unknown}) AS \`$(t "Patron category")\`, SUM(s.type = 'issue') AS \`$(t "Loans")\`, SUM(s.type = 'renew') AS \`$(t "Renewals")\`, SUM(s.type = 'localuse') AS \`$(t "In-library use")\` FROM ${p} JOIN statistics s ON $(_census_yr s.datetime) AND s.type IN ('issue', 'renew', 'localuse') LEFT JOIN items i ON i.itemnumber = s.itemnumber LEFT JOIN borrowers b ON b.borrowernumber = s.borrowernumber LEFT JOIN categories c ON c.categorycode = b.categorycode LEFT JOIN itemtypes t ON t.itemtype = COALESCE(NULLIF(s.itemtype, ''), i.itype) GROUP BY 1, 2 ORDER BY 1, 2"
+    _rp censo-readers PAT "$(t "Census: readers by category, sex and age group")" \
+        "SELECT COALESCE(c.description, b.categorycode) AS \`$(t "Patron category")\`, ${sex} AS \`$(t "Sex")\`, CASE WHEN b.dateofbirth IS NULL THEN ${unknown} WHEN ${age} < 12 THEN '00-11' WHEN ${age} < 18 THEN '12-17' WHEN ${age} < 30 THEN '18-29' WHEN ${age} < 60 THEN '30-59' ELSE '60+' END AS \`$(t "Age group")\`, COUNT(*) AS \`$(t "Registered patrons")\`, SUM(EXISTS (SELECT 1 FROM statistics s WHERE s.borrowernumber = b.borrowernumber AND s.type IN ('issue', 'renew') AND $(_census_yr s.datetime))) AS \`$(t "Active readers in the year")\` FROM ${p} JOIN borrowers b ON b.dateenrolled < CONCAT(p.y + 1, '-01-01') AND (b.dateexpiry IS NULL OR b.dateexpiry >= CONCAT(p.y, '-01-01')) LEFT JOIN categories c ON c.categorycode = b.categorycode GROUP BY 1, 2, 3 ORDER BY 1, 2, 3"
+    _rp censo-losses CAT "$(t "Census: losses and withdrawals of the year")" \
+        "SELECT r.kind AS \`$(t "Reason")\`, COALESCE(t.description, r.itype, ${unknown}) AS \`$(t "Item type")\`, COUNT(*) AS \`$(t "Volumes")\`, ROUND(SUM(COALESCE(r.price, 0)), 2) AS \`$(t "Replacement value")\` FROM ${p} JOIN (SELECT $(sql_quote "$(t "Lost")") AS kind, i.itemlost_on AS d, COALESCE(NULLIF(i.itype, ''), bi.itemtype) AS itype, i.replacementprice AS price FROM items i LEFT JOIN biblioitems bi ON bi.biblionumber = i.biblionumber WHERE i.itemlost <> 0 UNION ALL SELECT $(sql_quote "$(t "Withdrawn")"), i.withdrawn_on, COALESCE(NULLIF(i.itype, ''), bi.itemtype), i.replacementprice FROM items i LEFT JOIN biblioitems bi ON bi.biblionumber = i.biblionumber WHERE i.withdrawn <> 0 UNION ALL SELECT $(sql_quote "$(t "Damaged")"), i.damaged_on, COALESCE(NULLIF(i.itype, ''), bi.itemtype), i.replacementprice FROM items i LEFT JOIN biblioitems bi ON bi.biblionumber = i.biblionumber WHERE i.damaged <> 0 UNION ALL SELECT $(sql_quote "$(t "Deleted from the catalog (discarded)")"), d.timestamp, d.itype, d.replacementprice FROM deleteditems d) r ON $(_census_yr r.d) LEFT JOIN itemtypes t ON t.itemtype = r.itype GROUP BY 1, 2 ORDER BY 1, 2"
+    _rp censo-age CAT "$(t "Census: age of the collection by knowledge area (obsolescence)")" \
+        "SELECT ${area} AS \`$(t "Knowledge area (CDD)")\`, COUNT(*) AS \`$(t "Volumes")\`, SUM(YEAR(CURDATE()) - x.copyrightdate <= 5) AS \`$(t "Up to 5 years old")\`, SUM(YEAR(CURDATE()) - x.copyrightdate BETWEEN 6 AND 10) AS \`$(t "6 to 10 years old")\`, SUM(YEAR(CURDATE()) - x.copyrightdate > 10) AS \`$(t "Over 10 years old")\`, SUM(x.copyrightdate IS NULL) AS \`$(t "Year unknown")\`, ROUND(100 * SUM(YEAR(CURDATE()) - x.copyrightdate > 10) / COUNT(*), 1) AS \`$(t "Share over 10 years old (percent)")\` FROM ${ai} GROUP BY 1 ORDER BY 1"
+    _rp censo-weeding CAT "$(t "Census: weeding candidates (published over 10 years ago, not borrowed in 5 years)")" \
+        "SELECT x.barcode AS \`$(t "Barcode")\`, x.itemcallnumber AS \`$(t "Call number")\`, b.title AS \`$(t "Title")\`, b.author AS \`$(t "Author")\`, x.copyrightdate AS \`$(t "Year")\`, DATE(x.datelastborrowed) AS \`$(t "Last loan")\`, COALESCE(x.issues, 0) AS \`$(t "Loans")\`, x.homebranch AS \`$(t "Library")\` FROM ${ai} JOIN biblio b ON b.biblionumber = x.biblionumber WHERE x.copyrightdate < YEAR(CURDATE()) - 10 AND (x.datelastborrowed IS NULL OR x.datelastborrowed < DATE_SUB(CURDATE(), INTERVAL 5 YEAR)) ORDER BY x.itemcallnumber, b.title"
+}
+
+lt_br_census() {
+    require_database || return 0
+    local choice title
+    title="$(t "Government census reports")"
+    choice=$(ui_menu "$title" "$(t "Read-only SQL reports with the figures of the INEP School and Higher Education censuses, IBGE surveys, the SNBP registry and MEC evaluations. Koha asks for the census year when a report runs (Reports > Saved reports):")" \
+        "1" "$(t "Install or update the pack")" \
+        "2" "$(t "Remove the pack")") || return 0
+    case "$choice" in
+        1) tools_locked _lt_reports_install census_reports_define "$CENSUS_TAG" "$title" CENSO ;;
+        2) tools_locked _lt_reports_remove "$CENSUS_TAG" "$title" CENSO ;;
+    esac
+}
+
+# ----------------------------------------------------------------------
+# 5. ABNT references: bibliographies and collection listings formatted by
+#    ABNT NBR 6023:2018 (references) and presented as NBR 14724 asks for
+#    the reference list (heading centred in capitals, single spacing, left
+#    aligned, a blank line between entries, alphabetical order). Read-only:
+#    the records come from biblio_metadata, the files go to a chosen folder.
+# ----------------------------------------------------------------------
+# The MARC 21 to NBR 6023 formatter (written next to the data, run through
+# koha-shell like the other MARC::Record programs). Input: one line per
+# record, "biblionumber<TAB>call numbers<TAB>copies<TAB>MARCXML" as the
+# mysql client prints it (tabs, line breaks and backslashes escaped).
+abnt_write_formatter() {
+    cat > "$1" <<'ABNTPL'
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long;
+use Encode qw( decode );
+use MARC::Record;
+use MARC::File::XML ( BinaryEncoding => 'utf8', RecordFormat => 'MARC21' );
+use POSIX qw( strftime );
+use Unicode::Normalize qw( NFD );
+
+# koha-easy-installer: MARC 21 records -> references by ABNT NBR 6023:2018.
+# Books, chapters (773 with the host book), articles (773 with the journal),
+# theses (502) and online documents (856). Authors: SURNAME, Forenames; up
+# to three separated by ";", four or more as the first one plus "et al.";
+# organizers (org.), editors (ed.), coordinators (coord.). Without an
+# author the entry is the title with its first word (and a leading article
+# or monosyllable) in capitals. The title of the book or journal is in bold.
+my %o = ( caption => '', access => '' );
+GetOptions( \%o, 'in=s', 'html=s', 'text=s', 'caption=s', 'listing', 'access=s' ) or exit 2;
+binmode STDOUT, ':encoding(UTF-8)';
+$o{$_} = decode( 'UTF-8', $o{$_} ) for qw( caption access );
+my @MONTHS = qw( jan. fev. mar. abr. maio jun. jul. ago. set. out. nov. dez. );
+my @now = localtime;
+$o{access} ||= sprintf '%d %s %d', $now[3], $MONTHS[ $now[4] ], $now[5] + 1900;
+my %ARTICLE = map { $_ => 1 } qw( o a os as um uma uns umas the an el la los las lo le les un une il gli der die das ein eine );
+my ( $B, $E ) = ( "\x{1}", "\x{2}" );    # bold on / off
+
+sub clean { my $s = shift // ''; $s =~ s/\s+/ /g; $s =~ s/^ | $//g; return $s }
+# ISBD punctuation at the end ("Title /", "São Paulo :", "Ática,", "1997.").
+# The full stop stays after an initial or an abbreviation ("J.", "ed.", "al.").
+sub bare {
+    my $s = clean(shift);
+    1 while $s =~ s/\s*[\/:;,=+]$//;
+    $s =~ s/\.$// unless $s =~ /(?:^|[\s.(])[[:alpha:]]{1,3}\.$/;
+    return clean($s);
+}
+sub dot { my $s = clean(shift); return '' if $s eq ''; return $s =~ /[.?!]\x{2}?$/ ? $s : "$s." }
+sub sub_all { my ( $f, $codes ) = @_; return clean( join ' ', map { $_->[1] } grep { index( $codes, $_->[0] ) >= 0 } $f->subfields ) }
+
+sub person {    # "Assis, Machado de," -> "ASSIS, Machado de"
+    my $f = shift;
+    my $a = bare( scalar $f->subfield('a') );
+    return '' if $a eq '';
+    my ( $sur, $rest ) = $a =~ /^([^,]+),\s*(.*)$/ ? ( $1, $2 ) : ( $a, '' );
+    return uc($sur) . ( $rest ne '' ? ", $rest" : '' );
+}
+sub direct_name {    # "Silva, José da" -> "José da Silva"
+    my $a = bare( scalar shift->subfield('a') );
+    return $a =~ /^([^,]+),\s*(.+)$/ ? "$2 $1" : $a;
+}
+sub corporate {      # "Brasil. Ministério da Educação" -> "BRASIL. Ministério da Educação"
+    my $f = shift;
+    my @b = map { bare($_) } $f->subfield('b');
+    return join '. ', uc( bare( scalar $f->subfield('a') ) ), @b;
+}
+sub meeting {        # CONGRESSO BRASILEIRO DE BIBLIOTECONOMIA, 25., 2013, Florianópolis
+    my $f = shift;
+    my @p = ( uc( bare( scalar $f->subfield('a') ) ) );
+    for my $c (qw( n d c )) {
+        ( my $v = bare( scalar $f->subfield($c) ) ) =~ s/^\(|\)$//g;
+        $v = bare($v);
+        $v = "$1." if $c eq 'n' && $v =~ /^(\d+)(?:st|nd|rd|th|º|ª|o|a)?\.?$/;
+        push @p, $v if $v ne '';
+    }
+    return join ', ', @p;
+}
+sub role {
+    my $f = shift;
+    my $r = lc join ' ', $f->subfield('e'), $f->subfield('4');
+    return 'org.'   if $r =~ /\b(org|organi[sz]|comp|compil)/;
+    return 'ed.'    if $r =~ /\b(edt|ed\b|editor)/;
+    return 'coord.' if $r =~ /\bcoord/;
+    return 'trl'    if $r =~ /\b(trl|trad|transl)/;
+    return 'aut'    if $r eq '' || $r =~ /\b(aut|autor|author)/;
+    return 'other';
+}
+sub author_list {
+    my @n = @_;
+    return '' unless @n;
+    return @n > 3 ? "$n[0] et al" : join '; ', @n;
+}
+sub title_entry {    # "O pequeno príncipe" -> "O PEQUENO príncipe"
+    my $t = shift;
+    my @w = split / /, $t, -1;
+    return $t unless @w;
+    my $n = ( @w > 1 && ( $ARTICLE{ lc $w[0] } || length( $w[0] ) <= 2 ) ) ? 2 : 1;
+    $w[$_] = uc( $w[$_] ) for 0 .. $n - 1;
+    return join ' ', @w;
+}
+sub edition {        # "2nd ed.", "2ª edição rev. e ampl." -> "2. ed.", "2. ed. rev. e ampl."; 1st edition left out
+    my $e = bare(shift);
+    return '' if $e eq '';
+    if ( $e =~ /^(\d+)\s*(?:st|nd|rd|th|ª|º|a|o)?\.?\s*(?:edição|edicao|edition|edición|ed\.|éd\.|ed|éd)(?![[:alpha:]])\s*(.*)$/i ) {
+        my ( $n, $rest ) = ( $1, clean($2) );
+        return '' if $n == 1 && $rest eq '';
+        return dot( "$n. ed." . ( $rest ne '' ? " $rest" : '' ) );
+    }
+    return dot($e);
+}
+sub publisher {
+    my $p = bare(shift);
+    $p =~ s/,?\s+(?:Ltda\.?|S\.\s?A\.?|S\/A|Eireli|ME)$//i;
+    return $p;
+}
+sub no_value { my $s = shift; return $s eq '' || $s =~ /^\[?\s*s\.\s*[ln]\.?\s*\]?$/i || $s =~ /^\[?\s*(?:s\.\s*l\.?\s*:\s*s\.\s*n\.?|sine loco|sine nomine)\s*\]?$/i }
+sub year_of {
+    my ( $m, $c ) = @_;
+    my $y = clean( $c // '' );
+    return $1 if $y =~ /(\[[^\]]*\d{2}[^\]]*\])/;    # [2010?] [199-] as catalogued
+    return $1 if $y =~ /((?:1[5-9]|20)\d{2})/;
+    my $f008 = $m->field('008');
+    my $d = $f008 ? substr( $f008->data . ( ' ' x 40 ), 7, 4 ) : '';
+    return $d if $d =~ /^\d{4}$/;
+    return '';
+}
+sub imprint {        # "São Paulo: Ática, 1997"
+    my ( $m, $thesis ) = @_;
+    my ($f) = grep { $_->tag eq '260' || $_->indicator(2) eq '1' } $m->field( '260', '264' );
+    my $year = year_of( $m, $f ? scalar $f->subfield('c') : $thesis ? sub_all( $thesis, 'ad' ) : '' );
+    my $miss = $year eq '';
+    $year = '[s. d.]' if $miss;
+    return ( $year, $miss ) if !$f && $thesis;
+    my $place = $f ? bare( scalar $f->subfield('a') ) : '';
+    my $pub   = $f ? publisher( scalar $f->subfield('b') ) : '';
+    $place = '' if no_value($place);
+    $pub   = '' if no_value($pub);
+    my $pp = $place ne '' && $pub ne '' ? "$place: $pub"
+           : $place ne '' ? "$place: [s. n.]"
+           : $pub ne ''   ? "[S. l.]: $pub"
+           :                '[S. l.: s. n.]';
+    return ( "$pp, $year", $miss );
+}
+sub extent {         # "xii, 250 p. :" -> "250 p."
+    my ( $m, $thesis ) = @_;
+    my $f = $m->field('300') or return '';
+    my $a = sub_all( $f, 'a' );
+    if ( $a =~ /(\d+)\s*(p|f|v|folhas|páginas|paginas|pages|volumes?)\b\.?/i ) {
+        my ( $n, $u ) = ( $1, lc substr( $2, 0, 1 ) );
+        $u = 'f' if $thesis && $u eq 'p';
+        return "$n $u.";
+    }
+    return dot( bare($a) );
+}
+sub series { return join ' ', map { my $v = bare( scalar $_->subfield('v') ); '(' . bare( scalar $_->subfield('a') ) . ( $v ne '' ? ", $v" : '' ) . ').' } grep { bare( scalar $_->subfield('a') ) ne '' } $_[0]->field('490') }
+
+sub reference {
+    my $m = shift;
+    my $t245 = $m->field('245') or return;
+    my $main = bare( sub_all( $t245, 'anp' ) );
+    my $sub  = bare( sub_all( $t245, 'b' ) );
+    return if $main eq '';
+    my $thesis = $m->field('502');
+    my @people = $m->field('700');
+    my ( $entry, $role ) = ( '', '' );
+    if ( my $f = $m->field('100') ) {
+        $entry = author_list( person($f), map { person($_) } grep { role($_) eq 'aut' } @people );
+    } elsif ( $f = $m->field('110') ) {
+        $entry = corporate($f);
+    } elsif ( $f = $m->field('111') ) {
+        $entry = meeting($f);
+    } else {
+        for my $r ( 'org.', 'ed.', 'coord.' ) {
+            my @r = grep { role($_) eq $r } @people;
+            next unless @r;
+            $entry = author_list( map { person($_) } @r ) . " ($r)";
+            last;
+        }
+        # AACR2 enters works of four or more authors under the title, with
+        # the first author in 700: NBR 6023 keeps the author ("SILVA, Ana et al.").
+        if ( $entry eq '' ) {
+            my @a = map { person($_) } grep { role($_) eq 'aut' && $_->indicator(1) ne '3' } @people;
+            $entry = author_list(@a) . ( @a && @a < 4 && sub_all( $t245, 'c' ) =~ /et al/i ? ' et al' : '' ) if @a;
+        }
+    }
+    my @trl = map { direct_name($_) } grep { role($_) eq 'trl' } @people;
+    my $host = $m->field('773');
+    my $ref;
+    if ($entry ne '') {
+        $ref = dot($entry) . ' ';
+        $ref .= $host ? dot( $main . ( $sub ne '' ? ": $sub" : '' ) ) : dot( "$B$main$E" . ( $sub ne '' ? ": $sub" : '' ) );
+    } else {
+        $ref = dot( title_entry($main) . ( $sub ne '' ? ": $sub" : '' ) );
+    }
+    $ref .= ' Tradução: ' . dot( join( ', ', @trl[ 0 .. ( $#trl < 2 ? $#trl : 2 ) ] ) ) if @trl;
+    my $miss;
+    if ($host) {
+        my $ht = bare( scalar $host->subfield('t') );
+        my $g  = bare( scalar $host->subfield('g') );
+        my $d  = bare( scalar $host->subfield('d') );
+        my $h7 = $host->subfield('7') // '';
+        my $chapter = $d ne '' || $host->subfield('z') || substr( $h7 . '    ', 3, 1 ) eq 'm';
+        my $year = year_of( $m, $d ne '' ? $d : $g );
+        $miss = $year eq '';
+        $year = '[s. d.]' if $miss;
+        if ($chapter) {
+            my $ha = bare( scalar $host->subfield('a') );
+            $ha = $ha =~ /^([^,]+),\s*(.*)$/ ? uc($1) . ", $2" : uc($ha) if $ha ne '';
+            $d =~ s/\s*:\s*/: /g;
+            $d .= ", $year" if $d ne '' && index( $d, $year ) < 0;
+            $ref .= ' In: ' . ( $ha ne '' ? dot($ha) . ' ' : '' ) . dot( $ht ne '' ? "$B$ht$E" : '' ) . ' ' . dot( $d ne '' ? $d : $year );
+            $ref .= ' ' . dot($g) if $g ne '';
+        } else {
+            $g =~ s/\s*\(\s*\d{4}\s*\)//;    # "v. 10, n. 2 (2019), p. 33-50": the year goes last
+            $g = clean($g);
+            $g .= ( $g ne '' ? ', ' : '' ) . $year unless $g =~ /\Q$year\E$/;
+            $ref .= ' ' . dot( "$B$ht$E, $g" );
+        }
+    } else {
+        my $ed = edition( scalar( $m->field('250') ? $m->field('250')->subfield('a') : '' ) );
+        $ref .= " $ed" if $ed ne '';
+        my $imp;
+        ( $imp, $miss ) = imprint( $m, $thesis );
+        $ref .= ' ' . dot($imp);
+        my $ext = extent( $m, $thesis );
+        $ref .= " $ext" if $ext ne '';
+        my $ser = series($m);
+        $ref .= " $ser" if $ser ne '';
+        if ($thesis) {
+            my $a = bare( scalar $thesis->subfield('a') );
+            if ( $a eq '' ) {    # 502 $b degree, $c institution, $d year
+                my ( $deg, $inst, $when ) = map { bare( scalar $thesis->subfield($_) ) } qw( b c d );
+                $a = join ' – ', grep { $_ ne '' } $deg, join( ', ', grep { $_ ne '' } $inst, $when );
+            }
+            $a =~ s/\s+-{1,2}\s+/ – /g;
+            $ref .= ' ' . dot($a) if $a ne '';
+        }
+    }
+    # Online documents only: 856 of the resource itself (2nd indicator 0), or
+    # the whole record describes an online item (008/23 o, q or s).
+    my $f008 = $m->field('008');
+    my $online = $f008 && substr( $f008->data . ( ' ' x 40 ), 23, 1 ) =~ /[oqs]/;
+    if ( my ($url) = grep { defined } map { scalar $_->subfield('u') } grep { $online || $_->indicator(2) eq '0' } $m->field('856') ) {
+        $ref .= " Disponível em: $url. Acesso em: $o{access}.";
+    }
+    $ref =~ s/\.\././g;
+    $ref =~ s/ {2,}/ /g;
+    return ( $ref, $miss );
+}
+
+sub sort_key { my $s = NFD( lc shift ); $s =~ s/[\x{1}\x{2}]//g; $s =~ s/\p{Mn}//g; $s =~ s/[^\p{L}\p{N} ]+/ /g; $s =~ s/ +/ /g; return $s }
+sub html_escape { my $s = shift; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g; return $s }
+
+open( my $in, '<:encoding(UTF-8)', $o{in} ) or die "cannot read $o{in}\n";
+my ( @refs, %seen, $bad, $undated );
+( $bad, $undated ) = ( 0, 0 );
+while ( my $line = <$in> ) {
+    chomp $line;
+    my ( $bn, $calls, $copies, $xml ) = split /\t/, $line, 4;
+    next unless defined $xml && $xml ne '';
+    $_ =~ s/\\(.)/$1 eq 'n' ? "\n" : $1 eq 't' ? "\t" : $1 eq '0' ? "\0" : $1/ge for $calls, $xml;
+    my $m = eval { MARC::Record->new_from_xml( $xml, 'UTF-8', 'MARC21' ) };
+    my ( $ref, $miss ) = $m ? reference($m) : ();
+    unless ( defined $ref ) { $bad++; next }
+    my $loc = '';
+    if ( $o{listing} ) {
+        $loc = !$copies ? 'Sem exemplares no acervo.'
+             : 'Localização: ' . ( clean($calls) ne '' ? clean($calls) : 'sem número de chamada' ) . " ($copies ex.).";
+    } else {
+        next if $seen{$ref}++;
+    }
+    $undated++ if $miss;
+    push @refs, [ sort_key($ref), $ref, $loc, $bn ];
+}
+close $in;
+@refs = sort { $a->[0] cmp $b->[0] || $a->[3] <=> $b->[3] } @refs;
+
+open( my $t, '>:encoding(UTF-8)', $o{text} ) or die "cannot write $o{text}\n";
+print {$t} "$o{caption}\n\n" if $o{caption} ne '';
+print {$t} "REFERÊNCIAS\n\n";
+for (@refs) { ( my $r = $_->[1] ) =~ s/[\x{1}\x{2}]//g; print {$t} $r, "\n", ( $_->[2] ne '' ? "    $_->[2]\n" : '' ), "\n" }
+close($t) or die "cannot write $o{text}\n";
+
+open( my $h, '>:encoding(UTF-8)', $o{html} ) or die "cannot write $o{html}\n";
+my $cap = html_escape( $o{caption} );
+print {$h} <<"HTML";
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>${\( $cap ne '' ? $cap : 'Referências' )}</title>
+<!-- Koha Easy Installer: references by ABNT NBR 6023:2018, presented as NBR 14724 (A4, margins 3 cm top/left and 2 cm bottom/right, Times 12, single spacing, a blank line between references). -->
+<style>
+\@page { size: A4; margin: 3cm 2cm 2cm 3cm; }
+body { font-family: "Times New Roman", Times, serif; font-size: 12pt; line-height: 1; color: #000; background: #fff; max-width: 16cm; margin: 1cm auto; }
+.caption { text-align: center; margin: 0 0 24pt; }
+h1 { font-size: 12pt; font-weight: bold; text-align: center; text-transform: uppercase; margin: 0 0 12pt; }
+p.ref { text-align: left; margin: 0 0 12pt; }
+p.loc { text-align: left; margin: -9pt 0 12pt 1.25cm; font-size: 10pt; }
+\@media print { body { margin: 0; max-width: none; } }
+</style>
+</head>
+<body>
+HTML
+print {$h} qq{<p class="caption">$cap</p>\n} if $cap ne '';
+print {$h} "<h1>Referências</h1>\n";
+for (@refs) {
+    my $r = html_escape( $_->[1] );
+    $r =~ s/\x{1}/<strong>/g;
+    $r =~ s/\x{2}/<\/strong>/g;
+    print {$h} qq{<p class="ref">$r</p>\n};
+    print {$h} qq{<p class="loc">} . html_escape( $_->[2] ) . "</p>\n" if $_->[2] ne '';
+}
+print {$h} "</body>\n</html>\n";
+close($h) or die "cannot write $o{html}\n";
+print "References: ", scalar(@refs), "\n";
+print "Without date: $undated\n";
+print "Records not read: $bad\n";
+ABNTPL
+}
+
+lt_br_abnt() {
+    require_database || return 0
+    local title src sel a b n bib cond caption listing dir active="i.itemlost = 0 AND i.withdrawn = 0"
+    title="$(t "ABNT references (NBR 6023)")"
+    src=$(ui_menu "$title" "$(t "Bibliography or collection listing with the references by ABNT NBR 6023 and the NBR 14724 presentation (HTML for Word or LibreOffice, and plain text). Records to include:")" \
+        "list"    "$(t "A Koha list (e.g. the basic bibliography of a course)")" \
+        "new"     "$(t "Items added in a period (new acquisitions)")" \
+        "class"   "$(t "Call numbers starting with a class (e.g. 869 or 3)")" \
+        "branch"  "$(t "The whole collection of a library")" \
+        "numbers" "$(t "Record numbers typed by hand")") || return 0
+    case "$src" in
+        list)
+            if [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.virtualshelves;")" = "0" ]; then
+                msg_info "$title" "$(t "Koha has no list yet (OPAC or staff interface > Lists). Nothing was written.")" 9 72
+                return 0
+            fi
+            sel=$(tools_pick "$title" "$(t "Koha list:")" "SELECT shelfnumber, shelfname FROM ${DB_NAME}.virtualshelves ORDER BY shelfname;") || return 0
+            [[ "$sel" =~ ^[0-9]+$ ]] || return 0
+            bib="SELECT biblionumber FROM ${DB_NAME}.virtualshelfcontents WHERE shelfnumber = ${sel}"
+            cond="$active"
+            caption="$(run_sql "SELECT shelfname FROM ${DB_NAME}.virtualshelves WHERE shelfnumber = ${sel};")" ;;
+        new)
+            a=$(ui_input "$title" "$(t "First day (YYYY-MM-DD):")" "$(date +%Y)-01-01") || return 0
+            b=$(ui_input "$title" "$(t "Last day (YYYY-MM-DD):")" "$(date +%F)") || return 0
+            if ! valid_date "$a" || ! valid_date "$b"; then
+                msg_error "" "$(t "Invalid date. Use YYYY-MM-DD.\nNothing was written.")" 9 64
+                return 1
+            fi
+            cond="$active AND i.dateaccessioned BETWEEN '${a}' AND '${b}'"
+            bib="SELECT i.biblionumber FROM ${DB_NAME}.items i WHERE ${cond}"
+            caption="$(t 'New acquisitions from ${a} to ${b}')" ;;
+        class)
+            a=$(ui_input "$title" "$(t "Beginning of the call number (e.g. 869 for Brazilian literature, 3 for social sciences):")" "") || return 0
+            if ! [[ "$a" =~ ^[0-9A-Za-z.]{1,15}$ ]]; then
+                msg_error "" "$(t "Use only digits, letters and dots (up to 15).\nNothing was written.")" 9 64
+                return 1
+            fi
+            cond="$active AND i.itemcallnumber LIKE '${a}%'"
+            bib="SELECT i.biblionumber FROM ${DB_NAME}.items i WHERE ${cond}"
+            caption="$(t 'Collection: call numbers ${a}')" ;;
+        branch)
+            sel=$(tools_pick "$title" "$(t "Library")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+            cond="$active AND i.homebranch = $(sql_quote "$sel")"
+            bib="SELECT i.biblionumber FROM ${DB_NAME}.items i WHERE ${cond}"
+            caption="$(run_sql "SELECT branchname FROM ${DB_NAME}.branches WHERE branchcode = $(sql_quote "$sel");")" ;;
+        numbers)
+            a=$(ui_input "$title" "$(t "Record numbers (biblionumber), separated by spaces or commas:")" "") || return 0
+            a=$(tr ',;' '  ' <<< "$a" | xargs 2>/dev/null)
+            if ! [[ "$a" =~ ^[0-9]+(\ [0-9]+)*$ ]]; then
+                msg_error "" "$(t "Use only record numbers separated by spaces or commas.\nNothing was written.")" 9 70
+                return 1
+            fi
+            bib="SELECT biblionumber FROM ${DB_NAME}.biblio WHERE biblionumber IN (${a// /, })"
+            cond="$active"
+            caption="" ;;
+        *) return 0 ;;
+    esac
+    n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.biblio_metadata m WHERE m.format = 'marcxml' AND m.biblionumber IN (${bib});")
+    if [ "${n:-0}" = "0" ]; then
+        msg_info "$title" "$(t "No record found. Nothing was written.")" 8 60
+        return 0
+    fi
+    listing=""
+    prompt_yes_no "$title" "$(t 'Records found: ${n}\n\nAdd the call numbers and the number of copies under each reference (collection listing)?\n\nChoose No for a plain bibliography (e.g. for students or the MEC evaluators).')" 14 74 defaultno && listing="--listing"
+    dir=$(select_directory "/root") || return 0
+    tools_workdir || return 1
+    _lt_br_abnt_run "$bib" "$cond" "$caption" "$listing" "$dir"
+    local rc=$?
+    [ -d "$TOOLS_WORK" ] && rm -f "$TOOLS_WORK"/abnt-*
+    return "$rc"
+}
+
+_lt_br_abnt_run() {
+    local bib="$1" cond="$2" caption="$3" listing="$4" dir="$5" log data script stamp html text refs undated bad
+    local args=()
+    log=$(tools_log abnt)
+    # koha-shell cannot pass a single quote or a line break (kq): a list
+    # named "Leitura d'água" gets a typographic apostrophe in the caption.
+    caption="${caption//\'/’}"; caption="${caption//$'\n'/ }"
+    data="$TOOLS_WORK/abnt-records.tsv"; script="$TOOLS_WORK/abnt-format.pl"
+    stamp=$(date +%Y%m%d-%H%M%S)
+    display_explanation "Formatting the references..."
+    run_sql "SELECT m.biblionumber, COALESCE((SELECT GROUP_CONCAT(DISTINCT i.itemcallnumber ORDER BY i.itemcallnumber SEPARATOR ' | ') FROM ${DB_NAME}.items i WHERE i.biblionumber = m.biblionumber AND ${cond}), ''), (SELECT COUNT(*) FROM ${DB_NAME}.items i WHERE i.biblionumber = m.biblionumber AND ${cond}), REPLACE(REPLACE(REPLACE(m.metadata, '\r', ' '), '\n', ' '), '\t', ' ') FROM ${DB_NAME}.biblio_metadata m WHERE m.format = 'marcxml' AND m.biblionumber IN (${bib}) ORDER BY m.biblionumber;" > "$data"
+    abnt_write_formatter "$script"
+    chown "${INSTANCE}-koha:" "$data" "$script" 2>/dev/null || true
+    chmod 600 "$data" "$script"
+    args=(--in "$data" --html "$TOOLS_WORK/abnt-out.html" --text "$TOOLS_WORK/abnt-out.txt" --caption "$caption")
+    [ -n "$listing" ] && args+=("$listing")
+    if ! koha_exec "$log" abnt-format /usr/bin/perl "$script" "${args[@]}" || [ ! -s "$TOOLS_WORK/abnt-out.html" ]; then
+        ui_textbox "$(t "ABNT references (NBR 6023)")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was written.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    html="${dir%/}/referencias-abnt-${stamp}.html"; text="${dir%/}/referencias-abnt-${stamp}.txt"
+    if ! cp -f -- "$TOOLS_WORK/abnt-out.html" "$html" || ! cp -f -- "$TOOLS_WORK/abnt-out.txt" "$text"; then
+        msg_error "" "$(t 'The files could not be written in ${dir}.')" 9 72
+        return 1
+    fi
+    chmod 644 "$html" "$text"
+    refs=$(tools_num "$log" "References:"); undated=$(tools_num "$log" "Without date:"); bad=$(tools_num "$log" "Records not read:")
+    head -n 60 "$text" > "$TOOLS_WORK/abnt-preview.txt"
+    ui_textbox "$(t "ABNT references (NBR 6023)")" "$TOOLS_WORK/abnt-preview.txt"
+    log "tools: ABNT references written ($refs) in $dir"
+    msg_ok "$(t '✔ References: ${refs}\nWithout a publication date: ${undated} (NBR 6023 asks for an estimated date in brackets, e.g. [2010?])\nRecords not read: ${bad}\n\nOpen the HTML file in Word or LibreOffice:\n${html}\n${text}')" 15 76
+}
+
+# ----------------------------------------------------------------------
 # Brazil submenu (Library tools > 10)
 # ----------------------------------------------------------------------
 function_brazil_tools() {
@@ -7579,7 +8190,9 @@ function_brazil_tools() {
             "4" "$(t "▤  Pimaco label templates")" \
             "5" "$(t "▤  Cataloguing card (ficha catalográfica)")" \
             "6" "$(t "◷  Brazilian holidays in the calendar")" \
-            "7" "$(t "⇩  Migrate a collection spreadsheet (Biblioteca Fácil)")" 3>&1 1>&2 2>&3) || return 0
+            "7" "$(t "⇩  Migrate a collection spreadsheet (Biblioteca Fácil)")" \
+            "8" "$(t "▤  Government census reports (MEC/INEP/IBGE)")" \
+            "9" "$(t "▤  ABNT references and bibliographies (NBR 6023)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_br_migrate_marc ;;
             2) lt_br_patrons ;;
@@ -7588,6 +8201,8 @@ function_brazil_tools() {
             5) lt_br_ficha ;;
             6) lt_br_holidays ;;
             7) lt_br_migrate_sheet ;;
+            8) lt_br_census ;;
+            9) lt_br_abnt ;;
         esac
         clear
     done

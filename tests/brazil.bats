@@ -314,6 +314,16 @@ ficha_env() {
     assert 'echo "$card" | grep -qx "1. Romance brasileiro – Século XIX. I. Silva, João. II. Título."' "$card"
     assert 'echo "$card" | grep -qx "CDD 869.3"'
     assert 'echo "$output" | grep -q "class=\"kei-entrada\"" && echo "$output" | grep -q "text-indent: -2.2em"' "hanging indentation"
+    # The ABNT reference under the card (the organizer with $e is not a co-author).
+    local ref
+    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
+    assert '[ "$ref" = "ASSIS, Machado de. Dom Casmurro. 3. ed. São Paulo: Ática, 1997." ]' "ABNT reference: $ref"
+    assert 'echo "$output" | grep -q "<strong>Dom Casmurro</strong>"' "the title is in bold"
+    printf '%s\n' '<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><controlfield tag="008">090101s2009    bl            000 0 por d</controlfield>
+      <datafield tag="245" ind1="0" ind2="2"><subfield code="a">O pequeno príncipe /</subfield></datafield></record>' > "$W/rec2.xml"
+    run xsltproc "$W/ficha/pt-BR/opac-detail.xsl" "$W/rec2.xml"
+    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
+    assert '[ "$ref" = "O PEQUENO príncipe. [S. l.: s. n.], 2009." ]' "entry by title, date of the 008: $ref"
     # Off: the previous values come back.
     inputs "off"; answer yes
     panel lt_br_ficha
@@ -330,6 +340,239 @@ ficha_env() {
     panel ficha_refresh
     rm -f /etc/koha-easy-install/ficha.state
     assert '[ -f "$W/ficha/es-ES/opac-detail.xsl" ] && [ -f "$W/ficha/es-ES/staff-detail.xsl" ]' "$(ls -R "$W/ficha" 2>&1)"
+}
+
+# --- 4. Government census reports -----------------------------------------------
+
+# Koha columns used by the census reports, and a year (2025) with known
+# figures: 3 volumes added, 1 lost, 1 withdrawn, 1 damaged, 1 deleted,
+# 2 loans, 1 renewal, 1 in-library use, 2 active readers.
+census_data() {
+    tools_sql "
+ALTER TABLE items ADD COLUMN itype varchar(10), ADD COLUMN notforloan tinyint(1) NOT NULL DEFAULT 0, ADD COLUMN withdrawn tinyint(1) NOT NULL DEFAULT 0,
+  ADD COLUMN withdrawn_on datetime, ADD COLUMN damaged tinyint(1) NOT NULL DEFAULT 0, ADD COLUMN damaged_on datetime,
+  ADD COLUMN replacementprice decimal(8,2), ADD COLUMN datelastborrowed date;
+ALTER TABLE biblio ADD COLUMN copyrightdate smallint(6);
+ALTER TABLE borrowers ADD COLUMN sex varchar(1);
+ALTER TABLE statistics ADD COLUMN itemtype varchar(10);
+CREATE TABLE biblioitems (biblioitemnumber int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, biblionumber int(11) NOT NULL, itemtype varchar(10));
+CREATE TABLE deleteditems (itemnumber int(11) NOT NULL PRIMARY KEY, biblionumber int(11) NOT NULL, itype varchar(10), replacementprice decimal(8,2),
+  withdrawn tinyint(1) NOT NULL DEFAULT 0, timestamp timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp());
+CREATE TABLE virtualshelves (shelfnumber int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, shelfname varchar(255)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE virtualshelfcontents (shelfnumber int(11) NOT NULL, biblionumber int(11) NOT NULL);
+INSERT INTO biblioitems (biblionumber, itemtype) SELECT biblionumber, 'LIVRO' FROM biblio;
+UPDATE items SET itype = 'REV' WHERE itemnumber IN (10, 11);
+UPDATE biblio SET copyrightdate = IF(biblionumber <= 50, 2023, IF(biblionumber <= 100, 2010, NULL));
+UPDATE items SET itemcallnumber = '869.3 A1' WHERE itemnumber BETWEEN 20 AND 29;
+UPDATE items SET dateaccessioned = '2025-03-10' WHERE itemnumber IN (20, 21, 22);
+UPDATE items SET itemlost_on = '2025-02-02', replacementprice = 30 WHERE itemnumber = 1;
+UPDATE items SET withdrawn = 1, withdrawn_on = '2025-05-01' WHERE itemnumber = 30;
+UPDATE items SET damaged = 1, damaged_on = '2025-06-01', replacementprice = 45.5 WHERE itemnumber = 31;
+INSERT INTO deleteditems (itemnumber, biblionumber, itype, replacementprice, timestamp) VALUES (9001, 1, 'LIVRO', 10, '2025-08-01'), (9002, 1, 'LIVRO', 10, '2024-08-01');
+UPDATE borrowers SET sex = 'F' WHERE cardnumber = 'S1';
+UPDATE borrowers SET sex = 'M' WHERE cardnumber = 'S2';
+INSERT INTO statistics (datetime, branch, type, itemnumber, borrowernumber, itemtype)
+  SELECT '2025-03-15 10:00', 'CPL', 'issue', 20, borrowernumber, 'LIVRO' FROM borrowers WHERE cardnumber = 'S1' UNION ALL
+  SELECT '2025-03-20 10:00', 'CPL', 'renew', 20, borrowernumber, 'LIVRO' FROM borrowers WHERE cardnumber = 'S1' UNION ALL
+  SELECT '2025-04-02 10:00', 'CPL', 'issue', 10, borrowernumber, 'REV' FROM borrowers WHERE cardnumber = 'S2' UNION ALL
+  SELECT '2025-04-05 10:00', 'CPL', 'return', 10, borrowernumber, 'REV' FROM borrowers WHERE cardnumber = 'S2' UNION ALL
+  SELECT '2025-04-06 10:00', 'CPL', 'localuse', 11, NULL, 'REV' UNION ALL
+  SELECT '2024-12-31 23:00', 'CPL', 'issue', 21, borrowernumber, 'LIVRO' FROM borrowers WHERE cardnumber = 'S3';"
+}
+# census_run KEY: the saved report run for 2025, as Koha would after asking for the year.
+census_run() {
+    local q
+    q=$(tools_sql "SELECT savedsql FROM saved_sql WHERE notes LIKE '%[koha-easy-installer-censo:censo-$1]%';")
+    [ -n "$q" ] || return 1
+    tools_sql "$(sed -E "s/<<[^<>]*>>/'2025'/g" <<< "$q")"
+}
+
+@test "BR17 census reports: tagged read-only reports with the year asked by Koha, figures of the year, own pack" {
+    census_data
+    inputs "1"; answer yes
+    panel lt_br_census
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE notes LIKE '"'"'%[koha-easy-installer-censo:%'"'"';")" = "10" ]' "10 reports expected: $(cat "$KEI_S/textbox.last")"
+    assert '[ "$(pre_backups CENSO)" = "1" ]'
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE notes LIKE '"'"'%[koha-easy-installer-censo:%'"'"' AND savedsql NOT LIKE '"'"'SELECT %'"'"';")" = "0" ]' "only SELECT statements"
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE savedsql LIKE '"'"'%<<Census year (YYYY)>>%'"'"';")" = "6" ]' "reports of a year ask for it (once per query)"
+    local key
+    for key in summary collection-type collection-area acquisitions circulation loans-type readers losses age weeding; do
+        assert 'census_run "$key" >/dev/null' "report $key does not run"
+    done
+    assert '[ "$(census_run summary)" = "$(printf "2025\t198\t198\t3\t1\t1\t1\t5\t0\t2\t2\t1\t1")" ]' "summary of 2025: $(census_run summary)"
+    assert 'census_run collection-area | grep -qx "800 Literature	10	10"' "$(census_run collection-area)"
+    assert 'census_run collection-area | grep -qx "000 Computer science, information and general works	188	188"'
+    assert 'census_run collection-type | grep -qx "Revista	CPL	2	2	2	0"' "$(census_run collection-type)"
+    assert 'census_run acquisitions | grep -qx "Livro	800 Literature	3	3"' "$(census_run acquisitions)"
+    assert 'census_run circulation | grep -qx "2025-03	1	1	0	0	1"' "$(census_run circulation)"
+    assert 'census_run circulation | grep -qx "2025-04	1	0	1	1	1"'
+    assert 'census_run loans-type | grep -qx "Revista	Student	1	0	0"' "$(census_run loans-type)"
+    assert 'census_run loans-type | grep -qx "Revista	Not informed	0	0	1"' "anonymous in-library use"
+    assert 'census_run readers | grep -qx "Student	Female	18-29	1	1"' "$(census_run readers)"
+    assert 'census_run readers | grep -qx "Student	Not informed	00-11	1	0"' "S3 (born 2016) read nothing in 2025"
+    assert 'census_run losses | grep -qx "Damaged	Livro	1	45.50"' "$(census_run losses)"
+    assert 'census_run losses | grep -qx "Deleted from the catalog (discarded)	Livro	1	10.00"'
+    assert '[ "$(census_run losses | wc -l)" = "4" ]' "lost, withdrawn, damaged, deleted"
+    assert 'census_run age | grep -qx "800 Literature	10	10	0	0	0	0.0"' "$(census_run age)"
+    assert '[ "$(census_run weeding | wc -l)" = "50" ]' "records 51-100 (2010, never borrowed): $(census_run weeding | wc -l)"
+    # The essential pack and the census pack are removed separately.
+    inputs "1"; answer yes
+    panel lt_reports
+    local essential
+    essential=$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE notes LIKE '%[koha-easy-installer:%';")
+    inputs "2"; answer yes
+    panel lt_br_census
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE notes LIKE '"'"'%[koha-easy-installer-censo:%'"'"';")" = "0" ]'
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE notes LIKE '"'"'%[koha-easy-installer:%'"'"';")" = "$essential" ] && [ "$essential" -gt 0 ]' "the essential pack stays"
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql WHERE report_name = '"'"'My own report'"'"';")" = "1" ]'
+}
+
+@test "BR18 census reports declined after the preview, or on a Koha without the columns: nothing saved" {
+    inputs "1"; answer no
+    panel lt_br_census
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM saved_sql;")" = "1" ] && [ "$(pre_backups)" = "0" ]'
+    assert 'grep -q "not compatible with this Koha version" "$KEI_S/textbox.last"' "without biblioitems/withdrawn the dry run skips the reports: $(cat "$KEI_S/textbox.last")"
+}
+
+@test "BR22 census reports in every panel language: the translated labels keep the SQL valid and acceptable to Koha" {
+    census_data
+    local l q n
+    for l in pt es fr de it nl ru pl uk cs sv tr ar ja zh hi bn id tl fa vi ko; do
+        extra "SYS_LANG=$l" "load_panel_translations" 'census_dump() { census_reports_define; printf "%s\n" "${RP_SQL[@]}"; }'
+        panel census_dump
+        assert '[ "$status" -eq 0 ] && [ "$(printf "%s\n" "$output" | grep -c "^SELECT ")" = "10" ]' "$l: $output"
+        [ "$l" = "pt" ] && assert 'grep -q "<<Ano do censo (AAAA)>>" <<< "$output" && grep -q "AS \`Leitores ativos no ano\`" <<< "$output"' "pt-BR labels: $output"
+        n=0
+        while IFS= read -r q; do
+            [[ "$q" == SELECT* ]] || continue
+            n=$((n + 1))
+            # C4::Reports::Guided refuses these words anywhere in a saved report.
+            assert '! grep -qiE "(^|[^[:alnum:]_])(UPDATE|DELETE|DROP|INSERT|SHOW|CREATE)([^[:alnum:]_]|$)" <<< "$q"' "$l: report $n has a word Koha refuses"
+            assert 'tools_sql "$(sed -E "s/<<[^<>]*>>/'"'"'2025'"'"'/g" <<< "$q")" >/dev/null' "$l: report $n does not run: $q"
+        done <<< "$output"
+    done
+}
+
+# --- 5. ABNT references -----------------------------------------------------------
+
+abnt_records() {
+    cat > "$W/abnt.tsv" <<'EOF_TSV'
+1	869.3 A848d	2	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><controlfield tag="008">970101s1997    bl            000 0 por d</controlfield><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Assis, Machado de,</subfield><subfield code="d">1839-1908.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Dom Casmurro /</subfield><subfield code="c">Machado de Assis.</subfield></datafield><datafield tag="250" ind1=" " ind2=" "><subfield code="a">2nd ed. rev.</subfield></datafield><datafield tag="260" ind1=" " ind2=" "><subfield code="a">São Paulo :</subfield><subfield code="b">Ática,</subfield><subfield code="c">1997.</subfield></datafield><datafield tag="300" ind1=" " ind2=" "><subfield code="a">xii, 208 p. :</subfield><subfield code="b">il.</subfield></datafield><datafield tag="490" ind1="0" ind2=" "><subfield code="a">Bom livro ;</subfield><subfield code="v">12</subfield></datafield><datafield tag="856" ind1="4" ind2="2"><subfield code="u">http://capa.example/x.jpg</subfield></datafield></record>
+2		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="245" ind1="0" ind2="2"><subfield code="a">O pequeno príncipe /</subfield><subfield code="c">tradução de Dom Marcos Barbosa.</subfield></datafield><datafield tag="260" ind1=" " ind2=" "><subfield code="a">Rio de Janeiro :</subfield><subfield code="b">Agir Editora Ltda.,</subfield><subfield code="c">c2009.</subfield></datafield><datafield tag="700" ind1="1" ind2=" "><subfield code="a">Barbosa, Marcos,</subfield><subfield code="e">tradutor.</subfield></datafield></record>
+3	370 E24	1	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="245" ind1="0" ind2="0"><subfield code="a">Educação e sociedade :</subfield><subfield code="b">ensaios /</subfield><subfield code="c">organização de Ana Souza.</subfield></datafield><datafield tag="260" ind1=" " ind2=" "><subfield code="a">[S.l.] :</subfield><subfield code="b">[s.n.],</subfield></datafield><datafield tag="700" ind1="1" ind2=" "><subfield code="a">Souza, Ana,</subfield><subfield code="e">org.</subfield></datafield></record>
+4	610 M532	1	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Lima, João</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Medicina :</subfield><subfield code="b">manual /</subfield></datafield><datafield tag="264" ind1=" " ind2="1"><subfield code="a">Curitiba :</subfield><subfield code="b">UFPR,</subfield><subfield code="c">2020.</subfield></datafield><datafield tag="700" ind1="1" ind2=" "><subfield code="a">Costa, Maria.</subfield></datafield><datafield tag="700" ind1="1" ind2=" "><subfield code="a">Pereira, Rui.</subfield></datafield><datafield tag="700" ind1="1" ind2=" "><subfield code="a">Alves, Eva.</subfield></datafield></record>
+5		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="110" ind1="1" ind2=" "><subfield code="a">Brasil.</subfield><subfield code="b">Ministério da Educação.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Base nacional comum curricular.</subfield></datafield><datafield tag="264" ind1=" " ind2="1"><subfield code="a">Brasília, DF :</subfield><subfield code="b">MEC,</subfield><subfield code="c">2018.</subfield></datafield><datafield tag="856" ind1="4" ind2="0"><subfield code="u">http://basenacionalcomum.mec.gov.br/</subfield></datafield></record>
+6		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Oliveira, Paula.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Leitura na escola /</subfield></datafield><datafield tag="300" ind1=" " ind2=" "><subfield code="a">150 p.</subfield></datafield><datafield tag="502" ind1=" " ind2=" "><subfield code="b">Dissertação (Mestrado em Educação)</subfield><subfield code="c">Universidade Federal do Paraná</subfield><subfield code="d">2015.</subfield></datafield></record>
+7		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000naa a2200000 a 4500</leader><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Santos, Luís.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Bibliotecas escolares no Brasil.</subfield></datafield><datafield tag="773" ind1="0" ind2=" "><subfield code="t">Revista Brasileira de Biblioteconomia</subfield><subfield code="g">v. 10, n. 2 (2019), p. 33-50</subfield></datafield></record>
+8		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000naa a2200000 a 4500</leader><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Rocha, Ivo.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">A leitura.</subfield></datafield><datafield tag="773" ind1="0" ind2=" "><subfield code="a">Souza, Ana (org.)</subfield><subfield code="t">Educação e sociedade</subfield><subfield code="d">São Paulo : Cortez, 2012</subfield><subfield code="g">p. 10-25</subfield></datafield></record>
+9		0	not a record
+10		0	<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><datafield tag="110" ind1="2" ind2=" "><subfield code="a">Universidade Federal do Paraná.</subfield><subfield code="b">Sistema de Bibliotecas.</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Normas para apresentação de documentos científicos</subfield><subfield code="n">2</subfield><subfield code="p">Teses.</subfield></datafield><datafield tag="250" ind1=" " ind2=" "><subfield code="a">1ª edição</subfield></datafield><datafield tag="260" ind1=" " ind2=" "><subfield code="a">Curitiba :</subfield><subfield code="b">Ed. UFPR,</subfield><subfield code="c">[2007?]</subfield></datafield></record>
+EOF_TSV
+}
+
+@test "BR19 ABNT NBR 6023 formatter: books, entries by title and organizer, et al., corporate, thesis, article, chapter, online" {
+    abnt_records
+    panel abnt_write_formatter "$W/abnt.pl"
+    run perl "$W/abnt.pl" --in "$W/abnt.tsv" --html "$W/out.html" --text "$W/out.txt" --caption "Teste" --access "5 mar. 2026"
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'echo "$output" | grep -qx "References: 9" && echo "$output" | grep -qx "Records not read: 1" && echo "$output" | grep -qx "Without date: 1"' "$output"
+    cat > "$W/expected.txt" <<'EOF_REFS'
+Teste
+
+REFERÊNCIAS
+
+ASSIS, Machado de. Dom Casmurro. 2. ed. rev. São Paulo: Ática, 1997. 208 p. (Bom livro, 12).
+
+BRASIL. Ministério da Educação. Base nacional comum curricular. Brasília, DF: MEC, 2018. Disponível em: http://basenacionalcomum.mec.gov.br/. Acesso em: 5 mar. 2026.
+
+LIMA, João et al. Medicina: manual. Curitiba: UFPR, 2020.
+
+O PEQUENO príncipe. Tradução: Marcos Barbosa. Rio de Janeiro: Agir Editora, 2009.
+
+OLIVEIRA, Paula. Leitura na escola. 2015. 150 f. Dissertação (Mestrado em Educação) – Universidade Federal do Paraná, 2015.
+
+ROCHA, Ivo. A leitura. In: SOUZA, Ana (org.). Educação e sociedade. São Paulo: Cortez, 2012. p. 10-25.
+
+SANTOS, Luís. Bibliotecas escolares no Brasil. Revista Brasileira de Biblioteconomia, v. 10, n. 2, p. 33-50, 2019.
+
+SOUZA, Ana (org.). Educação e sociedade: ensaios. [S. l.: s. n.], [s. d.].
+
+UNIVERSIDADE FEDERAL DO PARANÁ. Sistema de Bibliotecas. Normas para apresentação de documentos científicos 2 Teses. Curitiba: Ed. UFPR, [2007?].
+
+EOF_REFS
+    assert 'diff "$W/expected.txt" "$W/out.txt"' "$(diff "$W/expected.txt" "$W/out.txt")"
+    assert 'grep -q "<p class=\"ref\">ASSIS, Machado de. <strong>Dom Casmurro</strong>. 2. ed. rev." "$W/out.html"' "bold title"
+    assert 'grep -q "In: SOUZA, Ana (org.). <strong>Educação e sociedade</strong>. São Paulo" "$W/out.html"' "bold host of the chapter"
+    assert 'grep -q "<strong>Revista Brasileira de Biblioteconomia</strong>, v. 10" "$W/out.html"' "bold journal"
+    assert 'grep -q "<p class=\"ref\">O PEQUENO príncipe. Tradução" "$W/out.html"' "no bold with an entry by title"
+    assert 'grep -q "@page { size: A4; margin: 3cm 2cm 2cm 3cm; }" "$W/out.html" && grep -q "<h1>Referências</h1>" "$W/out.html"' "NBR 14724 presentation"
+    # Collection listing: call numbers and copies, duplicates kept.
+    run perl "$W/abnt.pl" --in "$W/abnt.tsv" --html "$W/out.html" --text "$W/out.txt" --listing
+    assert 'grep -qx "    Localização: 869.3 A848d (2 ex.)." "$W/out.txt" && grep -qx "    Sem exemplares no acervo." "$W/out.txt"' "$(cat "$W/out.txt")"
+}
+
+abnt_catalog() {
+    census_data
+    abnt_records
+    local bn xml line
+    while IFS= read -r line; do
+        bn=${line%%$'\t'*}; xml=$(cut -f4- <<< "$line")
+        [ "$bn" -le 2 ] || continue
+        tools_sql "INSERT INTO biblio (biblionumber, title, datecreated) VALUES ($((300 + bn)), 'abnt $bn', '2025-01-01');
+            INSERT INTO biblio_metadata (biblionumber, format, \`schema\`, metadata) VALUES ($((300 + bn)), 'marcxml', 'MARC21', '${xml//\'/\'\'}');"
+    done < "$W/abnt.tsv"
+    tools_sql "INSERT INTO items (biblionumber, barcode, homebranch, itemcallnumber, dateaccessioned) VALUES
+        (301, 'AB1', 'CPL', '869.3 A848d', '2025-02-01'), (301, 'AB2', 'MPL', '869.3 A848d', '2025-02-01'), (302, 'AB3', 'CPL', '843 S129p', '2019-01-01');
+        INSERT INTO virtualshelves (shelfname) VALUES ('Bibliografia básica de Letras d''Água');
+        INSERT INTO virtualshelfcontents VALUES (1, 301), (1, 302);"
+    mkdir -p "$W/out"
+    export KEI_SELECT_DIR="$W/out"
+}
+
+@test "BR20 ABNT references from the catalog: typed records, a Koha list as a collection listing, files in the chosen folder" {
+    abnt_catalog
+    inputs "numbers" "301, 302;9999"; answer no
+    panel lt_br_abnt
+    assert '[ "$status" -eq 0 ]' "$output"
+    local txt html
+    txt=$(ls "$W"/out/referencias-abnt-*.txt 2>/dev/null); html=$(ls "$W"/out/referencias-abnt-*.html 2>/dev/null)
+    assert '[ -f "$txt" ] && [ -f "$html" ]' "$(ls -l "$W/out") $(dialogs | tail -n 5)"
+    assert 'grep -qx "ASSIS, Machado de. Dom Casmurro. 2. ed. rev. São Paulo: Ática, 1997. 208 p. (Bom livro, 12)." "$txt"' "$(cat "$txt")"
+    assert 'grep -qx "O PEQUENO príncipe. Tradução: Marcos Barbosa. Rio de Janeiro: Agir Editora, 2009." "$txt"'
+    assert '! grep -q "Localização" "$txt"' "a plain bibliography"
+    assert 'grep -q "ASSIS, Machado de" "$KEI_S/textbox.last"' "preview of the references"
+    assert 'dialogs | grep -q "OK .*References: 2"' "$(dialogs | tail -n 3)"
+    assert '[ -z "$(ls /tmp/koha_tools.* 2>/dev/null | grep abnt)" ]' "work files removed"
+    rm -f "$W"/out/*
+    inputs "list" "1"; answer yes
+    panel lt_br_abnt
+    txt=$(ls "$W"/out/referencias-abnt-*.txt 2>/dev/null)
+    assert 'head -n 1 "$txt" | grep -qx "Bibliografia básica de Letras d’Água"' "the list name is the caption (koha-shell cannot pass a quote): $(cat "$txt")"
+    assert 'grep -qx "    Localização: 869.3 A848d (2 ex.)." "$txt" && grep -qx "    Localização: 843 S129p (1 ex.)." "$txt"' "$(cat "$txt")"
+    rm -f "$W"/out/*
+    inputs "new" "2025-01-01" "2025-12-31"; answer no
+    panel lt_br_abnt
+    txt=$(ls "$W"/out/referencias-abnt-*.txt 2>/dev/null)
+    assert 'grep -q "^ASSIS" "$txt" && ! grep -q "PEQUENO" "$txt"' "only items added in 2025: $(cat "$txt")"
+    assert 'head -n 1 "$txt" | grep -qx "New acquisitions from 2025-01-01 to 2025-12-31"'
+}
+
+@test "BR21 ABNT references: bad input and empty selections write nothing" {
+    abnt_catalog
+    inputs "numbers" "301; DROP TABLE biblio"
+    panel lt_br_abnt
+    assert 'dialogs | grep -q "ERROR.*Use only record numbers"' "$(dialogs | tail -n 3)"
+    inputs "class" "8'%"
+    panel lt_br_abnt
+    assert 'dialogs | grep -q "ERROR.*Use only digits"'
+    inputs "new" "2025-13-01" "2025-12-31"
+    panel lt_br_abnt
+    assert 'dialogs | grep -q "ERROR.*Invalid date"'
+    inputs "class" "7"
+    panel lt_br_abnt
+    assert 'dialogs | grep -q "INFO .*No record found"' "$(dialogs | tail -n 3)"
+    assert '[ -z "$(ls "$W/out")" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio WHERE biblionumber = 301;")" = "1" ]' "$(ls "$W/out")"
 }
 
 # --- 3. Calendar ----------------------------------------------------------------
