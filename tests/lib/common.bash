@@ -3,6 +3,9 @@
 KEI_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KEI_S=/run/kei-mock
 PANEL="$KEI_REPO/tests/lib/panel.sh"
+# The battery describes a Linux server, even when it runs inside WSL;
+# tests/wsl_mode.bats sets the platform per test.
+export KEI_PLATFORM_OVERRIDE="${KEI_PLATFORM_OVERRIDE:-linux}"
 # Shell used for the panel and the generated scripts: KEI_BASH=/path/to/bash
 # runs the battery with another Bash release (e.g. 5.1 of Debian 11 / Ubuntu 22.04).
 KEI_SH="${KEI_BASH:-bash}"
