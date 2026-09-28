@@ -2,7 +2,7 @@
 
 A Cloudflare Worker that gives each library its own address under one central domain, for example `palotina-pr.koha.page`. It creates a Cloudflare Tunnel for each library and publishes it, without the Cloudflare API token ever leaving Cloudflare.
 
-**Status:** baseline. The Worker builds, and its unit tests and a local end-to-end test pass against a fake Cloudflare API. It has **not yet run against a real Cloudflare account**. The installer does not call it yet; that is the next step. The automatic verification gates on the sign-up page (Turnstile, email code, CNPJ and institutional-domain checks) are not built yet. For now an admin approves each request (`AUTO_APPROVE = "false"`).
+**Status:** baseline. The Worker builds, and its unit tests and a local end-to-end test pass against a fake Cloudflare API. It has **not yet run against a real Cloudflare account**. The installer's **Free address** menu (Cloudflare Tunnel Manager) uses it; `tests/free_address.bats` runs that menu against this Worker in local workerd. The automatic verification gates on the sign-up page (Turnstile, email code, CNPJ and institutional-domain checks) are not built yet. For now an admin approves each request (`AUTO_APPROVE = "false"`).
 
 Design documents in the project folder: `analysis/scenario-b-broker-blueprint.md` and `analysis/cloudflare-subdomain-automation.md`.
 
@@ -161,8 +161,15 @@ npm run test:e2e      # bundles the Worker and runs the full flow in local worke
 
 `CF_API_BASE` (used only by local tests) points the client at a fake API. Leave it unset in production.
 
+## Installer side
+
+The panel's **Free address** item (menu 6, Cloudflare Tunnel Manager) is the client. It asks for the library name, contact e-mail and wanted name, shows the request page as a QR code, browser or link, and continues on its own once the request is approved. It creates the server key (`/etc/koha-easy-install/broker.key`, 0600), keeps the tunnel token only in `/etc/cloudflared/koha-broker.env` (0600) and runs `cloudflared tunnel run` as a service. It sends a daily signed heartbeat (`/etc/cron.d/koha_broker`) and has menu items for remote staff access, reconnect, token renewal, sharing the catalog link (QR code on screen, printable PNG, browser, link) and giving the address up. A server uses either a free address or its own domain, never both.
+
+The installer points at `https://koha-broker.bibliotecamunicipalpalotina.org` (the test zone). `KEI_BROKER_URL` overrides it.
+
+To run the installer tests: `npm install` here, then `sudo KEI_TEST_SANDBOX=1 tests/run.sh tests/free_address.bats` from the repository root. `npm run test:e2e` runs the Worker-only end-to-end checks.
+
 ## Next steps
 
-1. Installer integration: "Get a free address" in the Cloudflare Tunnel Manager. It uses the device flow with the existing QR / browser / link helper, signs requests like `scripts/kei-sign.sh`, stores the tunnel token in a 0600 `EnvironmentFile`, runs a daily heartbeat, and adds a "Remote staff access" menu item.
-2. Verification gates on `/join`: Turnstile, email code, institutional-domain and CNPJ checks. Then `AUTO_APPROVE` can be turned on for requests that pass.
-3. Monitoring: Koha fingerprint check, reputation feeds, and automatic suspension.
+1. Verification gates on `/join`: Turnstile, email code, institutional-domain and CNPJ checks. Then `AUTO_APPROVE` can be turned on for requests that pass.
+2. Monitoring: Koha fingerprint check, reputation feeds, and automatic suspension.
