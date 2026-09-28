@@ -4448,6 +4448,231 @@ validate_and_register_rclone() {
     return 0
 }
 
+# ======================================================================
+# AUTHORIZATION LINKS: QR CODE, BROWSER OR COPY
+# ----------------------------------------------------------------------
+# rclone and cloudflared print a link and wait until someone authorizes it
+# in a browser. The panel runs them in the background, catches the link and
+# lets the person choose how to open it: a QR code for a phone, the browser
+# of this computer (Windows under WSL, or the desktop session on Linux) or
+# the plain link to copy. Every method stays available while the tool waits.
+# ======================================================================
+KEI_WIN_OPENER="${KEI_WIN_OPENER:-/mnt/c/Windows/System32/rundll32.exe}"
+AUTH_CANCELLED=0 AUTH_PID="" AUTH_URL="" RCLONE_TOKEN=""
+
+# Only plain http(s) links are ever shown, encoded or opened.
+is_auth_url() {
+    case "$1" in http://?*|https://?*) ;; *) return 1 ;; esac
+    case "$1" in *[[:space:]\"\'\`\<\>\\]*) return 1 ;; esac
+    [ "${#1}" -le 2048 ]
+}
+
+# First link matching the extended regex $2 in file $1 (tool output).
+extract_auth_url() {
+    local url
+    url=$(grep -oE "$2" "$1" 2>/dev/null | head -n1)
+    is_auth_url "$url" || return 1
+    printf '%s' "$url"
+}
+
+# How a link can be opened on this computer: "windows" (WSL: the Windows
+# default browser), "desktop" (xdg-open in the Linux graphical session) or
+# nothing (a server reached over SSH).
+browser_opener() {
+    if is_wsl && [ -x "$KEI_WIN_OPENER" ]; then printf 'windows'; return 0; fi
+    if { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && command -v xdg-open >/dev/null 2>&1; then
+        printf 'desktop'; return 0
+    fi
+    return 1
+}
+
+open_in_browser() {
+    local url="$1" how
+    is_auth_url "$url" || return 1
+    how=$(browser_opener) || return 1
+    log "authorization link opened in the browser ($how)"
+    if [ "$how" = "windows" ]; then
+        # rundll32 takes the link as one argument: no cmd.exe parsing of "&".
+        ( cd /mnt/c 2>/dev/null || cd /; "$KEI_WIN_OPENER" url.dll,FileProtocolHandler "$url" ) >/dev/null 2>&1 &
+    elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && command -v sudo >/dev/null 2>&1; then
+        # The browser belongs to the person logged in, not to root.
+        sudo -u "$SUDO_USER" env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+            XAUTHORITY="${XAUTHORITY:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+            xdg-open "$url" >/dev/null 2>&1 &
+    else
+        xdg-open "$url" >/dev/null 2>&1 &
+    fi
+    return 0
+}
+
+# Prints the link as a QR code (qrencode, installed on first use). Low error
+# correction keeps long OAuth links small enough for an 80x24 terminal.
+show_auth_qr() {
+    local url="$1" rows
+    is_auth_url "$url" || return 1
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echo "$(t "Installing the QR code generator (qrencode)...")"
+        apt_install qrencode >/dev/null 2>&1
+        command -v qrencode >/dev/null 2>&1 || {
+            echo "$(t "[WARN] The QR code generator could not be installed: use the link or the browser.")"
+            return 1
+        }
+    fi
+    qrencode -t ANSIUTF8 -l L -m 2 "$url" || return 1
+    rows=$(qrencode -t ANSIUTF8 -l L -m 2 "$url" 2>/dev/null | wc -l)
+    if [ -t 1 ] && [ "${rows:-0}" -gt "$(tput lines 2>/dev/null || echo 24)" ]; then
+        echo "$(t "[WARN] The QR code is taller than this window: enlarge it or use the link.")"
+    fi
+    echo "$(t "Scan it with the phone camera and authorize in the page that opens.")"
+    return 0
+}
+
+# Methods offered for a link, one tag per line: qr (only when $2 = yes, as
+# some flows must return to this very computer), browser (only when one can
+# be opened here) and link (always).
+auth_methods() {
+    [ "${2:-yes}" = "yes" ] && echo qr
+    browser_opener >/dev/null && echo browser
+    echo link
+    return 0
+}
+
+# Runs one method: qr | browser | link.
+auth_link_render() {
+    local method="$1" url="$2"
+    case "$method" in
+        qr)      show_auth_qr "$url" ;;
+        browser) open_in_browser "$url" && echo "$(t "The link was opened in the browser. Authorize there, then come back here.")" ;;
+        link)
+            echo "$(t "Open this link in a browser:")"
+            echo ""
+            printf '%s\n' "$url"
+            echo ""
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# auth_link_session PID URL QR_OK [HINT]: lets the person pick a method, then
+# waits for the tool (PID, a child of this shell) to finish, with keys to
+# switch method or cancel. Returns the tool's exit status, or 130 when
+# cancelled (the tool is stopped).
+auth_link_session() {
+    local pid="$1" url="$2" qr_ok="$3" hint="${4:-}" methods=() items=() m choice key keys rc
+    mapfile -t methods < <(auth_methods "$url" "$qr_ok")
+    for m in "${methods[@]}"; do
+        case "$m" in
+            qr)      items+=("qr"      "$(t "QR code: scan it with a phone")") ;;
+            browser) items+=("browser" "$(t "Open the browser of this computer")") ;;
+            link)    items+=("link"    "$(t "Show the link to copy")") ;;
+        esac
+    done
+    choice=$(ui_menu "$(t "Authorization")" "$(t "How do you want to open the authorization page?")" "${items[@]}") \
+        || choice="${methods[0]}"
+    [ -n "$choice" ] || choice="${methods[0]}"
+
+    AUTH_CANCELLED=0
+    trap 'AUTH_CANCELLED=1' INT
+    clear
+    auth_link_render "$choice" "$url"
+    [ -n "$hint" ] && printf '%b\n\n' "$hint"
+    keys="[L] $(t "link")"
+    [[ " ${methods[*]} " == *" browser "* ]] && keys="[B] $(t "browser")  $keys"
+    [[ " ${methods[*]} " == *" qr "* ]] && keys="[Q] $(t "QR code")  $keys"
+    echo -e "\e[1;33m$(t "Waiting for the authorization...")\e[0m  $keys  [C] $(t "cancel")"
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$AUTH_CANCELLED" = "1" ] && break
+        key=""
+        read -r -s -n1 -t 2 key </dev/tty 2>/dev/null
+        rc=$?
+        [ "$rc" -ne 0 ] && [ "$rc" -le 128 ] && sleep 1    # no terminal: just wait
+        case "$key" in
+            q|Q) [[ " ${methods[*]} " == *" qr "* ]] && { echo ""; auth_link_render qr "$url"; } ;;
+            b|B) [[ " ${methods[*]} " == *" browser "* ]] && auth_link_render browser "$url" ;;
+            l|L) echo ""; auth_link_render link "$url" ;;
+            c|C) AUTH_CANCELLED=1 ;;
+        esac
+    done
+    unshield_signals
+    if [ "$AUTH_CANCELLED" = "1" ]; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        log "authorization cancelled"
+        return 130
+    fi
+    wait "$pid" 2>/dev/null
+}
+
+# Starts COMMAND... in the background with its output in FILE ($1, created
+# 0600: rclone prints the OAuth token there) and waits up to 30 s for a link
+# matching the regex $2. Sets AUTH_PID and AUTH_URL (no command substitution:
+# the tool must stay a child of this shell); returns 1, with the tool
+# stopped, when no link appears.
+auth_tool_start() {
+    local out="$1" pattern="$2" i
+    shift 2
+    AUTH_PID="" AUTH_URL=""
+    ( umask 077; : > "$out" )
+    # Without the panel's lock descriptors (see koha_ctl).
+    "$@" > "$out" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+    AUTH_PID=$!
+    for i in $(seq 1 60); do
+        AUTH_URL=$(extract_auth_url "$out" "$pattern") && return 0
+        kill -0 "$AUTH_PID" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill "$AUTH_PID" 2>/dev/null
+    wait "$AUTH_PID" 2>/dev/null
+    AUTH_URL=""
+    return 1
+}
+
+RCLONE_AUTH_URL_RE='http://127\.0\.0\.1:53682/auth\?state=[A-Za-z0-9_-]+'
+CLOUDFLARE_AUTH_URL_RE='https://dash\.cloudflare\.com/argotunnel\?[^[:space:]]+'
+
+# Google Drive authorization on this computer. Google only sends the answer
+# back to 127.0.0.1:53682 of the machine running rclone, so a phone cannot
+# finish it: no QR code here. On a server reached over SSH the link works
+# through a tunnel (ssh -L), which the hint explains. The token is left in
+# RCLONE_TOKEN and never printed.
+rclone_authorize_here() {
+    local out hint="" token rc
+    RCLONE_TOKEN=""
+    out=$(mktemp /root/.kei-rclone-auth.XXXXXX) || return 1
+    if ! auth_tool_start "$out" "$RCLONE_AUTH_URL_RE" rclone authorize "drive" --auth-no-open-browser; then
+        echo -e "\e[1;31m[ERROR] $(t "rclone did not print an authorization link (is port 53682 busy?).")\e[0m"
+        grep -v '_token' "$out" | tail -n 5
+        rm -f "$out"
+        return 1
+    fi
+    if ! browser_opener >/dev/null; then
+        hint="$(t "This server has no browser. On your PC, first open an SSH tunnel:")\n  ssh -L 53682:127.0.0.1:53682 ${REAL_USER:-root}@$(get_server_ip)\n$(t "then open the link in the browser of that PC.")\n"
+    fi
+    hint+="$(t "A QR code is not offered: Google returns only to the computer running rclone.")"
+    auth_link_session "$AUTH_PID" "$AUTH_URL" no "$hint"
+    rc=$?
+    token=$(grep -o '{.*}' "$out" 2>/dev/null | head -n1)
+    rm -f "$out"
+    [ "$rc" -eq 0 ] && is_rclone_token "$token" || return 1
+    RCLONE_TOKEN="$token"
+}
+
+# Cloudflare authorization: the page can be opened on any device (the cert
+# is fetched by cloudflared itself), so the QR code is offered.
+cloudflare_login() {
+    local out rc
+    out=$(mktemp /root/.kei-cloudflared-login.XXXXXX) || return 1
+    if ! auth_tool_start "$out" "$CLOUDFLARE_AUTH_URL_RE" cloudflared tunnel login; then
+        tail -n 5 "$out"
+        rm -f "$out"
+        return 1
+    fi
+    auth_link_session "$AUTH_PID" "$AUTH_URL" yes "$(t "Select the domain you activated in Cloudflare and click Authorize. Nothing needs to be pasted back.")"
+    rc=$?
+    rm -f "$out"
+    return "$rc"
+}
+
 # A complete rclone OAuth token as printed by "rclone authorize": one JSON
 # object with the access and refresh tokens and the expiry (a copy cut
 # short loses the end). rclone itself checks it with a real write test.
@@ -4540,38 +4765,26 @@ function_configure_rclone() {
         echo "======================================================================"
         echo ""
         echo "$(t "Rclone will start an authentication server on this machine on port 53682.")"
-        echo "$(t "An authorization link will be printed below.")"
+        echo "$(t "Log in with the library Google account and authorize: the token is captured automatically.")"
         echo ""
-        echo "$(t "1. Open the generated link in any browser with network access to this server.")"
-        echo "$(t "2. Log in with your Google account and authorize the app.")"
-        echo "$(t "3. The terminal will capture the token automatically without copy-pasting!")"
-        echo ""
-        echo "----------------------------------------------------------------------"
-        echo -e "\e[1;33m$(t "Waiting for browser authorization (Press CTRL+C to cancel)...")\e[0m"
-        echo "----------------------------------------------------------------------"
-        echo ""
-
-        local token_output
         ALLOW_CTRL_C_RETURN=1
-        token_output=$(rclone authorize "drive" --auth-no-open-browser 2>&1 | tee /dev/tty)
-        ALLOW_CTRL_C_RETURN=0
-        local extracted_token
-        extracted_token=$(echo "$token_output" | grep -o '{.*}' | head -n 1)
-
-        if [ -n "$extracted_token" ] && is_rclone_token "$extracted_token"; then
+        if rclone_authorize_here; then
+            ALLOW_CTRL_C_RETURN=0
             echo ""
             echo -e "\e[1;32m[OK] $(t "Token captured automatically!")\e[0m"
             rclone config delete gdrive >/dev/null 2>&1 || true
-            if rclone config create gdrive drive config_is_local false token "$extracted_token" --non-interactive < /dev/null >/dev/null 2>&1; then
+            if rclone config create gdrive drive config_is_local false token "$RCLONE_TOKEN" --non-interactive < /dev/null >/dev/null 2>&1; then
+                RCLONE_TOKEN=""
                 echo -e "\e[1;32m[OK] $(t "'gdrive' remote successfully created!")\e[0m"
                 validate_and_register_rclone "gdrive"
             else
+                RCLONE_TOKEN=""
                 msg_error "" "$(t "Failed to register gdrive remote in Rclone.")" 8 66
             fi
         else
+            ALLOW_CTRL_C_RETURN=0
             echo ""
             echo -e "\e[1;31m[ERROR] $(t "Could not capture token automatically. Try Option 1.")\e[0m"
-            echo "$token_output" | tail -n 10
             echo ""
             pause_terminal
         fi
@@ -4821,9 +5034,10 @@ function_cloudflare_setup() {
 
     if [ ! -f "$REAL_HOME/.cloudflared/cert.pem" ] && [ ! -f "/root/.cloudflared/cert.pem" ]; then
         msg_info "$(t "Cloudflare Tunnel")" \
-"$(t "AUTHORIZATION (first time only):\n\nA link will appear below. Copy it into any browser, select the\ndomain you already activated in Cloudflare, and click Authorize.\n\nNo need to paste anything back - the server detects it automatically.")" 12 76
-        clear
-        cloudflared tunnel login
+"$(t "AUTHORIZATION (first time only):\n\nNext, choose how to open the Cloudflare page: a QR code for your phone,\nthe browser of this computer, or a link to copy. Select the domain\nyou already activated in Cloudflare and click Authorize.\n\nNo need to paste anything back - the server detects it automatically.")" 14 76
+        ALLOW_CTRL_C_RETURN=1
+        cloudflare_login
+        ALLOW_CTRL_C_RETURN=0
         echo ""
     fi
 
