@@ -163,6 +163,16 @@ The settings (with the tokens) are in `/etc/koha/sites/library/kei-messaging.con
 
 The page is checked with Koha's Perl modules before it is installed; removing it keeps the saved versions.
 
+#### AI cataloguing (photos of the book)
+
+Two more tabs of the same page catalogue a book from photos of its cover, title page and verso of the title page (with the CIP block):
+
+- **AI settings** (staff allowed to change the system preferences only): the vision model, either a cloud API with a token (OpenAI, Anthropic or any OpenAI-compatible service) or a model on the library's own network (Ollama `http://localhost:11434` or LM Studio `http://localhost:1234/v1` with a vision model such as `qwen2.5vl`, `llama3.2-vision` or `gemma3`). The settings are kept in `kei-marc-replace/vision.conf`, readable by the Koha instance user only; the token is never shown again, and a token is refused over plain `http` to a server outside the local network. **Test the connection** lists the models of the server. No token ships with the panel.
+- **AI cataloguing**: the photos go to the model, which answers with the bibliographic data as JSON (checked against a fixed schema: nothing invented, placeholders dropped). The national rules are then applied by `KohaEasy::Cataloguing::Rules`: AACR2 and ISBD punctuation (245 `:` `/`, 260 with `[S.l.]` / `[s.n.]`, 300), names inverted as Brazilian cataloguers do (`Assis, Machado de`, `Andrade Filho, José de`), 245 non-filing characters, ISBN check digits (wrong ones go to 020 `$z`), the CDD printed in the CIP block (otherwise the model's suggestion, flagged for checking) in 082 and 090, and the **author notation of the library's own PHA or Cutter-Sanborn table**, computed by a Perl port of the panel's algorithm, so the page and **Cataloguing aids** give the same notation.
+- The librarian corrects the draft next to the photos, and a **mandatory preview** follows. Only then is the record added with Koha's `AddBiblio`, in one transaction under a database lock, after the ISBN is checked against the catalogue again (a record with the same ISBN needs an explicit tick), with a copy of the record and of the model's answer saved in `kei-marc-replace/vision/`. A form sent twice adds nothing. With a biblionumber, the draft goes to the replacement above instead (with its lock and saved version).
+
+The two modules are installed with the page in `/usr/local/lib/site_perl/KohaEasy/Cataloguing/` and removed with it (the settings stay with the saved versions).
+
 ## Automated tasks
 
 Installed in `/etc/cron.d/koha_tasks`:
