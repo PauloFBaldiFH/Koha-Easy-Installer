@@ -2,7 +2,8 @@
 
 Runs the panel's own functions against a **real MariaDB and Memcached**, with
 test doubles only for what a container cannot have (the `koha-*` tools,
-`systemctl`, the Elasticsearch API) and for the dialogs.
+Koha's command-line scripts, `systemctl`, the Elasticsearch API) and for the
+dialogs.
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail   # shellcheck is optional
@@ -23,6 +24,8 @@ to a real `koha-common`, or while another run is in progress.
 | `indexing.bats` | Zebra watchdog (starts/unsticks `koha-indexer`, honours maintenance markers), health check, Elasticsearch watchdog following `SearchEngine`, indexing after restores (successful or rolled back) and engine switches, `koha-conf.xml` edits |
 | `backup.bats` | Nightly SQL backup (DB down, full disk, size check), manual backup, "test latest backup" never touching production |
 | `platform_services.bats` | Debian 11/12/13 and Ubuntu 22.04/24.04 on amd64/arm64, APT sources pinned to `dpkg --print-architecture`, boot order and readiness wait, ShellCheck, UTF-8, translations |
+| `library_tools.bats` | Library tools: MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, anonymisation and patron deletion. Dry run before any change, lock, verified `PRE-*` backup before Koha writes, input checks, `koha-shell` quoting |
+| `schedules_ui.bats` | Nightly cleanup with `--confirm`, e-mail handed to `koha-email-enable` (and the upgrade of old schedules), dialog geometry, dark theme never exported, status markers, main menu |
 
 `lib/panel.sh FUNCTION [ARGS]` loads the installer as a library (it opens no
 menu when sourced), applies `lib/overrides.sh` and calls one function in its

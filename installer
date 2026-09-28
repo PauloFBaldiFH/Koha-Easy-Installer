@@ -38,12 +38,17 @@ restore_apt_timers() {
 RESTORE_TRIAL_DB=""
 CLEANUP_FILE=""
 MAINT_MARKER_OWNED=""
+TOOLS_WORK=""
 on_exit() {
     restore_apt_timers
     [ -n "$RESTORE_TRIAL_DB" ] && mysql -e "DROP DATABASE IF EXISTS \`${RESTORE_TRIAL_DB}\`;" >/dev/null 2>&1
     [ -n "$CLEANUP_FILE" ] && rm -f "$CLEANUP_FILE"
     [ -n "$MAINT_MARKER_OWNED" ] && rm -f "$MAINT_MARKER_OWNED"
+    case "$TOOLS_WORK" in /tmp/koha_tools.?*) rm -rf "$TOOLS_WORK" ;; esac
     rm -f /tmp/koha_tmp_* 2>/dev/null || true
+    # No colour or attribute of the dialogs is left behind in the shell.
+    [ -t 1 ] && printf '\033[0m'
+    return 0
 }
 # CTRL+C only returns to the menu inside screens that explicitly allow it
 # (live log viewer, token prompts). Anywhere else it aborts the panel, so an
@@ -69,7 +74,7 @@ shield_signals() { trap '' INT TERM HUP; SIGNALS_SHIELDED=1; }
 trap on_exit EXIT
 unshield_signals
 
-PANEL_VERSION=" 1.1.0"
+PANEL_VERSION=" 1.2.0"
 UPDATE_URL="https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/refs/heads/main/installer"
 
 # ======================================================================
@@ -191,6 +196,7 @@ declare -A _MENU_PT=(
     ["◈  Diagnostics & maintenance center"]="◈  Diagnóstico e manutenção"
     ["⚠  Security center"]="⚠  Central de segurança"
     ["⚙  Koha settings & parameters"]="⚙  Configurações e parâmetros do Koha"
+    ["▦  Library tools"]="▦  Ferramentas da biblioteca"
     ["▤  General tools"]="▤  Ferramentas gerais"
     ["⏱  Schedules & cron tasks"]="⏱  Tarefas agendadas e automações"
     ["✦  Koha languages"]="✦  Idiomas do Koha e do Painel"
@@ -349,11 +355,151 @@ refresh_dialog_buttons() {
     WT_YES="$(t "Yes")"; WT_NO="$(t "No")"; WT_OK="$(t "OK")"; WT_CANCEL="$(t "Cancel")"
 }
 
-# Every dialog gets translated buttons. Options given by the caller come
-# later on the command line, so they still win (e.g. --cancel-button "Back").
+# ----------------------------------------------------------------------
+# Look and feel of every dialog, applied by the whiptail() wrapper below:
+#  - a dark palette (slate on 256-colour terminals, black on the Linux
+#    console; monochrome with NO_COLOR=1). It is passed to each whiptail
+#    call only and never exported, so the shell, nano, mc and htop keep
+#    their own colours;
+#  - one geometry: UI_WIDTH columns (text/log viewers up to UI_WIDTH_WIDE),
+#    the height taken from the text, everything shrunk to fit small
+#    terminals, with a scroll bar when the text no longer fits;
+#  - the panel name as back title and padded window titles.
+# ----------------------------------------------------------------------
+UI_WIDTH=74
+UI_WIDTH_WIDE=100
+if [ -n "${NO_COLOR:-}" ]; then
+    UI_THEME='root=lightgray,black roottext=lightgray,black window=lightgray,black border=lightgray,black
+shadow=black,black title=white,black textbox=lightgray,black acttextbox=black,lightgray label=lightgray,black
+listbox=lightgray,black actlistbox=black,lightgray sellistbox=white,black actsellistbox=black,lightgray
+checkbox=lightgray,black actcheckbox=black,lightgray entry=black,lightgray disentry=lightgray,black
+button=black,lightgray actbutton=black,lightgray compactbutton=lightgray,black helpline=lightgray,black
+emptyscale=,black fullscale=,lightgray'
+elif [ "$(tput colors 2>/dev/null || echo 8)" -ge 256 ] 2>/dev/null; then
+    UI_THEME='root=color250,color234 roottext=color245,color234 window=color252,color236 border=color240,color236
+shadow=color233,color233 title=color153,color236 textbox=color252,color236 acttextbox=color234,color110
+label=color252,color236 listbox=color252,color236 actlistbox=color234,color110 sellistbox=color153,color236
+actsellistbox=color234,color110 checkbox=color252,color236 actcheckbox=color234,color110
+entry=color255,color239 disentry=color243,color236 button=color234,color110 actbutton=color234,color110
+compactbutton=color250,color236 helpline=color245,color234 emptyscale=,color239 fullscale=,color110'
+else
+    UI_THEME='root=lightgray,black roottext=cyan,black window=lightgray,black border=gray,black
+shadow=black,black title=brightcyan,black textbox=lightgray,black acttextbox=black,cyan label=lightgray,black
+listbox=lightgray,black actlistbox=black,cyan sellistbox=brightcyan,black actsellistbox=black,cyan
+checkbox=lightgray,black actcheckbox=black,cyan entry=black,lightgray disentry=gray,black
+button=black,cyan actbutton=black,cyan compactbutton=lightgray,black helpline=lightgray,black
+emptyscale=,black fullscale=,cyan'
+fi
+
+# Terminal size: the controlling terminal, then $LINES/$COLUMNS, then 24x80.
+ui_term_size() {
+    local size
+    size=$( { stty size </dev/tty; } 2>/dev/null ) || size=""
+    UI_LINES="${size% *}"; UI_COLS="${size#* }"
+    [[ "$UI_LINES" =~ ^[0-9]+$ ]] || UI_LINES="${LINES:-24}"
+    [[ "$UI_COLS" =~ ^[0-9]+$ ]] || UI_COLS="${COLUMNS:-80}"
+    [[ "$UI_LINES" =~ ^[0-9]+$ ]] && [ "$UI_LINES" -ge 8 ] || UI_LINES=24
+    [[ "$UI_COLS" =~ ^[0-9]+$ ]] && [ "$UI_COLS" -ge 24 ] || UI_COLS=80
+}
+
+# ui_measure WIDTH TEXT: UI_ROWS = rows once wrapped like newt does (at word
+# boundaries, "\n" = line break), UI_LONGEST = longest line. CJK characters
+# take two columns.
+ui_measure() {
+    local width="$1" text="$2" line word len cur k=1 n=0 words=()
+    UI_ROWS=0; UI_LONGEST=0
+    case "${KOHA_PANEL_LANG:-en}" in ja|zh|ko) k=2 ;; esac
+    [ "$width" -lt 10 ] && width=10
+    text="${text//\\n/$'\n'}"
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1)); [ "$n" -gt 400 ] && break
+        len=$(( ${#line} * k ))
+        [ "$len" -gt "$UI_LONGEST" ] && UI_LONGEST=$len
+        UI_ROWS=$((UI_ROWS + 1))
+        [ "$len" -le "$width" ] && continue
+        read -ra words <<< "$line"
+        cur=0
+        for word in "${words[@]}"; do
+            len=$(( ${#word} * k ))
+            if [ "$cur" -eq 0 ]; then
+                cur=$len
+            elif [ $((cur + 1 + len)) -le "$width" ]; then
+                cur=$((cur + 1 + len))
+            else
+                UI_ROWS=$((UI_ROWS + 1)); cur=$len
+            fi
+            while [ "$cur" -gt "$width" ]; do UI_ROWS=$((UI_ROWS + 1)); cur=$((cur - width)); done
+        done
+    done <<< "$text"
+    return 0
+}
+
+# ui_layout WHIPTAIL_ARGS...: UI_ARGS = the same arguments with the panel's
+# geometry (the caller's height/width are only a fallback) and padded title.
+ui_layout() {
+    UI_ARGS=("$@")
+    local n=$# i box="" text h w lh rows maxh maxw items extra scroll=0 wide=0
+    for ((i = 0; i < n; i++)); do
+        case "${UI_ARGS[i]}" in
+            --msgbox|--yesno|--infobox|--inputbox|--passwordbox|--textbox|--gauge|--menu|--checklist|--radiolist)
+                box="${UI_ARGS[i]}"; break ;;
+            --scrolltext) wide=1 ;;
+            --title)
+                [[ "${UI_ARGS[i+1]:-}" == " "* ]] || UI_ARGS[i+1]=" ${UI_ARGS[i+1]:-} "
+                i=$((i + 1)) ;;
+            --backtitle|--yes-button|--no-button|--ok-button|--cancel-button|--default-item|--output-fd)
+                i=$((i + 1)) ;;
+        esac
+    done
+    [ -n "$box" ] && [ $((i + 3)) -lt "$n" ] || return 0
+    ui_term_size
+    maxw=$((UI_COLS - 2)); maxh=$((UI_LINES - 2))
+    if [ "$box" = "--textbox" ]; then
+        text=$(head -n 400 -- "${UI_ARGS[i+1]}" 2>/dev/null); wide=1
+    else
+        text="${UI_ARGS[i+1]}"
+    fi
+    w=$UI_WIDTH
+    if [ "$wide" = "1" ]; then
+        ui_measure 1000 "$text"
+        [ $((UI_LONGEST + 6)) -gt "$w" ] && w=$((UI_LONGEST + 6))
+        [ "$w" -gt "$UI_WIDTH_WIDE" ] && w=$UI_WIDTH_WIDE
+    fi
+    [ "$w" -gt "$maxw" ] && w=$maxw
+    ui_measure $((w - 4)) "$text"
+    rows=$UI_ROWS; [ "$rows" -lt 1 ] && rows=1
+    case "$box" in
+        --menu|--checklist|--radiolist)
+            if [ "$box" = "--menu" ]; then items=$(( (n - i - 5) / 2 )); extra=7
+            else items=$(( (n - i - 5) / 3 )); extra=6; fi
+            [ "$items" -lt 1 ] && items=1
+            lh=$items
+            [ "$lh" -gt $((maxh - rows - extra)) ] && lh=$((maxh - rows - extra))
+            [ "$lh" -lt 3 ] && lh=3
+            [ "$lh" -gt "$items" ] && lh=$items
+            UI_ARGS[i+4]=$lh
+            h=$((rows + lh + extra)) ;;
+        --inputbox|--passwordbox) h=$((rows + 7)) ;;
+        --gauge) h=$((rows + 5)) ;;
+        *) h=$((rows + 6)) ;;
+    esac
+    [ "$h" -gt "$maxh" ] && { h=$maxh; scroll=1; }
+    UI_ARGS[i+2]=$h
+    UI_ARGS[i+3]=$w
+    if [ "$scroll" = "1" ] && [ "$box" != "--gauge" ]; then
+        UI_ARGS=("${UI_ARGS[@]:0:i}" --scrolltext "${UI_ARGS[@]:i}")
+    fi
+    return 0
+}
+
+# Every dialog gets the panel's look, geometry and translated buttons.
+# Options given by the caller come later on the command line, so they still
+# win (e.g. --cancel-button "Back").
 whiptail() {
-    command whiptail --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
-        --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "$@"
+    ui_layout "$@"
+    NEWT_COLORS="$UI_THEME" command whiptail --backtitle "Koha Easy Installer & Manager v${PANEL_VERSION# }" \
+        --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
+        --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "${UI_ARGS[@]}"
 }
 
 # Applies and saves the panel language ($1 = code such as pt-BR).
@@ -696,10 +842,13 @@ prompt_yes_no() {
     local message="${2:-$(t "Continue?")}"
     local h="${3:-12}"
     local w="${4:-74}"
+    local defno=()
     local rc
+    # "defaultno" (5th argument): the No button has the focus.
+    [ "${5:-}" = "defaultno" ] && defno=(--defaultno)
 
     if command -v whiptail >/dev/null 2>&1; then
-        whiptail --title "$title" --yesno "$message" "$h" "$w" </dev/tty >/dev/tty 2>/dev/tty
+        whiptail --title "$title" "${defno[@]}" --yesno "$message" "$h" "$w" </dev/tty >/dev/tty 2>/dev/tty
         rc=$?
         case "$rc" in
             0) return 0 ;;
@@ -1061,8 +1210,13 @@ create_safety_backup() {
 # ======================================================================
 # FILE EXPLORER
 # ======================================================================
+# select_file [START] [EXTENSIONS] [PROMPT] [LABEL]: default = SQL backups.
 select_file() {
-    local current="${1:-/}" choice items=()
+    local current="${1:-/}" exts="${2:-sql sql.gz}" prompt="${3:-}" label="${4:-}" choice items=() e fexpr=()
+    [ -n "$prompt" ] || prompt="$(t "Pick the backup (.sql or .sql.gz):")"
+    [ -n "$label" ] || label="$(t "Backup file")"
+    for e in $exts; do fexpr+=(-o -iname "*.${e}"); done
+    fexpr=("${fexpr[@]:1}")
     [ -d "$current" ] || current="/"
     while true; do
         items=()
@@ -1071,14 +1225,14 @@ select_file() {
             [ -n "$d" ] && items+=("$d" "$(t "[Folder]")")
         done < <(find "$current" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
         while IFS= read -r f; do
-            [ -n "$f" ] && items+=("$f" "$(t "Backup file")")
-        done < <(find "$current" -mindepth 1 -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' \) -printf '%f\n' 2>/dev/null | sort)
+            [ -n "$f" ] && items+=("$f" "$label")
+        done < <(find "$current" -mindepth 1 -maxdepth 1 -type f \( "${fexpr[@]}" \) -printf '%f\n' 2>/dev/null | sort)
 
         [ ${#items[@]} -eq 0 ] && items+=(".." "$(t "[Empty - Back]")")
 
         choice=$(whiptail --title "$(t "File Explorer")" \
             --cancel-button "$(t "Back")" \
-            --menu "$(t "Current folder:") $current\n\n$(t "Pick the backup (.sql or .sql.gz):")" \
+            --menu "$(t "Current folder:") $current\n\n${prompt}" \
             22 76 12 "${items[@]}" 3>&1 1>&2 2>&3) || return 1
         [ -z "$choice" ] && return 1
 
@@ -1137,10 +1291,11 @@ v_reset() {
         echo "======================================================================"
     } > "$VALIDATION_LOG"
 }
-v_ok()   { V_OK=$((V_OK+1));    printf '[ OK ] %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
-v_warn() { V_WARN=$((V_WARN+1)); printf '[%s] %s\n' "$(t "WARN")" "$1" | tee -a "$VALIDATION_LOG"; }
-v_fail() { V_FAIL=$((V_FAIL+1)); printf '[%s] %s\n' "$(t "FAIL")" "$1" | tee -a "$VALIDATION_LOG"; }
-v_info() { printf '[INFO] %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
+# Status markers: ✔ ok, ⚠ warning, ✖ failure, ● information.
+v_ok()   { V_OK=$((V_OK+1));    printf '✔ %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
+v_warn() { V_WARN=$((V_WARN+1)); printf '⚠ %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
+v_fail() { V_FAIL=$((V_FAIL+1)); printf '✖ %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
+v_info() { printf '● %s\n' "$1" | tee -a "$VALIDATION_LOG"; }
 
 validate_command() {
     local msg
@@ -1569,7 +1724,7 @@ validate_pre_installation() {
     if [ "$V_FAIL" -ne 0 ]; then
         local err_list
         local fail_tag
-        fail_tag="[$(t "FAIL")] "
+        fail_tag="✖ "
         err_list=$(awk -v tag="$fail_tag" 'index($0, tag) == 1 { print substr($0, length(tag) + 1) }' "$VALIDATION_LOG" | head -n 4)
         
         local fail_msg
@@ -2288,10 +2443,50 @@ EOF
     chown root:root /root/backup_sql.sh /root/backup_marc.sh
 }
 
+# E-mail notices are sent by koha-common's own schedule (cron.daily: overdue
+# and advance notices; cron.d: the message queue every 15 minutes) for the
+# instances enabled with koha-email-enable. Returns 0 when e-mail is on.
+KOHA_EMAIL_FLAG="/var/lib/koha/${INSTANCE}/email.enabled"
+koha_email_enable() {
+    [ -e "$KOHA_EMAIL_FLAG" ] && return 0
+    koha_ctl /usr/sbin/koha-email-enable "$INSTANCE" >> "$RUN_LOG" 2>&1
+    [ -e "$KOHA_EMAIL_FLAG" ]
+}
+
+# Brings a koha_tasks file written by older panels up to date:
+#  - the 01:30 cleanup_database.pl ran without --confirm, i.e. as a dry run
+#    that never deleted anything;
+#  - the 08:00/08:05 e-mail block duplicated koha-common's own jobs (notices
+#    generated twice, the queue flushed once a day). It is replaced by
+#    koha-email-enable and removed only once e-mail is enabled, so notices
+#    never stop.
+upgrade_cron_tasks() {
+    [ -f "$CRON_TASKS" ] || return 0
+    local changed=0
+    if grep 'cleanup_database\.pl' "$CRON_TASKS" | grep -qv -- '--confirm'; then
+        sed -i '/cleanup_database\.pl/{/--confirm/!s#cleanup_database\.pl#cleanup_database.pl --confirm#}' "$CRON_TASKS"
+        changed=1
+        log "cron: --confirm added to cleanup_database.pl"
+    fi
+    if grep -q '^# BEGIN KOHA EMAIL NOTICES$' "$CRON_TASKS"; then
+        if koha_email_enable; then
+            sed -i '/^# BEGIN KOHA EMAIL NOTICES$/,/^# END KOHA EMAIL NOTICES$/d' "$CRON_TASKS"
+            changed=1
+            log "cron: 08:00/08:05 e-mail block replaced by koha-email-enable"
+        else
+            log "cron: koha-email-enable failed; the old e-mail block was kept"
+        fi
+    fi
+    [ "$changed" = "1" ] && systemctl restart cron >/dev/null 2>&1
+    return 0
+}
+
 write_cron_tasks() {
-    local email_block=""
-    if [ -f "$CRON_TASKS" ] && grep -q '^# BEGIN KOHA EMAIL NOTICES' "$CRON_TASKS"; then
-        email_block=$(sed -n '/^# BEGIN KOHA EMAIL NOTICES$/,/^# END KOHA EMAIL NOTICES$/p' "$CRON_TASKS")
+    local legacy_email=""
+    upgrade_cron_tasks
+    # Still there only if e-mail could not be enabled: keep it running.
+    if [ -f "$CRON_TASKS" ] && grep -q '^# BEGIN KOHA EMAIL NOTICES$' "$CRON_TASKS"; then
+        legacy_email=$(sed -n '/^# BEGIN KOHA EMAIL NOTICES$/,/^# END KOHA EMAIL NOTICES$/p' "$CRON_TASKS")
     fi
 
     cat > "$CRON_TASKS" << EOF
@@ -2302,6 +2497,10 @@ write_cron_tasks() {
 #
 # Schedule format:
 # MIN HOUR DAY_OF_MONTH MONTH DAY_OF_WEEK(0=Sunday) USER COMMAND
+#
+# E-mail notices are not scheduled here: koha-common sends them (overdue and
+# advance notices daily, message queue every 15 minutes) once e-mail is
+# enabled with "koha-email-enable ${INSTANCE}".
 # ======================================================================
 $CRON_PATH
 MAILTO=""
@@ -2322,23 +2521,10 @@ MAILTO=""
 0 3 * * 0 root /bin/bash /root/backup_marc.sh >/dev/null 2>&1
 
 # Clear old user sessions and Zebra queue - Daily at 01:30
-30 1 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/cleanup_database.pl --sessions --sessdays 2 --zebraqueue 10" >/dev/null 2>&1
+# (without --confirm, cleanup_database.pl only reports what it would delete)
+30 1 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/cleanup_database.pl --confirm --sessions --sessdays 2 --zebraqueue 10" >/dev/null 2>&1
 EOF
-
-    if [ -n "$email_block" ]; then
-        printf '%s\n' "$email_block" >> "$CRON_TASKS"
-    else
-        cat >> "$CRON_TASKS" << EOF
-
-# BEGIN KOHA EMAIL NOTICES
-# Triggers overdue rules and generates patron notices - Daily at 08:00
-0 8 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/overdue_notices.pl -v -t" >/dev/null 2>&1
-
-# Dispatches pending emails from message queue - Daily at 08:05
-5 8 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/process_message_queue.pl -v" >/dev/null 2>&1
-# END KOHA EMAIL NOTICES
-EOF
-    fi
+    [ -n "$legacy_email" ] && printf '\n%s\n' "$legacy_email" >> "$CRON_TASKS"
 
     chmod 644 "$CRON_TASKS"
     chown root:root "$CRON_TASKS"
@@ -2790,6 +2976,7 @@ function_install_koha() {
     ssh_login=$(get_ssh_login "$ip")
     write_backup_scripts
     write_cron_tasks
+    koha_email_enable || log "koha-email-enable failed (e-mail notices stay off)"
 
     cat > "$CREDENTIALS_FILE" << EOF
 ======================================================================
@@ -2873,7 +3060,7 @@ EOF
         reboot_now
     else
         msg_info "$(t "Pending Reboot")" \
-"$(t "All set! You chose to reboot later.\n\nRemember: if the catalog feels sluggish, restart the server via option 15 in the panel before heavy indexing.")" 11 74
+"$(t "All set! You chose to reboot later.\n\nRemember: if the catalog feels sluggish, restart the server via option 16 in the panel before heavy indexing.")" 11 74
     fi
 }
 
@@ -4187,7 +4374,7 @@ function_manage_crons() {
                 txt_help+="$(t "• MARC21 Records Backup (Sundays at 03:00):\n  Exports catalog and authorities in standard MARC21 exchange format.\n\n")"
                 txt_help+="$(t "• DB & Session Cleanup (01:30 daily):\n  Purges stale web sessions keeping database and browsing responsive.\n\n")"
                 txt_help+="$(t "• Plack Accelerator Maintenance (05:00 daily):\n  Flushes workers ensuring stable low memory consumption.\n\n")"
-                txt_help+="$(t "• Email & Circulation Notices (08:00 & 08:05 daily):\n  Generates overdue notices and dispatches pending emails to patrons.\n\n")"
+                txt_help+="$(t "• E-mail notices (Koha's own schedule, once e-mail is enabled):\n  Overdue and advance notices daily, message queue every 15 minutes.\n\n")"
                 txt_help+="$(t "• Incremental Catalog Indexing (every 2 min):\n  Ensures new titles become searchable in the OPAC almost immediately.")"
 
                 whiptail --title "$(t "Automated Tasks Guide")" --scrolltext --msgbox "$txt_help" 22 80 2>/dev/null || true
@@ -4230,18 +4417,14 @@ function_configure_emails() {
     clear
     apt_install libsasl2-modules >/dev/null 2>&1
     [ -f "$CRON_TASKS" ] || write_cron_tasks
-    sed -i '/^# BEGIN KOHA EMAIL NOTICES$/,/^# END KOHA EMAIL NOTICES$/d' "$CRON_TASKS"
-    printf '\n' >> "$CRON_TASKS"
-    cat >> "$CRON_TASKS" << EOF
-# BEGIN KOHA EMAIL NOTICES
-0 8 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/overdue_notices.pl -v -t" >/dev/null 2>&1
-5 8 * * * root /usr/sbin/koha-shell ${INSTANCE} -c "/usr/share/koha/bin/cronjobs/process_message_queue.pl -v" >/dev/null 2>&1
-# END KOHA EMAIL NOTICES
-EOF
-    chmod 644 "$CRON_TASKS"
-    systemctl restart cron >/dev/null 2>&1
+    if ! koha_email_enable; then
+        msg_error "" "$(t 'E-mail could not be enabled for the instance (koha-email-enable ${INSTANCE}).\nNothing was changed.\n\nDetails: ${RUN_LOG}')" 12 74
+        return 1
+    fi
+    upgrade_cron_tasks
+    log "e-mail enabled for ${INSTANCE} (koha-email-enable)"
     msg_info "$(t "Email Setup")" \
-"$(t "The sending tasks are scheduled (08:00 and 08:05).\n\nYOU STILL NEED TO REGISTER THE SMTP SERVER IN KOHA:\nAdministration > Additional parameters > SMTP servers\n\nGmail example:\n  Host: smtp.gmail.com   Port: 587   Security: STARTTLS\n  User: the library email\n  Password: an APP PASSWORD (not the account password)\n\nThen set the preferences:\n  KohaAdminEmailAddress, EmailAddressForSuggestions\n  EnhancedMessagingPreferences = Allow\n\nAnd the triggers in Tools > Overdue notice triggers.\nKoha's own SMTP screen has a send-test-email button.\n\nThe panel never stores email passwords in a file.")" 26 78
+"$(t "E-mail is enabled for the instance (koha-email-enable).\nKoha's own schedule sends the notices: overdue and advance\nnotices once a day, the message queue every 15 minutes.\n\nYOU STILL NEED TO REGISTER THE SMTP SERVER IN KOHA:\nAdministration > Additional parameters > SMTP servers\n\nGmail example:\n  Host: smtp.gmail.com   Port: 587   Security: STARTTLS\n  User: the library email\n  Password: an APP PASSWORD (not the account password)\n\nThen set the preferences:\n  KohaAdminEmailAddress, EmailAddressForSuggestions\n  EnhancedMessagingPreferences = Allow\n\nAnd the triggers in Tools > Overdue notice triggers.\nKoha's own SMTP screen has a send-test-email button.\n\nThe panel never stores email passwords in a file.")" 28 78
 }
 
 # ======================================================================
@@ -5053,26 +5236,37 @@ function_deep_maintenance() {
 # ======================================================================
 # 21. DETAILED STATUS
 # ======================================================================
+# "✔ active", "✖ failed" or "● inactive" for the status screen.
+st_mark() {
+    case "$1" in
+        active) printf '✔ %s' "$1" ;;
+        failed) printf '✖ %s' "$1" ;;
+        *)      printf '● %s' "${1:-unknown}" ;;
+    esac
+}
+
 function_detailed_status() {
-    local engine idx pend docs bibs plack
+    local engine idx pend docs bibs plack email
     engine=$(get_search_engine)
-    is_koha_indexer_running && idx="$(t "running")" || idx="$(t "stopped")"
-    plack_running && plack="$(t "running")" || plack="$(t "stopped")"
+    if is_koha_indexer_running; then idx="✔ $(t "running")"; else idx="● $(t "stopped")"; fi
+    if plack_running; then plack="✔ $(t "running")"; else plack="✖ $(t "stopped")"; fi
+    if [ -e "$KOHA_EMAIL_FLAG" ]; then email="✔ koha-email-enable"; else email="● $(t "not configured")"; fi
     pend=$(get_pending_es_jobs)
     docs=$(get_total_es_documents)
     bibs=$(get_total_biblios)
     whiptail --title "$(t "Server Status")" --scrolltext --msgbox \
 "$(t "SERVICES")
-  Apache         : $(systemctl is-active apache2 2>/dev/null)
-  MariaDB        : $(systemctl is-active mariadb 2>/dev/null)
-  Memcached      : $(systemctl is-active memcached 2>/dev/null)
-  Koha common    : $(systemctl is-active koha-common 2>/dev/null)
-  Cron           : $(systemctl is-active cron 2>/dev/null)
-  Plack          : ${plack:-?}
-  Zebra          : $(is_koha_zebra_running && echo active || echo inactive)
-  Elasticsearch  : $(systemctl is-active elasticsearch 2>/dev/null)
+  Apache         : $(st_mark "$(systemctl is-active apache2 2>/dev/null)")
+  MariaDB        : $(st_mark "$(systemctl is-active mariadb 2>/dev/null)")
+  Memcached      : $(st_mark "$(systemctl is-active memcached 2>/dev/null)")
+  Koha common    : $(st_mark "$(systemctl is-active koha-common 2>/dev/null)")
+  Cron           : $(st_mark "$(systemctl is-active cron 2>/dev/null)")
+  Plack          : ${plack}
+  Zebra          : $(if is_koha_zebra_running; then st_mark active; else st_mark inactive; fi)
+  Elasticsearch  : $(st_mark "$(systemctl is-active elasticsearch 2>/dev/null)")
   ES Indexer     : ${idx}
-  Cloudflare     : $(systemctl is-active cloudflared 2>/dev/null)
+  Cloudflare     : $(st_mark "$(systemctl is-active cloudflared 2>/dev/null)")
+  E-mail         : ${email}
 
 $(t "SEARCH")
   $(t "Engine")         : ${engine:-?}
@@ -5419,6 +5613,677 @@ function_about() {
     rm -f "$tmp_about"
 }
 
+# ======================================================================
+# 29. LIBRARY TOOLS
+# ----------------------------------------------------------------------
+# Day-to-day tasks for the library staff, done with Koha's own command-line
+# tools run as the instance user (koha-shell). Everything that writes to the
+# database goes through the same steps: the backup/restore lock, a dry run
+# shown to the operator, an explicit confirmation, a verified PRE-* backup,
+# and only then the real run. The tools never stop or restart Koha: a
+# failure leaves the services as they were, and the PRE-* backup undoes any
+# change (Restore database). Logs: ${TOOLS_LOG_DIR}.
+# ======================================================================
+TOOLS_LOG_DIR="${LOG_DIR}/tools"
+KOHA_BIN="/usr/share/koha/bin"
+PATRON_TEMPLATE="/root/koha_patrons_template.csv"
+TOOLS_PRE=""
+
+# Path of one of Koha's command-line scripts (Debian package layout).
+koha_script() {
+    local d
+    for d in "$KOHA_BIN" "$KOHA_BIN/cronjobs" "$KOHA_BIN/maintenance" "$KOHA_BIN/migration_tools"; do
+        [ -f "$d/$1" ] && { printf '%s' "$d/$1"; return 0; }
+    done
+    return 1
+}
+
+# Quotes one argument for koha-shell, which hands the command line to the
+# instance user's shell wrapped in single quotes: a single quote or a line
+# break can never get through safely, so such arguments are refused.
+kq() {
+    case "$1" in *\'*|*$'\n'*) return 1 ;; esac
+    local s="$1"
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//\$/\\\$}; s=${s//\`/\\\`}
+    printf '"%s"' "$s"
+}
+
+# koha_tool LOG SCRIPT [ARGS...]: runs a Koha script as the instance user
+# (koha-shell), appending the command line and its output to LOG.
+koha_tool() {
+    local log="$1" name="$2" path cmd a q
+    shift 2
+    if ! path=$(koha_script "$name"); then
+        printf '%s: not found in %s\n' "$name" "$KOHA_BIN" >> "$log"
+        return 127
+    fi
+    cmd=$(kq "$path") || return 2
+    for a in "$@"; do
+        q=$(kq "$a") || { printf 'refused argument: %s\n' "$a" >> "$log"; return 2; }
+        cmd+=" $q"
+    done
+    printf '$ %s %s\n' "$name" "$*" >> "$log"
+    log "tools: $name $*"
+    ( cd "${TOOLS_WORK:-/tmp}" 2>/dev/null || cd /tmp || exit 1
+      koha_ctl /usr/sbin/koha-shell "$INSTANCE" -c "$cmd" ) >> "$log" 2>&1 </dev/null
+}
+
+# Output of the last command written to LOG by koha_tool.
+tools_output() { awk '/^\$ /{ out = ""; next } { out = out $0 "\n" } END { printf "%s", out }' "$1"; }
+# tools_num LOG LABEL: number after LABEL (at line start) in the last command's output.
+tools_num() {
+    tools_output "$1" | awk -v label="$2" 'index($0, label) == 1 {
+        s = substr($0, length(label) + 1); if (match(s, /[0-9]+/)) v = substr(s, RSTART, RLENGTH)
+    } END { print (v == "" ? 0 : v) }'
+}
+# tools_lead LOG TEXT: number of a "<N> TEXT" line in the last command's output.
+tools_lead() {
+    tools_output "$1" | awk -v text="$2" 'match($0, /^[0-9]+ /) && index($0, text) == RLENGTH + 1 {
+        v = substr($0, 1, RLENGTH - 1)
+    } END { print (v == "" ? 0 : v) }'
+}
+
+# Work folder for the files handed to Koha's scripts: only root and the
+# instance user can read it (patron lists are personal data). Removed on exit.
+tools_workdir() {
+    if [ -z "$TOOLS_WORK" ] || [ ! -d "$TOOLS_WORK" ]; then
+        TOOLS_WORK=$(mktemp -d /tmp/koha_tools.XXXXXX) || return 1
+    fi
+    chown "${INSTANCE}-koha:" "$TOOLS_WORK" 2>/dev/null || true
+    chmod 700 "$TOOLS_WORK"
+}
+# tools_copy SRC NAME: copy of SRC in the work folder; prints its path.
+tools_copy() {
+    local dst="${TOOLS_WORK}/$2"
+    cp -f -- "$1" "$dst" 2>/dev/null || return 1
+    chown "${INSTANCE}-koha:" "$dst" 2>/dev/null || true
+    chmod 600 "$dst"
+    printf '%s' "$dst"
+}
+# tools_log NAME: new log file (root only) for one run of a tool.
+tools_log() {
+    local f
+    mkdir -p "$TOOLS_LOG_DIR" && chmod 700 "$TOOLS_LOG_DIR"
+    f="${TOOLS_LOG_DIR}/$1-$(date +%Y%m%d-%H%M%S).log"
+    : > "$f" && chmod 600 "$f"
+    printf '%s' "$f"
+}
+
+# Runs a tool that writes to the database while holding the backup/restore
+# lock: no nightly backup, restore or update can run in the middle of it.
+tools_locked() {
+    if ! backup_lock_acquire; then
+        msg_error "" "$(t "Another backup or restore is already running.\nNothing was changed.")" 10 72
+        return 1
+    fi
+    local rc=0
+    tools_workdir && "$@" || rc=$?
+    # The copies handed to Koha (patron lists are personal data) go at once.
+    [ -d "$TOOLS_WORK" ] && find "$TOOLS_WORK" -mindepth 1 -delete 2>/dev/null
+    backup_lock_release
+    return "$rc"
+}
+
+# Verified PRE-<TAG> dump taken right before a tool writes (the caller holds
+# the lock). Sets TOOLS_PRE; returns 1, with nothing changed, if it failed.
+tools_safety_backup() {
+    TOOLS_PRE="${DIR_SQL}/PRE-${1}_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+    display_explanation "Generating the backup..."
+    CLEANUP_FILE="$TOOLS_PRE"
+    if ! create_safety_backup "$TOOLS_PRE"; then
+        CLEANUP_FILE=""; TOOLS_PRE=""
+        msg_error "$(t "Safety backup failed")" "$(t 'The safety backup of the current database could not be created or validated (check the free space and ${DIR_SQL}).\n\nNothing was changed.')" 12 76
+        return 1
+    fi
+    CLEANUP_FILE=""
+    log "tools: safety backup $TOOLS_PRE"
+    return 0
+}
+
+# Dialogs of the tools (the test battery replaces them).
+ui_menu() {     # ui_menu TITLE TEXT TAG ITEM [TAG ITEM ...] -> chosen tag
+    local title="$1" text="$2"
+    shift 2
+    whiptail --title "$title" --menu "$text" 0 0 0 "$@" 3>&1 1>&2 2>&3
+}
+ui_input() {    # ui_input TITLE TEXT [DEFAULT] -> typed text
+    whiptail --title "$1" --inputbox "$2" 0 0 "${3:-}" 3>&1 1>&2 2>&3
+}
+ui_textbox() {  # ui_textbox TITLE FILE (scrollable)
+    whiptail --title "$1" --scrolltext --textbox "$2" 0 0 3>&1 1>&2 2>&3 || true
+}
+# tools_pick TITLE TEXT SQL [TAG ITEM]: menu built from a "code<TAB>name" query.
+tools_pick() {
+    local items=() code name
+    [ -n "${4:-}" ] && items+=("$4" "$5")
+    while IFS=$'\t' read -r code name; do
+        [ -n "$code" ] && items+=("$code" "${name:0:48}")
+    done < <(run_sql "$3")
+    [ ${#items[@]} -gt 0 ] || return 1
+    ui_menu "$1" "$2" "${items[@]}"
+}
+valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$1" >/dev/null 2>&1; }
+
+# ----------------------------------------------------------------------
+# 1. MARC import (stage_file.pl, then commit_file.pl) and its undo
+# ----------------------------------------------------------------------
+lt_marc_import() {
+    require_database || return 0
+    local file fmt enc="UTF-8" guess mode
+    file=$(select_file "/root" "mrc marc iso xml" "$(t "Pick the MARC file (.mrc, .iso or .xml):")" "$(t "MARC file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    case "${file,,}" in
+        *.xml)
+            fmt="MARCXML"
+            if ! grep -qE '<([A-Za-z0-9]+:)?record[ >]' "$file"; then
+                msg_error "" "$(t "This is not a MARCXML file (no <record> element).\nNothing was changed.")" 10 70
+                return 1
+            fi ;;
+        *)
+            fmt="ISO2709"
+            if ! [[ "$(head -c 5 "$file")" =~ ^[0-9]{5}$ ]]; then
+                msg_error "" "$(t "This is not an ISO 2709 MARC file (it must start with the 5-digit record length).\nNothing was changed.")" 10 74
+                return 1
+            fi
+            # Leader position 09: "a" = Unicode, blank = MARC-8 (offered first).
+            local encs=("MARC-8" "MARC-8 (ANSEL)" "UTF-8" "Unicode" "ISO_8859-1" "Latin-1 / Windows")
+            guess="MARC-8"
+            if [ "$(head -c 10 "$file" | tail -c 1)" = "a" ]; then
+                guess="UTF-8"
+                encs=("UTF-8" "Unicode" "MARC-8" "MARC-8 (ANSEL)" "ISO_8859-1" "Latin-1 / Windows")
+            fi
+            enc=$(ui_menu "$(t "Character encoding")" "$(t 'Encoding of the records (the file says: ${guess}):')" "${encs[@]}") || return 0 ;;
+    esac
+    mode=$(ui_menu "$(t "Records already in the catalog")" "$(t "When an incoming record matches one in the catalog (ISBN and title):")" \
+        "keep"    "$(t "Keep the catalog record, add only new items")" \
+        "replace" "$(t "Replace the catalog record with the incoming one")" \
+        "new"     "$(t "Do not compare: every record becomes a new title")") || return 0
+    tools_locked _lt_marc_import_run "$file" "$fmt" "$enc" "$mode"
+}
+
+_lt_marc_import_run() {
+    local file="$1" fmt="$2" enc="$3" mode="$4" log name work matcher batch valid added replaced items
+    local args=()
+    log=$(tools_log marc-import)
+    name="${file##*/}"; name="${name//[^A-Za-z0-9._-]/_}"
+    if ! work=$(tools_copy "$file" "$name"); then
+        msg_error "" "$(t "The file could not be copied to the work folder.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    args=(--file "$work" --format "$fmt" --encoding "$enc" --add-items --comment "koha-easy-installer $(date +%F) ${name}")
+    if [ "$mode" != "new" ]; then
+        # A matcher id that does not exist selects stage_file.pl's built-in rule (ISBN + title).
+        matcher=$(run_sql "SELECT COALESCE((SELECT matcher_id FROM ${DB_NAME}.marc_matchers WHERE code='ISBN' AND record_type='biblio' ORDER BY matcher_id LIMIT 1), (SELECT COALESCE(MAX(matcher_id), 0) + 1 FROM ${DB_NAME}.marc_matchers));")
+        [[ "$matcher" =~ ^[0-9]+$ ]] || matcher=1
+        args+=(--match "$matcher")
+        [ "$mode" = "keep" ] && args+=(--no-replace)
+    fi
+
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    koha_tool "$log" stage_file.pl "${args[@]}"
+    batch=$(tools_num "$log" "Batch number assigned:")
+    valid=$(tools_num "$log" "Number of valid records:")
+    if [ "$batch" = "0" ]; then
+        ui_textbox "$(t "MARC import")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 11 76
+        return 1
+    fi
+    if [ "$valid" = "0" ]; then
+        ui_textbox "$(t "MARC import")" "$log"
+        msg_error "" "$(t 'The file has no valid records. Nothing was added to the catalog.\n\nLog: ${log}')" 11 76
+        return 1
+    fi
+    ui_textbox "$(t "Preview (dry run)")" "$log"
+    if ! prompt_yes_no "$(t "MARC import")" "$(t 'Batch ${batch}: ${valid} valid record(s) staged.\n\nImport them into the catalog now? A verified backup is made first, and the import can be undone later (Library tools > Undo a MARC import).')" 14 74 defaultno; then
+        msg_info "$(t "MARC import")" "$(t 'Nothing was added to the catalog. The staged batch ${batch} stays in Koha (Cataloging > Manage staged records).')" 10 74
+        return 0
+    fi
+    tools_safety_backup IMPORT || return 1
+    display_explanation "Applying the changes..."
+    if ! koha_tool "$log" commit_file.pl --batch-number "$batch"; then
+        ui_textbox "$(t "MARC import")" "$log"
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    added=$(tools_num "$log" "Number of new records added:")
+    replaced=$(tools_num "$log" "Number of records replaced:")
+    items=$(tools_num "$log" "Number of items added:")
+    log "tools: MARC batch $batch imported (new=$added replaced=$replaced items=$items)"
+    msg_ok "$(t '✔ Batch ${batch} imported.\n\nNew records: ${added}\nReplaced records: ${replaced}\nItems added: ${items}\n\nThe new titles are indexed automatically in a few minutes.\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 16 76
+}
+
+lt_marc_undo() {
+    require_database || return 0
+    local items=() id when recs note batch
+    while IFS=$'\t' read -r id when recs note; do
+        [ -n "$id" ] && items+=("$id" "${when}  ${recs}  ${note:0:36}")
+    done < <(run_sql "SELECT import_batch_id, DATE_FORMAT(upload_timestamp, '%Y-%m-%d %H:%i'), num_records, COALESCE(NULLIF(comments, ''), file_name, '') FROM ${DB_NAME}.import_batches WHERE import_status = 'imported' AND record_type = 'biblio' ORDER BY import_batch_id DESC LIMIT 30;")
+    if [ ${#items[@]} -eq 0 ]; then
+        msg_info "$(t "Undo a MARC import")" "$(t "There is no imported batch to undo.")" 9 70
+        return 0
+    fi
+    batch=$(ui_menu "$(t "Undo a MARC import")" "$(t "Pick the batch to undo (date, records, file):")" "${items[@]}") || return 0
+    [[ "$batch" =~ ^[0-9]+$ ]] || return 0
+    tools_locked _lt_marc_undo_run "$batch"
+}
+
+_lt_marc_undo_run() {
+    local batch="$1" log recs items deleted reverted gone errors
+    log=$(tools_log marc-undo)
+    recs=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.import_records WHERE import_batch_id = ${batch} AND status = 'imported';")
+    items=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.import_items ii JOIN ${DB_NAME}.import_records ir ON ir.import_record_id = ii.import_record_id WHERE ir.import_batch_id = ${batch} AND ii.status = 'imported';")
+    printf 'Preview: batch %s, imported records: %s, imported items: %s\n' "$batch" "${recs:-?}" "${items:-?}" >> "$log"
+    prompt_yes_no "$(t "Undo a MARC import")" "$(t 'Batch ${batch}: ${recs} record(s) and ${items} item(s) were imported.\n\nUndo it? New records and their items are deleted; replaced records get their previous version back. A verified backup is made first.')" 14 74 defaultno || return 0
+    tools_safety_backup UNDO-IMPORT || return 1
+    display_explanation "Applying the changes..."
+    if ! koha_tool "$log" commit_file.pl --revert --batch-number "$batch"; then
+        ui_textbox "$(t "Undo a MARC import")" "$log"
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    deleted=$(tools_num "$log" "Number of records deleted:")
+    reverted=$(tools_num "$log" "Number of records reverted:")
+    gone=$(tools_num "$log" "Number of items deleted:")
+    errors=$(tools_num "$log" "Number of errors:")
+    log "tools: MARC batch $batch reverted (deleted=$deleted reverted=$reverted items=$gone errors=$errors)"
+    msg_ok "$(t '✔ Batch ${batch} undone.\n\nRecords deleted: ${deleted}\nRecords restored to their previous version: ${reverted}\nItems deleted: ${gone}\nErrors (e.g. items on loan): ${errors}\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 16 76
+}
+
+# ----------------------------------------------------------------------
+# 2. Essential SQL reports pack (read-only SELECTs in Koha's saved reports)
+# ----------------------------------------------------------------------
+# Each report carries "[koha-easy-installer:<key>]" in its notes: installing
+# again updates the same reports (same ids, so bookmarks keep working), and
+# removing the pack deletes only these.
+REPORTS_TAG="koha-easy-installer"
+_rp() { RP_KEY+=("$1"); RP_GROUP+=("$2"); RP_NAME+=("$3"); RP_SQL+=("$4"); }
+reports_define() {
+    RP_KEY=(); RP_GROUP=(); RP_NAME=(); RP_SQL=()
+    _rp top-loans CIRC "$(t "Most borrowed titles (last 12 months)")" \
+        "SELECT b.biblionumber AS \`$(t "Record")\`, b.title AS \`$(t "Title")\`, b.author AS \`$(t "Author")\`, COUNT(*) AS \`$(t "Loans")\` FROM statistics s JOIN items i ON i.itemnumber = s.itemnumber JOIN biblio b ON b.biblionumber = i.biblionumber WHERE s.type = 'issue' AND s.datetime >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH) GROUP BY b.biblionumber, b.title, b.author ORDER BY COUNT(*) DESC LIMIT 100"
+    _rp overdue CIRC "$(t "Overdue loans with patron contacts")" \
+        "SELECT p.cardnumber AS \`$(t "Card number")\`, CONCAT_WS(', ', p.surname, p.firstname) AS \`$(t "Patron")\`, p.email AS \`$(t "E-mail")\`, p.phone AS \`$(t "Phone")\`, b.title AS \`$(t "Title")\`, i.barcode AS \`$(t "Barcode")\`, DATE(c.date_due) AS \`$(t "Due date")\`, DATEDIFF(CURDATE(), c.date_due) AS \`$(t "Days overdue")\`, c.branchcode AS \`$(t "Library")\` FROM issues c JOIN borrowers p ON p.borrowernumber = c.borrowernumber JOIN items i ON i.itemnumber = c.itemnumber JOIN biblio b ON b.biblionumber = i.biblionumber WHERE c.date_due < NOW() ORDER BY c.date_due"
+    _rp never-borrowed CAT "$(t "Items never borrowed (acquired over 2 years ago)")" \
+        "SELECT i.barcode AS \`$(t "Barcode")\`, i.itemcallnumber AS \`$(t "Call number")\`, b.title AS \`$(t "Title")\`, b.author AS \`$(t "Author")\`, i.dateaccessioned AS \`$(t "Acquired")\`, i.homebranch AS \`$(t "Library")\` FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber WHERE COALESCE(i.issues, 0) = 0 AND i.dateaccessioned < DATE_SUB(CURDATE(), INTERVAL 2 YEAR) ORDER BY i.dateaccessioned"
+    _rp new-items CAT "$(t "New acquisitions (last 30 days)")" \
+        "SELECT i.dateaccessioned AS \`$(t "Acquired")\`, i.barcode AS \`$(t "Barcode")\`, i.itemcallnumber AS \`$(t "Call number")\`, b.title AS \`$(t "Title")\`, b.author AS \`$(t "Author")\`, i.homebranch AS \`$(t "Library")\` FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber WHERE i.dateaccessioned >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) ORDER BY i.dateaccessioned DESC"
+    _rp expiring PAT "$(t "Patron accounts expiring in the next 30 days")" \
+        "SELECT cardnumber AS \`$(t "Card number")\`, CONCAT_WS(', ', surname, firstname) AS \`$(t "Patron")\`, categorycode AS \`$(t "Category")\`, branchcode AS \`$(t "Library")\`, email AS \`$(t "E-mail")\`, dateexpiry AS \`$(t "Expires")\` FROM borrowers WHERE dateexpiry BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY) ORDER BY dateexpiry"
+    _rp loans-month CIRC "$(t "Loans per month and library (last 12 months)")" \
+        "SELECT DATE_FORMAT(s.datetime, '%Y-%m') AS \`$(t "Month")\`, s.branch AS \`$(t "Library")\`, COUNT(*) AS \`$(t "Loans")\` FROM statistics s WHERE s.type = 'issue' AND s.datetime >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH) GROUP BY DATE_FORMAT(s.datetime, '%Y-%m'), s.branch ORDER BY 1, 2"
+    _rp missing-data CAT "$(t "Items without barcode or call number")" \
+        "SELECT b.biblionumber AS \`$(t "Record")\`, b.title AS \`$(t "Title")\`, i.barcode AS \`$(t "Barcode")\`, i.itemcallnumber AS \`$(t "Call number")\`, i.homebranch AS \`$(t "Library")\` FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber WHERE COALESCE(i.barcode, '') = '' OR COALESCE(i.itemcallnumber, '') = '' ORDER BY b.title"
+    _rp lost-items CAT "$(t "Lost items")" \
+        "SELECT i.barcode AS \`$(t "Barcode")\`, b.title AS \`$(t "Title")\`, i.itemcallnumber AS \`$(t "Call number")\`, COALESCE(av.lib, i.itemlost) AS \`$(t "Status")\`, i.itemlost_on AS \`$(t "Since")\`, i.homebranch AS \`$(t "Library")\` FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber LEFT JOIN authorised_values av ON av.category = 'LOST' AND av.authorised_value = i.itemlost WHERE i.itemlost <> 0 ORDER BY i.itemlost_on DESC"
+}
+
+# SQL string literal.
+sql_quote() { local s="${1//\\/\\\\}"; s="${s//\'/\\\'}"; printf "'%s'" "$s"; }
+
+lt_reports() {
+    require_database || return 0
+    local choice
+    choice=$(ui_menu "$(t "Essential reports pack")" "$(t "Read-only SQL reports for Koha (Reports > Saved reports):")" \
+        "1" "$(t "Install or update the pack")" \
+        "2" "$(t "Remove the pack")") || return 0
+    case "$choice" in
+        1) tools_locked _lt_reports_install ;;
+        2) tools_locked _lt_reports_remove ;;
+    esac
+}
+
+_lt_reports_install() {
+    local i key mark state log script ok=0 created=0 updated=0 notes
+    reports_define
+    log=$(tools_log reports)
+    script="${TOOLS_WORK}/reports.sql"
+    printf 'START TRANSACTION;\nSET @owner := (SELECT borrowernumber FROM borrowers WHERE flags %% 2 = 1 ORDER BY borrowernumber LIMIT 1);\n' > "$script"
+    # Dry run: every query must compile against this Koha's schema (EXPLAIN runs nothing).
+    for i in "${!RP_KEY[@]}"; do
+        key="${RP_KEY[i]}"; mark="[${REPORTS_TAG}:${key}]"
+        if ! mysql --default-character-set=utf8mb4 "$DB_NAME" -e "EXPLAIN ${RP_SQL[i]}" >/dev/null 2>> "$log"; then
+            printf '⚠ %s — %s\n' "${RP_NAME[i]}" "$(t "skipped: not compatible with this Koha version")" >> "$log"
+            continue
+        fi
+        if [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark"), notes) > 0;")" = "0" ]; then
+            state="$(t "new")"; created=$((created + 1))
+        else
+            state="$(t "update")"; updated=$((updated + 1))
+        fi
+        printf '● %s — %s\n' "${RP_NAME[i]}" "$state" >> "$log"
+        ok=$((ok + 1))
+        notes="$(t "Read-only report installed by Koha Easy Installer.") ${mark}"
+        {
+            printf 'UPDATE saved_sql SET report_name = %s, savedsql = %s, notes = %s, report_group = %s, last_modified = NOW() WHERE LOCATE(%s, notes) > 0;\n' \
+                "$(sql_quote "${RP_NAME[i]}")" "$(sql_quote "${RP_SQL[i]}")" "$(sql_quote "$notes")" "$(sql_quote "${RP_GROUP[i]}")" "$(sql_quote "$mark")"
+            printf 'INSERT INTO saved_sql (borrowernumber, date_created, last_modified, savedsql, report_name, type, notes, cache_expiry, public, report_group) SELECT @owner, NOW(), NOW(), %s, %s, %s, %s, 300, 0, %s FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM saved_sql WHERE LOCATE(%s, notes) > 0);\n' \
+                "$(sql_quote "${RP_SQL[i]}")" "$(sql_quote "${RP_NAME[i]}")" "'1'" "$(sql_quote "$notes")" "$(sql_quote "${RP_GROUP[i]}")" "$(sql_quote "$mark")"
+        } >> "$script"
+    done
+    printf 'COMMIT;\n' >> "$script"
+    if [ "$ok" -eq 0 ]; then
+        ui_textbox "$(t "Essential reports pack")" "$log"
+        msg_error "" "$(t 'None of the reports is compatible with this Koha version. Nothing was changed.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    { printf '\n'; grep -E '^(●|⚠) ' "$log"; } > "${TOOLS_WORK}/preview.txt"
+    ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
+    prompt_yes_no "$(t "Essential reports pack")" "$(t 'New reports: ${created}\nReports to update: ${updated}\n\nInstall them now? A verified backup is made first.')" 12 70 defaultno || return 0
+    tools_safety_backup REPORTS || return 1
+    if ! mysql --default-character-set=utf8mb4 "$DB_NAME" < "$script" >> "$log" 2>&1; then
+        msg_error "" "$(t 'The reports could not be saved (no change was kept).\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    log "tools: reports pack installed (new=$created updated=$updated)"
+    msg_ok "$(t '✔ Reports installed: ${ok}\n\nIn Koha: Reports > Saved reports.\nSafety backup: ${TOOLS_PRE}')" 12 74
+}
+
+_lt_reports_remove() {
+    local n log mark_all="[${REPORTS_TAG}:"
+    log=$(tools_log reports)
+    n=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0;")
+    if [ "${n:-0}" = "0" ]; then
+        msg_info "$(t "Essential reports pack")" "$(t "The pack is not installed. Nothing was changed.")" 9 70
+        return 0
+    fi
+    run_sql "SELECT CONCAT('● ', report_name) FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0 ORDER BY id;" > "${TOOLS_WORK}/preview.txt"
+    cat "${TOOLS_WORK}/preview.txt" >> "$log"
+    ui_textbox "$(t "Preview (dry run)")" "${TOOLS_WORK}/preview.txt"
+    prompt_yes_no "$(t "Essential reports pack")" "$(t 'Remove the ${n} report(s) of the pack? Other saved reports are not touched. A verified backup is made first.')" 11 72 defaultno || return 0
+    tools_safety_backup REPORTS || return 1
+    if ! run_sql "DELETE FROM ${DB_NAME}.saved_sql WHERE LOCATE($(sql_quote "$mark_all"), notes) > 0;" >/dev/null; then
+        msg_error "" "$(t 'The reports could not be removed.\n\nLog: ${log}')" 10 72
+        return 1
+    fi
+    log "tools: reports pack removed ($n)"
+    msg_ok "$(t '✔ Reports removed: ${n}')" 8 60
+}
+
+# ----------------------------------------------------------------------
+# 3. Patrons: CSV import (import_patrons.pl) and school-year category
+#    turnover (update_patrons_category.pl). Both have a native dry run.
+# ----------------------------------------------------------------------
+lt_patron_import() {
+    require_database || return 0
+    local file header match branch cat over="no"
+    [ -e "$PATRON_TEMPLATE" ] || { printf '%s\n' 'cardnumber,surname,firstname,dateofbirth,email,phone,branchcode,categorycode,dateexpiry,userid' > "$PATRON_TEMPLATE"; chmod 600 "$PATRON_TEMPLATE"; }
+    msg_info "$(t "Import patrons")" "$(t 'The first line of the CSV names Koha patron columns, separated by commas:\n  cardnumber,surname,firstname,dateofbirth,email,phone,branchcode,categorycode,dateexpiry,userid\n\nSave it as "CSV UTF-8". Empty template: ${PATRON_TEMPLATE}\nLibrary and category are asked next for the lines that leave them empty.')" 16 76
+    file=$(select_file "/root" "csv" "$(t "Pick the patron file (.csv):")" "$(t "CSV file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    if ! iconv -f UTF-8 -t UTF-8 "$file" >/dev/null 2>&1; then
+        msg_error "" "$(t 'The file is not UTF-8. Save it again as "CSV UTF-8" and try again.\nNothing was changed.')" 10 74
+        return 1
+    fi
+    header=$(head -n 1 "$file" | tr -d '\r" ' | tr '[:upper:]' '[:lower:]')
+    if [[ "$header" == *";"* && "$header" != *","* ]]; then
+        msg_error "" "$(t "The columns are separated by semicolons (;). Koha needs commas (,): save the file again as CSV with commas.\nNothing was changed.")" 11 74
+        return 1
+    fi
+    if [[ ",${header}," == *",cardnumber,"* ]]; then match="cardnumber"
+    elif [[ ",${header}," == *",userid,"* ]]; then match="userid"
+    else match=""
+    fi
+    if [ -z "$match" ] || [[ ",${header}," != *",surname,"* ]]; then
+        msg_error "" "$(t "The first line must name the columns and include surname and cardnumber (or userid).\nNothing was changed.")" 11 74
+        return 1
+    fi
+    branch=$(tools_pick "$(t "Import patrons")" "$(t "Library for the lines without branchcode:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    cat=$(tools_pick "$(t "Import patrons")" "$(t "Category for the lines without categorycode:")" "SELECT categorycode, description FROM ${DB_NAME}.categories ORDER BY description;") || return 0
+    prompt_yes_no "$(t "Import patrons")" "$(t 'Update the patrons that are already registered (same ${match})?\n\nNo = keep them as they are and import only the new ones.')" 11 72 defaultno && over="yes"
+    tools_locked _lt_patron_import_run "$file" "$match" "$branch" "$cat" "$over"
+}
+
+_lt_patron_import_run() {
+    local file="$1" match="$2" branch="$3" cat="$4" over="$5" log work n_new n_upd n_skip n_bad
+    local args=()
+    log=$(tools_log patron-import)
+    if ! work=$(tools_copy "$file" patrons.csv); then
+        msg_error "" "$(t "The file could not be copied to the work folder.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    args=(--file "$work" --matchpoint "$match" --default "branchcode=${branch}" --default "categorycode=${cat}" -v -v)
+    [ "$over" = "yes" ] && args+=(--overwrite)
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_tool "$log" import_patrons.pl "${args[@]}"; then
+        ui_textbox "$(t "Import patrons")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    n_new=$(tools_num "$log" "Imported:"); n_upd=$(tools_num "$log" "Overwritten:")
+    n_skip=$(tools_num "$log" "Skipped:"); n_bad=$(tools_num "$log" "Invalid:")
+    ui_textbox "$(t "Preview (dry run)")" "$log"
+    if [ $((n_new + n_upd)) -eq 0 ]; then
+        msg_info "$(t "Import patrons")" "$(t 'Nothing to import: ${n_skip} already registered, ${n_bad} invalid line(s).\nNothing was changed.\n\nLog: ${log}')" 11 74
+        return 0
+    fi
+    prompt_yes_no "$(t "Import patrons")" "$(t 'Dry run:\n  New patrons      : ${n_new}\n  Updated patrons  : ${n_upd}\n  Already registered: ${n_skip}\n  Invalid lines    : ${n_bad}\n\nImport now? A verified backup is made first.')" 15 70 defaultno || return 0
+    tools_safety_backup PATRONS || return 1
+    display_explanation "Applying the changes..."
+    if ! koha_tool "$log" import_patrons.pl "${args[@]}" --confirm; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    n_new=$(tools_num "$log" "Imported:"); n_upd=$(tools_num "$log" "Overwritten:")
+    log "tools: patrons imported (new=$n_new updated=$n_upd)"
+    msg_ok "$(t '✔ Patrons imported: ${n_new} new, ${n_upd} updated.\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 12 76
+}
+
+lt_patron_category() {
+    require_database || return 0
+    local sql from to rule day="" branch
+    sql="SELECT categorycode, description FROM ${DB_NAME}.categories ORDER BY description;"
+    from=$(tools_pick "$(t "School-year turnover")" "$(t "Move patrons FROM the category:")" "$sql") || return 0
+    to=$(tools_pick "$(t "School-year turnover")" "$(t "TO the category:")" "$sql") || return 0
+    if [ "$from" = "$to" ]; then
+        msg_error "" "$(t "Pick two different categories.\nNothing was changed.")" 9 60
+        return 1
+    fi
+    rule=$(ui_menu "$(t "School-year turnover")" "$(t 'Which patrons of ${from}?')" \
+        "all"  "$(t "All of them")" \
+        "age"  "$(t "Only those older than the category's age limit")" \
+        "date" "$(t "Only those registered before a date")") || return 0
+    if [ "$rule" = "date" ]; then
+        day=$(ui_input "$(t "School-year turnover")" "$(t "Registered before (YYYY-MM-DD):")" "$(date +%Y)-01-01") || return 0
+        if ! valid_date "$day"; then
+            msg_error "" "$(t "Invalid date. Use the format YYYY-MM-DD.\nNothing was changed.")" 9 64
+            return 1
+        fi
+    fi
+    branch=$(tools_pick "$(t "School-year turnover")" "$(t "Library")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;" "*" "$(t "All libraries")") || return 0
+    tools_locked _lt_patron_category_run "$from" "$to" "$rule" "$day" "$branch"
+}
+
+_lt_patron_category_run() {
+    local from="$1" to="$2" log found moved
+    local args=(--from "$1" --to "$2" -v)
+    case "$3" in
+        age)  args+=(--too_old) ;;
+        date) args+=(--regbefore "$4") ;;
+    esac
+    [ "$5" != "*" ] && args+=(--branch "$5")
+    log=$(tools_log patron-category)
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_tool "$log" update_patrons_category.pl "${args[@]}"; then
+        ui_textbox "$(t "School-year turnover")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    found=$(tools_lead "$log" "found,")
+    if [ "$found" = "0" ]; then
+        msg_info "$(t "School-year turnover")" "$(t "No patron matches. Nothing was changed.")" 9 64
+        return 0
+    fi
+    ui_textbox "$(t "Preview (dry run)")" "$log"
+    prompt_yes_no "$(t "School-year turnover")" "$(t '${found} patron(s) will move from ${from} to ${to}.\n\nContinue? A verified backup is made first.')" 11 70 defaultno || return 0
+    tools_safety_backup PATRONS || return 1
+    if ! koha_tool "$log" update_patrons_category.pl "${args[@]}" --confirm; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    moved=$(tools_output "$log" | sed -n 's/^[0-9][0-9]* found, \([0-9][0-9]*\) updated.*/\1/p' | tail -n 1)
+    log "tools: patrons moved $from -> $to (${moved:-0})"
+    msg_ok "$(t '✔ Patrons moved from ${from} to ${to}: ${moved}\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 12 76
+}
+
+# ----------------------------------------------------------------------
+# 4. Catalog data-quality check (read-only)
+# ----------------------------------------------------------------------
+lt_data_quality() {
+    require_database || return 0
+    local log
+    tools_workdir || return 1
+    log=$(tools_log data-quality)
+    display_explanation "Checking the catalog (read-only, it may take a few minutes)..."
+    if ! koha_tool "$log" search_for_data_inconsistencies.pl; then
+        ui_textbox "$(t "Catalog data-quality check")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 1
+    fi
+    if [ -z "$(tools_output "$log" | tr -d '[:space:]')" ]; then
+        msg_ok "$(t '✔ No inconsistencies found.\n\nLog: ${log}')" 10 72
+        return 0
+    fi
+    ui_textbox "$(t "Catalog data-quality check")" "$log"
+}
+
+# ----------------------------------------------------------------------
+# 5. Privacy (LGPD): anonymise old circulation history, delete old patrons
+# ----------------------------------------------------------------------
+lt_privacy_anonymise() {
+    require_database || return 0
+    local days
+    days=$(ui_input "$(t "Privacy: anonymise history")" "$(t "Anonymise loans and holds that ended more than how many days ago?\n\nPatrons who chose to keep their history are skipped by Koha.")" "365") || return 0
+    if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 30 ]; then
+        msg_error "" "$(t "Type a number of days (30 or more).\nNothing was changed.")" 9 64
+        return 1
+    fi
+    tools_locked _lt_anonymise_run "$days"
+}
+
+_lt_anonymise_run() {
+    local days="$1" log anon loans holds
+    log=$(tools_log privacy-anonymise)
+    # The same selection as Koha (filter_by_anonymizable + filter_by_last_update).
+    anon=$(run_sql "SELECT value FROM ${DB_NAME}.systempreferences WHERE variable = 'AnonymousPatron';")
+    [[ "$anon" =~ ^[0-9]+$ ]] || anon=0
+    loans=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.old_issues o JOIN ${DB_NAME}.borrowers b ON b.borrowernumber = o.borrowernumber WHERE b.privacy <> 0 AND o.borrowernumber <> ${anon} AND o.returndate < DATE_SUB(CURDATE(), INTERVAL ${days} DAY);")
+    holds=$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.old_reserves r JOIN ${DB_NAME}.borrowers b ON b.borrowernumber = r.borrowernumber WHERE b.privacy <> 0 AND r.borrowernumber <> ${anon} AND r.timestamp < DATE_SUB(CURDATE(), INTERVAL ${days} DAY);")
+    if ! [[ "$loans" =~ ^[0-9]+$ && "$holds" =~ ^[0-9]+$ ]]; then
+        msg_error "" "$(t "The records could not be counted. Nothing was changed.")" 9 70
+        return 1
+    fi
+    printf 'Preview (%s days): loans=%s holds=%s AnonymousPatron=%s\n' "$days" "$loans" "$holds" "$anon" >> "$log"
+    if [ $((loans + holds)) -eq 0 ]; then
+        msg_info "$(t "Privacy: anonymise history")" "$(t "Nothing to anonymise. Nothing was changed.")" 9 64
+        return 0
+    fi
+    prompt_yes_no "$(t "Privacy: anonymise history")" "$(t 'Records that ended more than ${days} days ago:\n  Loans: ${loans}\n  Holds: ${holds}\n\nTheir link to the patrons is removed for good (the statistics stay). A verified backup is made first.\n\nContinue?')" 15 72 defaultno || return 0
+    tools_safety_backup PRIVACY || return 1
+    if ! koha_tool "$log" batch_anonymise.pl --days "$days" -v; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    loans=$(tools_lead "$log" "checkouts anonymised"); holds=$(tools_lead "$log" "holds anonymised")
+    log "tools: history anonymised (loans=$loans holds=$holds, ${days} days)"
+    msg_ok "$(t '✔ Anonymised: ${loans} loan(s) and ${holds} hold(s).\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 12 76
+}
+
+lt_privacy_delete() {
+    require_database || return 0
+    local day cat
+    day=$(ui_input "$(t "Privacy: delete old patrons")" "$(t "Delete the patrons whose account expired before this date (YYYY-MM-DD) and who borrowed nothing since then.\n\nPatrons with loans, fines, guarantees or staff permissions are never deleted.")" "$(date -d '-2 years' +%F)") || return 0
+    if ! valid_date "$day"; then
+        msg_error "" "$(t "Invalid date. Use the format YYYY-MM-DD.\nNothing was changed.")" 9 64
+        return 1
+    fi
+    cat=$(tools_pick "$(t "Privacy: delete old patrons")" "$(t "Category")" "SELECT categorycode, description FROM ${DB_NAME}.categories ORDER BY description;" "*" "$(t "All categories")") || return 0
+    tools_locked _lt_delete_run "$day" "$cat"
+}
+
+_lt_delete_run() {
+    local day="$1" log n typed gone
+    local args=(--expired_before "$1" --not_borrowed_since "$1" -v)
+    [ "$2" != "*" ] && args+=(--category_code "$2")
+    log=$(tools_log privacy-delete)
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_tool "$log" delete_patrons.pl "${args[@]}"; then
+        ui_textbox "$(t "Privacy: delete old patrons")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    n=$(tools_lead "$log" "patrons would have been deleted")
+    if [ "$n" = "0" ]; then
+        msg_info "$(t "Privacy: delete old patrons")" "$(t "No patron matches. Nothing was changed.")" 9 64
+        return 0
+    fi
+    ui_textbox "$(t "Preview (dry run)")" "$log"
+    typed=$(ui_input "$(t "Privacy: delete old patrons")" "$(t '${n} patron(s) will be deleted (expired before ${day}). A verified backup is made first.\n\nType the number ${n} to confirm:')") || return 0
+    if [ "$typed" != "$n" ]; then
+        msg_info "$(t "Privacy: delete old patrons")" "$(t "The number did not match. Nothing was changed.")" 9 64
+        return 0
+    fi
+    tools_safety_backup PRIVACY || return 1
+    if ! koha_tool "$log" delete_patrons.pl "${args[@]}" --confirm; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    gone=$(tools_lead "$log" "patrons deleted")
+    log "tools: patrons deleted ($gone, expired before $day)"
+    msg_ok "$(t '✔ Patrons deleted: ${gone}\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 12 76
+}
+
+# ----------------------------------------------------------------------
+# Tool logs and the submenu
+# ----------------------------------------------------------------------
+lt_view_logs() {
+    local items=() when name size choice
+    while IFS=$'\t' read -r when name size; do
+        [ -n "$name" ] && items+=("$name" "$((size / 1024 + 1)) KB")
+    done < <(find "$TOOLS_LOG_DIR" -maxdepth 1 -name '*.log' -printf '%T@\t%f\t%s\n' 2>/dev/null | sort -rn | head -n 20)
+    if [ ${#items[@]} -eq 0 ]; then
+        msg_info "$(t "Tool logs")" "$(t "No tool has been run yet.")" 8 60
+        return 0
+    fi
+    choice=$(ui_menu "$(t "Tool logs")" "$(t 'Newest first (${TOOLS_LOG_DIR}):')" "${items[@]}") || return 0
+    [ -f "${TOOLS_LOG_DIR}/${choice}" ] && ui_textbox "$choice" "${TOOLS_LOG_DIR}/${choice}"
+}
+
+function_library_tools() {
+    require_koha || return 0
+    local opt
+    while true; do
+        opt=$(whiptail --title "$(t "▦  Library tools")" --cancel-button "$(t "Back")" \
+            --menu "$(t "Changes are always previewed first and protected by a verified backup.")" 0 0 0 \
+            "1" "$(t "⇩  Import MARC records (preview, then import)")" \
+            "2" "$(t "↶  Undo a MARC import")" \
+            "3" "$(t "▤  Essential SQL reports pack")" \
+            "4" "$(t "⇩  Import patrons from a CSV file")" \
+            "5" "$(t "⇄  School-year turnover (patron categories)")" \
+            "6" "$(t "◈  Catalog data-quality check")" \
+            "7" "$(t "◌  Privacy (LGPD): anonymise old history")" \
+            "8" "$(t "✖  Privacy (LGPD): delete old patrons")" \
+            "9" "$(t "▤  View tool logs")" 3>&1 1>&2 2>&3) || return 0
+        case "$opt" in
+            1) lt_marc_import ;;
+            2) lt_marc_undo ;;
+            3) lt_reports ;;
+            4) lt_patron_import ;;
+            5) lt_patron_category ;;
+            6) lt_data_quality ;;
+            7) lt_privacy_anonymise ;;
+            8) lt_privacy_delete ;;
+            9) lt_view_logs ;;
+        esac
+        clear
+    done
+}
+
 # Loaded with "source installer" (tests/): functions only, no menu.
 (return 0 2>/dev/null) && return 0
 
@@ -5436,6 +6301,9 @@ if [ -f /usr/local/bin/config.sh ] && [ -f "$_SCRIPT_PATH" ] \
     log "config.sh refreshed from $_SCRIPT_PATH"
 fi
 
+# Schedules written by older versions of the panel (see upgrade_cron_tasks).
+is_koha_installed && upgrade_cron_tasks
+
 # ======================================================================
 # PRIMEIRA EXECUÇÃO: IDIOMA OBRIGATÓRIO SE NÃO ESTIVER CONFIGURADO
 # ======================================================================
@@ -5452,19 +6320,8 @@ if [ ! -s "$TRANSLATION_CONFIG" ] || [ -z "$(_read_lang_conf KOHA_PANEL_LANG)" ]
 fi
 
 # ======================================================================
-# MAIN MENU (16 OPTIONS)
+# MAIN MENU (17 OPTIONS)
 # ======================================================================
-export NEWT_COLORS='
-root=,,
-window=black,lightgray
-border=black,lightgray
-shadow=black,black
-title=black,lightgray
-textbox=black,lightgray
-listbox=black,lightgray
-actlistbox=white,blue
-'
-
 while true; do
     restore_apt_timers
 
@@ -5486,17 +6343,18 @@ while true; do
     m7=$(t '◈  Diagnostics & maintenance center')
     m8=$(t '⚠  Security center')
     m9=$(t '⚙  Koha settings & parameters')
-    m10=$(t '▤  General tools')
-    m11=$(t '⏱  Schedules & cron tasks')
-    m12=$(t '✦  Koha languages')
-    m13=$(t '⟳  Update center')
-    m14=$(t 'ℹ  About the program & support')
-    m15=$(t '↻  Reboot server')
-    m16=$(t '✖  Exit')
+    m10=$(t '▦  Library tools')
+    m11=$(t '▤  General tools')
+    m12=$(t '⏱  Schedules & cron tasks')
+    m13=$(t '✦  Koha languages')
+    m14=$(t '⟳  Update center')
+    m15=$(t 'ℹ  About the program & support')
+    m16=$(t '↻  Reboot server')
+    m17=$(t '✖  Exit')
 
-    MAIN_OPT=$(whiptail --title "Koha Easy Installer & Manager v${PANEL_VERSION} - ${title_dash}" \
+    MAIN_OPT=$(whiptail --title "${title_dash}" \
         --cancel-button "${exit_btn}" \
-        --menu "${menu_prompt}" 25 80 16 \
+        --menu "${menu_prompt}" 0 0 0 \
         "1"  "$m1" \
         "2"  "$m2" \
         "3"  "$m3" \
@@ -5512,7 +6370,8 @@ while true; do
         "13" "$m13" \
         "14" "$m14" \
         "15" "$m15" \
-        "16" "$m16" 3>&1 1>&2 2>&3) || { clear; exit 0; }
+        "16" "$m16" \
+        "17" "$m17" 3>&1 1>&2 2>&3) || { clear; exit 0; }
 
     case "$MAIN_OPT" in
         1) function_install_koha ;;
@@ -5600,7 +6459,8 @@ while true; do
                 5) function_configure_clock ;;
             esac
             ;;
-        10)
+        10) function_library_tools ;;
+        11)
             SUB_OPT=$(whiptail --title "$(t '▤ General Tools')" --cancel-button "$(t 'Back')" \
                 --menu "$(t 'Choose a tool:')" 17 76 3 \
                 "1" "$(t '▤  Resource monitoring (Htop / Nethogs)')" \
@@ -5612,9 +6472,9 @@ while true; do
                 3) function_run_mc ;;
             esac
             ;;
-        11) function_manage_crons ;;
-        12) function_install_languages ;;
-        13)
+        12) function_manage_crons ;;
+        13) function_install_languages ;;
+        14)
             SUB_OPT=$(whiptail --title "$(t '⟳ Update Center')" --cancel-button "$(t 'Back')" \
                 --menu "$(t 'Choose what to update:')" 16 76 2 \
                 "1" "$(t '⟳  Update OS packages & Koha schemas')" \
@@ -5624,9 +6484,9 @@ while true; do
                 2) function_autoupdate ;;
             esac
             ;;
-        14) function_about ;;
-        15) function_reboot_server ;;
-        16) clear; exit 0 ;;
+        15) function_about ;;
+        16) function_reboot_server ;;
+        17) clear; exit 0 ;;
     esac
     clear
 done

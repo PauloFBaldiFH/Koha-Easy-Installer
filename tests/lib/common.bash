@@ -153,7 +153,9 @@ kei_kill_daemons() {
 kei_reset_env() {
     kei_kill_daemons
     rm -rf "$KEI_S/calls.log" "$KEI_S/dialogs.log" "$KEI_S/answers" "$KEI_S/syslog" \
-           "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs"
+           "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs" \
+           "$KEI_S/inputs" "$KEI_S/textbox.last" "$KEI_S"/batch-*.biblios
+    rm -rf /var/log/koha-easy-install/tools /var/lib/koha/library/email.enabled /root/koha_patrons_template.csv
     mkdir -p "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs"
     touch "$KEI_S/svc/mariadb" "$KEI_S/svc/memcached" "$KEI_S/svc/apache2" "$KEI_S/svc/cron"
     touch "$KEI_S/run/zebra" "$KEI_S/run/indexer" "$KEI_S/run/plack" "$KEI_S/run/worker"
@@ -175,6 +177,7 @@ panel() { run "$KEI_SH" "$PANEL" "$@"; }
 dialogs() { cat "$KEI_S/dialogs.log" 2>/dev/null; }
 calls()   { cat "$KEI_S/calls.log" 2>/dev/null; }
 answer()  { printf '%s\n' "$@" >> "$KEI_S/answers"; }
+inputs()  { printf '%s\n' "$@" >> "$KEI_S/inputs"; }
 
 # Fails the test with context when a condition is false.
 assert() {
@@ -191,3 +194,78 @@ assert_catalog_untouched() {
     assert '[ "$(live_biblios)" = "200" ]' "OLD catalog must keep its 200 records (got '$(live_biblios)')"
     assert '! grep -q "koha-plack --stop" "$KEI_S/calls.log" 2>/dev/null' "Koha services must not have been stopped"
 }
+
+# ---------------------------------------------------------------------
+# Library tools: the tables and columns they read or write (same names and
+# types as Koha's kohastructure.sql), added to the live catalog.
+#   patrons: C1 Ana (PT), 3 students (ST: two adults, one child), 2 expired
+#   patrons without loans, 1 expired with a loan, 1 expired staff member,
+#   1 patron who keeps his history (privacy 0)
+#   history: 3 old loans + 2 old holds anonymisable, 1 recent loan
+# ---------------------------------------------------------------------
+kei_tools_catalog() {
+    mysql "$DB" <<'SQL'
+ALTER TABLE borrowers ADD COLUMN email mediumtext, ADD COLUMN phone mediumtext, ADD COLUMN dateofbirth date,
+  ADD COLUMN dateenrolled date, ADD COLUMN dateexpiry date, ADD COLUMN privacy int(11) NOT NULL DEFAULT 1;
+ALTER TABLE items ADD COLUMN itemcallnumber varchar(255), ADD COLUMN dateaccessioned date, ADD COLUMN issues smallint(6),
+  ADD COLUMN itemlost tinyint(1) NOT NULL DEFAULT 0, ADD COLUMN itemlost_on datetime;
+ALTER TABLE items MODIFY homebranch varchar(10) NULL;
+CREATE TABLE import_batches (import_batch_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, matcher_id int(11), num_records int(11) NOT NULL DEFAULT 0,
+  num_items int(11) NOT NULL DEFAULT 0, upload_timestamp timestamp NOT NULL DEFAULT current_timestamp(),
+  import_status enum('staging','staged','importing','imported','reverting','reverted','cleaned') NOT NULL DEFAULT 'staging',
+  batch_type enum('batch','z3950','webservice') NOT NULL DEFAULT 'batch', record_type enum('biblio','auth','holdings') NOT NULL DEFAULT 'biblio',
+  file_name varchar(100), comments longtext);
+CREATE TABLE import_records (import_record_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, import_batch_id int(11) NOT NULL,
+  status enum('error','staged','imported','reverted','items_reverted','ignored') NOT NULL DEFAULT 'staged');
+CREATE TABLE import_items (import_items_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, import_record_id int(11) NOT NULL,
+  itemnumber int(11), status enum('error','staged','imported','reverted','ignored') NOT NULL DEFAULT 'staged');
+CREATE TABLE marc_matchers (matcher_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, code varchar(10) NOT NULL DEFAULT '',
+  description varchar(255) NOT NULL DEFAULT '', record_type varchar(10) NOT NULL DEFAULT 'biblio', threshold int(11) NOT NULL DEFAULT 0);
+CREATE TABLE saved_sql (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11), date_created datetime, last_modified datetime,
+  savedsql mediumtext, last_run datetime, report_name varchar(255) NOT NULL DEFAULT '', type varchar(255), notes mediumtext,
+  cache_expiry int(11) NOT NULL DEFAULT 300, public tinyint(1) NOT NULL DEFAULT 0, report_area varchar(6), report_group varchar(80),
+  report_subgroup varchar(80), mana_id int(11)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE issues (issue_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11), itemnumber int(11),
+  date_due datetime, branchcode varchar(10), issuedate datetime);
+CREATE TABLE old_issues (issue_id int(11) NOT NULL PRIMARY KEY, borrowernumber int(11), itemnumber int(11), date_due datetime,
+  branchcode varchar(10), returndate datetime, issuedate datetime);
+CREATE TABLE old_reserves (reserve_id int(11) NOT NULL PRIMARY KEY, borrowernumber int(11), biblionumber int(11),
+  timestamp timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp());
+CREATE TABLE statistics (datetime datetime, branch varchar(10), type varchar(16), itemnumber int(11), borrowernumber int(11));
+CREATE TABLE authorised_values (id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, category varchar(32) NOT NULL DEFAULT '',
+  authorised_value varchar(80) NOT NULL DEFAULT '', lib varchar(200));
+
+INSERT INTO marc_matchers (code, description) VALUES ('ISBN', 'ISBN');
+INSERT INTO authorised_values (category, authorised_value, lib) VALUES ('LOST', '1', 'Lost');
+INSERT INTO branches VALUES ('MPL', 'Midway');
+INSERT INTO categories VALUES ('ST', 'Student', 'C'), ('FM', 'Former student', 'A');
+UPDATE borrowers SET dateexpiry = '2099-01-01', dateenrolled = '2020-01-01' WHERE cardnumber = 'C1';
+INSERT INTO borrowers (cardnumber, surname, firstname, branchcode, categorycode, flags, dateofbirth, dateenrolled, dateexpiry, privacy) VALUES
+  ('S1', 'Souza', 'Bia', 'CPL', 'ST', 0, '2000-03-01', '2019-02-01', '2099-01-01', 1),
+  ('S2', 'Lima', 'Caio', 'CPL', 'ST', 0, '2001-05-01', '2024-02-01', '2099-01-01', 1),
+  ('S3', 'Rocha', 'Duda', 'MPL', 'ST', 0, '2016-07-01', '2024-02-01', '2099-01-01', 1),
+  ('E1', 'Old', 'Eva', 'CPL', 'PT', 0, NULL, '2010-01-01', '2019-01-01', 1),
+  ('E2', 'Old', 'Fabio', 'CPL', 'PT', 0, NULL, '2010-01-01', '2019-06-01', 1),
+  ('E3', 'Old', 'Gil', 'CPL', 'PT', 0, NULL, '2010-01-01', '2019-06-01', 1),
+  ('E4', 'Staff', 'Hugo', 'CPL', 'S', 1, NULL, '2010-01-01', '2019-06-01', 1),
+  ('K1', 'Keep', 'Iris', 'CPL', 'PT', 0, NULL, '2010-01-01', '2099-01-01', 0);
+UPDATE items SET itemcallnumber = CONCAT('000.', itemnumber), dateaccessioned = '2020-01-01', issues = 0;
+UPDATE items SET itemlost = 1, itemlost_on = NOW() WHERE itemnumber = 1;
+INSERT INTO issues (borrowernumber, itemnumber, date_due, branchcode, issuedate)
+  SELECT borrowernumber, 2, DATE_SUB(NOW(), INTERVAL 3 DAY), 'CPL', DATE_SUB(NOW(), INTERVAL 20 DAY) FROM borrowers WHERE cardnumber = 'E3';
+INSERT INTO old_issues (issue_id, borrowernumber, itemnumber, returndate, issuedate)
+  SELECT 1, borrowernumber, 3, '2019-03-01', '2019-02-01' FROM borrowers WHERE cardnumber = 'C1' UNION ALL
+  SELECT 2, borrowernumber, 4, '2019-03-01', '2019-02-01' FROM borrowers WHERE cardnumber = 'S1' UNION ALL
+  SELECT 3, borrowernumber, 5, '2019-03-01', '2019-02-01' FROM borrowers WHERE cardnumber = 'E1' UNION ALL
+  SELECT 4, borrowernumber, 6, '2019-03-01', '2019-02-01' FROM borrowers WHERE cardnumber = 'K1' UNION ALL
+  SELECT 5, borrowernumber, 7, NOW(), DATE_SUB(NOW(), INTERVAL 5 DAY) FROM borrowers WHERE cardnumber = 'C1';
+INSERT INTO old_reserves (reserve_id, borrowernumber, biblionumber, timestamp)
+  SELECT 1, borrowernumber, 1, '2020-03-01' FROM borrowers WHERE cardnumber = 'C1' UNION ALL
+  SELECT 2, borrowernumber, 2, '2020-03-01' FROM borrowers WHERE cardnumber = 'S2';
+INSERT INTO statistics (datetime, branch, type, itemnumber, borrowernumber) VALUES
+  (NOW(), 'CPL', 'issue', 3, 1), (NOW(), 'CPL', 'issue', 3, 1), (NOW(), 'MPL', 'return', 3, 1);
+INSERT INTO saved_sql (borrowernumber, date_created, savedsql, report_name, type, notes)
+  VALUES (NULL, NOW(), 'SELECT 1', 'My own report', '1', 'written by the library');
+SQL
+}
+tools_sql() { mysql -Nse "$1" "$DB"; }

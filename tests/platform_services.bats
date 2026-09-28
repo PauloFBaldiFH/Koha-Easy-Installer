@@ -116,7 +116,7 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
 
 @test "P09 scripts parse and pass ShellCheck (warnings)" {
     local f
-    for f in installer uninstall.sh tests/run.sh tests/lib/panel.sh tests/mocks/koha-mock tests/mocks/systemctl tests/mocks/curl; do
+    for f in installer uninstall.sh tests/run.sh tests/lib/panel.sh tests/mocks/koha-mock tests/mocks/koha-script tests/mocks/systemctl tests/mocks/curl; do
         assert 'bash -n "$KEI_REPO/$f"' "$f must parse"
     done
     command -v shellcheck >/dev/null || skip "shellcheck not installed"
@@ -156,7 +156,7 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
 
 @test "P14 uninstall.sh removes everything the panel now installs" {
     local f
-    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf; do
+    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf /root/koha_patrons_template.csv; do
         assert 'grep -qF "$f" "$KEI_REPO/uninstall.sh"' "uninstall.sh must remove $f"
     done
 }

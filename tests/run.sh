@@ -13,7 +13,11 @@ MOCKS="$REPO/tests/mocks"
 LIBDIR=/usr/local/lib/kei-mock
 KOHA_TOOLS=(koha-plack koha-zebra koha-indexer koha-es-indexer koha-worker koha-list
             koha-rebuild-zebra koha-upgrade-schema koha-shell koha-elasticsearch
-            koha-create koha-remove koha-sip koha-z3950-responder)
+            koha-create koha-remove koha-sip koha-z3950-responder koha-email-enable)
+# Koha's command-line scripts used by the library tools (tests/mocks/koha-script).
+KOHA_SCRIPTS=(stage_file.pl commit_file.pl import_patrons.pl cronjobs/update_patrons_category.pl
+              cronjobs/delete_patrons.pl cronjobs/batch_anonymise.pl
+              maintenance/search_for_data_inconsistencies.pl)
 
 die() { echo "tests/run.sh: $*" >&2; exit 1; }
 
@@ -35,6 +39,12 @@ install_doubles() {
         ln -sfn "$LIBDIR/koha-mock" "/usr/sbin/$t"
     done
     install -m 644 "$MOCKS/koha-functions.sh" /usr/share/koha/bin/koha-functions.sh
+    install -m 755 "$MOCKS/koha-script" "$LIBDIR/koha-script"
+    mkdir -p /usr/share/koha/bin/cronjobs /usr/share/koha/bin/maintenance
+    for t in "${KOHA_SCRIPTS[@]}"; do
+        if [ -e "/usr/share/koha/bin/$t" ] && [ ! -L "/usr/share/koha/bin/$t" ]; then die "/usr/share/koha/bin/$t is a real file; not overwriting."; fi
+        ln -sfn "$LIBDIR/koha-script" "/usr/share/koha/bin/$t"
+    done
     # First in the installer's PATH: the containers have no systemd.
     install -m 755 "$MOCKS/systemctl" /usr/local/sbin/systemctl
     install -m 755 "$MOCKS/curl" /usr/local/sbin/curl
@@ -49,6 +59,7 @@ install_doubles() {
 remove_doubles() {
     local t
     for t in "${KOHA_TOOLS[@]}"; do [ -L "/usr/sbin/$t" ] && rm -f "/usr/sbin/$t"; done
+    for t in "${KOHA_SCRIPTS[@]}"; do [ -L "/usr/share/koha/bin/$t" ] && rm -f "/usr/share/koha/bin/$t"; done
     rm -f /usr/local/sbin/systemctl /usr/local/sbin/service /usr/local/sbin/logger /usr/local/sbin/curl
     rm -rf "$LIBDIR"
     if [ -f /run/kei-mock/daemons.pids ]; then

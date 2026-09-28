@@ -224,7 +224,7 @@ rm -rf /etc/koha /var/lib/koha /var/log/koha /var/run/koha /run/koha /var/lock/k
 rm -rf /etc/koha-easy-install /var/log/koha-easy-install /run/koha-easy-install
 rm -rf /var/backups/koha_sql /var/backups/koha_marc
 rm -rf /etc/cloudflared /root/.cloudflared /home/*/.cloudflared
-rm -f /root/koha_credentials.txt /root/credenciais_koha.txt
+rm -f /root/koha_credentials.txt /root/credenciais_koha.txt /root/koha_patrons_template.csv
 rm -f /var/run/koha_panel.lock /var/run/koha_backup.pid /var/run/koha_es_watchdog.pid \
       /var/lock/koha_backup.lock /var/lock/koha_es_rebuild.lock /run/lock/koha_zebra_watchdog.lock
 rm -rf /tmp/koha_* /tmp/koha-* /tmp/drop_koha_dbs.sql /tmp/99-koha-tuning.bak
