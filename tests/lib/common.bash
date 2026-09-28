@@ -157,7 +157,7 @@ kei_reset_env() {
     kei_kill_daemons
     rm -rf "$KEI_S/calls.log" "$KEI_S/dialogs.log" "$KEI_S/answers" "$KEI_S/syslog" \
            "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs" \
-           "$KEI_S/inputs" "$KEI_S/textbox.last" "$KEI_S/textboxes.log" "$KEI_S/last-staged.mrc" "$KEI_S"/batch-*.biblios
+           "$KEI_S/inputs" "$KEI_S/cache-module-broken" "$KEI_S/textbox.last" "$KEI_S/textboxes.log" "$KEI_S/last-staged.mrc" "$KEI_S"/batch-*.biblios
     rm -rf /var/log/koha-easy-install/tools /var/lib/koha/library/email.enabled /root/koha_patrons_template.csv
     mkdir -p "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs"
     touch "$KEI_S/svc/mariadb" "$KEI_S/svc/memcached" "$KEI_S/svc/apache2" "$KEI_S/svc/cron"
