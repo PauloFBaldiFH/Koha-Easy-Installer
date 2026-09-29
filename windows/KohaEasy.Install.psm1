@@ -513,7 +513,8 @@ function New-KohaLinuxUser {
 function Test-KohaLinuxUserExists {
     param([string]$User)
     if (-not $User -or $User -eq 'root') { return $true }
-    return ((Invoke-KohaLinux -Command @('id', '-u', $User)).ExitCode -eq 0)
+    if (Test-KohaLinuxUserName $User) { return $false }
+    return ((Invoke-KohaLinuxScript -Script ("id -u '{0}' >/dev/null 2>&1" -f $User)).ExitCode -eq 0)
 }
 
 # ----------------------------------------------------------------------
@@ -767,10 +768,16 @@ function Install-Koha {
     }
 
     if (-not (Test-KohaPhaseDone 'distro' $phase)) {
-        Write-KohaStep (T 'Downloading and installing Debian (a few minutes)...')
-        if (-not $Facts) { $Facts = Get-KohaHostFacts }
-        New-KohaDistro -Arm ([bool]$Facts.Arm) | Out-Null
-        Write-KohaStep (T 'Debian is installed.') 'ok'
+        if (Test-KohaDistroInstalled) {
+            # Never installed over: this Debian may already hold Koha.
+            Write-KohaLog 'distro phase: Debian is already registered, nothing downloaded' 'install'
+            Write-KohaStep (T 'Debian is already installed; keeping it and its data.') 'ok'
+        } else {
+            Write-KohaStep (T 'Downloading and installing Debian (a few minutes)...')
+            if (-not $Facts) { $Facts = Get-KohaHostFacts }
+            New-KohaDistro -Arm ([bool]$Facts.Arm) | Out-Null
+            Write-KohaStep (T 'Debian is installed.') 'ok'
+        }
         Set-KohaState @{ phase = 'systemd' } | Out-Null; $phase = 'systemd'
     }
 

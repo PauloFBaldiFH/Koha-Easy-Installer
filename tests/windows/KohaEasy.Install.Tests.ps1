@@ -148,6 +148,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
         Mock -ModuleName KohaEasy.Install Start-KohaTrayChecked { [void]$script:calls.Add('tray') }
         Mock -ModuleName KohaEasy.Install Test-KohaLinuxUserExists { $true }
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
         Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
         Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'none' }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { [void]$script:calls.Add('icons') }
@@ -799,5 +800,45 @@ Describe 'Koha window' {
         $tray | Should -Match "keep\s+= \(T 'Keep Koha running'\)"
         $tray | Should -Match "Invoke-KohaCommand 'Stop -Force'"
         $tray | Should -Match "add_DoubleClick\(\{ Invoke-KohaCommand 'Window' \}\)"
+    }
+}
+
+Describe 'Linux errors are answers, not PowerShell errors' {
+    BeforeAll {
+        $script:bin = Join-Path $TestDrive 'fakebin'
+        New-Item -ItemType Directory -Path $script:bin -Force | Out-Null
+        $fake = Join-Path $script:bin 'wsl.exe'
+        [System.IO.File]::WriteAllText($fake, "#!/bin/sh`necho `"id: 'paulo': no such user`" >&2`nexit 1`n")
+        & chmod +x $fake
+        $script:path = $env:PATH
+        $env:PATH = $script:bin + [System.IO.Path]::PathSeparator + $env:PATH
+    }
+    AfterAll { $env:PATH = $script:path }
+
+    It 'returns what wsl.exe wrote to stderr with its exit code, even under Stop' {
+        $ErrorActionPreference = 'Stop'
+        $r = Invoke-KohaWsl -Arguments @('-d', 'koha', '--', 'id', '-u', 'paulo')
+        $r.ExitCode | Should -Be 1
+        $r.Output | Should -Match 'no such user'
+    }
+
+    It 'reports a missing Debian user as missing instead of stopping the installer' {
+        $ErrorActionPreference = 'Stop'
+        Test-KohaLinuxUserExists 'paulo' | Should -BeFalse
+        Test-KohaLinuxUserExists 'root' | Should -BeTrue
+    }
+
+    It 'keeps an existing Debian instead of downloading it again' {
+        Remove-Item -LiteralPath (Get-KohaPath Root) -Recurse -Force -ErrorAction SilentlyContinue
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $true }
+        Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
+        Mock -ModuleName KohaEasy.Install New-KohaDistro { throw 'must not download' }
+        Mock -ModuleName KohaEasy.Install Test-KohaLinuxUserExists { $true }
+        Mock -ModuleName KohaEasy.Install Set-KohaDistroConfig { $false }
+        Set-KohaState @{ phase = 'distro'; linuxUser = 'paulo' } | Out-Null
+        Install-Koha -Facts @{ Build = 22631; Is64 = $true; MemGB = 16; FreeGB = 200; VirtFirmware = $true; Hypervisor = $true; Arm = $false } -NonInteractive | Should -Be 1
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*already installed*' }
+        (Get-KohaState).phase | Should -Be 'systemd'
     }
 }

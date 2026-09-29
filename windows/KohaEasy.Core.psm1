@@ -152,6 +152,11 @@ function Get-KohaTerminalPath {
 # Runs wsl.exe with UTF-8 output. Returns ExitCode and Output (one string).
 function Invoke-KohaWsl {
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText)
+    # Whatever Linux writes to stderr is part of the answer, never a
+    # PowerShell error: under 'Stop', Windows PowerShell 5.1 turns the first
+    # stderr line of a native command redirected with 2>&1 into an exception
+    # ("id: 'paulo': no such user" stopped the installer that way).
+    $ErrorActionPreference = 'Continue'
     $env:WSL_UTF8 = '1'
     $prev = [Console]::OutputEncoding
     try {
