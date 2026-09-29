@@ -1,0 +1,208 @@
+// Koha Easy Installer for Windows: KohaEasy.exe.
+//
+// Built on this PC by the installer (KohaEasy.Core.psm1, Install-KohaLauncher)
+// with the C# compiler that ships with Windows (.NET Framework 4), so it is
+// never downloaded: no SmartScreen question, and this source is what runs.
+// C# 5 only (the compiler of .NET Framework 4.x).
+//
+//   KohaEasy.exe <command> [options]   runs "KohaEasy.ps1 <command> [options]"
+//                                       in Windows PowerShell 5.1 with no
+//                                       console window at all, waits for it
+//                                       and returns its exit code
+//   KohaEasy.exe --self-test            exit 0 (the installer checks that
+//                                       Windows lets it run)
+//
+// It is a Windows (GUI) program, so Windows never opens a console or a
+// Windows Terminal window for it, and PowerShell is started with
+// CREATE_NO_WINDOW. The Koha icon is inside the file.
+//
+// KohaEasy.Native, in the same file, is loaded by the PowerShell side: the
+// Koha identity on the taskbar (AppUserModelID) for the Koha window, and on
+// the shortcuts, so the taskbar groups the window as Koha and Windows
+// notifications say Koha.
+
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+
+[assembly: AssemblyTitle("Koha")]
+[assembly: AssemblyDescription("Koha Easy Installer for Windows")]
+[assembly: AssemblyProduct("Koha Easy Installer")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+
+namespace KohaEasy
+{
+    public static class Launcher
+    {
+        [STAThread]
+        public static int Main(string[] args)
+        {
+            if (args.Length == 1 && args[0] == "--self-test") { return 0; }
+            string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            string script = Path.Combine(dir, "KohaEasy.ps1");
+            string root = Environment.GetEnvironmentVariable("SystemRoot");
+            if (string.IsNullOrEmpty(root)) { root = @"C:\Windows"; }
+            string ps = Path.Combine(root, @"System32\WindowsPowerShell\v1.0\powershell.exe");
+            ProcessStartInfo psi = new ProcessStartInfo(ps, BuildArguments(script, args));
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.WorkingDirectory = dir;
+            try
+            {
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit();
+                    return p.ExitCode;
+                }
+            }
+            catch (Exception e)
+            {
+                Log(dir, "KohaEasy.exe could not start PowerShell: " + e.Message);
+                return 1;
+            }
+        }
+
+        // -NoProfile -ExecutionPolicy Bypass -File "<script>" <args...>
+        public static string BuildArguments(string script, string[] args)
+        {
+            StringBuilder sb = new StringBuilder("-NoProfile -ExecutionPolicy Bypass -File ");
+            sb.Append(Quote(script));
+            foreach (string a in args)
+            {
+                sb.Append(' ');
+                sb.Append(Quote(a));
+            }
+            return sb.ToString();
+        }
+
+        // One argument as Windows programs read it back (CommandLineToArgvW).
+        public static string Quote(string a)
+        {
+            if (a == null) { a = ""; }
+            if (a.Length > 0 && a.IndexOfAny(new char[] { ' ', '\t', '"' }) < 0) { return a; }
+            StringBuilder sb = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char c in a)
+            {
+                if (c == '\\') { slashes++; continue; }
+                if (c == '"')
+                {
+                    sb.Append('\\', slashes * 2 + 1);
+                    sb.Append('"');
+                }
+                else
+                {
+                    sb.Append('\\', slashes);
+                    sb.Append(c);
+                }
+                slashes = 0;
+            }
+            sb.Append('\\', slashes * 2);
+            sb.Append('"');
+            return sb.ToString();
+        }
+
+        // C:\KohaEasy\logs\koha-yyyyMMdd.log, the log of the PowerShell side.
+        static void Log(string dir, string message)
+        {
+            try
+            {
+                string logs = Path.Combine(Path.GetDirectoryName(dir), "logs");
+                Directory.CreateDirectory(logs);
+                string file = Path.Combine(logs, "koha-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+                File.AppendAllText(file, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " | " + message + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch { }
+        }
+    }
+
+    public static class Native
+    {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
+        [DllImport("ole32.dll")]
+        static extern int PropVariantClear(ref PropVariant pvar);
+
+        // This process's windows group on the taskbar under appId.
+        public static bool SetProcessAppId(string appId)
+        {
+            return SetCurrentProcessExplicitAppUserModelID(appId) >= 0;
+        }
+
+        // System.AppUserModel.ID of a .lnk file: a pinned Koha window and
+        // Koha's notifications are tied to this shortcut (its name and icon).
+        public static void SetShortcutAppId(string lnkPath, string appId)
+        {
+            object link = new CShellLink();
+            try
+            {
+                IPersistFile file = (IPersistFile)link;
+                file.Load(lnkPath, 2); // STGM_READWRITE
+                IPropertyStore store = (IPropertyStore)link;
+                PropertyKey key = new PropertyKey();
+                key.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+                key.pid = 5;
+                PropVariant value = new PropVariant();
+                value.vt = 31; // VT_LPWSTR
+                value.p1 = Marshal.StringToCoTaskMemUni(appId);
+                try
+                {
+                    Check(store.SetValue(ref key, ref value));
+                    Check(store.Commit());
+                }
+                finally
+                {
+                    PropVariantClear(ref value);
+                }
+                file.Save(lnkPath, true);
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(link);
+            }
+        }
+
+        static void Check(int hr)
+        {
+            if (hr < 0) { Marshal.ThrowExceptionForHR(hr); }
+        }
+
+        [ComImport, Guid("00021401-0000-0000-C000-000000000046"), ClassInterface(ClassInterfaceType.None)]
+        class CShellLink { }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+        interface IPropertyStore
+        {
+            [PreserveSig] int GetCount(out uint count);
+            [PreserveSig] int GetAt(uint index, out PropertyKey key);
+            [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+            [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+            [PreserveSig] int Commit();
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        struct PropertyKey
+        {
+            public Guid fmtid;
+            public uint pid;
+        }
+
+        // PROPVARIANT: 16 bytes on 32-bit Windows, 24 on 64-bit.
+        [StructLayout(LayoutKind.Sequential)]
+        struct PropVariant
+        {
+            public ushort vt;
+            public ushort r1;
+            public ushort r2;
+            public ushort r3;
+            public IntPtr p1;
+            public IntPtr p2;
+        }
+    }
+}

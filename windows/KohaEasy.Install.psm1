@@ -276,37 +276,44 @@ function Get-KohaWslConf {
 
 # Pure: adds the keys Koha needs to the user's .wslconfig without changing
 # anything the user already set. vmIdleTimeout=-1 keeps WSL running while
-# Koha waits for readers; networkingMode=mirrored (Windows 11 22H2+) lets
-# other PCs of the library reach Koha by this PC's name.
+# Koha waits for readers. On Windows 11 22H2+ (build 22621): networking
+# mirrored, so other PCs of the library reach Koha by this PC's address,
+# and [experimental] hostAddressLoopback, so this PC reaches Koha by that
+# address too (the library network test goes that way).
 function Merge-KohaWslConfig {
     param([AllowEmptyString()][string]$Text, [int]$Build)
-    $want = [ordered]@{ vmIdleTimeout = '-1' }
-    if ($Build -ge 22621) { $want['networkingMode'] = 'mirrored' }
+    $want = [ordered]@{ wsl2 = [ordered]@{ vmIdleTimeout = '-1' } }
+    if ($Build -ge 22621) {
+        $want.wsl2['networkingMode'] = 'mirrored'
+        $want['experimental'] = [ordered]@{ hostAddressLoopback = 'true' }
+    }
     $lines = New-Object System.Collections.ArrayList
     if ($Text) { foreach ($l in ($Text -split "`r?`n")) { [void]$lines.Add($l) } }
     while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
-    $start = -1; $end = $lines.Count
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\s*\[(.+)\]\s*$') {
-            if ($start -ge 0) { $end = $i; break }
-            if ($Matches[1].Trim() -ieq 'wsl2') { $start = $i }
+    foreach ($section in $want.Keys) {
+        $start = -1; $end = $lines.Count
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*\[(.+)\]\s*$') {
+                if ($start -ge 0) { $end = $i; break }
+                if ($Matches[1].Trim() -ieq $section) { $start = $i }
+            }
         }
-    }
-    if ($start -lt 0) {
-        if ($lines.Count -gt 0) { [void]$lines.Add('') }
-        [void]$lines.Add('[wsl2]')
-        $start = $lines.Count - 1; $end = $lines.Count
-    }
-    $present = @{}
-    for ($i = $start + 1; $i -lt $end; $i++) {
-        if ($lines[$i] -match '^\s*([A-Za-z0-9_.]+)\s*=') { $present[$Matches[1].ToLowerInvariant()] = $true }
-    }
-    $insert = $end
-    while ($insert -gt $start + 1 -and $lines[$insert - 1].Trim() -eq '') { $insert-- }
-    foreach ($k in $want.Keys) {
-        if (-not $present.ContainsKey($k.ToLowerInvariant())) {
-            $lines.Insert($insert, ('{0}={1}' -f $k, $want[$k]))
-            $insert++
+        if ($start -lt 0) {
+            if ($lines.Count -gt 0) { [void]$lines.Add('') }
+            [void]$lines.Add('[' + $section + ']')
+            $start = $lines.Count - 1; $end = $lines.Count
+        }
+        $present = @{}
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            if ($lines[$i] -match '^\s*([A-Za-z0-9_.]+)\s*=') { $present[$Matches[1].ToLowerInvariant()] = $true }
+        }
+        $insert = $end
+        while ($insert -gt $start + 1 -and $lines[$insert - 1].Trim() -eq '') { $insert-- }
+        foreach ($k in $want[$section].Keys) {
+            if (-not $present.ContainsKey($k.ToLowerInvariant())) {
+                $lines.Insert($insert, ('{0}={1}' -f $k, $want[$section][$k]))
+                $insert++
+            }
         }
     }
     return (($lines -join "`r`n") + "`r`n")
@@ -314,6 +321,7 @@ function Merge-KohaWslConfig {
 
 function Update-KohaWslConfig {
     param([int]$Build = [Environment]::OSVersion.Version.Build)
+    if (-not $env:USERPROFILE) { return $false }
     $file = [System.IO.Path]::Combine([string]$env:USERPROFILE, '.wslconfig')
     $old = ''
     if (Test-Path -LiteralPath $file) { $old = [System.IO.File]::ReadAllText($file) }
@@ -582,6 +590,7 @@ function Copy-KohaPanelIntoDistro {
     ) -join "`n"
     $r = Invoke-KohaLinuxScript -Script $sh
     if ($r.ExitCode -ne 0) { throw ('copy: ' + $r.Output) }
+    if (-not (Install-KohaWindowScript)) { throw ('copy: ' + (Get-KohaConfig).WindowPath + ' not written') }
 }
 
 # The data-safety settings inside Debian (installer, install_data_safety:
@@ -644,11 +653,13 @@ function Show-KohaStartProblem {
 # "1 - Install Koha server", then leaves the panel with Exit. Start-Process
 # -NoNewWindow hands it the console itself; "& wsl.exe" here would send its
 # screens into Install-Koha's return value, and the panel could not draw.
+# koha-window runs it, so a process the panel left holding the terminal
+# cannot keep wsl.exe (and this installer) waiting after Exit.
 # The console is switched to UTF-8, and the panel is told whether this is
 # Windows Terminal (emoji) or the classic console (plain symbols), through
 # WSLENV, the list of variables WSL passes into Linux.
 function Invoke-KohaPanel {
-    $a = '-d {0} -u root --cd {1} -- bash ./installer' -f (Get-KohaConfig).Distro, $script:DistroDir
+    $a = '-d {0} -u root --cd {1} -- {2} bash ./installer' -f (Get-KohaConfig).Distro, $script:DistroDir, (Get-KohaConfig).WindowPath
     $saved = @{ WSLENV = $env:WSLENV; KEI_PLAIN_GLYPHS = $env:KEI_PLAIN_GLYPHS }
     $enc = $null
     try { $enc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
@@ -839,6 +850,7 @@ function Install-Koha {
             Write-KohaStep (T 'The Koha control panel opens now. Choose your language, then 1 - Install Koha server. When it finishes, leave the panel with Exit.')
             Read-Host (T 'Press Enter to continue') | Out-Null
             Invoke-KohaPanel | Out-Null
+            Write-KohaStep (T 'Back in the Windows installer. Checking the installation...')
             if (-not (Test-KohaInstalledInDistro)) {
                 Write-KohaStep (T 'Koha was not installed. Run the installer again to continue from here.') 'error'
                 return 1
@@ -854,7 +866,9 @@ function Install-Koha {
         $mode = 'manual'
         if ($auto) { $mode = 'logon' }
         Set-KohaState @{ autostart = $mode; desired = 'running' } | Out-Null
-        # One step that fails must not skip the others.
+        # One step that fails must not skip the others. KohaEasy.exe first:
+        # the tasks and shortcuts start through it.
+        Invoke-KohaSafeStep { Install-KohaLauncherStep }
         Invoke-KohaSafeStep { Register-KohaTasks -Autostart $mode }
         Invoke-KohaSafeStep { Install-KohaShortcuts }
         Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
@@ -864,15 +878,13 @@ function Install-Koha {
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         $r = Start-Koha -Trigger user -Wait
         Invoke-KohaSafeStep { Start-KohaTrayChecked }
-        Set-KohaState @{ phase = 'done'; lanAccess = $lan } | Out-Null
+        $done = @{ phase = 'done'; lanAccess = $lan }
+        if ($lan) { $done['lanSetup'] = (Get-KohaConfig).LanSetup }
+        Set-KohaState $done | Out-Null
         Write-Host ''
         if ($r -eq 'ready') {
             Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
-            $urls = $null
-            if ($lan) { $urls = Get-KohaLanUrls }
-            if ($null -ne $urls) {
-                Write-KohaStep ((T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $urls.Staff, $urls.Opac) 'ok'
-            }
+            if ($lan) { Show-KohaLanCheck }
             Write-KohaStep (T 'The first-access user and password are in the control panel, option 2. Keep this computer on during opening hours.') 'ok'
             if (-not $NonInteractive) { Start-Process (Get-KohaConfig).StaffUrl }
         } else {
@@ -881,28 +893,57 @@ function Install-Koha {
     }
     # Running the installer again on a finished install also repairs: Koha is
     # started, and when it does not answer, the same help as above.
+    $ready = $false
     if ($wasDone -and $phase -eq 'done' -and -not $NonInteractive) {
-        # Shortcuts, the tray at sign-in and the tray itself of this version.
+        # KohaEasy.exe, the tasks, the shortcuts, the tray at sign-in and the
+        # tray itself of this version (older tasks started PowerShell with a
+        # window of its own).
+        Invoke-KohaSafeStep { Install-KohaLauncherStep }
+        $outdated = Test-KohaKeepAliveOutdated
+        Invoke-KohaSafeStep { Register-KohaTasks -Autostart ([string](Get-KohaState).autostart) }
         Invoke-KohaSafeStep { Install-KohaShortcuts }
+        # .wslconfig settings of this version (hostAddressLoopback) take
+        # effect when WSL starts again, and a keep-alive task still running
+        # with an older version's action keeps its window: Koha is stopped
+        # cleanly first, and started again below.
+        if (Update-KohaWslConfig) {
+            Write-KohaStep (T 'Restarting WSL to apply the new network settings (other Linux windows will close)...') 'warn'
+            Stop-KohaDebianGracefully -SetStopped -Shutdown | Out-Null
+        } elseif ($outdated) {
+            Write-KohaStep (T 'Restarting Koha so it runs in the background with no window...')
+            Stop-KohaDebianGracefully -SetStopped | Out-Null
+        }
         Invoke-KohaSafeStep { Start-KohaTrayChecked }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         if ((Start-Koha -Trigger user -Wait) -eq 'ready') {
+            $ready = $true
             Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
         } else {
             Show-KohaStartProblem
         }
     }
-    # A finished install whose library-network step was refused, or that
-    # predates it: offered again on every run of the installer.
-    if ($phase -eq 'done' -and -not $NonInteractive -and -not [bool](Get-KohaState)['lanAccess']) {
-        Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
-        if (Enable-KohaLanAccess) {
-            Set-KohaState @{ lanAccess = $true } | Out-Null
-            $urls = Get-KohaLanUrls
-            if ($null -ne $urls) { Write-KohaStep ((T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $urls.Staff, $urls.Opac) 'ok' }
-        } else {
-            Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn'
+    # The library network: a finished install whose step was refused, or
+    # that predates it, is offered it again on every run; one set up by an
+    # older version gets this version's rules (both network modes).
+    if ($phase -eq 'done' -and -not $NonInteractive) {
+        $st = Get-KohaState
+        $lan = [bool]$st['lanAccess']
+        if (-not $lan -or [int]$st['lanSetup'] -lt (Get-KohaConfig).LanSetup) {
+            if ($lan) {
+                Write-KohaStep (T 'Updating the library network settings (Windows asks for permission once)...')
+            } else {
+                Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
+            }
+            if (Enable-KohaLanAccess) {
+                Set-KohaState @{ lanAccess = $true; lanSetup = (Get-KohaConfig).LanSetup } | Out-Null
+                $lan = $true
+            } elseif (-not $lan) {
+                Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn'
+            } else {
+                Write-KohaStep (T 'The library network settings were not updated. Run the installer again and allow the Windows permission prompt.') 'warn'
+            }
         }
+        if ($lan -and $ready) { Show-KohaLanCheck }
     }
     if ($renamed -eq 'renamed' -and (Test-KohaPhaseDone 'windows' $phase)) {
         # The shortcuts of a finished install still name KohaEasy.
@@ -915,6 +956,24 @@ function Install-Koha {
 }
 
 function Start-KohaTray { Start-KohaHidden 'Tray' }
+
+# KohaEasy.exe for this PC, with what it means for the librarian.
+function Install-KohaLauncherStep {
+    $r = Install-KohaLauncher
+    if ($r -eq 'built') { Write-KohaStep (T 'KohaEasy.exe is ready: Koha starts in the background with no windows.') 'ok' }
+    if ($r -eq 'failed') { Write-KohaStep (T 'KohaEasy.exe could not be used on this PC; Koha starts through a hidden console instead.') 'warn' }
+}
+
+# The library network test, printed: what works, what to fix, and the
+# addresses for the other computers.
+function Show-KohaLanCheck {
+    $check = Test-KohaLanAccess
+    foreach ($l in @($check.Lines)) {
+        $kind = 'ok'
+        if ($l.Kind -eq 'warn') { $kind = 'warn' }
+        Write-KohaStep $l.Text $kind
+    }
+}
 
 # Runs one step of the Windows side; a failure is shown and logged, and the
 # steps after it still run.
@@ -938,20 +997,23 @@ function Install-KohaShortcuts {
     Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f [Environment]::GetFolderPath('Desktop')) 'ok'
 }
 
-function Test-KohaTrayRunning {
-    try {
-        return (@(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
-                Where-Object { ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Tray' }).Count -gt 0)
-    } catch { return $false }
-}
-
-# Starts the tray and checks it is there. When the console-free start
-# (conhost --headless) does not bring it up, the tray, the shortcuts and the
-# tray at sign-in switch to a plain hidden PowerShell for good.
+# Starts the tray and checks it is there. When KohaEasy.exe does not bring
+# it up, the Koha tools go back to conhost --headless; when that does not
+# either, to a plain hidden PowerShell for good. The tray at sign-in, the
+# shortcuts and the tasks follow.
 function Start-KohaTrayChecked {
     param([int]$WaitSeconds = 8)
     Restart-KohaTray
     Start-Sleep -Seconds $WaitSeconds
+    if (-not (Test-KohaTrayRunning) -and (Get-KohaState).launcher -eq 'ok') {
+        Write-KohaLog 'the tray did not start through KohaEasy.exe; using conhost --headless' 'install'
+        Set-KohaState @{ launcher = 'refused' } | Out-Null
+        Set-KohaTrayAtSignIn -Enabled $true
+        New-KohaShortcuts | Out-Null
+        try { Register-KohaTasks } catch { Write-KohaLog ('tasks not registered again: ' + $_.Exception.Message) 'install' }
+        Start-KohaTray
+        Start-Sleep -Seconds $WaitSeconds
+    }
     if (-not (Test-KohaTrayRunning) -and (Get-KohaState).hiddenLaunch -ne 'powershell') {
         Write-KohaLog 'the tray did not start through conhost --headless; using powershell -WindowStyle Hidden' 'install'
         Set-KohaState @{ hiddenLaunch = 'powershell' } | Out-Null
