@@ -158,7 +158,11 @@ $row2 = New-Row
 $btnReport = New-Button (T 'Export diagnostics (.txt)') { Invoke-Action 'report' }
 $btnZip = New-Button (T 'Export diagnostics (.zip)') { Start-KohaHidden 'ExportDiagnostics' }
 $btnPanel = New-Button (T 'Open the control panel') { Start-KohaHidden 'Panel' }
-foreach ($b in $btnReport, $btnZip, $btnPanel) { [void]$row2.Controls.Add($b) }
+$btnReindex = New-Button (T 'Rebuild search index') {
+    $q = (T 'Rebuild the search index from scratch?') + "`n`n" + (T 'Searches in the catalog may be incomplete until it finishes. On large catalogs this takes several minutes.')
+    if ([System.Windows.Forms.MessageBox]::Show($form, $q, 'Koha', 'YesNo', 'Question') -eq 'Yes') { Invoke-Action 'reindex' }
+}
+foreach ($b in $btnReport, $btnZip, $btnPanel, $btnReindex) { [void]$row2.Controls.Add($b) }
 [void]$root.Controls.Add($row2)
 
 $form.Controls.Add($root)
@@ -188,6 +192,7 @@ $worker = {
         'services' { $result = Restart-KohaServices }
         'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
         'report'   { $result = Export-KohaDiagnosticsText }
+        'reindex'  { $result = Invoke-KohaSearchReindex }
     }
     return [pscustomobject]@{ Action = $Action; Result = $result; Status = (Get-KohaStatus); Health = (Get-KohaServiceHealth) }
 }
@@ -199,6 +204,7 @@ $busyText = @{
     services = (T 'Restarting Koha services...')
     debian   = (T 'Restarting Debian and Koha... (up to 3 minutes)')
     report   = (T 'Collecting diagnostics... This can take a minute.')
+    reindex  = (T 'Rebuilding the search index... On large catalogs this takes several minutes.')
 }
 
 function Set-Buttons {
@@ -210,6 +216,7 @@ function Set-Buttons {
     $btnStop.Enabled = (-not $Busy) -and $on
     $btnServices.Enabled = (-not $Busy) -and $on
     $btnDebian.Enabled = (-not $Busy) -and $on
+    $btnReindex.Enabled = (-not $Busy) -and $on
     $btnRefresh.Enabled = -not $Busy
     $btnReport.Enabled = -not $Busy
     $btnPanel.Enabled = $installed
@@ -279,6 +286,13 @@ function Show-Result {
                 'ready'       { $text = T 'Koha services restarted.' }
                 'not_running' { $text = T 'Debian is stopped. Start Koha first.'; $color = $bad }
                 default       { $text = T 'Koha services restarted, but the staff interface does not answer yet. Export the diagnostics and send them to whoever supports your library.'; $color = $bad }
+            }
+        }
+        'reindex' {
+            switch ([string]$Result) {
+                'rebuilt'     { $text = T 'The search index was rebuilt.' }
+                'not_running' { $text = T 'Debian is stopped. Start Koha first.'; $color = $bad }
+                default       { $text = T 'Rebuilding the search index failed. Export the diagnostics and send them to whoever supports your library.'; $color = $bad }
             }
         }
         'report' {

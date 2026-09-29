@@ -815,6 +815,17 @@ function Start-Koha {
     return 'timeout'
 }
 
+# Windows is shutting down, restarting or signing out (the tray's session
+# window): Koha is stopped cleanly in the time Windows gives, without
+# changing what the librarian wants, so it starts again at the next sign-in
+# in automatic mode. A power cut or a forced shutdown never gets here; the
+# clean-stop guard inside Debian repairs Koha at the next start instead.
+function Stop-KohaForSessionEnd {
+    if (-not (Test-KohaDistroRunning)) { return 'not_running' }
+    Write-KohaLog 'Windows is ending the session: stopping Koha cleanly'
+    return (Stop-KohaDebianGracefully)
+}
+
 # KohaEasy.ps1 Stop: desired=stopped first, so the keep-alive task's
 # restart-on-failure does not bring Koha back a minute later.
 function Stop-Koha {
@@ -1175,6 +1186,18 @@ function Get-KohaServiceHealth {
     return $h
 }
 
+# The Koha window's "Rebuild search index": the panel rebuilds the index of
+# the active engine (Zebra or Elasticsearch) from scratch. Never starts a
+# stopped Debian. Returns rebuilt, failed or not_running.
+function Invoke-KohaSearchReindex {
+    if (-not (Test-KohaDistroRunning)) { return 'not_running' }
+    Write-KohaLog 'rebuilding the search index'
+    $r = Invoke-KohaLinux -Command @($script:Cfg.PanelPath, '--rebuild-search-index')
+    Write-KohaLog ('search index rebuild (exit {0}) {1}' -f $r.ExitCode, ([string]$r.Output).Trim())
+    if ($r.ExitCode -eq 0) { return 'rebuilt' }
+    return 'failed'
+}
+
 # Restarts Koha's services inside Debian, without restarting WSL: faster
 # than Koha - Restart, and what most "Koha stopped answering" cases need.
 $script:RestartServicesScript = @'
@@ -1243,6 +1266,44 @@ for f in /var/log/koha/*/plack-error.log /var/log/koha/*/intranet-error.log /var
 done
 '@
 
+# Windows' "Turn off Windows write-cache buffer flushing on the device"
+# (Device Manager > Disk drives > the disk > Policies) tells Windows the disk
+# has its own battery, so the flushes MariaDB relies on stop reaching it and
+# a power cut can lose or damage data. Stored as CacheIsPowerProtected=1
+# under the disk's Device Parameters\Disk. [verify] on real Windows.
+function Get-KohaDiskOfDrive {
+    param([string]$Letter)
+    $part = Get-Partition -DriveLetter $Letter -ErrorAction Stop | Select-Object -First 1
+    $disk = Get-CimInstance Win32_DiskDrive -Filter ('Index={0}' -f [int]$part.DiskNumber) -ErrorAction Stop | Select-Object -First 1
+    return [pscustomobject]@{ Number = [int]$part.DiskNumber; Model = [string]$disk.Model; PnpId = [string]$disk.PNPDeviceID }
+}
+
+function Get-KohaDiskFlushOff {
+    param([string]$PnpId)
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Enum\{0}\Device Parameters\Disk' -f $PnpId
+    $p = Get-ItemProperty -LiteralPath $key -Name CacheIsPowerProtected -ErrorAction SilentlyContinue
+    if ($null -eq $p) { return $false }
+    return ([int]$p.CacheIsPowerProtected -eq 1)
+}
+
+# One line for the diagnostics: whether Windows still flushes the write
+# cache of the disk that holds Koha's virtual disk (ext4.vhdx).
+function Get-KohaWriteCacheCheck {
+    param([string]$Vhdx = (Get-KohaVhdxPath))
+    if ([string]$Vhdx -notmatch '^([A-Za-z]):') { return [pscustomobject]@{ Level = 'unknown'; Text = 'Write-cache flushing: the Koha virtual disk (ext4.vhdx) was not found on a drive letter.' } }
+    $letter = $Matches[1].ToUpperInvariant()
+    try {
+        $d = Get-KohaDiskOfDrive -Letter $letter
+        $name = 'drive {0}: (disk {1}, {2})' -f $letter, $d.Number, $d.Model
+        if (Get-KohaDiskFlushOff -PnpId $d.PnpId) {
+            return [pscustomobject]@{ Level = 'warning'; Text = ('WARNING: Windows write-cache buffer flushing is turned OFF for {0}. A power cut can lose or damage Koha''s database. Turn it back on: Device Manager > Disk drives > {1} > Policies > clear "Turn off Windows write-cache buffer flushing on the device".' -f $name, $d.Model) }
+        }
+        return [pscustomobject]@{ Level = 'ok'; Text = ('Write-cache flushing: on for {0} (safe).' -f $name) }
+    } catch {
+        return [pscustomobject]@{ Level = 'unknown'; Text = ('Write-cache flushing: could not be read for drive {0}: ({1}).' -f $letter, $_.Exception.Message) }
+    }
+}
+
 # One text file on the desktop that anyone can open and paste into a
 # message: Windows and WSL versions, the services, the saved choices,
 # Debian's latest service errors and the Windows logs of the last days.
@@ -1266,6 +1327,7 @@ function Export-KohaDiagnosticsText {
     $state = Get-KohaState
     $out.Add(('Wanted: {0}   automatic start: {1}   library network: {2}' -f $state.desired, $state.autostart, [bool]$state['lanAccess']))
     foreach ($l in @(Get-KohaQuickCheck)) { $out.Add($l) }
+    $out.Add((Get-KohaWriteCacheCheck).Text)
     if (Test-KohaDistroRunning) {
         $out.Add('')
         $out.Add('== Debian: service logs')
@@ -1320,7 +1382,7 @@ function Export-KohaDiagnostics {
     $wasRunning = Test-KohaDistroRunning
     $linux = $null
     if ($wasRunning) { $linux = Get-KohaLinuxStatus }
-    Save-KohaText (Join-Path $win 'disk.txt') (Invoke-KohaCapture { Get-KohaDiskHealth -Linux $linux | Format-List })
+    Save-KohaText (Join-Path $win 'disk.txt') ((Invoke-KohaCapture { Get-KohaDiskHealth -Linux $linux | Format-List }) + "`n" + (Get-KohaWriteCacheCheck).Text + "`n")
     Save-KohaText (Join-Path $win 'events.txt') (Invoke-KohaCapture {
             Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'; Level = 1, 2, 3; StartTime = (Get-Date).AddDays(-3) } -MaxEvents 2000 -ErrorAction SilentlyContinue |
                 Where-Object { $_.ProviderName -match 'wsl|Lxss|Hyper-V|vmcompute|Kernel-Power|Power-Troubleshooter|disk|Ntfs' } |
