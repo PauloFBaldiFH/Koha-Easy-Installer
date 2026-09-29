@@ -235,7 +235,7 @@ function Set-Buttons {
     $btnDebian.Enabled = (-not $Busy) -and $on
     $btnReindex.Enabled = (-not $Busy) -and $on
     $btnLan.Enabled = (-not $Busy) -and $on
-    $btnTerminal.Enabled = $installed
+    $btnTerminal.Enabled = (-not $Busy) -and $on
     $btnRefresh.Enabled = -not $Busy
     $btnReport.Enabled = -not $Busy
     $btnPanel.Enabled = $installed

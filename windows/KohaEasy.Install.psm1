@@ -871,13 +871,16 @@ function Install-Koha {
         Invoke-KohaSafeStep { Install-KohaLauncherStep }
         Invoke-KohaSafeStep { Register-KohaTasks -Autostart $mode }
         Invoke-KohaSafeStep { Install-KohaShortcuts }
+        # The tray settles how Koha's tools start on this PC (KohaEasy.exe,
+        # conhost, PowerShell) before the Koha network task and the
+        # keep-alive task are started with it.
+        Invoke-KohaSafeStep { Start-KohaTrayChecked }
         Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
         $lan = $true
         if (-not $NonInteractive) { $lan = Enable-KohaLanAccess }
         if (-not $lan) { Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn' }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         $r = Start-Koha -Trigger user -Wait
-        Invoke-KohaSafeStep { Start-KohaTrayChecked }
         $done = @{ phase = 'done'; lanAccess = $lan }
         if ($lan) { $done['lanSetup'] = (Get-KohaConfig).LanSetup }
         Set-KohaState $done | Out-Null
@@ -924,15 +927,16 @@ function Install-Koha {
     }
     # The library network: a finished install whose step was refused, or
     # that predates it, is offered it again on every run; one set up by an
-    # older version gets this version's rules (both network modes).
+    # older version, whose task no longer matches how Koha's tools start
+    # here, or whose firewall rules or task went missing, is set up again.
     if ($phase -eq 'done' -and -not $NonInteractive) {
-        $st = Get-KohaState
-        $lan = [bool]$st['lanAccess']
-        if (-not $lan -or [int]$st['lanSetup'] -lt (Get-KohaConfig).LanSetup) {
-            if ($lan) {
-                Write-KohaStep (T 'Updating the library network settings (Windows asks for permission once)...')
-            } else {
+        $lan = [bool](Get-KohaState)['lanAccess']
+        $need = Get-KohaLanSetupNeed
+        if ($need) {
+            if ($need -eq 'open') {
                 Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
+            } else {
+                Write-KohaStep (T 'Updating the library network settings (Windows asks for permission once)...')
             }
             if (Enable-KohaLanAccess) {
                 Set-KohaState @{ lanAccess = $true; lanSetup = (Get-KohaConfig).LanSetup } | Out-Null
@@ -1019,6 +1023,7 @@ function Start-KohaTrayChecked {
         Set-KohaState @{ hiddenLaunch = 'powershell' } | Out-Null
         Set-KohaTrayAtSignIn -Enabled $true
         New-KohaShortcuts | Out-Null
+        try { Register-KohaTasks } catch { Write-KohaLog ('tasks not registered again: ' + $_.Exception.Message) 'install' }
         Start-KohaTray
         Start-Sleep -Seconds $WaitSeconds
     }
