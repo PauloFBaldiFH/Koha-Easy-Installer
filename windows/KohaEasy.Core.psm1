@@ -84,6 +84,7 @@ $script:StateDefaults = [ordered]@{
     lastDiskWarn         = 0
     notifyBackupOk       = $true
     handshakePending     = $false
+    hiddenLaunch         = 'conhost'
 }
 
 # state.json as an ordered hashtable, with defaults for missing keys. A
@@ -604,7 +605,7 @@ function Invoke-KohaDiskpart {
 function Get-KohaHiddenLaunch {
     param(
         [string]$Arguments,
-        [string]$Conhost = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'conhost.exe')
+        [string]$Conhost = (Get-KohaConhostPath)
     )
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     $a = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
@@ -612,6 +613,13 @@ function Get-KohaHiddenLaunch {
         return [pscustomobject]@{ Target = $Conhost; Arguments = ('--headless "{0}" {1}' -f $ps, $a) }
     }
     return [pscustomobject]@{ Target = $ps; Arguments = $a }
+}
+
+# conhost.exe, unless the installer found that it does not start Koha's
+# tools on this PC (state.json hiddenLaunch = powershell).
+function Get-KohaConhostPath {
+    if ((Get-KohaState).hiddenLaunch -eq 'powershell') { return '' }
+    return [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'conhost.exe')
 }
 
 function Start-KohaHidden {
@@ -1315,6 +1323,14 @@ function New-KohaShortcuts {
         Copy-Item -LiteralPath $IconSource -Destination $icon -Force
     }
     New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null
+    if ($Desktop) {
+        # Older versions also put the two web shortcuts on the desktop; the
+        # one Koha icon (the Koha window) replaces them.
+        foreach ($n in @('Koha - Staff interface', 'Koha - Public catalog', (T 'Koha - Staff interface'), (T 'Koha - Public catalog'))) {
+            $old = [System.IO.Path]::Combine($Desktop, (ConvertTo-KohaFileName $n) + '.url')
+            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+        }
+    }
     $made = New-Object System.Collections.ArrayList
     foreach ($s in Get-KohaShortcutList) {
         $dirs = @()

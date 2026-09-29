@@ -378,13 +378,20 @@ function Restart-KohaDistro {
     return (Test-KohaSystemd)
 }
 
-function Set-KohaDistroConfig {
+# /etc/wsl.conf with systemd and the default user, keeping everything else.
+# WSL reads it when Debian starts.
+function Write-KohaWslConf {
     param([string]$User = 'root')
     $cur = Invoke-KohaLinux -Command @('cat', '/etc/wsl.conf')
     $existing = ''
     if ($cur.ExitCode -eq 0) { $existing = [string]$cur.Output }
     $r = Invoke-KohaLinuxScript -Script "tr -d '\r' > /etc/wsl.conf" -InputText (Get-KohaWslConf -Existing $existing -User $User)
     if ($r.ExitCode -ne 0) { throw ('wsl.conf: ' + $r.Output) }
+}
+
+function Set-KohaDistroConfig {
+    param([string]$User = 'root')
+    Write-KohaWslConf -User $User
     $changed = Update-KohaWslConfig
     if ($changed) {
         # .wslconfig is read when the WSL virtual machine starts.
@@ -498,6 +505,15 @@ function New-KohaLinuxUser {
         if ($null -ne $p -and $p.PSObject.Properties['RunOOBE']) { Set-ItemProperty -LiteralPath $e.PSPath -Name RunOOBE -Value 0 -ErrorAction SilentlyContinue }
     }
     Write-KohaLog ('Debian user {0} ready' -f $User) 'install'
+}
+
+# Whether Debian has this user. WSL opens Debian as the user wsl.conf names;
+# when that user is missing, every start prints "getpwnam(...) failed" and
+# falls back to another account.
+function Test-KohaLinuxUserExists {
+    param([string]$User)
+    if (-not $User -or $User -eq 'root') { return $true }
+    return ((Invoke-KohaLinux -Command @('id', '-u', $User)).ExitCode -eq 0)
 }
 
 # ----------------------------------------------------------------------
@@ -758,7 +774,31 @@ function Install-Koha {
         Set-KohaState @{ phase = 'systemd' } | Out-Null; $phase = 'systemd'
     }
 
-    if (-not (Test-KohaPhaseDone 'systemd' $phase) -or ($null -ne $account -and $phase -ne 'done')) {
+    # The Debian user that wsl.conf names must exist. A Debian installed again
+    # (it went missing between two runs) no longer has it, and its password
+    # was never saved, so it is asked again.
+    $savedUser = [string](Get-KohaState)['linuxUser']
+    if ($null -eq $account -and $savedUser -and (Test-KohaPhaseDone 'distro' $phase) -and -not (Test-KohaLinuxUserExists $savedUser)) {
+        Write-KohaLog ('Debian user {0} is missing' -f $savedUser) 'install'
+        if (-not $NonInteractive) {
+            Write-KohaStep ((T 'The Debian user {0} is missing (Debian was installed again), so WSL cannot open Debian with it. Choose its password again.') -f $savedUser) 'warn'
+            $account = Read-KohaLinuxAccount -Default $savedUser
+        }
+    }
+
+    # Debian already runs systemd: create the user, point wsl.conf at it and
+    # restart Debian, so WSL opens it with that user from now on.
+    if ($null -ne $account -and (Test-KohaPhaseDone 'systemd' $phase)) {
+        New-KohaLinuxUser -User $account.User -Password $account.Password
+        Set-KohaState @{ linuxUser = $account.User } | Out-Null
+        Write-KohaStep ((T 'Debian user {0} created.') -f $account.User) 'ok'
+        Write-KohaWslConf -User $account.User
+        $account = $null
+        Write-KohaStep (T 'Restarting Debian so that WSL opens it with this user...')
+        Restart-KohaDistro | Out-Null
+    }
+
+    if (-not (Test-KohaPhaseDone 'systemd' $phase)) {
         $user = [string](Get-KohaState)['linuxUser']
         if ($null -ne $account) {
             New-KohaLinuxUser -User $account.User -Password $account.Password
@@ -800,18 +840,16 @@ function Install-Koha {
         $mode = 'manual'
         if ($auto) { $mode = 'logon' }
         Set-KohaState @{ autostart = $mode; desired = 'running' } | Out-Null
-        Register-KohaTasks -Autostart $mode
-        Set-KohaTrayAtSignIn -Enabled $true
-        New-KohaShortcuts | Out-Null
-        Set-KohaDistroIcon | Out-Null
-        Write-KohaStep (T 'Shortcuts created in the Start menu (folder Koha) and on the desktop.') 'ok'
+        # One step that fails must not skip the others.
+        Invoke-KohaSafeStep { Register-KohaTasks -Autostart $mode }
+        Invoke-KohaSafeStep { Install-KohaShortcuts }
         Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
         $lan = $true
         if (-not $NonInteractive) { $lan = Enable-KohaLanAccess }
         if (-not $lan) { Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn' }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         $r = Start-Koha -Trigger user -Wait
-        Start-KohaTray
+        Invoke-KohaSafeStep { Start-KohaTrayChecked }
         Set-KohaState @{ phase = 'done'; lanAccess = $lan } | Out-Null
         Write-Host ''
         if ($r -eq 'ready') {
@@ -831,11 +869,8 @@ function Install-Koha {
     # started, and when it does not answer, the same help as above.
     if ($wasDone -and $phase -eq 'done' -and -not $NonInteractive) {
         # Shortcuts, the tray at sign-in and the tray itself of this version.
-        try {
-            Set-KohaTrayAtSignIn -Enabled $true
-            New-KohaShortcuts | Out-Null
-            Restart-KohaTray
-        } catch { Write-KohaLog ('refreshing shortcuts failed: ' + $_.Exception.Message) 'install' }
+        Invoke-KohaSafeStep { Install-KohaShortcuts }
+        Invoke-KohaSafeStep { Start-KohaTrayChecked }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         if ((Start-Koha -Trigger user -Wait) -eq 'ready') {
             Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
@@ -866,6 +901,57 @@ function Install-Koha {
 }
 
 function Start-KohaTray { Start-KohaHidden 'Tray' }
+
+# Runs one step of the Windows side; a failure is shown and logged, and the
+# steps after it still run.
+function Invoke-KohaSafeStep {
+    param([scriptblock]$Step)
+    try {
+        & $Step
+    } catch {
+        Write-KohaLog ('step failed: {0} | {1}' -f $Step.ToString().Trim(), $_.Exception.Message) 'install'
+        Write-KohaStep ((T 'This step did not work: {0}') -f $_.Exception.Message) 'warn'
+    }
+}
+
+# The Koha icon on the desktop (the Koha window), the Start menu folder, the
+# tray at sign-in and the Koha icon on Debian's own entries. The desktop is
+# the one Windows reports, so a desktop moved by OneDrive gets it too.
+function Install-KohaShortcuts {
+    Set-KohaTrayAtSignIn -Enabled $true
+    New-KohaShortcuts | Out-Null
+    Set-KohaDistroIcon | Out-Null
+    Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f [Environment]::GetFolderPath('Desktop')) 'ok'
+}
+
+function Test-KohaTrayRunning {
+    try {
+        return (@(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
+                Where-Object { ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Tray' }).Count -gt 0)
+    } catch { return $false }
+}
+
+# Starts the tray and checks it is there. When the console-free start
+# (conhost --headless) does not bring it up, the tray, the shortcuts and the
+# tray at sign-in switch to a plain hidden PowerShell for good.
+function Start-KohaTrayChecked {
+    param([int]$WaitSeconds = 8)
+    Restart-KohaTray
+    Start-Sleep -Seconds $WaitSeconds
+    if (-not (Test-KohaTrayRunning) -and (Get-KohaState).hiddenLaunch -ne 'powershell') {
+        Write-KohaLog 'the tray did not start through conhost --headless; using powershell -WindowStyle Hidden' 'install'
+        Set-KohaState @{ hiddenLaunch = 'powershell' } | Out-Null
+        Set-KohaTrayAtSignIn -Enabled $true
+        New-KohaShortcuts | Out-Null
+        Start-KohaTray
+        Start-Sleep -Seconds $WaitSeconds
+    }
+    if (Test-KohaTrayRunning) {
+        Write-KohaStep (T 'The Koha icon is in the notification area, next to the clock.') 'ok'
+    } else {
+        Write-KohaStep (T 'The Koha icon did not start. Open Koha - Status icon in the Start menu (folder Koha).') 'warn'
+    }
+}
 
 # The tray of an older version keeps its old menu until it is restarted.
 function Restart-KohaTray {
