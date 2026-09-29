@@ -702,9 +702,10 @@ PANEL_LOCK_FILE="/var/run/koha_panel.lock"
 
 # Commands for the Windows tools (section 21.5) run next to an open panel:
 # no lock, no dependency install, no menu. All are read-only except
-# --install-data-safety, which only (re)writes the data-safety settings.
+# --install-data-safety, which only (re)writes the data-safety settings,
+# and --rebuild-search-index (the Koha window's button).
 KEI_CLI_MODE=""
-case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat|--install-data-safety) KEI_CLI_MODE="$1" ;; esac
+case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat|--install-data-safety|--rebuild-search-index) KEI_CLI_MODE="$1" ;; esac
 
 if [ -z "$KEI_CLI_MODE" ]; then
     exec 9> "$PANEL_LOCK_FILE"
@@ -1217,10 +1218,11 @@ EOF
     chown root:root "$KOHA_WAIT_SCRIPT" 2>/dev/null
     mkdir -p /etc/systemd/system/koha-common.service.d /etc/systemd/system/apache2.service.d
     cat > /etc/systemd/system/koha-common.service.d/koha-easy-install.conf << EOF
-# Koha Easy Installer: Plack must start after Memcached and MariaDB.
+# Koha Easy Installer: Plack must start after Memcached and MariaDB, and
+# Koha's background workers after RabbitMQ (their message queue).
 [Unit]
 Wants=memcached.service mariadb.service
-After=memcached.service mariadb.service network-online.target
+After=memcached.service mariadb.service rabbitmq-server.service network-online.target
 
 [Service]
 # "active" is not "answering": wait until both respond. The "-" lets Koha
@@ -1495,6 +1497,77 @@ EOF
 # installer (--install-data-safety).
 install_data_safety() {
     install_stop_guard
+    install_mariadb_durability
+    install_log_limits
+}
+
+# MariaDB's crash-safety settings, pinned in their own file so that no later
+# tuning (99-koha-tuning.cnf, loaded after it, only sets the buffer pool)
+# turns them off. They are MariaDB's defaults: nothing changes on a stock
+# server, and they take effect at MariaDB's next start. innodb_flush_method
+# is left out on purpose: MariaDB 11 deprecates it, and O_DIRECT has been
+# the default since 10.6.
+KEI_MARIADB_CONF_DIR="${KEI_MARIADB_CONF_DIR:-/etc/mysql/mariadb.conf.d}"
+install_mariadb_durability() {
+    [ -d "${KEI_MARIADB_CONF_DIR%/*}" ] || return 0
+    mkdir -p "$KEI_MARIADB_CONF_DIR"
+    write_if_changed "${KEI_MARIADB_CONF_DIR}/98-koha-durability.cnf" 644 << 'EOF' && log "MariaDB durability settings written"
+# Koha Easy Installer: MariaDB's crash-safety settings (a power cut loses no
+# committed transaction and tears no page). Do not change them.
+[mysqld]
+innodb_doublewrite = 1
+innodb_flush_log_at_trx_commit = 1
+innodb_file_per_table = 1
+skip-log-bin
+EOF
+    return 0
+}
+
+# Logs that never fill the disk: the system journal capped at 100 MB (30 MB
+# in memory) and one month, the panel's own logs rotated once they pass
+# 5 MB, and the weekly log rotation and TRIM timers switched on. Koha's own
+# /etc/logrotate.d/koha-common belongs to its package and is left as it is.
+KEI_JOURNALD_DIR="${KEI_JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
+KEI_LOGROTATE_DIR="${KEI_LOGROTATE_DIR:-/etc/logrotate.d}"
+install_log_limits() {
+    local t
+    if [ -d "${KEI_JOURNALD_DIR%/*}" ]; then
+        mkdir -p "$KEI_JOURNALD_DIR"
+        if write_if_changed "${KEI_JOURNALD_DIR}/00-koha-limits.conf" 644 << 'EOF'
+# Koha Easy Installer: the system journal keeps at most 100 MB on disk,
+# 30 MB in memory, and one month.
+[Journal]
+SystemMaxUse=100M
+RuntimeMaxUse=30M
+MaxRetentionSec=1month
+EOF
+        then
+            [ -d "$KEI_SYSTEMD_RUNDIR" ] && systemctl restart systemd-journald >/dev/null 2>&1
+            log "journald limits written"
+        fi
+    fi
+    if [ -d "$KEI_LOGROTATE_DIR" ]; then
+        write_if_changed "${KEI_LOGROTATE_DIR}/koha-easy-install" 644 << EOF && log "logrotate rule for ${LOG_DIR} written"
+# Koha Easy Installer: the panel's logs, rotated once they pass 5 MB (the
+# last line of backup_sql.log is what the Windows tray reads).
+${LOG_DIR}/*.log {
+    size 5M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    fi
+    [ -d "$KEI_SYSTEMD_RUNDIR" ] || return 0
+    for t in logrotate.timer fstrim.timer; do
+        systemctl cat "$t" >/dev/null 2>&1 || continue
+        systemctl is-enabled --quiet "$t" 2>/dev/null && systemctl is-active --quiet "$t" && continue
+        systemctl enable --now "$t" >/dev/null 2>&1 && log "$t enabled"
+    done
+    return 0
 }
 
 # Result of the last repair after an unclean stop, for --status-json:
@@ -1940,6 +2013,22 @@ validate_mariadb() {
         "")      : ;;
         *)       v_warn "${DB_NAME}: charset '$charset' ($(t "utf8mb4 is recommended"))." ;;
     esac
+    # Crash safety: doublewrite (can read 1, ON or fast), a log flush at every
+    # commit and one file per table.
+    local dw fl fpt
+    IFS=$'\t' read -r dw fl fpt < <(run_sql "SELECT @@innodb_doublewrite, @@innodb_flush_log_at_trx_commit, @@innodb_file_per_table;")
+    if [ "$fl" = "1" ] && [ "$fpt" = "1" ] && [ -n "$dw" ] && [ "$dw" != "0" ] && [ "$dw" != "OFF" ]; then
+        v_ok "MariaDB: $(t "crash-safe settings on (doublewrite, flush at every commit, one file per table)")."
+    elif [ -n "$fl" ]; then
+        v_warn "MariaDB: $(t "crash-safe settings off; a power cut can lose or damage data") (innodb_doublewrite=$dw, innodb_flush_log_at_trx_commit=$fl, innodb_file_per_table=$fpt)."
+    fi
+    if is_koha_installed && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet koha-stop-guard.service 2>/dev/null; then
+            v_ok "$(t "Clean-stop guard: active (Koha is checked and repaired after a power cut).")"
+        else
+            v_warn "$(t "Clean-stop guard: not active (open the panel again to install it).")"
+        fi
+    fi
     return 0
 }
 
@@ -4746,6 +4835,54 @@ require_koha_tables() {
     return 0
 }
 
+# Unlocks Zebra and rebuilds both of its indices from scratch: the core of
+# "Repair / rebuild indexing", also run by the Koha window on Windows
+# (--rebuild-search-index). The rebuild's output goes to zebra-rebuild.log,
+# and to the screen too with "show". Returns 1 if anything failed.
+zebra_full_rebuild() {
+    local show="${1:-}" ok=0
+    maintenance_begin
+    repair_koha_conf_xml
+    [ -n "$show" ] && display_explanation "Unlocking Zebra..."
+    zebra_stop
+    force_stop_koha_zebra
+    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
+    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
+    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
+        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
+        "/var/lock/koha/${INSTANCE}" 2>/dev/null
+    zebra_start >/dev/null 2>&1
+    write_cron_zebra
+    if [ -n "$show" ]; then
+        display_explanation "Rebuilding the indices..."
+        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || ok=1
+    else
+        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" > "${LOG_DIR}/zebra-rebuild.log" 2>&1 || ok=1
+    fi
+    zebra_stop
+    zebra_start >/dev/null 2>&1 || ok=1
+    maintenance_end
+    ensure_search_indexing >/dev/null 2>&1 || ok=1
+    return "$ok"
+}
+
+# config.sh --rebuild-search-index: the search index of the active engine
+# rebuilt from scratch, without questions (the Koha window's "Rebuild search
+# index"). Exit 0 when it worked, 2 when Koha is not installed.
+kei_rebuild_search_index() {
+    local rc=0
+    is_koha_installed || return 2
+    if [ "$(get_search_engine)" = "Elasticsearch" ]; then
+        # No screen to show "already running" on: it goes to the log.
+        msg_info() { log "$1: $2"; }
+        rebuild_koha_elasticsearch || rc=1
+    else
+        zebra_full_rebuild || rc=1
+    fi
+    log "search index rebuilt from the Windows tools (exit $rc)"
+    return "$rc"
+}
+
 function_repair_indexing() {
     require_koha_tables || return 0
     local engine; engine=$(get_search_engine)
@@ -4800,25 +4937,8 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
 
     prompt_yes_no "$(t "Repair Zebra")" "$(t "Unlock Zebra and rebuild the indices from scratch?")" 10 70 || return 0
     clear
-    maintenance_begin
-    repair_koha_conf_xml
-    display_explanation "Unlocking Zebra..."
-    zebra_stop
-    force_stop_koha_zebra
-    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
-    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
-    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
-        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
-        "/var/lock/koha/${INSTANCE}" 2>/dev/null
-    zebra_start >/dev/null 2>&1
-    write_cron_zebra
-    display_explanation "Rebuilding the indices..."
     local zebra_ok="yes"
-    koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || zebra_ok="no"
-    zebra_stop
-    zebra_start >/dev/null 2>&1 || zebra_ok="no"
-    maintenance_end
-    ensure_search_indexing >/dev/null 2>&1 || zebra_ok="no"
+    zebra_full_rebuild show || zebra_ok="no"
     display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
     ensure_koha_services >/dev/null 2>&1
 
@@ -13064,6 +13184,7 @@ if [ -n "$KEI_CLI_MODE" ]; then
         # Not read-only, but idempotent: the Windows installer refreshes the
         # data-safety settings of an existing Koha without opening the panel.
         --install-data-safety) is_koha_installed && install_data_safety ;;
+        --rebuild-search-index) kei_rebuild_search_index ;;
     esac
     exit $?
 fi

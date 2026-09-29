@@ -341,6 +341,30 @@ Describe 'Start, Stop and automatic start' {
         )
     }
 
+    It 'at the end of the Windows session Koha is stopped cleanly and stays wanted' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [void]$script:calls.Add('stop Koha inside Debian'); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Set-KohaState @{ desired = 'running' } | Out-Null
+        Stop-KohaForSessionEnd | Should -Be 'clean'
+        $script:calls | Should -Be @('stop Koha inside Debian', 'wsl --terminate koha')
+        (Get-KohaState).desired | Should -Be 'running'
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Stop-KohaForSessionEnd | Should -Be 'not_running'
+    }
+
+    It 'Rebuild search index asks the panel, and never starts a stopped Debian' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [void]$script:calls.Add('linux ' + ($Command -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Invoke-KohaSearchReindex | Should -Be 'rebuilt'
+        $script:calls | Should -Contain 'linux /usr/local/bin/koha-panel --rebuild-search-index'
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 1; Output = 'zebra failed' } }
+        Invoke-KohaSearchReindex | Should -Be 'failed'
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { throw 'must not start the distro' }
+        Invoke-KohaSearchReindex | Should -Be 'not_running'
+    }
+
     It 'the sign-in task starts nothing in manual mode; the Start shortcut always does' {
         Set-KohaState @{ autostart = 'manual'; desired = 'stopped' } | Out-Null
         Start-Koha -Trigger logon | Should -Be 'skipped'
@@ -571,6 +595,19 @@ Describe 'Diagnostics' {
         foreach ($secret in 'KeiTest-Pass_42', 'hunter2', 'abcdefghijklmnop', 'S3cr3t', '1//0gAb') { $t | Should -Not -Match ([regex]::Escape($secret)) }
         $t | Should -Match 'user=koha'
         $t | Should -Match 'Timezone: America/Sao_Paulo'
+    }
+
+    It 'warns when Windows no longer flushes the write cache of the disk holding ext4.vhdx' {
+        Mock -ModuleName KohaEasy.Core Get-KohaDiskOfDrive { [pscustomobject]@{ Number = 0; Model = 'ACME SSD'; PnpId = 'SCSI\DISK&VEN_ACME\1' } }
+        Mock -ModuleName KohaEasy.Core Get-KohaDiskFlushOff { $true }
+        $r = Get-KohaWriteCacheCheck -Vhdx 'D:\WSL\koha\ext4.vhdx'
+        $r.Level | Should -Be 'warning'
+        $r.Text | Should -Match 'turned OFF for drive D: \(disk 0, ACME SSD\)'
+        Mock -ModuleName KohaEasy.Core Get-KohaDiskFlushOff { $false }
+        (Get-KohaWriteCacheCheck -Vhdx 'D:\WSL\koha\ext4.vhdx').Level | Should -Be 'ok'
+        Mock -ModuleName KohaEasy.Core Get-KohaDiskOfDrive { throw 'no Storage module' }
+        (Get-KohaWriteCacheCheck -Vhdx 'D:\WSL\koha\ext4.vhdx').Level | Should -Be 'unknown'
+        (Get-KohaWriteCacheCheck -Vhdx '').Level | Should -Be 'unknown'
     }
 
     It 'zips the Windows part and the Linux bundle, and stops Koha again if it was off' {

@@ -803,6 +803,21 @@ Describe 'Koha window' {
         $tray | Should -Match "Invoke-KohaCommand 'Stop -Force'"
         $tray | Should -Match "add_DoubleClick\(\{ Invoke-KohaCommand 'Window' \}\)"
     }
+
+    It 'holds a shutdown block reason only while Koha runs, and stops Koha cleanly when the session ends' {
+        $tray = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Tray.ps1') -Raw
+        $tray | Should -Match 'ShutdownBlockReasonCreate'
+        $tray | Should -Match 'm.Msg == WM_ENDSESSION && m.WParam != IntPtr.Zero'
+        $tray | Should -Match 'if \(\$on\) \{ \$session.Block\(\$blockReason\) \} else \{ \$session.Unblock\(\) \}'
+        $tray | Should -Match "AddScript\(\{ Stop-KohaForSessionEnd \}\)"
+        $tray | Should -Match 'Application\]::DoEvents\(\)'
+    }
+
+    It 'the Koha window offers Rebuild search index only while Debian runs' {
+        $w = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match "'reindex'\s+\{ \`$result = Invoke-KohaSearchReindex \}"
+        $w | Should -Match '\$btnReindex.Enabled = \(-not \$Busy\) -and \$on'
+    }
 }
 
 Describe 'Linux errors are answers, not PowerShell errors' {

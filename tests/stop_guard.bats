@@ -1,7 +1,9 @@
 #!/usr/bin/env bats
-# Clean-stop guard: the mark a clean stop leaves, the boot that does not find
-# it, and the repair after a power cut or a forced shutdown (database check,
-# fresh backup, Zebra index brought up to date or rebuilt).
+# Data safety. The clean-stop guard: the mark a clean stop leaves, the boot
+# that does not find it, and the repair after a power cut or a forced
+# shutdown (database check, fresh backup, Zebra index brought up to date or
+# rebuilt). Also the MariaDB durability settings, the log limits and the
+# search index rebuild the Koha window asks for.
 
 GUARD=/usr/local/sbin/koha-stop-guard
 STATE=/var/lib/koha-easy-install
@@ -129,4 +131,49 @@ status_value() { sed -n "s/^$1=//p" "$STATE/recovery.status"; }
     rm -f "$STATE/recovery.status"
     panel kei_status_json
     assert 'echo "$output" | python3 -c "import json,sys; r=json.load(sys.stdin)[\"recovery\"]; assert r[\"state\"]==\"none\" and r[\"epoch\"]==0, r"' "$output"
+}
+
+@test "G09 data-safety settings: MariaDB durability pinned, journal and panel logs capped, timers on" {
+    export KEI_MARIADB_CONF_DIR="$BATS_TEST_TMPDIR/mysql/mariadb.conf.d" KEI_JOURNALD_DIR="$BATS_TEST_TMPDIR/systemd/journald.conf.d" \
+           KEI_LOGROTATE_DIR="$BATS_TEST_TMPDIR/logrotate.d"
+    mkdir -p "$BATS_TEST_TMPDIR/mysql" "$BATS_TEST_TMPDIR/systemd" "$KEI_LOGROTATE_DIR" "$KEI_S/units"
+    touch "$KEI_S/units/logrotate.timer" "$KEI_S/units/fstrim.timer"
+    : > "$KEI_S/calls.log"
+    panel install_data_safety
+    assert '[ "$status" -eq 0 ]' "$output"
+    local cnf="$KEI_MARIADB_CONF_DIR/98-koha-durability.cnf"
+    assert 'grep -qx "innodb_doublewrite = 1" "$cnf" && grep -qx "innodb_flush_log_at_trx_commit = 1" "$cnf"'
+    assert 'grep -qx "innodb_file_per_table = 1" "$cnf" && grep -qx "skip-log-bin" "$cnf"'
+    assert '! grep -q "^innodb_flush_method" "$cnf"' "deprecated in MariaDB 11"
+    assert '[[ "98-koha-durability.cnf" < "99-koha-tuning.cnf" ]]' "must load before the tuning file"
+    assert 'grep -qx "SystemMaxUse=100M" "$KEI_JOURNALD_DIR/00-koha-limits.conf" && grep -qx "MaxRetentionSec=1month" "$KEI_JOURNALD_DIR/00-koha-limits.conf"'
+    assert 'grep -q "^/var/log/koha-easy-install/\*.log {" "$KEI_LOGROTATE_DIR/koha-easy-install" && grep -q "compress" "$KEI_LOGROTATE_DIR/koha-easy-install"'
+    assert 'calls | grep -q "systemctl enable --now logrotate.timer" && calls | grep -q "systemctl enable --now fstrim.timer"'
+    assert 'calls | grep -q "systemctl restart systemd-journald"'
+    : > "$KEI_S/calls.log"
+    panel install_data_safety
+    assert '! calls | grep -q "restart systemd-journald"' "nothing rewritten the second time"
+    panel install_boot_ordering
+    assert 'grep -q "^After=.*rabbitmq-server.service" /etc/systemd/system/koha-common.service.d/koha-easy-install.conf'
+}
+
+@test "G10 validation reports MariaDB's crash-safe settings and the guard" {
+    touch "$KEI_S/svc/koha-stop-guard"
+    panel eval 'VALIDATION_LOG=/dev/null; v_reset test; validate_mariadb'
+    assert 'echo "$output" | grep -q "crash-safe settings on"' "$output"
+    assert 'echo "$output" | grep -q "Clean-stop guard: active"' "$output"
+    rm -f "$KEI_S/svc/koha-stop-guard"
+    panel eval 'VALIDATION_LOG=/dev/null; v_reset test; validate_mariadb'
+    assert 'echo "$output" | grep -q "Clean-stop guard: not active"' "$output"
+}
+
+@test "G11 --rebuild-search-index rebuilds Zebra from scratch without questions" {
+    : > "$KEI_S/calls.log"
+    panel kei_rebuild_search_index
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'calls | grep -q "koha-rebuild-zebra -f -v -b -a library"'
+    assert '[ ! -e /run/koha-easy-install/maintenance.in-progress ]'
+    touch "$KEI_S/fail/koha-rebuild-zebra"
+    panel kei_rebuild_search_index
+    assert '[ "$status" -eq 1 ]'
 }

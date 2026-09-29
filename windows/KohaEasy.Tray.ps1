@@ -7,7 +7,10 @@
 #     Start, Stop, Restart Koha services, diagnostics (.txt and .zip), disk
 #     space, backups folder, control panel, automatic start, and a Close
 #     that asks whether Koha keeps running
-#   * notifications: service events, nightly backups, disk space
+#   * notifications: service events, nightly backups, disk space, the
+#     repair after an unclean stop
+#   * Windows shutdown, restart or sign-out while Koha runs: Koha is stopped
+#     cleanly first, with "Koha is saving..." on Windows' shutdown screen
 # Checks run in a background runspace so the menu never freezes.
 # Windows PowerShell 5.1. Loaded by KohaEasy.ps1 (modules already imported).
 
@@ -53,6 +56,50 @@ $icons = @{
     stopped_by_user = New-DotIcon ([System.Drawing.Color]::FromArgb(140, 140, 140))
     not_installed   = New-DotIcon ([System.Drawing.Color]::FromArgb(140, 140, 140))
 }
+
+# A window nobody sees, for Windows' end-of-session messages. While Koha
+# runs it holds a shutdown block reason (ShutdownBlockReasonCreate), which
+# blocks nothing by itself: Windows shows it only if the clean stop below
+# takes longer than a few seconds, with "Shut down anyway" beside it.
+# WM_ENDSESSION with wParam TRUE means the session really ends (a shutdown
+# another program cancelled never gets it). [verify] on Windows 10 and 11.
+if (-not ('KohaSessionWindow' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class KohaSessionWindow : Form {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
+    [DllImport("user32.dll")]
+    static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
+    const int WM_ENDSESSION = 0x16;
+    bool blocking;
+    public event EventHandler SessionEnding;
+    public KohaSessionWindow() {
+        ShowInTaskbar = false;
+        FormBorderStyle = FormBorderStyle.None;
+        Text = "Koha";
+        IntPtr h = Handle;
+    }
+    public bool Blocking { get { return blocking; } }
+    public void Block(string reason) {
+        if (!blocking) { blocking = ShutdownBlockReasonCreate(Handle, reason); }
+    }
+    public void Unblock() {
+        if (blocking) { ShutdownBlockReasonDestroy(Handle); blocking = false; }
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_ENDSESSION && m.WParam != IntPtr.Zero && SessionEnding != null) {
+            SessionEnding(this, EventArgs.Empty);
+        }
+        base.WndProc(ref m);
+    }
+}
+'@
+}
+$session = New-Object KohaSessionWindow
+$blockReason = T 'Koha is saving the catalog before Windows shuts down...'
 
 $tray = New-Object System.Windows.Forms.NotifyIcon
 $tray.Icon = $icons.stopped
@@ -172,6 +219,7 @@ function Update-Menu {
     $miStart.Enabled = (-not $on) -and $s -ne 'not_installed'
     $miStop.Enabled = $on
     $miRestart.Enabled = $on
+    if ($on) { $session.Block($blockReason) } else { $session.Unblock() }
     $miStaff.Enabled = ($s -eq 'running')
     $miOpac.Enabled = ($s -eq 'running')
     $st = Get-KohaState
@@ -212,10 +260,32 @@ $timer.add_Tick({
     })
 $timer.Start()
 
+# The session ends: Koha is stopped cleanly in its own runspace while this
+# thread keeps answering Windows, then the block reason is released and
+# Windows carries on. Bounded by the stop's own time limit.
+$session.add_SessionEnding({
+        $timer.Stop()
+        if (-not $session.Blocking) { return }
+        $rs = [runspacefactory]::CreateRunspace($iss)
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript({ Stop-KohaForSessionEnd })
+        $h = $ps.BeginInvoke()
+        $deadline = (Get-Date).AddSeconds([int]$cfg.StopWaitS + 15)
+        while (-not $h.IsCompleted -and (Get-Date) -lt $deadline) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 100
+        }
+        $session.Unblock()
+    })
+
 try {
     [System.Windows.Forms.Application]::Run()
 } finally {
     $timer.Stop()
+    $session.Unblock()
+    $session.Dispose()
     $tray.Visible = $false
     $tray.Dispose()
     $pool.Close()

@@ -200,7 +200,8 @@ rmdir /etc/systemd/system/apache2.service.d 2>/dev/null
 rm -f /etc/apt/sources.list.d/koha.list /etc/apt/sources.list.d/elastic*.list /etc/apt/sources.list.d/cloudflared.list
 rm -f /usr/share/keyrings/koha-keyring.gpg /usr/share/keyrings/elasticsearch-keyring.gpg /etc/apt/keyrings/cloudflare-main.gpg
 rm -f /etc/fail2ban/jail.d/koha-easy-install.local
-rm -f /etc/mysql/mariadb.conf.d/99-koha-tuning.cnf
+rm -f /etc/mysql/mariadb.conf.d/99-koha-tuning.cnf /etc/mysql/mariadb.conf.d/98-koha-durability.cnf
+rm -f /etc/systemd/journald.conf.d/00-koha-limits.conf /etc/logrotate.d/koha-easy-install
 rm -f /etc/elasticsearch/jvm.options.d/koha_heap.options
 systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed 2>/dev/null || true
