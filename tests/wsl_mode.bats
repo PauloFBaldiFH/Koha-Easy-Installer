@@ -148,10 +148,12 @@ EOF
 
 # --- capabilities ---------------------------------------------------------------
 
-@test "W05 host_can: everything on Linux, nothing host-level under WSL" {
+@test "W05 host_can: everything on Linux, nothing host-level under WSL but the timezone" {
     local cap
     win_conf 'WIN_NET_MODE=nat'
-    for cap in swap ntp timezone firewall fail2ban mdns reboot lan_direct; do
+    wsl host_can timezone
+    assert '[ "$status" -eq 0 ]' "the zone inside Debian is the panel's to set"
+    for cap in swap ntp firewall fail2ban mdns reboot lan_direct; do
         panel host_can "$cap"
         assert '[ "$status" -eq 0 ]' "linux may manage $cap"
         wsl host_can "$cap"
@@ -188,20 +190,100 @@ EOF
     assert 'grep -q "host_can mdns && systemctl enable --now avahi-daemon" "$KEI_REPO/installer"'
 }
 
-@test "W07 WSL timezone follows Windows unless it reads UTC" {
-    printf 'get_current_timezone() { printf "%%s" "$KEI_TZ"; }\napply_timezone() { echo "apply_timezone $1" >> "$KEI_S/calls.log"; }\n' \
-        > "$BATS_TEST_TMPDIR/tz.sh"
+@test "W07 WSL: the timezone is asked in Debian, and a zone other than Windows' outlives WSL restarts" {
+    export KEI_WSL_CONF="$BATS_TEST_TMPDIR/wsl.conf"
+    printf '# Written by Koha Easy Installer for Windows.\n[boot]\nsystemd=true\n\n[user]\ndefault=maria\n' > "$KEI_WSL_CONF"
+    cat > "$BATS_TEST_TMPDIR/tz.sh" <<'EOS'
+get_current_timezone() { cat "$KEI_S/tz" 2>/dev/null || printf 'America/Sao_Paulo'; }
+timedatectl() { echo "timedatectl $*" >> "$KEI_S/calls.log"; [ "$1" = set-timezone ] && printf '%s' "$2" > "$KEI_S/tz"; return 0; }
+choose_timezone() { echo "choose_timezone" >> "$KEI_S/calls.log"; printf '%s' "${KEI_PICK:-$(get_current_timezone)}"; }
+EOS
     export KEI_EXTRA="$BATS_TEST_TMPDIR/tz.sh"
-    KEI_TZ=America/Sao_Paulo wsl timezone_follows_host
-    assert '[ "$status" -eq 0 ]'
-    KEI_TZ=Etc/UTC wsl timezone_follows_host
-    assert '[ "$status" -eq 1 ]' "UTC under WSL still asks"
-    KEI_TZ=America/Sao_Paulo panel timezone_follows_host
-    assert '[ "$status" -eq 1 ]' "Linux always asks"
+    rm -f "$KEI_S/tz"
 
-    KEI_TZ=America/Sao_Paulo wsl function_configure_clock
-    assert 'dialogs | grep -q "INFO \[Clock and timezone\].*America/Sao_Paulo"' "$(dialogs)"
-    assert '! calls | grep -qE "apply_timezone|timesyncd"' "$(calls)"
+    # The zone Windows passed on is kept: wsl.conf is not touched.
+    wsl function_configure_clock
+    assert 'calls | grep -q choose_timezone' "the panel asks under WSL: $(calls)"
+    assert '! grep -q "\[time\]" "$KEI_WSL_CONF"' "$(cat "$KEI_WSL_CONF")"
+
+    # Another zone: WSL must stop copying Windows' zone at every start.
+    KEI_PICK=America/Manaus wsl function_configure_clock
+    assert 'calls | grep -q "timedatectl set-timezone America/Manaus"' "$(calls)"
+    assert 'grep -qx "useWindowsTimezone=false" "$KEI_WSL_CONF"' "$(cat "$KEI_WSL_CONF")"
+    assert 'grep -qx "default=maria" "$KEI_WSL_CONF" && grep -qx "systemd=true" "$KEI_WSL_CONF"' "the rest of wsl.conf stays"
+    assert '[ "$(stat -c %a "$KEI_WSL_CONF")" = 644 ]'
+
+    # Once more: still one [time] section, one key.
+    rm -f "$KEI_S/tz"
+    KEI_PICK=America/Cuiaba wsl function_configure_clock
+    assert '[ "$(grep -c "^\[time\]" "$KEI_WSL_CONF")" = 1 ] && [ "$(grep -c "^useWindowsTimezone" "$KEI_WSL_CONF")" = 1 ]' "$(cat "$KEI_WSL_CONF")"
+
+    # Plain Linux never writes a wsl.conf.
+    rm -f "$KEI_WSL_CONF" "$KEI_S/tz"
+    KEI_PICK=America/Manaus panel function_configure_clock
+    assert '[ ! -e "$KEI_WSL_CONF" ]'
+    rm -f "$KEI_S/tz"
+}
+
+@test "W12 ini_set_value: sets one key, keeps every other line, adds the section when missing" {
+    local f="$BATS_TEST_TMPDIR/x.conf"
+    printf '# top\n[boot]\nsystemd=true\n\n[Time]\n  useWindowsTimezone = true\nother=1\n' > "$f"
+    panel ini_set_value "$f" time useWindowsTimezone false
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert '[ "$(cat "$f")" = "$(printf "# top\n[boot]\nsystemd=true\n\n[Time]\nuseWindowsTimezone=false\nother=1")" ]' "$(cat "$f")"
+    panel ini_set_value "$f" interop appendWindowsPath false
+    assert 'tail -n 3 "$f" | tr "\n" "|" | grep -qx "|\[interop\]|appendWindowsPath=false|"' "$(cat "$f")"
+    rm -f "$f"
+    panel ini_set_value "$f" time useWindowsTimezone false
+    assert '[ "$(cat "$f")" = "$(printf "[time]\nuseWindowsTimezone=false")" ]' "$(cat "$f")"
+}
+
+@test "W13 Apache listens on every address on 80 and 8080, single-address lines widened once" {
+    local f="$BATS_TEST_TMPDIR/ports.conf"
+    export KEI_APACHE_PORTS="$f"
+    printf 'Listen 127.0.0.1:80\n\n<IfModule ssl_module>\n\tListen 443\n</IfModule>\n' > "$f"
+    panel apache_listen_all
+    assert '[ "$(grep -E "^[[:space:]]*Listen" "$f" | tr "\n" "|")" = "Listen 80|Listen 8080|	Listen 443|" ]' "$(cat "$f")"
+    panel apache_listen_all
+    assert '[ "$(grep -c "^Listen 8080$" "$f")" = 1 ] && [ "$(grep -c "^Listen 80$" "$f")" = 1 ]' "run twice: $(cat "$f")"
+    printf '# empty\n' > "$f"
+    panel apache_listen_all
+    assert 'grep -qx "Listen 80" "$f" && grep -qx "Listen 8080" "$f"' "$(cat "$f")"
+    printf 'Listen 192.168.0.5:80\nListen 127.0.0.1:80\nListen [::1]:8080\nListen 0.0.0.0:8080\n' > "$f"
+    panel apache_listen_all
+    assert '[ "$(tr "\n" "|" < "$f")" = "Listen 80|Listen 8080|" ]' "one Listen per port: $(cat "$f")"
+    assert 'grep -q "^    apache_listen_all$" "$KEI_REPO/installer"' "the install step uses it"
+}
+
+@test "W14 UTF-8 screens, and plain symbols in the classic Windows console" {
+    # No locale at all (as under wsl.exe): the panel switches itself to UTF-8.
+    run env -u LANG -u LC_ALL -u LC_CTYPE LANGUAGE= KEI_PLATFORM_OVERRIDE=wsl2 "$KEI_SH" "$PANEL" eval 'locale charmap; echo "plain=$KEI_PLAIN_GLYPHS"'
+    assert 'echo "$output" | grep -qx "UTF-8"' "$output"
+
+    # WSL outside Windows Terminal: plain symbols; inside it (WT_SESSION): emoji.
+    run env -u WT_SESSION KEI_PLAIN_GLYPHS= KEI_PLATFORM_OVERRIDE=wsl2 "$KEI_SH" "$PANEL" eval 'echo "plain=$KEI_PLAIN_GLYPHS"'
+    assert 'echo "$output" | grep -qx "plain=1"' "$output"
+    run env WT_SESSION=abc KEI_PLAIN_GLYPHS= KEI_PLATFORM_OVERRIDE=wsl2 "$KEI_SH" "$PANEL" eval 'echo "plain=$KEI_PLAIN_GLYPHS"'
+    assert 'echo "$output" | grep -qx "plain=0"' "$output"
+    run env -u WT_SESSION KEI_PLAIN_GLYPHS=0 KEI_PLATFORM_OVERRIDE=wsl2 "$KEI_SH" "$PANEL" eval 'echo "plain=$KEI_PLAIN_GLYPHS"'
+    assert 'echo "$output" | grep -qx "plain=0"' "the Windows installer's choice wins: $output"
+    run env -u WT_SESSION KEI_PLAIN_GLYPHS= KEI_PLATFORM_OVERRIDE=linux "$KEI_SH" "$PANEL" eval 'echo "plain=$KEI_PLAIN_GLYPHS"'
+    assert 'echo "$output" | grep -qx "plain=0"' "Linux keeps its symbols: $output"
+
+    # The conversion: icons dropped with their spaces, marks turned into ASCII.
+    panel eval 'kei_plain_text "⚙  Install Koha server"; echo "[$REPLY]"; kei_plain_text "✔ ok ● run ⚠ x → y ⇄ z ★ Free ⚙️ set"; echo "[$REPLY]"; kei_plain_text "Ação já é"; echo "[$REPLY]"'
+    assert 'echo "$output" | grep -qxF "[Install Koha server]"' "$output"
+    assert 'echo "$output" | grep -qxF "[+ ok * run ! x -> y <-> z Free set]"' "$output"
+    assert 'echo "$output" | grep -qxF "[Ação já é]"' "accents stay: $output"
+
+    # t() and every dialog argument, a --textbox file through a converted copy.
+    printf '✔ good\n✖ bad\n' > "$BATS_TEST_TMPDIR/report.txt"
+    KEI_PLAIN_GLYPHS=1 panel eval 'echo "[$(t "✖  Exit")]"; UI_ARGS=(--title "⚠ Warn" --textbox "'"$BATS_TEST_TMPDIR"'/report.txt" 10 40); kei_plain_args; printf "%s|" "${UI_ARGS[@]}"; echo; cat "${UI_ARGS[3]}"'
+    assert 'echo "$output" | grep -qxF "[x  Exit]"' "$output"
+    assert 'echo "$output" | grep -qF -- "--title|! Warn|--textbox|/tmp/koha_tmp_glyphs."' "$output"
+    assert 'echo "$output" | grep -qx "+ good" && echo "$output" | grep -qx "x bad"' "$output"
+    assert 'grep -q "✔ good" "$BATS_TEST_TMPDIR/report.txt"' "the original file is untouched"
+    rm -f /tmp/koha_tmp_glyphs.*
 }
 
 # --- reboot ----------------------------------------------------------------------

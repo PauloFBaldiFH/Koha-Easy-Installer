@@ -84,11 +84,13 @@ O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para
 ### O que já funciona no Windows
 
 - **Modo WSL no painel**: o WSL 2 é detectado automaticamente. O WSL 1 é recusado, com explicação.
-  - As tarefas do computador ficam com o Windows: sem swapfile, NTP, UFW, Fail2ban ou avahi. O fuso horário segue o do Windows.
+  - As tarefas do computador ficam com o Windows: sem swapfile, NTP, UFW, Fail2ban ou avahi.
+  - O fuso horário é escolhido dentro do Debian durante a instalação, com o fuso do Windows oferecido primeiro. Um fuso diferente continua valendo depois que o WSL reinicia (`useWindowsTimezone=false` em `/etc/wsl.conf`).
   - "Reiniciar servidor" vira **Reiniciar os serviços do Koha**.
-  - O systemd precisa estar ativado no WSL.
+  - O systemd precisa estar ativado no WSL (o instalador do Windows faz isso).
+  - As telas são sempre em UTF-8. No console clássico do Windows, que não tem fonte de emoji, o painel mostra símbolos simples no lugar dos ícones; o Terminal do Windows mostra os ícones.
   - O lado Windows conversa com o painel pelo arquivo `/etc/koha-easy-install/windows.conf`. Ele é lido com uma lista fechada de chaves e nunca é executado.
-- **Rede**: no Windows 11, a rede espelhada (mirrored) do WSL deixa os outros computadores da rede acessarem o Koha. No Windows 10 (NAT), use o **Túnel Cloudflare** do painel para publicá-lo.
+- **Rede**: o Apache escuta em todos os endereços, nas portas 80 (catálogo) e 8080 (interface da equipe). O instalador abre as duas portas no firewall do Windows só para a rede local, e os outros computadores da biblioteca acessam o Koha pelo endereço deste computador. No Windows 11 (rede espelhada) é só isso. No Windows 10 (NAT), uma tarefa *Koha network* aponta o `netsh interface portproxy` para o endereço do Debian toda vez que o Koha inicia. Para publicar o Koha na internet, use o **Túnel Cloudflare** do painel.
 - **Ícone e atalhos do Koha**: um ícone **Koha** na área de trabalho, que liga o Koha se estiver desligado e abre a interface da equipe, e uma pasta *Koha* no menu Iniciar, todos com o ícone oficial `koha.ico`. A pasta traz:
   - Interface da equipe, Catálogo público, Painel de controle e Pasta de backups
   - **Iniciar**, **Parar** e **Reiniciar**
@@ -111,18 +113,19 @@ Abra o **PowerShell** (menu Iniciar, digite *PowerShell*; não precisa ser como 
 [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
 ```
 
-Se preferir dois cliques, o **`Install Koha.cmd`** do repositório roda exatamente a mesma linha. Se o Windows mostrar "O Windows protegeu o computador" para ele, clique em **Mais informações > Executar assim mesmo**: o script não é assinado, e você pode lê-lo antes de executar.
+Essa linha é a única forma de instalar o Koha no Windows.
 
 O instalador faz todo o resto e mostra cada etapa em linguagem simples:
 
 1. Verifica o computador: Windows 10 versão 2004 ou mais recente, ou Windows 11; 64 bits; pelo menos 4 GB de memória (8 GB recomendados); pelo menos 10 GB livres no C:; virtualização ativada na BIOS.
-2. Instala o WSL 2. O Windows pede permissão uma vez. Se o Windows precisar reiniciar, o instalador continua sozinho quando você entrar de novo.
-3. Pede ao WSL que instale o Debian da lista oficial do WSL da Microsoft como `KohaEasy` em `C:\KohaEasy\wsl`. Em um WSL mais antigo, baixa a mesma imagem, confere o SHA-256 e a importa.
-4. Ativa o systemd. No Windows 11 22H2 ou mais recente, também acrescenta a rede espelhada (mirrored) ao seu `.wslconfig`, mantendo as suas configurações e uma cópia de segurança.
-5. Abre o painel de controle do Koha. Escolha o idioma, depois **1 – Instalar servidor Koha**, e saia do painel com **Sair** quando terminar.
-6. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, inicia o Koha e abre a interface da equipe. A partir daí, o ícone **Koha** na área de trabalho liga o Koha se estiver desligado e abre a interface da equipe.
+2. Pede um nome de usuário e uma senha para o Debian, antes de instalar qualquer coisa. Você os usa para abrir o Debian e com `sudo`; não são o login da equipe no Koha. A senha nunca é gravada nem registrada no log, e é pedida de novo se o Windows reiniciar antes de o Debian ficar pronto.
+3. Instala o WSL 2. O Windows pede permissão uma vez. Se o Windows precisar reiniciar, o instalador continua sozinho quando você entrar de novo.
+4. Pede ao WSL que instale o Debian da lista oficial do WSL da Microsoft como `koha` em `C:\KohaEasy\wsl`. Em um WSL mais antigo, baixa a mesma imagem, confere o SHA-256 e a importa.
+5. Cria o seu usuário do Debian com permissão de `sudo` e ativa o systemd. No Windows 11 22H2 ou mais recente, também acrescenta a rede espelhada (mirrored) ao seu `.wslconfig`, mantendo as suas configurações e uma cópia de segurança. Depois reinicia o Debian e espera o systemd estar funcionando por completo antes de seguir.
+6. Abre o painel de controle do Koha. Escolha o idioma, depois **1 – Instalar servidor Koha** (ele pergunta o fuso horário), e saia do painel com **Sair** quando terminar.
+7. Pergunta se o Koha deve iniciar quando você entrar no Windows. Depois cria os atalhos e o ícone de status, coloca o ícone do Koha na entrada do Debian no menu Iniciar e no perfil do Terminal do Windows, abre o Koha para a rede da biblioteca (o Windows pede permissão uma vez), inicia o Koha e abre a interface da equipe. Mostra também os endereços que os outros computadores usam. A partir daí, o ícone **Koha** na área de trabalho liga o Koha se estiver desligado e abre a interface da equipe.
 
-Pode rodar de novo sem medo: ele continua da última etapa concluída. O usuário e a senha de primeiro acesso ficam no painel de controle, opção 2. Tudo fica em `C:\KohaEasy`, e o log do instalador em `C:\KohaEasy\logs`.
+Pode rodar de novo sem medo: ele continua da última etapa concluída. Uma instalação feita por uma versão anterior, em que o Debian se chamava `KohaEasy`, passa a se chamar `koha`, com os dados mantidos. O usuário e a senha de primeiro acesso ficam no painel de controle, opção 2. Tudo fica em `C:\KohaEasy`, e o log do instalador em `C:\KohaEasy\logs`.
 
 O comportamento em um Windows real (o instalador, notificações, ícone de status, Agendador de Tarefas e compactação do disco) ainda está sendo conferido em computadores físicos, então avise se algo parecer estranho.
 

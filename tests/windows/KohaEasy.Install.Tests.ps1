@@ -1,5 +1,5 @@
 ﻿# Pester 5 tests for the Windows install flow (windows\KohaEasy.Install.psm1,
-# windows\install.ps1, Install Koha.cmd). wsl.exe, UAC and downloads are mocked.
+# windows\install.ps1). wsl.exe, UAC and downloads are mocked.
 
 BeforeAll {
     $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -46,11 +46,23 @@ Describe 'Debian image and WSL settings' {
         { Get-KohaDebianImage -Manifest ('{"Distributions":[]}' | ConvertFrom-Json) } | Should -Throw
     }
 
-    It 'enables systemd and keeps Windows paths out of Linux' {
-        $c = Get-KohaWslConf
+    It 'enables systemd, makes the chosen user the default and keeps Windows paths out of Linux' {
+        $c = Get-KohaWslConf -User 'maria'
         $c | Should -Match '(?m)^\[boot\]$'
         $c | Should -Match '(?m)^systemd=true$'
+        $c | Should -Match '(?s)\[user\]\ndefault=maria\n'
         $c | Should -Match '(?m)^appendWindowsPath=false$'
+        Get-KohaWslConf | Should -Match '(?m)^default=root$'
+    }
+
+    It 'keeps what the panel wrote in wsl.conf (the timezone) when it writes it again' {
+        $old = "[boot]`nsystemd=false`n`n[user]`ndefault=root`n`n[time]`nuseWindowsTimezone=false`n"
+        $c = Get-KohaWslConf -Existing $old -User 'maria'
+        $c | Should -Match '(?s)\[boot\]\nsystemd=true\n'
+        $c | Should -Match '(?s)\[user\]\ndefault=maria\n'
+        $c | Should -Match '(?s)\[time\]\nuseWindowsTimezone=false\n'
+        $c | Should -Not -Match 'systemd=false'
+        Get-KohaWslConf -Existing $c -User 'maria' | Should -Be $c
     }
 
     It 'adds only missing .wslconfig keys, mirrored networking only on Windows 11 22H2+' {
@@ -83,7 +95,7 @@ Describe 'Debian download' {
         @(Get-ChildItem (Get-KohaPath Wsl) -Filter '*.tar.gz').Count | Should -Be 0
     }
 
-    It 'imports a good image as KohaEasy with WSL 2, and leaves an existing one alone' {
+    It 'imports a good image as koha with WSL 2, and leaves an existing one alone' {
         Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $false }
         $script:img = Join-Path $TestDrive 'img'
         Set-Content -LiteralPath $script:img -Value 'debian' -NoNewline
@@ -92,7 +104,7 @@ Describe 'Debian download' {
         Mock -ModuleName KohaEasy.Install Save-KohaDownload { Copy-Item -LiteralPath $script:img -Destination $Path }
         Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [pscustomobject]@{ ExitCode = [int]($Arguments[0] -eq '--install'); Output = '' } }
         New-KohaDistro | Should -Be 'imported'
-        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -ParameterFilter { $Arguments[0] -eq '--import' -and $Arguments[1] -eq 'KohaEasy' -and $Arguments[-1] -eq '2' }
+        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -ParameterFilter { $Arguments[0] -eq '--import' -and $Arguments[1] -eq 'koha' -and $Arguments[-1] -eq '2' }
         Mock -ModuleName KohaEasy.Install Test-KohaDistroInstalled { $true }
         New-KohaDistro | Should -Be 'exists'
     }
@@ -104,7 +116,7 @@ Describe 'Debian download' {
         Mock -ModuleName KohaEasy.Install Get-KohaDistributionManifest { throw 'must not download' }
         New-KohaDistro | Should -Be 'installed'
         Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter {
-            ($Arguments -join ' ') -eq ('--install Debian --name KohaEasy --location {0} --no-launch --web-download' -f (Get-KohaPath Wsl))
+            ($Arguments -join ' ') -eq ('--install Debian --name koha --location {0} --no-launch --web-download' -f (Get-KohaPath Wsl))
         }
     }
 
@@ -134,6 +146,12 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Koha { [void]$script:calls.Add('start'); 'ready' }
         Mock -ModuleName KohaEasy.Install Start-KohaTray { }
         Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
+        Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'none' }
+        Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { [void]$script:calls.Add('icons') }
+        Mock -ModuleName KohaEasy.Install Enable-KohaLanAccess { [void]$script:calls.Add('lan'); $true }
+        Mock -ModuleName KohaEasy.Install Get-KohaLanUrls { $null }
+        Mock -ModuleName KohaEasy.Install New-KohaLinuxUser { [void]$script:calls.Add('user ' + $User) }
+        Mock -ModuleName KohaEasy.Install Read-KohaLinuxAccount { throw 'must not ask' }
     }
 
     It 'stops before touching Windows when a check fails' {
@@ -151,9 +169,67 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'tasks logon', 'tray at sign-in', 'shortcuts', 'start')
+        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start')
         (Get-KohaState).phase | Should -Be 'done'
         (Get-KohaState).autostart | Should -Be 'logon'
+    }
+
+    It 'creates the Debian user chosen at the start before systemd, and keeps only its name' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Set-KohaDistroConfig { [void]$script:calls.Add('systemd ' + $User); $true }
+        $acc = [pscustomobject]@{ User = 'maria'; Password = 'S3gredo!long' }
+        Install-Koha -Facts $good -NonInteractive -Account $acc | Should -Be 0
+        $script:calls[0..2] | Should -Be @('distro', 'user maria', 'systemd maria')
+        (Get-KohaState).linuxUser | Should -Be 'maria'
+        [System.IO.File]::ReadAllText((Get-KohaPath State)) | Should -Not -Match 'S3gredo'
+        Get-ChildItem (Get-KohaPath Logs) -ErrorAction SilentlyContinue | ForEach-Object { Get-Content -Raw $_.FullName | Should -Not -Match 'S3gredo' }
+    }
+
+    It 'asks for the Debian user before installing anything, and again after a restart' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $false }
+        Mock -ModuleName KohaEasy.Install Read-KohaLinuxAccount { [void]$script:calls.Add('ask'); [pscustomobject]@{ User = 'maria'; Password = 'x' * 8 } }
+        Mock -ModuleName KohaEasy.Install Read-Host { '' }
+        Install-Koha -Facts $good | Should -Be 3
+        $script:calls | Should -Be @('ask', 'wsl platform', 'resume')
+    }
+
+    It 'adds the Debian user to an install that had none, with the restart that applies it' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'windows' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive -Account ([pscustomobject]@{ User = 'maria'; Password = 'x' * 8 }) | Should -Be 0
+        $script:calls[0..1] | Should -Be @('user maria', 'systemd')
+    }
+
+    It 'opens Koha to the library network in the Windows step' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'windows' } | Out-Null
+        Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
+        Mock -ModuleName KohaEasy.Install Start-Process { }
+        Mock -ModuleName KohaEasy.Install Get-KohaLanUrls { [pscustomobject]@{ Opac = 'http://192.168.0.9/'; Staff = 'http://192.168.0.9:8080/' } }
+        Set-KohaState @{ linuxUser = 'maria' } | Out-Null
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Contain 'lan'
+        (Get-KohaState).lanAccess | Should -BeTrue
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*http://192.168.0.9:8080/*' }
+    }
+
+    It 'offers the library network again to a finished install that does not have it' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Be @('lan')
+        (Get-KohaState).lanAccess | Should -BeTrue
+        $script:calls.Clear()
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls.Count | Should -Be 0
+    }
+
+    It 'renames the KohaEasy distro of an older install and refreshes its shortcuts' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'renamed' }
+        Set-KohaState @{ phase = 'done'; desired = 'running' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 0
+        $script:calls | Should -Be @('shortcuts', 'icons', 'start')
     }
 
     It 'does nothing again once done' {
@@ -167,7 +243,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Process { [pscustomobject]@{ ExitCode = 0 } }
         Invoke-KohaPanel | Should -Be 0
         Should -Invoke -ModuleName KohaEasy.Install Start-Process -Times 1 -Exactly -ParameterFilter {
-            $FilePath -eq 'wsl.exe' -and $NoNewWindow -and $Wait -and $ArgumentList -like '-d KohaEasy -u root --cd /root/koha-easy-installer -- bash ./installer'
+            $FilePath -eq 'wsl.exe' -and $NoNewWindow -and $Wait -and $ArgumentList -like '-d koha -u root --cd /root/koha-easy-installer -- bash ./installer'
         }
     }
 
@@ -223,7 +299,7 @@ Describe 'Debian gone missing' {
         $vhd = [System.IO.Path]::Combine((Get-KohaPath Wsl), 'ext4.vhdx')
         Set-Content -LiteralPath $vhd -Value 'disk'
         Restore-KohaDistro | Should -Be 'reattached'
-        $script:wsl | Should -Contain ('--import-in-place KohaEasy ' + $vhd)
+        $script:wsl | Should -Contain ('--import-in-place koha ' + $vhd)
     }
 
     It 'reports missing when there is no disk to bring back' {
@@ -290,7 +366,7 @@ Describe 'Install flow output' {
     }
 }
 
-Describe 'Bootstrapper and Install Koha.cmd' {
+Describe 'Bootstrapper' {
     It 'install.ps1 is plain ASCII without BOM, parses, and uses no PowerShell 7 operator' {
         $file = Join-Path $repo 'windows/install.ps1'
         $bytes = [System.IO.File]::ReadAllBytes($file)
@@ -308,13 +384,192 @@ Describe 'Bootstrapper and Install Koha.cmd' {
         $text | Should -Not -Match '(?m)^\s*&\s*\$ps\b'
     }
 
-    It 'Install Koha.cmd has Windows line endings and runs the same one-liner as the README' {
-        $cmd = [System.IO.File]::ReadAllText((Join-Path $repo 'Install Koha.cmd'))
-        ($cmd -replace "`r`n", '') | Should -Not -Match "`n"
-        $cmd | Should -Not -Match '-File'
+    It 'is the only way to install: no .cmd, and both READMEs show the same one-liner' {
+        @(Get-ChildItem -LiteralPath $repo -Recurse -Filter '*.cmd' -File).Count | Should -Be 0
         $url = 'https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1'
-        $cmd | Should -Match ([regex]::Escape($url))
         Get-Content -Raw (Join-Path $repo 'README.md') | Should -Match ([regex]::Escape("irm $url | iex"))
         Get-Content -Raw (Join-Path $repo 'README.pt-BR.md') | Should -Match ([regex]::Escape("irm $url | iex"))
+    }
+}
+
+Describe 'Debian user' {
+    It 'makes a valid Debian name from the Windows one' {
+        ConvertTo-KohaLinuxUserName 'João.Silva' | Should -Be 'joaosilva'
+        ConvertTo-KohaLinuxUserName '1Biblioteca Municipal' | Should -Be 'bibliotecamunicipal'
+        ConvertTo-KohaLinuxUserName 'Administrator' | Should -Be 'administrator'
+        ConvertTo-KohaLinuxUserName 'root' | Should -Be 'librarian'
+        ConvertTo-KohaLinuxUserName '' | Should -Be 'librarian'
+    }
+
+    It 'refuses names Debian would refuse or already uses, and short passwords' {
+        foreach ($bad in 'Maria', '1maria', 'ma ria', 'maria;rm', ('a' * 33), 'root', 'koha', 'www-data', '') {
+            Test-KohaLinuxUserName $bad | Should -Not -BeNullOrEmpty -Because $bad
+        }
+        Test-KohaLinuxUserName 'maria_s-2' | Should -BeNullOrEmpty
+        Test-KohaLinuxPassword 'short' | Should -Not -BeNullOrEmpty
+        Test-KohaLinuxPassword "long enough`n" | Should -Not -BeNullOrEmpty
+        Test-KohaLinuxPassword 'çãõ: long enough' | Should -BeNullOrEmpty
+    }
+
+    It 'asks again until the name is valid and both passwords match' {
+        $script:answers = [System.Collections.Queue]::new(@('Maria', 'maria'))
+        $script:secrets = [System.Collections.Queue]::new(@('short', 'S3gredo!long', 'other-one', 'S3gredo!long', 'S3gredo!long'))
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+        Mock -ModuleName KohaEasy.Install Read-Host -ParameterFilter { $AsSecureString } { ConvertTo-SecureString $script:secrets.Dequeue() -AsPlainText -Force }
+        Mock -ModuleName KohaEasy.Install Read-Host -ParameterFilter { -not $AsSecureString } { $script:answers.Dequeue() }
+        $a = Read-KohaLinuxAccount -Default 'joao'
+        $a.User | Should -Be 'maria'
+        $a.Password | Should -Be 'S3gredo!long'
+        $script:secrets.Count | Should -Be 0
+    }
+
+    It 'sends the password on stdin in base64, never on the script or the command line' {
+        $script:seen = $null
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinuxScript { $script:seen = @{ Script = $Script; Input = $InputText }; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Get-KohaLxssEntry { $null }
+        New-KohaLinuxUser -User 'maria' -Password 'Pão: 12345678'
+        $script:seen.Script | Should -Not -Match '12345678'
+        $script:seen.Script | Should -Match "u='maria'"
+        $script:seen.Script | Should -Match 'useradd -m -s /bin/bash'
+        $script:seen.Script | Should -Match 'usermod -aG sudo'
+        $script:seen.Script | Should -Match 'chpasswd'
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:seen.Input)) | Should -Be 'Pão: 12345678'
+        { New-KohaLinuxUser -User 'bad name' -Password '12345678' } | Should -Throw
+    }
+
+    It 'the user script creates the user and sets the password (run by a real sh with stand-ins)' {
+        $bin = Join-Path $TestDrive 'fakebin'
+        New-Item -ItemType Directory -Path $bin -Force | Out-Null
+        $log = Join-Path $TestDrive 'user.log'
+        foreach ($c in 'useradd', 'usermod', 'chpasswd', 'sudo') {
+            $f = Join-Path $bin $c
+            [System.IO.File]::WriteAllText($f, "#!/bin/sh`necho `"$c `$* `$(cat 2>/dev/null)`" >> '$log'`n")
+            & chmod +x $f
+        }
+        [System.IO.File]::WriteAllText((Join-Path $bin 'id'), "#!/bin/sh`nexit 1`n"); & chmod +x (Join-Path $bin 'id')
+        Mock -ModuleName KohaEasy.Install Get-KohaLxssEntry { $null }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinuxScript {
+            $f = Join-Path $TestDrive 'user.sh'
+            [System.IO.File]::WriteAllText($f, $Script)
+            $out = ($InputText + "`r`n") | & /usr/bin/env "PATH=$(Join-Path $TestDrive 'fakebin'):/usr/bin:/bin" sh $f 2>&1
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+        }
+        New-KohaLinuxUser -User 'maria' -Password 'Pão: 12345678'
+        $l = Get-Content -Raw $log
+        $l | Should -Match 'useradd -m -s /bin/bash maria'
+        $l | Should -Match 'usermod -aG sudo maria'
+        $l | Should -Match 'chpasswd  maria:Pão: 12345678'
+    }
+}
+
+Describe 'Restarting Debian for systemd' {
+    BeforeEach {
+        $script:log = New-Object System.Collections.ArrayList
+        $script:running = 3
+        Mock -ModuleName KohaEasy.Install Start-Sleep { [void]$script:log.Add('sleep ' + $Seconds) }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [void]$script:log.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroRunning { $script:running--; [void]$script:log.Add('running?'); ($script:running -gt 0) }
+        Mock -ModuleName KohaEasy.Install Test-KohaSystemd { [void]$script:log.Add('systemd?'); $true }
+    }
+
+    It 'terminates, waits until WSL lists it as stopped, waits 8 s, then checks systemd' {
+        Restart-KohaDistro | Should -BeTrue
+        $script:log | Should -Be @('wsl --terminate koha', 'running?', 'sleep 1', 'running?', 'sleep 1', 'running?', 'sleep 8', 'systemd?')
+    }
+
+    It 'shuts WSL down when .wslconfig changed' {
+        Restart-KohaDistro -Shutdown | Should -BeTrue
+        $script:log[0] | Should -Be 'wsl --shutdown'
+    }
+
+    It 'rewrites wsl.conf keeping its other sections, and tries once more with WSL shut down' {
+        $script:sys = 0
+        Mock -ModuleName KohaEasy.Install Test-KohaSystemd { $script:sys++; ($script:sys -gt 1) }
+        Mock -ModuleName KohaEasy.Install Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Install Update-KohaWslConfig { $false }
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 0; Output = "[time]`nuseWindowsTimezone=false" } }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaLinuxScript { $script:conf = $InputText; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Set-KohaDistroConfig -User 'maria' | Should -BeTrue
+        $script:conf | Should -Match 'useWindowsTimezone=false'
+        $script:conf | Should -Match 'default=maria'
+        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq '--terminate' }
+        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq '--shutdown' }
+    }
+}
+
+Describe 'systemd probe' {
+    It 'the probe accepts running and degraded, and refuses a PID 1 that is not systemd' {
+        foreach ($case in @(@{ Code = 0; Out = 'pid1=systemd state=running'; Ok = $true }, @{ Code = 4; Out = 'pid1=systemd state=starting'; Ok = $true },
+                @{ Code = 3; Out = 'pid1=init'; Ok = $false })) {
+            $script:case = $case
+            Mock -ModuleName KohaEasy.Install Invoke-KohaLinuxScript { [pscustomobject]@{ ExitCode = $script:case.Code; Output = $script:case.Out } }
+            InModuleScope KohaEasy.Install { Test-KohaSystemd } | Should -Be $case.Ok
+        }
+        InModuleScope KohaEasy.Install { $script:SystemdProbe } | Should -Match 'systemctl is-system-running --wait'
+    }
+}
+
+Describe 'Old distro name' {
+    BeforeEach {
+        $script:log = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [void]$script:log.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Stop-KohaKeepAlive { }
+        Mock -ModuleName KohaEasy.Install Get-KohaLxssEntry { [pscustomobject]@{ PSPath = 'HKCU:\x\{1}'; Name = 'KohaEasy' } }
+        Mock -ModuleName KohaEasy.Install Set-ItemProperty { [void]$script:log.Add(('set {0}={1}' -f $Name, $Value)) }
+    }
+
+    It 'renames KohaEasy to koha in WSL''s registration, with WSL stopped' {
+        $script:lists = [System.Collections.Queue]::new(@(, @('Ubuntu', 'KohaEasy')))
+        $script:lists.Enqueue(@('Ubuntu', 'koha'))
+        Mock -ModuleName KohaEasy.Install Get-KohaInstalledDistros { $script:lists.Dequeue() }
+        Rename-KohaLegacyDistro | Should -Be 'renamed'
+        $script:log | Should -Be @('wsl --terminate KohaEasy', 'wsl --shutdown', 'set DistributionName=koha')
+    }
+
+    It 'asks for a Windows restart when WSL still lists the old name' {
+        Mock -ModuleName KohaEasy.Install Get-KohaInstalledDistros { @('Ubuntu', 'KohaEasy') }
+        Rename-KohaLegacyDistro | Should -Be 'restart'
+        Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'restart' }
+        Mock -ModuleName KohaEasy.Install Register-KohaResume { [void]$script:log.Add('resume') }
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+        Set-KohaState @{ phase = 'koha'; linuxUser = 'maria' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 3
+        $script:log | Should -Contain 'resume'
+        (Get-KohaState).phase | Should -Be 'koha'
+    }
+
+    It 'leaves everything alone when there is nothing to rename or both names exist' {
+        Mock -ModuleName KohaEasy.Install Get-KohaInstalledDistros { @('koha') }
+        Rename-KohaLegacyDistro | Should -Be 'none'
+        Mock -ModuleName KohaEasy.Install Get-KohaInstalledDistros { @('koha', 'KohaEasy') }
+        Rename-KohaLegacyDistro | Should -Be 'kept'
+        $script:log.Count | Should -Be 0
+    }
+}
+
+Describe 'Panel window' {
+    It 'passes the symbol mode into Linux through WSLENV, once' {
+        Add-KohaWslEnv -Current '' -Name 'KEI_PLAIN_GLYPHS' | Should -Be 'KEI_PLAIN_GLYPHS'
+        Add-KohaWslEnv -Current 'WT_SESSION:WT_PROFILE_ID' -Name 'KEI_PLAIN_GLYPHS' | Should -Be 'WT_SESSION:WT_PROFILE_ID:KEI_PLAIN_GLYPHS'
+        Add-KohaWslEnv -Current 'KEI_PLAIN_GLYPHS/u' -Name 'KEI_PLAIN_GLYPHS' | Should -Be 'KEI_PLAIN_GLYPHS/u'
+    }
+
+    It 'asks for plain symbols in the classic console and emoji in Windows Terminal' {
+        $saved = $env:WT_SESSION
+        try {
+            $env:WT_SESSION = ''
+            Get-KohaGlyphMode | Should -Be '1'
+            $env:WT_SESSION = 'b0f4c2f6-1111-2222-3333-444455556666'
+            Get-KohaGlyphMode | Should -Be '0'
+        } finally { $env:WT_SESSION = $saved }
+    }
+
+    It 'starts the panel with KEI_PLAIN_GLYPHS in WSLENV and puts the environment back' {
+        $env:WSLENV = 'WT_SESSION'
+        Mock -ModuleName KohaEasy.Install Start-Process { $script:env = $env:WSLENV + '|' + $env:KEI_PLAIN_GLYPHS; [pscustomobject]@{ ExitCode = 0 } }
+        Invoke-KohaPanel | Should -Be 0
+        $script:env | Should -Match '^WT_SESSION:KEI_PLAIN_GLYPHS\|[01]$'
+        $env:WSLENV | Should -Be 'WT_SESSION'
     }
 }

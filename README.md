@@ -84,11 +84,13 @@ Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux),
 ### What works on Windows
 
 - **WSL mode in the panel**: WSL 2 is detected automatically. WSL 1 is refused, with an explanation.
-  - The host tasks are left to Windows: no swapfile, NTP, UFW, Fail2ban or avahi. The timezone follows Windows.
+  - The host tasks are left to Windows: no swapfile, NTP, UFW, Fail2ban or avahi.
+  - The timezone is chosen inside Debian during the installation, with the Windows zone offered first. A different zone is kept across WSL restarts (`useWindowsTimezone=false` in `/etc/wsl.conf`).
   - "Reboot server" becomes **Restart Koha services**.
-  - systemd must be enabled in WSL.
+  - systemd must be enabled in WSL (the Windows installer does it).
+  - Screens are always UTF-8. In the classic Windows console, which has no emoji font, the panel shows plain symbols instead of icons; Windows Terminal shows the icons.
   - The Windows side talks to the panel through `/etc/koha-easy-install/windows.conf`. It is read with a whitelist of keys and never executed.
-- **Networking**: on Windows 11, WSL's mirrored networking lets other PCs on the network reach Koha. On Windows 10 (NAT), use the panel's built-in **Cloudflare Tunnel** to publish it.
+- **Networking**: Apache listens on every address, on ports 80 (catalog) and 8080 (staff interface). The installer opens both ports in the Windows firewall to the local network only, so other PCs of the library reach Koha at this PC's address. On Windows 11 (mirrored networking) that is all it needs. On Windows 10 (NAT) a *Koha network* task points `netsh interface portproxy` at Debian's address each time Koha starts. To publish Koha on the internet, use the panel's built-in **Cloudflare Tunnel**.
 - **Koha icon and shortcuts**: one **Koha** icon on the desktop, which starts Koha when it is off and opens the staff interface, and a *Koha* folder in the Start menu, all with the official `koha.ico`. The folder holds:
   - Staff interface, Public catalog, Control panel and Backups folder
   - **Start**, **Stop** and **Restart**
@@ -111,18 +113,19 @@ Open **PowerShell** (Start menu, type *PowerShell*; no need to run it as adminis
 [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
 ```
 
-If you prefer double-clicking, **`Install Koha.cmd`** in the repository runs exactly the same line. If Windows shows "Windows protected your PC" for it, click **More info > Run anyway**: the script is not signed, and you can read it before running it.
+This line is the only way to install Koha on Windows.
 
 The installer does everything else and shows each step in plain language:
 
 1. It checks the PC: Windows 10 version 2004 or later, or Windows 11; 64-bit; at least 4 GB of memory (8 GB recommended); at least 10 GB free on C:; virtualization turned on in the BIOS.
-2. It installs WSL 2. Windows asks for permission once. If Windows needs a restart, the installer continues by itself after you sign in again.
-3. It has WSL install Debian from Microsoft's own WSL list as `KohaEasy` in `C:\KohaEasy\wsl`. On an older WSL it downloads the same image itself, checks its SHA-256 and imports it.
-4. It enables systemd. On Windows 11 22H2 or later it also adds mirrored networking to your `.wslconfig`, keeping your own settings and a backup.
-5. It opens the Koha control panel. Choose your language, then **1 – Install Koha server**, and leave the panel with **Exit** when it finishes.
-6. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, starts Koha, and opens the staff interface. From then on, the **Koha** icon on the desktop starts Koha if it is off and opens the staff interface.
+2. It asks for a user name and password for Debian, before anything is installed. You use them to open Debian and with `sudo`; they are not the Koha staff login. The password is never saved or logged, and it is asked again if Windows restarts before Debian is ready.
+3. It installs WSL 2. Windows asks for permission once. If Windows needs a restart, the installer continues by itself after you sign in again.
+4. It has WSL install Debian from Microsoft's own WSL list as `koha` in `C:\KohaEasy\wsl`. On an older WSL it downloads the same image itself, checks its SHA-256 and imports it.
+5. It creates your Debian user with `sudo` rights and enables systemd. On Windows 11 22H2 or later it also adds mirrored networking to your `.wslconfig`, keeping your own settings and a backup. Then it restarts Debian and waits until systemd is fully running before going on.
+6. It opens the Koha control panel. Choose your language, then **1 – Install Koha server** (it asks for the timezone), and leave the panel with **Exit** when it finishes.
+7. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, gives Debian's own Start menu entry and Windows Terminal profile the Koha icon, opens Koha to the library network (Windows asks for permission once), starts Koha, and opens the staff interface. It shows the addresses other PCs use. From then on, the **Koha** icon on the desktop starts Koha if it is off and opens the staff interface.
 
-Running it again is safe: it continues from the last step it finished. The first-access user and password are in the control panel, option 2. Everything is kept in `C:\KohaEasy`, with the installer's log in `C:\KohaEasy\logs`.
+Running it again is safe: it continues from the last step it finished. An install made by an earlier version, whose Debian was called `KohaEasy`, is renamed to `koha` with its data kept. The first-access user and password are in the control panel, option 2. Everything is kept in `C:\KohaEasy`, with the installer's log in `C:\KohaEasy\logs`.
 
 Real-Windows behaviour (the installer, notifications, the tray, Task Scheduler and disk compaction) is still being checked on physical machines, so please report anything odd.
 

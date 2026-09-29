@@ -16,11 +16,13 @@
     KohaEasy.ps1 RegisterTasks [-Mode logon|manual]   tasks, tray at sign-in and shortcuts
     KohaEasy.ps1 Install                       the whole installation (windows\install.ps1 starts it)
     KohaEasy.ps1 CreateShortcuts               Start menu "Koha" and desktop, with koha.ico
+    KohaEasy.ps1 SetupNetwork                  firewall and port forwarding for the library network (admin)
+    KohaEasy.ps1 UpdatePortProxy               action of the "Koha network" task (NAT networking)
     -Quiet: no dialog boxes (scheduled tasks). Windows PowerShell 5.1.
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Open', 'Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'Install')]
+    [ValidateSet('Open', 'Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -161,8 +163,22 @@ switch ($Command) {
         if ($Mode) { Register-KohaTasks -Autostart $Mode } else { Register-KohaTasks }
         Set-KohaTrayAtSignIn -Enabled $true
         New-KohaShortcuts | Out-Null
+        Set-KohaDistroIcon | Out-Null
     }
-    'CreateShortcuts' { New-KohaShortcuts }
+    'CreateShortcuts' { New-KohaShortcuts; Set-KohaDistroIcon | Out-Null }
+    'SetupNetwork' {
+        try {
+            Set-KohaLanAccess | Out-Null
+            exit 0
+        } catch {
+            Write-KohaLog ('network setup failed: ' + $_.Exception.Message) 'network'
+            exit 1
+        }
+    }
+    'UpdatePortProxy' {
+        if ((Update-KohaPortProxy) -eq 'failed') { exit 1 }
+        exit 0
+    }
     'Install' {
         Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Install.psm1') -Force
         try {

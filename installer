@@ -23,6 +23,17 @@ set -o pipefail
 umask 022
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# Every screen is drawn in UTF-8. A shell started by wsl.exe, cron or a bare
+# SSH session can arrive without any locale; the dialogs then print accents
+# and symbols byte by byte, as garbage (â†’ for →). C.UTF-8 is built into
+# Debian's libc: no locale package is needed. When even that fails, the
+# panel falls back to plain ASCII symbols (KEI_PLAIN_GLYPHS, below).
+kei_is_utf8() { case "$(locale charmap 2>/dev/null)" in UTF-8|utf-8|utf8) return 0 ;; esac; return 1; }
+if ! kei_is_utf8; then
+    if [ -n "${LC_ALL:-}" ]; then export LC_ALL=C.UTF-8; else export LC_CTYPE=C.UTF-8; fi
+    kei_is_utf8 || KEI_PLAIN_GLYPHS=1
+fi
+
 # ======================================================================
 # 1. CLEANUP ON EXIT (Declarado ANTES do trap)
 # ======================================================================
@@ -280,6 +291,10 @@ t() {
             _t_is_safe "$__t_src" "$__t_val" && __t_res="$__t_val"
         fi
     fi
+    if [ "${KEI_PLAIN_GLYPHS:-0}" = "1" ]; then
+        kei_plain_text "$__t_res"
+        __t_res=$REPLY
+    fi
     if [[ "$__t_res" == *'$'* ]]; then
         _t_expand "$__t_res"
     else
@@ -492,11 +507,55 @@ ui_layout() {
     return 0
 }
 
+# Plain symbols for the classic Windows console (conhost), which has no
+# font for emoji and most pictographs: they show as boxes or question marks
+# and push the dialogs' borders out of line. KEI_PLAIN_GLYPHS=1 (set below
+# for WSL outside Windows Terminal, or passed by the Windows installer)
+# turns them into ASCII; the menu icons are dropped.
+declare -A KEI_GLYPH_ASCII=(
+    ["✔"]="+" ["✓"]="+" ["☑"]="+" ["✖"]="x" ["●"]="*" ["•"]="*" ["◆"]="*"
+    ["⚠"]="!" ["→"]="->" ["⇄"]="<->" ["↔"]="<->"
+)
+KEI_GLYPH_ICONS=("⚙" "ℹ" "↻" "↶" "▣" "▤" "▦" "⌁" "⌕" "☁" "◈" "◌" "◷" "⏱" "✦" "★" "⟳" "⇩" "✉" "✎" "✏" "📖" "📋" "️")
+KEI_GLYPH_SED=""
+for _g in "${!KEI_GLYPH_ASCII[@]}"; do KEI_GLYPH_SED+="s/${_g}/${KEI_GLYPH_ASCII[$_g]}/g;"; done
+for _g in "${KEI_GLYPH_ICONS[@]}"; do KEI_GLYPH_SED+="s/${_g} *//g;"; done
+unset _g
+
+# REPLY = $1 with those symbols replaced (an icon goes with the spaces after it).
+kei_plain_text() {
+    local s="$1" g
+    if [[ "$s" != *[![:ascii:]]* ]]; then REPLY="$s"; return 0; fi
+    for g in "${!KEI_GLYPH_ASCII[@]}"; do s=${s//"$g"/"${KEI_GLYPH_ASCII[$g]}"}; done
+    for g in "${KEI_GLYPH_ICONS[@]}"; do
+        s=${s//"$g  "/}; s=${s//"$g "/}; s=${s//"$g"/}
+    done
+    REPLY="$s"
+}
+
+# Applies kei_plain_text to every dialog argument; a --textbox file is shown
+# from a converted copy (removed on exit with the other /tmp/koha_tmp_* files).
+kei_plain_args() {
+    local i n=${#UI_ARGS[@]} f
+    for ((i = 0; i < n; i++)); do
+        if [ "${UI_ARGS[i]}" = "--textbox" ] && [ $((i + 1)) -lt "$n" ] && [ -f "${UI_ARGS[i+1]}" ]; then
+            if f=$(mktemp /tmp/koha_tmp_glyphs.XXXXXX) && sed "$KEI_GLYPH_SED" "${UI_ARGS[i+1]}" > "$f"; then
+                UI_ARGS[i+1]=$f
+            fi
+            i=$((i + 1))
+            continue
+        fi
+        kei_plain_text "${UI_ARGS[i]}"
+        UI_ARGS[i]=$REPLY
+    done
+}
+
 # Every dialog gets the panel's look, geometry and translated buttons.
 # Options given by the caller come later on the command line, so they still
 # win (e.g. --cancel-button "Back").
 whiptail() {
     ui_layout "$@"
+    [ "${KEI_PLAIN_GLYPHS:-0}" = "1" ] && kei_plain_args
     NEWT_COLORS="$UI_THEME" command whiptail --backtitle "Koha Easy Installer & Manager v${PANEL_VERSION# }" \
         --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
         --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "${UI_ARGS[@]}"
@@ -738,6 +797,7 @@ log "===== panel started (v$PANEL_VERSION, user=$REAL_USER) ====="
 KEI_PROC="${KEI_PROC:-/proc}"
 KEI_SYSTEMD_RUNDIR="${KEI_SYSTEMD_RUNDIR:-/run/systemd/system}"
 KEI_WIN_CONF="${KEI_WIN_CONF:-${CONF_DIR}/windows.conf}"
+KEI_WSL_CONF="${KEI_WSL_CONF:-/etc/wsl.conf}"
 KEI_WIN_KEYS="KEI_WIN_VERSION WIN_BUILD WIN_EDITION WIN_NET_MODE WIN_LAN_IP WIN_HOSTNAME WIN_USER WIN_BACKUP_DIR WIN_MEM_GB WIN_UPDATED_AT WIN_AUTOSTART"
 KEI_PLATFORM="linux"
 KEI_WSL_NET=""
@@ -856,6 +916,9 @@ host_can() {
     esac
     [ "$KEI_PLATFORM" = "linux" ] && return 0
     [ "$1" = "lan_direct" ] && [ "$KEI_WSL_NET" = "mirrored" ] && return 0
+    # The zone inside Debian is the panel's to set (apply_timezone keeps WSL
+    # from putting Windows' zone back at the next start).
+    [ "$1" = "timezone" ] && return 0
     return 1
 }
 
@@ -863,6 +926,15 @@ host_can() {
 systemd_is_pid1() { [ -d "$KEI_SYSTEMD_RUNDIR" ]; }
 
 detect_platform
+
+# Plain symbols (see kei_plain_text) when the Windows installer asked for
+# them, or under WSL outside Windows Terminal (which marks its sessions with
+# WT_SESSION). A value other than 0 or 1 is ignored.
+case "${KEI_PLAIN_GLYPHS:-}" in
+    0|1) ;;
+    *) KEI_PLAIN_GLYPHS=0
+       is_wsl && [ -z "${WT_SESSION:-}" ] && KEI_PLAIN_GLYPHS=1 ;;
+esac
 
 # ======================================================================
 # 7. PANEL DEPENDENCIES
@@ -3148,14 +3220,35 @@ install_swap() {
     return 0
 }
 
+# Apache answers on every address of the machine (0.0.0.0 and ::), on 80
+# (public catalog) and 8080 (staff interface): the other PCs of the library,
+# and Windows' port forwarding under WSL, reach Koha by the machine's own
+# address. A Listen bound to one address on those ports (127.0.0.1,
+# localhost, [::1], a LAN address) is widened to all of them, and the
+# duplicates this can leave are dropped (Apache refuses to start on two
+# Listen lines for the same port).
+apache_listen_all() {
+    local conf="${KEI_APACHE_PORTS:-/etc/apache2/ports.conf}" tmp
+    [ -f "$conf" ] || return 1
+    sed -i -E 's/^([[:space:]]*Listen[[:space:]]+)([0-9.]+|localhost|\[[0-9a-fA-F:]+\]):(80|8080)([[:space:]]*)$/\1\3\4/' "$conf"
+    tmp=$(mktemp "${conf}.XXXXXX") || return 1
+    awk '/^[[:space:]]*Listen[[:space:]]+(80|8080)[[:space:]]*$/ { if (seen[$2]++) next } { print }' "$conf" > "$tmp" \
+        && chmod 644 "$tmp" && mv -f "$tmp" "$conf" || rm -f "$tmp"
+    grep -qE '^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$' "$conf" \
+        || sed -i '1i Listen 80' "$conf"
+    grep -qE '^[[:space:]]*Listen[[:space:]]+8080[[:space:]]*$' "$conf" \
+        || sed -i -E '0,/^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$/s//&\nListen 8080/' "$conf"
+    awk '/^[[:space:]]*Listen[[:space:]]/ { l = l " " $2 } END { print "apache: listening on" l }' "$conf" | while IFS= read -r m; do log "$m"; done
+    return 0
+}
+
 function_install_koha() {
     validate_pre_installation || return 1
 
+    # Asked on Windows (WSL) too: the zone WSL copied from Windows is offered
+    # first, so due dates and circulation logs follow the library's clock.
     local tz
-    if timezone_follows_host; then
-        tz=$(get_current_timezone)
-        log "install: timezone ${tz} kept (follows Windows)"
-    elif tz=$(choose_timezone) && [ -n "$tz" ]; then
+    if tz=$(choose_timezone) && [ -n "$tz" ]; then
         apply_timezone "$tz" || echo "$(t '[WARN] Could not apply the timezone ${tz}.')"
     fi
 
@@ -3236,10 +3329,7 @@ function_install_koha() {
     display_explanation "Configuring Apache and Koha defaults..."
     define_koha_sites_conf
     a2enmod rewrite cgi deflate headers proxy proxy_http >/dev/null 2>&1
-    grep -qE '^[[:space:]]*Listen[[:space:]]+8080' /etc/apache2/ports.conf 2>/dev/null \
-        || sed -i '/^[[:space:]]*Listen[[:space:]]\+80$/a Listen 8080' /etc/apache2/ports.conf
-    grep -qE '^[[:space:]]*Listen[[:space:]]+8080' /etc/apache2/ports.conf 2>/dev/null \
-        || echo 'Listen 8080' >> /etc/apache2/ports.conf
+    apache_listen_all
     systemctl restart apache2 memcached >/dev/null 2>&1
 
     local exists="no"
@@ -6247,23 +6337,47 @@ get_current_timezone() {
     printf '%s' "${tz:-UTC}"
 }
 
-# Under WSL the timezone comes from Windows. If it still reads UTC, Windows
-# did not pass it on (or really is on UTC): the panel asks, as on Linux.
-timezone_follows_host() {
-    host_can timezone && return 1
-    case "$(get_current_timezone)" in
-        UTC|Etc/UTC|Etc/Universal|Universal|Zulu|Etc/Zulu|"") return 1 ;;
-    esac
-    return 0
+# Sets KEY=VALUE in [SECTION] of an INI file such as /etc/wsl.conf, keeping
+# every other line; the section is added when missing. Replaced atomically.
+ini_set_value() {
+    local file="$1" section="$2" key="$3" value="$4" tmp
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    { cat "$file" 2>/dev/null || true; } | awk -v sec="$section" -v key="$key" -v val="$value" '
+        function put() { if (insec && !done) { print key "=" val; done = 1 } }
+        /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            name = $0; gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", name)
+            put()
+            insec = (tolower(name) == tolower(sec))
+            print; next
+        }
+        insec && index($0, "=") {
+            k = substr($0, 1, index($0, "=") - 1); gsub(/[[:space:]]/, "", k)
+            if (tolower(k) == tolower(key)) { if (!done) { print key "=" val; done = 1 }; next }
+        }
+        { print }
+        END { put(); if (!done) { if (NR) print ""; print "[" sec "]"; print key "=" val } }
+    ' > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" && mv -f "$tmp" "$file"
 }
 
 # Applies a timezone, with a fallback for systems where timedatectl fails.
+# Under WSL, Windows' zone is copied into Debian at every start; a library
+# that picks another zone has that switched off in /etc/wsl.conf
+# ([time] useWindowsTimezone=false), or the choice would last one boot.
 apply_timezone() {
-    local tz="$1"
+    local tz="$1" before
     [ -n "$tz" ] && [ -f "/usr/share/zoneinfo/$tz" ] || return 1
+    before=$(get_current_timezone)
     if ! timedatectl set-timezone "$tz" >/dev/null 2>&1; then
         ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime || return 1
         printf '%s\n' "$tz" > /etc/timezone
+    fi
+    if is_wsl && [ "$tz" != "$before" ]; then
+        if ini_set_value "$KEI_WSL_CONF" time useWindowsTimezone false; then
+            log "timezone: $tz differs from Windows ($before), useWindowsTimezone=false in $KEI_WSL_CONF"
+        else
+            log "timezone: could not update $KEI_WSL_CONF"
+        fi
     fi
     log "timezone set to $tz"
     return 0
@@ -6328,12 +6442,6 @@ choose_timezone() {
 
 function_configure_clock() {
     local tz cur_tz cur_time
-    if timezone_follows_host; then
-        cur_tz=$(get_current_timezone)
-        cur_time=$(date '+%Y-%m-%d %H:%M')
-        msg_info "$(t "Clock and timezone")" "$(t 'Timezone: ${cur_tz}\nCurrent time: ${cur_time}\n\nOn Windows (WSL) the clock and the timezone follow Windows.\nChange them in Windows: Settings > Time & language.')" 13 74
-        return 0
-    fi
     if tz=$(choose_timezone) && [ -n "$tz" ]; then
         if ! apply_timezone "$tz"; then
             msg_error "" "$(t 'Could not apply the timezone ${tz}.')" 9 70

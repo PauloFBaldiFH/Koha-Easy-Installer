@@ -1,14 +1,18 @@
 ﻿# Koha Easy Installer for Windows: the install flow (blueprint 2.3).
-# Started by windows\install.ps1 (the irm | iex one-liner and Install Koha.cmd)
-# as "KohaEasy.ps1 Install". Every phase is idempotent and recorded in
-# state.json, so running Install again (or the RunOnce entry after a
+# Started by windows\install.ps1 (the irm | iex one-liner, the only way to
+# install) as "KohaEasy.ps1 Install". Every phase is idempotent and recorded
+# in state.json, so running Install again (or the RunOnce entry after a
 # restart) continues where it stopped:
-#   checks    Windows version, 64-bit, memory, disk, virtualization
+#   checks    Windows version, 64-bit, memory, disk, virtualization; then the
+#             Debian user name and password, asked before anything is installed
 #   wsl       WSL 2 platform (one UAC prompt; a restart when Windows asks)
-#   distro    Debian imported as "KohaEasy" from Microsoft's own WSL list
-#   systemd   /etc/wsl.conf with systemd, .wslconfig (mirrored on Win 11)
+#   distro    Debian installed as "koha" from Microsoft's own WSL list
+#   systemd   the Debian user, /etc/wsl.conf with systemd, .wslconfig
+#             (mirrored on Win 11), and a full restart of Debian until
+#             systemd runs
 #   koha      the panel copied in and opened for "1 - Install Koha server"
-#   windows   tasks, automatic start choice, shortcuts, tray, first start
+#   windows   tasks, automatic start choice, shortcuts and icons, access
+#             from the library network, tray, first start
 # Windows PowerShell 5.1 compatible. UTF-8 with BOM.
 
 Set-StrictMode -Version 2.0
@@ -135,7 +139,7 @@ function Save-KohaDownload {
     try { Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -UserAgent 'KohaEasyInstaller' } finally { $ProgressPreference = $prev }
 }
 
-# Debian as "KohaEasy" in C:\KohaEasy\wsl. First choice: WSL itself installs
+# Debian as "koha" in C:\KohaEasy\wsl. First choice: WSL itself installs
 # Debian from Microsoft's list and checks its hash ("wsl --install --name
 # --location", WSL 2.4.4 and later). When that is not available, the image is
 # downloaded here, its SHA-256 checked against the same list, and imported.
@@ -176,7 +180,7 @@ function New-KohaDistro {
     return 'imported'
 }
 
-# The KohaEasy distro must still be registered when a later phase runs.
+# The koha distro must still be registered when a later phase runs.
 # When WSL no longer knows it, its disk is registered again in place
 # (wsl --import-in-place), so Debian, its settings and any Koha data come
 # back; without a disk, the install goes back to the Debian phase.
@@ -204,18 +208,50 @@ function Restore-KohaDistro {
 # ----------------------------------------------------------------------
 # systemd and WSL settings
 # ----------------------------------------------------------------------
+# Pure: sets Key=Value in [Section] of an INI text such as /etc/wsl.conf,
+# keeping every other section, key and comment as it was.
+function Set-KohaIniValue {
+    param([AllowEmptyString()][string]$Text, [string]$Section, [string]$Key, [string]$Value)
+    $lines = New-Object System.Collections.ArrayList
+    if ($Text) { foreach ($l in ($Text -split "`r?`n")) { [void]$lines.Add($l) } }
+    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+    $start = -1; $end = $lines.Count
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*\[(.+)\]\s*$') {
+            if ($start -ge 0) { $end = $i; break }
+            if ($Matches[1].Trim() -ieq $Section) { $start = $i }
+        }
+    }
+    $entry = '{0}={1}' -f $Key, $Value
+    if ($start -lt 0) {
+        if ($lines.Count -gt 0) { [void]$lines.Add('') }
+        [void]$lines.Add('[' + $Section + ']')
+        [void]$lines.Add($entry)
+    } else {
+        $found = $false
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            if ($lines[$i] -match '^\s*([A-Za-z0-9_.]+)\s*=' -and $Matches[1] -ieq $Key) { $lines[$i] = $entry; $found = $true; break }
+        }
+        if (-not $found) {
+            $insert = $end
+            while ($insert -gt $start + 1 -and $lines[$insert - 1].Trim() -eq '') { $insert-- }
+            $lines.Insert($insert, $entry)
+        }
+    }
+    return (($lines -join "`n") + "`n")
+}
+
+# /etc/wsl.conf: systemd, the Debian user chosen at the start as the default
+# user of "wsl -d koha", no Windows folders in Linux's PATH. Anything else
+# already there (the panel's [time] section, for one) is kept.
 function Get-KohaWslConf {
-    return (@(
-            '# Written by Koha Easy Installer for Windows.'
-            '[boot]'
-            'systemd=true'
-            ''
-            '[user]'
-            'default=root'
-            ''
-            '[interop]'
-            'appendWindowsPath=false'
-        ) -join "`n") + "`n"
+    param([AllowEmptyString()][string]$Existing = '', [string]$User = 'root')
+    $t = $Existing
+    if (-not $t -or -not $t.Trim()) { $t = '# Written by Koha Easy Installer for Windows.' }
+    $t = Set-KohaIniValue $t 'boot' 'systemd' 'true'
+    $t = Set-KohaIniValue $t 'user' 'default' $User
+    $t = Set-KohaIniValue $t 'interop' 'appendWindowsPath' 'false'
+    return $t
 }
 
 # Pure: adds the keys Koha needs to the user's .wslconfig without changing
@@ -268,28 +304,214 @@ function Update-KohaWslConfig {
     return $true
 }
 
+# systemd must be PID 1 and done booting (running, or degraded: a unit
+# failed but the system is up). Prints "pid1=<name> state=<state>"; exit 3
+# when systemd is not PID 1, 4 when it is but still booting after 2 minutes.
+$script:SystemdProbe = @'
+p=$(cat /proc/1/comm 2>/dev/null)
+if [ "$p" != systemd ]; then echo "pid1=$p"; exit 3; fi
+s=$(timeout 120 systemctl is-system-running --wait 2>/dev/null)
+echo "pid1=systemd state=$s"
+case "$s" in running|degraded) exit 0 ;; esac
+exit 4
+'@
+
 function Test-KohaSystemd {
-    $r = Invoke-KohaLinux -Command @('sh', '-c', 'cat /proc/1/comm')
-    return ($r.ExitCode -eq 0 -and $r.Output.Trim() -eq 'systemd')
+    $r = Invoke-KohaLinuxScript -Script $script:SystemdProbe
+    Write-KohaLog ('systemd check (exit {0}): {1}' -f $r.ExitCode, ([string]$r.Output).Trim()) 'install'
+    if ($r.ExitCode -eq 4 -and $r.Output -match 'pid1=systemd') {
+        Write-KohaLog 'systemd is PID 1 but still booting after 2 minutes; carrying on' 'install'
+        return $true
+    }
+    return ($r.ExitCode -eq 0)
+}
+
+function Wait-KohaDistroStopped {
+    param([int]$Seconds = 30)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-KohaDistroRunning)) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+# The restart that makes /etc/wsl.conf (and .wslconfig) take effect. WSL
+# reads wsl.conf only when the distro boots, and a command sent right after
+# "wsl --terminate" can still land in the old instance. So: terminate (or
+# shut all of WSL down when .wslconfig changed), wait until WSL lists the
+# distro as stopped, give WSL its 8 seconds, boot it again and wait until
+# systemd has finished starting. Nothing else runs in Debian before that.
+function Restart-KohaDistro {
+    param([switch]$Shutdown, [int]$SettleSeconds = 8)
+    if ($Shutdown) {
+        Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+    } else {
+        Invoke-KohaWsl -Arguments @('--terminate', (Get-KohaConfig).Distro) | Out-Null
+    }
+    if (-not (Wait-KohaDistroStopped)) {
+        Write-KohaLog 'the distro was still running 30 s after --terminate; shutting WSL down' 'install'
+        Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+        Wait-KohaDistroStopped | Out-Null
+    }
+    Start-Sleep -Seconds $SettleSeconds
+    return (Test-KohaSystemd)
 }
 
 function Set-KohaDistroConfig {
-    $r = Invoke-KohaLinux -Command @('sh', '-c', 'cat > /etc/wsl.conf') -InputText (Get-KohaWslConf)
+    param([string]$User = 'root')
+    $cur = Invoke-KohaLinux -Command @('cat', '/etc/wsl.conf')
+    $existing = ''
+    if ($cur.ExitCode -eq 0) { $existing = [string]$cur.Output }
+    $r = Invoke-KohaLinuxScript -Script "tr -d '\r' > /etc/wsl.conf" -InputText (Get-KohaWslConf -Existing $existing -User $User)
     if ($r.ExitCode -ne 0) { throw ('wsl.conf: ' + $r.Output) }
     $changed = Update-KohaWslConfig
     if ($changed) {
         # .wslconfig is read when the WSL virtual machine starts.
         Write-KohaStep (T 'Restarting WSL to apply the settings (other Linux windows will close).') 'warn'
+    }
+    Write-KohaStep (T 'Restarting Debian so that systemd takes over (up to 2 minutes)...')
+    if (Restart-KohaDistro -Shutdown:$changed) { return $true }
+    # Once more, with the whole of WSL restarted.
+    Write-KohaLog 'systemd not running after the first restart; restarting WSL' 'install'
+    return (Restart-KohaDistro -Shutdown)
+}
+
+# ----------------------------------------------------------------------
+# The Debian user (asked first, before anything is installed)
+# ----------------------------------------------------------------------
+# Names Debian or Koha's packages already use.
+$script:ReservedUsers = @('root', 'daemon', 'bin', 'sys', 'sync', 'games', 'man', 'lp', 'mail', 'news', 'uucp', 'proxy',
+    'www-data', 'backup', 'list', 'irc', 'gnats', 'nobody', 'systemd-network', 'systemd-resolve', 'systemd-timesync',
+    'messagebus', 'sshd', 'mysql', 'memcache', 'rabbitmq', 'postfix', 'koha', 'library-koha', 'sudo', 'admin', 'staff', 'users')
+
+# Pure: a valid Debian user name from the Windows one (Joao.Silva -> joaosilva).
+function ConvertTo-KohaLinuxUserName {
+    param([string]$Name)
+    $n = ([string]$Name).ToLowerInvariant().Normalize([Text.NormalizationForm]::FormD)
+    $n = $n -replace '\p{Mn}', ''
+    $n = $n -replace '[^a-z0-9_-]', ''
+    $n = $n -replace '^[^a-z_]+', ''
+    if ($n.Length -gt 32) { $n = $n.Substring(0, 32) }
+    if (-not $n -or $script:ReservedUsers -contains $n) { $n = 'librarian' }
+    return $n
+}
+
+# '' when the name can be used, otherwise why not (translated).
+function Test-KohaLinuxUserName {
+    param([string]$Name)
+    if ([string]$Name -cnotmatch '^[a-z_][a-z0-9_-]{0,31}$') { return (T 'Use lowercase letters, digits, - and _, starting with a letter, up to 32 characters.') }
+    if ($script:ReservedUsers -contains $Name) { return (T 'Debian or Koha already uses that name. Choose another.') }
+    return ''
+}
+
+function Test-KohaLinuxPassword {
+    param([string]$Password)
+    if ([string]$Password -match '[\x00-\x1f\x7f]') { return (T 'The password cannot contain control characters.') }
+    if (([string]$Password).Length -lt 8) { return (T 'The password needs at least 8 characters.') }
+    return ''
+}
+
+function ConvertFrom-KohaSecureString {
+    param([System.Security.SecureString]$Secure)
+    if ($null -eq $Secure) { return '' }
+    $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+}
+
+# Asked in this window before WSL, Debian or any package is installed. The
+# password stays in memory only: it is never written to state.json or to a
+# log, and after a Windows restart it is asked again.
+function Read-KohaLinuxAccount {
+    param([string]$Default = (ConvertTo-KohaLinuxUserName $env:USERNAME))
+    Write-Host ''
+    Write-KohaStep (T 'First, choose a user name and password for Debian, the Linux system that runs Koha on this PC. You will use them to open Debian and to run commands with sudo. They are not the login of the Koha staff interface.')
+    while ($true) {
+        $u = Read-Host ((T 'Debian user name [{0}]') -f $Default)
+        if ([string]::IsNullOrWhiteSpace($u)) { $u = $Default }
+        $u = $u.Trim()
+        $why = Test-KohaLinuxUserName $u
+        if (-not $why) { break }
+        Write-KohaStep $why 'warn'
+    }
+    while ($true) {
+        $p1 = ConvertFrom-KohaSecureString (Read-Host -AsSecureString (T 'Password (at least 8 characters)'))
+        $why = Test-KohaLinuxPassword $p1
+        if ($why) { Write-KohaStep $why 'warn'; continue }
+        $p2 = ConvertFrom-KohaSecureString (Read-Host -AsSecureString (T 'Type the password again'))
+        if ($p1 -cne $p2) { Write-KohaStep (T 'The passwords do not match. Try again.') 'warn'; continue }
+        break
+    }
+    return [pscustomobject]@{ User = $u; Password = $p1 }
+}
+
+# Creates the user (or sets the password of one already there) with sudo
+# rights. Only the name is on the script; the password crosses on stdin, in
+# base64 so that no Windows code page can change a character of it.
+function New-KohaLinuxUser {
+    param([Parameter(Mandatory = $true)][string]$User, [Parameter(Mandatory = $true)][string]$Password)
+    $why = Test-KohaLinuxUserName $User
+    if ($why) { throw $why }
+    $sh = @(
+        'set -e'
+        ("u='{0}'" -f $User)
+        '# Read first: nothing after this may eat stdin.'
+        'IFS= read -r b || true'
+        'p=$(printf %s "$b" | tr -d "\r" | base64 -d)'
+        '[ ${#p} -ge 8 ]'
+        'if ! command -v sudo >/dev/null 2>&1; then'
+        '  DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || true'
+        '  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo </dev/null >/dev/null 2>&1 || echo "sudo not installed yet"'
+        'fi'
+        'id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"'
+        'usermod -aG sudo "$u"'
+        'printf "%s:%s\n" "$u" "$p" | chpasswd'
+    ) -join "`n"
+    $b64 = [Convert]::ToBase64String((New-Object System.Text.UTF8Encoding($false)).GetBytes($Password))
+    $r = Invoke-KohaLinuxScript -Script $sh -InputText $b64
+    if ($r.ExitCode -ne 0) { throw ((T 'The Debian user could not be created: {0}') -f $r.Output) }
+    # A Debian installed by "wsl --install" still has its first-start
+    # questions pending (RunOOBE): the user now exists, so they are done.
+    $e = Get-KohaLxssEntry
+    if ($null -ne $e) {
+        $p = Get-ItemProperty -LiteralPath $e.PSPath -ErrorAction SilentlyContinue
+        if ($null -ne $p -and $p.PSObject.Properties['RunOOBE']) { Set-ItemProperty -LiteralPath $e.PSPath -Name RunOOBE -Value 0 -ErrorAction SilentlyContinue }
+    }
+    Write-KohaLog ('Debian user {0} ready' -f $User) 'install'
+}
+
+# ----------------------------------------------------------------------
+# The old name of the distro
+# ----------------------------------------------------------------------
+# Installs before this version named the distro "KohaEasy". WSL keeps the
+# name only in its registration (HKCU\...\Lxss\{guid}\DistributionName):
+# changing it there, with WSL stopped, keeps Debian, its disk and Koha as
+# they were. When WSL still answers with the old name afterwards (it read
+# its list before the change), a Windows restart finishes the rename.
+#   none | renamed | restart | kept (both names exist: nothing is touched)
+function Rename-KohaLegacyDistro {
+    $new = (Get-KohaConfig).Distro
+    $installed = @(Get-KohaInstalledDistros)
+    foreach ($old in @((Get-KohaConfig).OldDistros)) {
+        if ($installed -notcontains $old) { continue }
+        if ($installed -contains $new) {
+            Write-KohaLog ('both {0} and {1} exist; {0} left as it is' -f $old, $new) 'install'
+            return 'kept'
+        }
+        $e = Get-KohaLxssEntry -Name $old
+        if ($null -eq $e) { return 'none' }
+        try { Stop-KohaKeepAlive } catch { }
+        Invoke-KohaWsl -Arguments @('--terminate', $old) | Out-Null
         Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
-    } else {
-        Invoke-KohaWsl -Arguments @('--terminate', (Get-KohaConfig).Distro) | Out-Null
+        Set-ItemProperty -LiteralPath $e.PSPath -Name DistributionName -Value $new
+        if (@(Get-KohaInstalledDistros) -notcontains $new) {
+            Write-KohaLog ('distro {0} renamed to {1} in the registry; WSL still lists the old name until Windows restarts' -f $old, $new) 'install'
+            return 'restart'
+        }
+        Write-KohaLog ('distro {0} renamed to {1}' -f $old, $new) 'install'
+        return 'renamed'
     }
-    Start-Sleep -Seconds 3
-    for ($i = 0; $i -lt 10; $i++) {
-        if (Test-KohaSystemd) { return $true }
-        Start-Sleep -Seconds 3
-    }
-    return $false
+    return 'none'
 }
 
 # ----------------------------------------------------------------------
@@ -327,10 +549,51 @@ function Test-KohaInstalledInDistro {
 # "1 - Install Koha server", then leaves the panel with Exit. Start-Process
 # -NoNewWindow hands it the console itself; "& wsl.exe" here would send its
 # screens into Install-Koha's return value, and the panel could not draw.
+# The console is switched to UTF-8, and the panel is told whether this is
+# Windows Terminal (emoji) or the classic console (plain symbols), through
+# WSLENV, the list of variables WSL passes into Linux.
 function Invoke-KohaPanel {
     $a = '-d {0} -u root --cd {1} -- bash ./installer' -f (Get-KohaConfig).Distro, $script:DistroDir
-    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $a -NoNewWindow -Wait -PassThru
-    return [int]$p.ExitCode
+    $saved = @{ WSLENV = $env:WSLENV; KEI_PLAIN_GLYPHS = $env:KEI_PLAIN_GLYPHS }
+    $enc = $null
+    try { $enc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+    try {
+        $env:KEI_PLAIN_GLYPHS = Get-KohaGlyphMode
+        $env:WSLENV = Add-KohaWslEnv -Current $env:WSLENV -Name 'KEI_PLAIN_GLYPHS'
+        $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $a -NoNewWindow -Wait -PassThru
+        return [int]$p.ExitCode
+    } finally {
+        $env:WSLENV = $saved.WSLENV
+        $env:KEI_PLAIN_GLYPHS = $saved.KEI_PLAIN_GLYPHS
+        if ($null -ne $enc) { try { [Console]::OutputEncoding = $enc } catch { } }
+    }
+}
+
+# 1 = plain symbols (the classic console has no emoji font), 0 = emoji.
+function Get-KohaGlyphMode {
+    if ($env:WT_SESSION) { return '0' }
+    return '1'
+}
+
+# Pure: WSLENV with Name added once (entries are separated by colons).
+function Add-KohaWslEnv {
+    param([AllowEmptyString()][string]$Current, [string]$Name)
+    $items = @(([string]$Current) -split ':' | Where-Object { $_ })
+    if (@($items | ForEach-Object { ($_ -split '/')[0] }) -contains $Name) { return $Current }
+    return (@($items) + $Name) -join ':'
+}
+
+# Other PCs of the library reach Koha by this PC's address: one UAC prompt
+# for the firewall rules (and, under NAT, the port forwarding task).
+function Enable-KohaLanAccess {
+    $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    try {
+        $code = Start-KohaElevated -FilePath $ps -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" SetupNetwork' -f (Get-KohaScriptPath))
+        return ([int]$code -eq 0)
+    } catch {
+        Write-KohaLog ('network setup not run: ' + $_.Exception.Message) 'install'
+        return $false
+    }
 }
 
 # ----------------------------------------------------------------------
@@ -346,7 +609,7 @@ function Read-KohaYesNo {
 
 # Returns 0 when done, 3 when Windows must restart first, 1 on a failure.
 function Install-Koha {
-    param([hashtable]$Facts, [switch]$NonInteractive)
+    param([hashtable]$Facts, [switch]$NonInteractive, $Account)
     $state = Get-KohaState
     $phase = [string]$state['phase']
     if (-not $phase -or $script:Phases -notcontains $phase) { $phase = 'checks' }
@@ -364,6 +627,22 @@ function Install-Koha {
             return 1
         }
         Set-KohaState @{ phase = 'wsl' } | Out-Null; $phase = 'wsl'
+    }
+
+    # The Debian user comes first, before WSL, Debian or any package is
+    # installed. An install made before this question existed is asked too.
+    $account = $Account
+    if ($null -eq $account -and $phase -ne 'done' -and -not [string]$state['linuxUser'] -and -not $NonInteractive) {
+        $account = Read-KohaLinuxAccount
+    }
+
+    # Installs made before this version called the distro KohaEasy.
+    $renamed = 'none'
+    if (Test-KohaPhaseDone 'wsl' $phase) { $renamed = Rename-KohaLegacyDistro }
+    if ($renamed -eq 'restart') {
+        Register-KohaResume
+        Write-KohaStep (T 'Windows must restart to finish renaming the Debian of Koha. After the restart, the installer continues by itself when you sign in.') 'warn'
+        return 3
     }
 
     if (-not (Test-KohaPhaseDone 'wsl' $phase)) {
@@ -394,14 +673,23 @@ function Install-Koha {
         Set-KohaState @{ phase = 'systemd' } | Out-Null; $phase = 'systemd'
     }
 
-    if (-not (Test-KohaPhaseDone 'systemd' $phase)) {
+    if (-not (Test-KohaPhaseDone 'systemd' $phase) -or ($null -ne $account -and $phase -ne 'done')) {
+        $user = [string](Get-KohaState)['linuxUser']
+        if ($null -ne $account) {
+            New-KohaLinuxUser -User $account.User -Password $account.Password
+            $user = $account.User
+            $account = $null
+            Set-KohaState @{ linuxUser = $user } | Out-Null
+            Write-KohaStep ((T 'Debian user {0} created.') -f $user) 'ok'
+        }
+        if (-not $user) { $user = 'root' }
         Write-KohaStep (T 'Configuring Debian for Koha (systemd)...')
-        if (-not (Set-KohaDistroConfig)) {
+        if (-not (Set-KohaDistroConfig -User $user)) {
             Write-KohaStep (T 'systemd did not start in WSL. Update WSL with "wsl --update" and run the installer again.') 'error'
             return 1
         }
         Write-KohaStep (T 'Debian is ready for Koha.') 'ok'
-        Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha'
+        if (-not (Test-KohaPhaseDone 'systemd' $phase)) { Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha' }
     }
 
     if (-not (Test-KohaPhaseDone 'koha' $phase)) {
@@ -430,19 +718,48 @@ function Install-Koha {
         Register-KohaTasks -Autostart $mode
         Set-KohaTrayAtSignIn -Enabled $true
         New-KohaShortcuts | Out-Null
+        Set-KohaDistroIcon | Out-Null
         Write-KohaStep (T 'Shortcuts created in the Start menu (folder Koha) and on the desktop.') 'ok'
+        Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
+        $lan = $true
+        if (-not $NonInteractive) { $lan = Enable-KohaLanAccess }
+        if (-not $lan) { Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn' }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         $r = Start-Koha -Trigger user -Wait
         Start-KohaTray
-        Set-KohaState @{ phase = 'done' } | Out-Null
+        Set-KohaState @{ phase = 'done'; lanAccess = $lan } | Out-Null
         Write-Host ''
         if ($r -eq 'ready') {
             Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
+            $urls = $null
+            if ($lan) { $urls = Get-KohaLanUrls }
+            if ($null -ne $urls) {
+                Write-KohaStep ((T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $urls.Staff, $urls.Opac) 'ok'
+            }
             Write-KohaStep (T 'The first-access user and password are in the control panel, option 2. Keep this computer on during opening hours.') 'ok'
             if (-not $NonInteractive) { Start-Process (Get-KohaConfig).StaffUrl }
         } else {
             Write-KohaStep (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') 'warn'
         }
+    }
+    # A finished install whose library-network step was refused, or that
+    # predates it: offered again on every run of the installer.
+    if ($phase -eq 'done' -and -not $NonInteractive -and -not [bool](Get-KohaState)['lanAccess']) {
+        Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
+        if (Enable-KohaLanAccess) {
+            Set-KohaState @{ lanAccess = $true } | Out-Null
+            $urls = Get-KohaLanUrls
+            if ($null -ne $urls) { Write-KohaStep ((T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $urls.Staff, $urls.Opac) 'ok' }
+        } else {
+            Write-KohaStep (T 'Koha opens only on this computer for now. Run the installer again to open it to the library network.') 'warn'
+        }
+    }
+    if ($renamed -eq 'renamed' -and (Test-KohaPhaseDone 'windows' $phase)) {
+        # The shortcuts of a finished install still name KohaEasy.
+        New-KohaShortcuts | Out-Null
+        Set-KohaDistroIcon | Out-Null
+        if ((Get-KohaState).desired -eq 'running') { Start-Koha -Trigger user | Out-Null }
+        Write-KohaStep ((T 'The Debian of Koha is now called {0} in WSL.') -f (Get-KohaConfig).Distro) 'ok'
     }
     return 0
 }
