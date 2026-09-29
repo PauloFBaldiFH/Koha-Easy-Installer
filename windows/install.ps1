@@ -17,6 +17,17 @@
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
+# UTF-8 before anything is printed, so accents never turn into "?". The
+# encoding has no BOM: [Text.Encoding]::UTF8 in Windows PowerShell 5.1 would
+# put one in front of every script this installer sends into Debian.
+try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch { }
+try {
+    $kohaUtf8 = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $kohaUtf8
+    [Console]::InputEncoding = $kohaUtf8
+    $OutputEncoding = $kohaUtf8
+} catch { }
+
 function Install-KohaEasyBootstrap {
     $ErrorActionPreference = 'Stop'
     $repo = 'PauloFBaldiFH/Koha-Easy-Installer'
@@ -30,10 +41,14 @@ function Install-KohaEasyBootstrap {
     Write-Host ''
     Write-Host 'Koha Easy Installer for Windows' -ForegroundColor Green
     if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'This installer runs on Windows 10 or 11.' }
+    # Emoji only where they can be drawn: Windows Terminal. Code points keep
+    # this file ASCII.
+    $mark = '[>]'
+    if ($env:WT_SESSION) { $mark = [char]::ConvertFromUtf32(0x1F680) }
 
     $src = $env:KOHAEASY_SOURCE
     if (-not $src) {
-        Write-Host ('[>] Downloading Koha Easy Installer ({0})...' -f $branch) -ForegroundColor Cyan
+        Write-Host ('{0} Downloading Koha Easy Installer ({1})...' -f $mark, $branch) -ForegroundColor Cyan
         $tmp = Join-Path $env:TEMP ('KohaEasy-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         $zip = Join-Path $tmp 'source.zip'
@@ -66,13 +81,34 @@ function Install-KohaEasyBootstrap {
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $env:KOHAEASY_ROOT = $root
     $arg = '-NoProfile -ExecutionPolicy Bypass -File "{0}" Install' -f (Join-Path $bin 'KohaEasy.ps1')
+
+    # The classic console has no emoji font. When Windows Terminal is
+    # installed, the install continues in a Windows Terminal window, which
+    # shows the emoji and accents; this window can then be closed. Without
+    # Windows Terminal it stays here, with plain symbols.
+    $wt = $null
+    if (-not $env:WT_SESSION -and $env:KOHAEASY_NO_WT -ne '1') {
+        $wt = Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    # A Windows Terminal that is already open would not see KOHAEASY_ROOT,
+    # so a custom folder keeps the install in this window.
+    if ($wt -and $root -eq 'C:\KohaEasy') {
+        try {
+            Start-Process -FilePath $wt.Source -ArgumentList ('-w new --title Koha "{0}" {1} -Pause' -f $ps, $arg) | Out-Null
+            Write-Host '[>] The installation continues in the new Windows Terminal window.' -ForegroundColor Cyan
+            return -1
+        } catch {
+            Write-Host '[!] Windows Terminal did not open; the installation continues here.' -ForegroundColor Yellow
+        }
+    }
     $p = Start-Process -FilePath $ps -ArgumentList $arg -NoNewWindow -Wait -PassThru
     return [int]$p.ExitCode
 }
 
 try {
     $code = Install-KohaEasyBootstrap
-    if ($code -eq 3) { Write-Host 'Restart Windows now. The installation continues after you sign in again.' -ForegroundColor Yellow }
+    if ($code -eq -1) { }
+    elseif ($code -eq 3) { Write-Host 'Restart Windows now. The installation continues after you sign in again.' -ForegroundColor Yellow }
     elseif ($code -ne 0) { Write-Host ('The installation stopped (code {0}). Run the same command again to continue. Log: C:\KohaEasy\logs' -f $code) -ForegroundColor Red }
 } catch {
     Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red

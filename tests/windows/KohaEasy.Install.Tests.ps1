@@ -626,10 +626,54 @@ Describe 'Checks inside Debian' {
 
     It 'opens the control panel in its own window, through the koha-panel launcher, and starts Koha' {
         Mock -ModuleName KohaEasy.Core Start-Koha { 'started' }
-        Mock -ModuleName KohaEasy.Core Start-Process { $script:args = $ArgumentList; $script:wslenv = $env:WSLENV }
+        Mock -ModuleName KohaEasy.Core Get-KohaTerminalPath { $null }
+        Mock -ModuleName KohaEasy.Core Start-Process { $script:file = $FilePath; $script:args = $ArgumentList }
         Open-KohaPanel
         Should -Invoke -ModuleName KohaEasy.Core Start-Koha -Times 1 -Exactly
-        $script:args | Should -Be '-d koha -u root --cd /root -- /usr/local/bin/koha-panel'
-        $script:wslenv | Should -Match 'KEI_PLAIN_GLYPHS'
+        $script:file | Should -Match 'wsl\.exe$'
+        $script:args | Should -Be '-d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=1 /usr/local/bin/koha-panel'
+    }
+
+    It 'opens the control panel in Windows Terminal, with emoji, when it is installed' {
+        $l = Get-KohaPanelLaunch -Wsl 'C:\Windows\System32\wsl.exe' -Terminal 'C:\Users\a\AppData\Local\Microsoft\WindowsApps\wt.exe'
+        $l.File | Should -Match 'wt\.exe$'
+        $l.Arguments | Should -Be '-w new --title Koha "C:\Windows\System32\wsl.exe" -d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=0 /usr/local/bin/koha-panel'
+    }
+}
+
+Describe 'Emoji and UTF-8' {
+    It 'marks steps with emoji in Windows Terminal and plain tags in the classic console' {
+        Get-KohaStepMark -Kind ok -Mode 1 | Should -Be '[OK]'
+        Get-KohaStepMark -Kind error -Mode 1 | Should -Be '[X]'
+        Get-KohaStepMark -Kind ok -Mode 0 | Should -Be ([char]::ConvertFromUtf32(0x2705))
+        Get-KohaStepMark -Kind step -Mode 0 | Should -Be ([char]::ConvertFromUtf32(0x23F3))
+        Get-KohaStepMark -Kind warn -Mode 0 | Should -Be ([char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F))
+        Get-KohaStepMark -Kind error -Mode 0 | Should -Be ([char]::ConvertFromUtf32(0x274C))
+    }
+
+    It 'sets UTF-8 without a BOM, so scripts piped into Debian do not start with one' {
+        $saved = $global:OutputEncoding
+        try {
+            Set-KohaUtf8Console
+            $global:OutputEncoding.WebName | Should -Be 'utf-8'
+            $global:OutputEncoding.GetPreamble().Length | Should -Be 0
+        } finally { $global:OutputEncoding = $saved }
+    }
+
+    It 'continues the install in Windows Terminal after a restart when it is installed' {
+        $ps = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        Get-KohaInstallCommand -PowerShell $ps -Script 'C:\KohaEasy\bin\KohaEasy.ps1' -Terminal $null |
+            Should -Be ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "C:\KohaEasy\bin\KohaEasy.ps1" Install' -f $ps)
+        Get-KohaInstallCommand -PowerShell $ps -Script 'C:\KohaEasy\bin\KohaEasy.ps1' -Terminal 'C:\wt.exe' |
+            Should -Be ('"C:\wt.exe" -w new --title Koha "{0}" -NoProfile -ExecutionPolicy Bypass -File "C:\KohaEasy\bin\KohaEasy.ps1" Install -Pause' -f $ps)
+    }
+
+    It 'keeps install.ps1 plain ASCII, with UTF-8 set before anything is printed' {
+        $f = Join-Path $PSScriptRoot '..\..\windows\install.ps1'
+        $bytes = [System.IO.File]::ReadAllBytes($f)
+        @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        $text = [System.IO.File]::ReadAllText($f)
+        $text.IndexOf('UTF8Encoding($false)') | Should -BeLessThan $text.IndexOf('Write-Host')
+        $text | Should -Not -Match '\[System\.Text\.Encoding\]::UTF8'
     }
 }

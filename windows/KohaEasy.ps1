@@ -19,7 +19,9 @@
     KohaEasy.ps1 CreateShortcuts               Start menu "Koha" and desktop, with koha.ico
     KohaEasy.ps1 SetupNetwork                  firewall and port forwarding for the library network (admin)
     KohaEasy.ps1 UpdatePortProxy               action of the "Koha network" task (NAT networking)
-    -Quiet: no dialog boxes (scheduled tasks). Windows PowerShell 5.1.
+    -Quiet: no dialog boxes (scheduled tasks).
+    -Pause: Install waits for Enter before its window closes (Windows Terminal).
+    Windows PowerShell 5.1.
 #>
 param(
     [Parameter(Position = 0)]
@@ -28,7 +30,8 @@ param(
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
     [switch]$Force,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Pause
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +40,7 @@ Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Core.psm1') -Force
 $langDir = Join-Path $PSScriptRoot 'lang'
 if (-not (Test-Path -LiteralPath $langDir)) { $langDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'lang' }
 Import-KeiLanguage -LangDir $langDir
+Set-KohaUtf8Console
 $cfg = Get-KohaConfig
 if ($Trigger -eq 'logon') { $Quiet = $true }
 
@@ -191,10 +195,13 @@ switch ($Command) {
             # must never turn the exit code into a list.
             $code = [int](@(Install-Koha) | Select-Object -Last 1)
         } catch {
-            Write-KohaLog ('install failed: ' + $_.Exception.Message) 'install'
-            Write-Host ('[X] ' + $_.Exception.Message) -ForegroundColor Red
+            Write-KohaStep $_.Exception.Message 'error'
             Write-Host (T 'Run the installer again to continue from this step. The log is in C:\KohaEasy\logs.') -ForegroundColor Red
             $code = 1
+        }
+        if ($Pause) {
+            Write-Host ''
+            try { Read-Host (T 'Press Enter to close this window.') | Out-Null } catch { }
         }
         exit $code
     }

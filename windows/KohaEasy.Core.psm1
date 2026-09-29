@@ -127,6 +127,27 @@ function Get-UnixTime { return [int64][Math]::Floor(([DateTimeOffset]::UtcNow).T
 # ----------------------------------------------------------------------
 # WSL
 # ----------------------------------------------------------------------
+# UTF-8 for this console, both ways, and for text piped into wsl.exe. The
+# encoding carries no BOM: [Text.Encoding]::UTF8 in Windows PowerShell 5.1
+# would put one in front of every script sent to Debian through stdin.
+function Set-KohaUtf8Console {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch { }
+    try { [Console]::OutputEncoding = $utf8 } catch { }
+    try { [Console]::InputEncoding = $utf8 } catch { }
+    $global:OutputEncoding = $utf8
+}
+
+# Windows Terminal (wt.exe), when installed. It draws emoji; the classic
+# console has no emoji font and shows them as boxes. KOHAEASY_NO_WT=1 keeps
+# everything in the classic console.
+function Get-KohaTerminalPath {
+    if ($env:KOHAEASY_NO_WT -eq '1') { return $null }
+    $c = Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return [string]$c.Source }
+    return $null
+}
+
 # Runs wsl.exe with UTF-8 output. Returns ExitCode and Output (one string).
 function Invoke-KohaWsl {
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText)
@@ -837,19 +858,23 @@ function Get-KohaLanUrls {
 function Open-KohaPanel {
     param([switch]$NoStart)
     if (-not $NoStart) { Start-Koha -Trigger user | Out-Null }
-    $saved = @{ WSLENV = $env:WSLENV; KEI_PLAIN_GLYPHS = $env:KEI_PLAIN_GLYPHS }
-    try {
-        $env:KEI_PLAIN_GLYPHS = '1'
-        if ($env:WT_SESSION) { $env:KEI_PLAIN_GLYPHS = '0' }
-        $items = @(([string]$env:WSLENV) -split ':' | Where-Object { $_ -and (($_ -split '/')[0] -ne 'KEI_PLAIN_GLYPHS') })
-        $env:WSLENV = (@($items) + 'KEI_PLAIN_GLYPHS') -join ':'
-        $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
-        Start-Process -FilePath $wsl -ArgumentList ('-d {0} -u root --cd /root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) | Out-Null
-    } finally {
-        $env:WSLENV = $saved.WSLENV
-        $env:KEI_PLAIN_GLYPHS = $saved.KEI_PLAIN_GLYPHS
-    }
+    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath)
+    Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null
     Write-KohaLog 'control panel opened'
+}
+
+# Pure: how the control panel window opens. In Windows Terminal the panel
+# shows emoji; in the classic console, plain symbols. The choice travels as
+# "env KEI_PLAIN_GLYPHS=..." on the command line, because a Windows Terminal
+# that is already open does not see this process's environment.
+function Get-KohaPanelLaunch {
+    param([string]$Wsl, [string]$Terminal)
+    $plain = '1'
+    if ($Terminal) { $plain = '0' }
+    $cmd = '-d {0} -u root --cd /root -- env KEI_PLAIN_GLYPHS={1} {2}' -f $script:Cfg.Distro, $plain, $script:Cfg.PanelPath
+    if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title Koha "{0}" {1}' -f $Wsl, $cmd) } }
+    return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
 }
 
 # What is running, in a few lines a librarian can paste into a message:

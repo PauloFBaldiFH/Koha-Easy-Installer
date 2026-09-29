@@ -27,9 +27,18 @@ $script:LauncherPath = '/usr/local/bin/koha-panel'
 function Write-KohaStep {
     param([string]$Text, [ValidateSet('step', 'ok', 'warn', 'error')][string]$Kind = 'step')
     $color = @{ step = 'Cyan'; ok = 'Green'; warn = 'Yellow'; error = 'Red' }[$Kind]
-    $mark = @{ step = '>'; ok = 'OK'; warn = '!'; error = 'X' }[$Kind]
-    Write-Host ('[{0}] {1}' -f $mark, $Text) -ForegroundColor $color
+    Write-Host ('{0} {1}' -f (Get-KohaStepMark $Kind), $Text) -ForegroundColor $color
     Write-KohaLog ('install: [{0}] {1}' -f $Kind, $Text) 'install'
+}
+
+# Emoji in Windows Terminal; plain tags in the classic console, which has
+# no emoji font. Built from code points so this file stays readable in any
+# editor. The warning sign takes U+FE0F to be drawn as an emoji.
+function Get-KohaStepMark {
+    param([string]$Kind, [string]$Mode = (Get-KohaGlyphMode))
+    if ($Mode -eq '1') { return @{ step = '[>]'; ok = '[OK]'; warn = '[!]'; error = '[X]' }[$Kind] }
+    $cp = @{ step = @(0x23F3); ok = @(0x2705); warn = @(0x26A0, 0xFE0F); error = @(0x274C) }[$Kind]
+    return -join @($cp | ForEach-Object { [char]::ConvertFromUtf32($_) })
 }
 
 function Test-KohaPhaseDone {
@@ -97,10 +106,20 @@ function Start-KohaElevated {
     return $p.ExitCode
 }
 
+# Pure: the command line that continues the install, in Windows Terminal
+# when it is installed (emoji and accents), else in the classic console.
+# -Pause keeps the window open at the end so the last lines can be read.
+function Get-KohaInstallCommand {
+    param([string]$PowerShell, [string]$Script, [string]$Terminal)
+    $cmd = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" Install' -f $PowerShell, $Script
+    if (-not $Terminal) { return $cmd }
+    return ('"{0}" -w new --title Koha {1} -Pause' -f $Terminal, $cmd)
+}
+
 # After a restart, Install runs again by itself (HKCU RunOnce, no admin).
 function Register-KohaResume {
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    $cmd = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" Install' -f $ps, (Get-KohaScriptPath)
+    $cmd = Get-KohaInstallCommand -PowerShell $ps -Script (Get-KohaScriptPath) -Terminal (Get-KohaTerminalPath)
     New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'KohaEasyInstall' -Value $cmd -PropertyType String -Force | Out-Null
 }
 

@@ -88,7 +88,7 @@ Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux),
   - The timezone is chosen inside Debian during the installation, with the Windows zone offered first. A different zone is kept across WSL restarts (`useWindowsTimezone=false` in `/etc/wsl.conf`).
   - "Reboot server" becomes **Restart Koha services**.
   - systemd must be enabled in WSL (the Windows installer does it).
-  - Screens are always UTF-8. In the classic Windows console, which has no emoji font, the panel shows plain symbols instead of icons; Windows Terminal shows the icons.
+  - Screens are always UTF-8, and the installer and the panel show emoji. When Windows Terminal is installed (it comes with Windows 11), the installer and the control panel open in it. The classic Windows console has no emoji font, so on a PC without Windows Terminal they show plain symbols such as `[OK]` instead of boxes.
   - The Windows side talks to the panel through `/etc/koha-easy-install/windows.conf`. It is read with a whitelist of keys and never executed.
 - **Networking**: Apache listens on every address, on ports 80 (catalog) and 8080 (staff interface). The installer opens both ports in the Windows firewall to the local network only, so other PCs of the library reach Koha at this PC's address. On Windows 11 (mirrored networking) that is all it needs. On Windows 10 (NAT) a *Koha network* task points `netsh interface portproxy` at Debian's address each time Koha starts. To publish Koha on the internet, use the panel's built-in **Cloudflare Tunnel**.
 - **Koha icon and shortcuts**: one **Koha** icon on the desktop, which starts Koha when it is off and opens the control panel, and a *Koha* folder in the Start menu, all with the official `koha.ico`. The folder holds:
