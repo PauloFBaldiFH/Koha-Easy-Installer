@@ -197,7 +197,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'windows' } | Out-Null
         Install-Koha -Facts $good -NonInteractive -Account ([pscustomobject]@{ User = 'maria'; Password = 'x' * 8 }) | Should -Be 0
-        $script:calls[0..1] | Should -Be @('user maria', 'systemd')
+        $script:calls[0..2] | Should -Be @('copy panel', 'user maria', 'systemd')
     }
 
     It 'opens Koha to the library network in the Windows step' {
@@ -217,11 +217,11 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('lan')
+        $script:calls | Should -Be @('copy panel', 'start', 'lan')
         (Get-KohaState).lanAccess | Should -BeTrue
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls.Count | Should -Be 0
+        $script:calls | Should -Be @('copy panel', 'start')
     }
 
     It 'renames the KohaEasy distro of an older install and refreshes its shortcuts' {
@@ -229,14 +229,40 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'renamed' }
         Set-KohaState @{ phase = 'done'; desired = 'running' } | Out-Null
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('shortcuts', 'icons', 'start')
+        $script:calls | Should -Be @('copy panel', 'shortcuts', 'icons', 'start')
+    }
+
+    It 'sends a Koha install that stopped half-way back to the control panel' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        $script:installed = $false
+        Mock -ModuleName KohaEasy.Install Test-KohaInstalledInDistro { $script:installed }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaPanel { [void]$script:calls.Add('panel'); $script:installed = $true; 0 }
+        Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
+        Mock -ModuleName KohaEasy.Install Start-Process { }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls[0..2] | Should -Be @('copy panel', 'copy panel', 'panel')
+        (Get-KohaState).phase | Should -Be 'done'
+    }
+
+    It 'shows what Debian reports, saves the diagnostics and offers the panel when Koha does not start' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Start-Koha { [void]$script:calls.Add('start'); 'timeout' }
+        Mock -ModuleName KohaEasy.Install Get-KohaQuickCheck { @('apache2: failed', 'koha-common package: iF 24.11') }
+        Mock -ModuleName KohaEasy.Install Export-KohaDiagnostics { [void]$script:calls.Add('diagnostics'); 'C:\Users\x\Desktop\d.zip' }
+        Mock -ModuleName KohaEasy.Install Invoke-KohaPanel { [void]$script:calls.Add('panel'); 0 }
+        Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Be @('copy panel', 'start', 'diagnostics', 'panel', 'start')
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*koha-common package: iF*' }
     }
 
     It 'does nothing again once done' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done' } | Out-Null
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls.Count | Should -Be 0
+        $script:calls | Should -Be @('copy panel')
     }
 
     It 'gives the Koha panel the console itself, never a captured pipe' {
@@ -339,16 +365,19 @@ Describe 'Panel copy into Debian' {
             $out = & sh $f 2>&1
             [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
         }
-        InModuleScope KohaEasy.Install -Parameters @{ Dst = $dst } { param($Dst) $script:DistroDir = $Dst }
+        $launcher = Join-Path $TestDrive 'koha-panel'
+        InModuleScope KohaEasy.Install -Parameters @{ Dst = $dst; L = $launcher } { param($Dst, $L) $script:DistroDir = $Dst; $script:LauncherPath = $L }
         try {
             Copy-KohaPanelIntoDistro
             Test-Path -LiteralPath (Join-Path $dst 'installer') | Should -BeTrue
+            (& sh $launcher --status-json 2>&1) | Should -Be 'panel'
+            [System.IO.File]::ReadAllText($launcher) | Should -Match ([regex]::Escape("cd '$dst' && exec bash ./installer"))
             Test-Path -LiteralPath (Join-Path $dst 'lang/pt.cache') | Should -BeTrue
 
             Set-Content -LiteralPath (Join-Path $src 'installer') -Value 'tampered' -NoNewline
             { Copy-KohaPanelIntoDistro } | Should -Throw '*copy:*'
         } finally {
-            InModuleScope KohaEasy.Install { $script:DistroDir = '/root/koha-easy-installer' }
+            InModuleScope KohaEasy.Install { $script:DistroDir = '/root/koha-easy-installer'; $script:LauncherPath = '/usr/local/bin/koha-panel' }
         }
     }
 }
@@ -571,5 +600,36 @@ Describe 'Panel window' {
         Invoke-KohaPanel | Should -Be 0
         $script:env | Should -Match '^WT_SESSION:KEI_PLAIN_GLYPHS\|[01]$'
         $env:WSLENV | Should -Be 'WT_SESSION'
+    }
+}
+
+Describe 'Checks inside Debian' {
+    It 'the installed and quick-check scripts are valid sh' {
+        foreach ($name in 'InstalledProbe', 'SystemdProbe') {
+            $f = Join-Path $TestDrive "$name.sh"
+            [System.IO.File]::WriteAllText($f, (InModuleScope KohaEasy.Install -Parameters @{ N = $name } { param($N) (Get-Variable -Scope Script -Name $N).Value }))
+            & sh -n $f
+            $LASTEXITCODE | Should -Be 0 -Because $name
+        }
+        $f = Join-Path $TestDrive 'quick.sh'
+        [System.IO.File]::WriteAllText($f, (InModuleScope KohaEasy.Core { $script:QuickCheckScript }))
+        & sh -n $f
+        $LASTEXITCODE | Should -Be 0
+    }
+
+    It 'counts Koha as installed only with the instance, the credentials file and koha-common configured' {
+        $p = InModuleScope KohaEasy.Install { $script:InstalledProbe }
+        $p | Should -Match 'koha-conf.xml'
+        $p | Should -Match 'koha_credentials.txt'
+        $p | Should -Match "grep -q '\^ii'"
+    }
+
+    It 'opens the control panel in its own window, through the koha-panel launcher, and starts Koha' {
+        Mock -ModuleName KohaEasy.Core Start-Koha { 'started' }
+        Mock -ModuleName KohaEasy.Core Start-Process { $script:args = $ArgumentList; $script:wslenv = $env:WSLENV }
+        Open-KohaPanel
+        Should -Invoke -ModuleName KohaEasy.Core Start-Koha -Times 1 -Exactly
+        $script:args | Should -Be '-d koha -u root --cd /root -- /usr/local/bin/koha-panel'
+        $script:wslenv | Should -Match 'KEI_PLAIN_GLYPHS'
     }
 }

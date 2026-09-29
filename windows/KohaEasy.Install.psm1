@@ -22,6 +22,7 @@ Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Core.psm1')
 $script:ManifestUrl = 'https://raw.githubusercontent.com/microsoft/WSL/master/distributions/DistributionInfo.json'
 $script:Phases = @('checks', 'wsl', 'distro', 'systemd', 'koha', 'windows', 'done')
 $script:DistroDir = '/root/koha-easy-installer'
+$script:LauncherPath = '/usr/local/bin/koha-panel'
 
 function Write-KohaStep {
     param([string]$Text, [ValidateSet('step', 'ok', 'warn', 'error')][string]$Kind = 'step')
@@ -535,14 +536,67 @@ function Copy-KohaPanelIntoDistro {
         'cp "$s"/lang/*.cache "$d/lang/" 2>/dev/null || true'
         'cd "$d"'
         'sha256sum -c installer.sha256'
+        '# The panel launcher the Windows tools call: the newest of the copy from'
+        '# Windows and the one "Update this panel" installs as config.sh.'
+        ('l=''{0}''' -f $script:LauncherPath)
+        'cat > "$l.tmp" <<EOF'
+        '#!/bin/sh'
+        '# Written by Koha Easy Installer for Windows.'
+        'p=''$d/installer''; c=/usr/local/bin/config.sh'
+        'if [ -x "\$c" ] && [ "\$c" -nt "\$p" ]; then exec "\$c" "\$@"; fi'
+        'cd ''$d'' && exec bash ./installer "\$@"'
+        'EOF'
+        'chmod 755 "$l.tmp" && mv -f "$l.tmp" "$l"'
     ) -join "`n"
     $r = Invoke-KohaLinuxScript -Script $sh
     if ($r.ExitCode -ne 0) { throw ('copy: ' + $r.Output) }
 }
 
+# Koha counts as installed only when option 1 went all the way: the
+# instance exists, the koha-common package is fully configured ("ii": an
+# install stopped inside its setup leaves it half-configured) and the panel
+# wrote the credentials file, its last step.
+$script:InstalledProbe = @'
+test -f /etc/koha/sites/library/koha-conf.xml || exit 1
+test -f /root/koha_credentials.txt || exit 2
+dpkg-query -W -f='${db:Status-Abbrev}' koha-common 2>/dev/null | grep -q '^ii' || exit 3
+exit 0
+'@
+
 function Test-KohaInstalledInDistro {
-    $r = Invoke-KohaLinux -Command @('test', '-f', '/etc/koha/sites/library/koha-conf.xml')
+    $r = Invoke-KohaLinuxScript -Script $script:InstalledProbe
+    if ($r.ExitCode -ne 0) { Write-KohaLog ('Koha not fully installed (check {0})' -f $r.ExitCode) 'install' }
     return ($r.ExitCode -eq 0)
+}
+
+# Koha did not answer: what Debian reports, the diagnostics .zip on the
+# desktop, and the control panel offered to repair it.
+function Show-KohaStartProblem {
+    param([switch]$NonInteractive)
+    Write-KohaStep (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') 'warn'
+    Write-Host ''
+    Write-Host (T 'What Debian reports (copy these lines when you ask for help):') -ForegroundColor Yellow
+    foreach ($l in Get-KohaQuickCheck) {
+        Write-Host ('    ' + $l)
+        Write-KohaLog ('quick check: ' + $l) 'install'
+    }
+    Write-Host ''
+    try {
+        $zip = Export-KohaDiagnostics
+        Write-KohaStep ((T 'Diagnostics saved on the desktop: {0}') -f $zip) 'ok'
+    } catch {
+        Write-KohaStep ((T 'The diagnostics could not be saved: {0}') -f $_.Exception.Message) 'warn'
+    }
+    if ($NonInteractive) { return }
+    if (Read-KohaYesNo (T 'Open the control panel now? Option 7 (Diagnostics & maintenance), then 6 (Restart / repair Koha services), usually brings Koha back.')) {
+        Invoke-KohaPanel | Out-Null
+        Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
+        if ((Start-Koha -Trigger user -Wait) -eq 'ready') {
+            Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
+        } else {
+            Write-KohaStep (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') 'warn'
+        }
+    }
 }
 
 # The panel runs in this window: the librarian picks the language and
@@ -665,6 +719,18 @@ function Install-Koha {
         Set-KohaState @{ phase = 'distro' } | Out-Null; $phase = 'distro'
     }
 
+    # After the Koha step, the panel inside Debian is refreshed on every run
+    # (a new version, the koha-panel launcher), and an install of Koha that
+    # stopped half-way sends the flow back to the Koha step.
+    $wasDone = ($phase -eq 'done')
+    if (Test-KohaPhaseDone 'koha' $phase) {
+        Copy-KohaPanelIntoDistro
+        if (-not (Test-KohaInstalledInDistro)) {
+            Write-KohaStep (T 'Koha was not installed all the way. The control panel opens again to finish it.') 'warn'
+            Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha'
+        }
+    }
+
     if (-not (Test-KohaPhaseDone 'distro' $phase)) {
         Write-KohaStep (T 'Downloading and installing Debian (a few minutes)...')
         if (-not $Facts) { $Facts = Get-KohaHostFacts }
@@ -739,7 +805,17 @@ function Install-Koha {
             Write-KohaStep (T 'The first-access user and password are in the control panel, option 2. Keep this computer on during opening hours.') 'ok'
             if (-not $NonInteractive) { Start-Process (Get-KohaConfig).StaffUrl }
         } else {
-            Write-KohaStep (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') 'warn'
+            Show-KohaStartProblem -NonInteractive:$NonInteractive
+        }
+    }
+    # Running the installer again on a finished install also repairs: Koha is
+    # started, and when it does not answer, the same help as above.
+    if ($wasDone -and $phase -eq 'done' -and -not $NonInteractive) {
+        Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
+        if ((Start-Koha -Trigger user -Wait) -eq 'ready') {
+            Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
+        } else {
+            Show-KohaStartProblem
         }
     }
     # A finished install whose library-network step was refused, or that

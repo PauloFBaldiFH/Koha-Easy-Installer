@@ -299,7 +299,8 @@ Describe 'Shortcuts' {
         $desk = @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop })
         $desk.Count | Should -Be 1
         $desk[0].Name | Should -Be 'Koha'
-        $desk[0].Arguments | Should -BeLike '* Open'
+        $desk[0].Arguments | Should -BeLike '* Panel'
+        ($list | Where-Object { $_.Name -like '*Control panel*' }).Arguments | Should -BeLike '* Panel'
         ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
     }
 

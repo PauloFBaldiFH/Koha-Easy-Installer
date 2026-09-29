@@ -22,7 +22,7 @@ $script:Cfg = @{
     NetTask     = 'Koha network'
     FirewallRule = 'Koha (web, local network)'
     WebPorts    = @(80, 8080)
-    PanelPath   = '/usr/local/bin/config.sh'
+    PanelPath   = '/usr/local/bin/koha-panel'
     StaffUrl    = 'http://localhost:8080/'
     OpacUrl     = 'http://localhost/'
     StartWaitS  = 180
@@ -829,6 +829,63 @@ function Get-KohaLanUrls {
 }
 
 # ----------------------------------------------------------------------
+# Control panel window and a quick check
+# ----------------------------------------------------------------------
+# Opens the Koha control panel in its own console window, as root, and
+# starts Koha as well (the panel alone would keep Debian up only while it is
+# open). The window gets UTF-8 and the symbol mode through WSLENV.
+function Open-KohaPanel {
+    param([switch]$NoStart)
+    if (-not $NoStart) { Start-Koha -Trigger user | Out-Null }
+    $saved = @{ WSLENV = $env:WSLENV; KEI_PLAIN_GLYPHS = $env:KEI_PLAIN_GLYPHS }
+    try {
+        $env:KEI_PLAIN_GLYPHS = '1'
+        if ($env:WT_SESSION) { $env:KEI_PLAIN_GLYPHS = '0' }
+        $items = @(([string]$env:WSLENV) -split ':' | Where-Object { $_ -and (($_ -split '/')[0] -ne 'KEI_PLAIN_GLYPHS') })
+        $env:WSLENV = (@($items) + 'KEI_PLAIN_GLYPHS') -join ':'
+        $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+        Start-Process -FilePath $wsl -ArgumentList ('-d {0} -u root --cd /root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) | Out-Null
+    } finally {
+        $env:WSLENV = $saved.WSLENV
+        $env:KEI_PLAIN_GLYPHS = $saved.KEI_PLAIN_GLYPHS
+    }
+    Write-KohaLog 'control panel opened'
+}
+
+# What is running, in a few lines a librarian can paste into a message:
+# Debian's services, the koha-common package, whether Apache answers inside
+# Debian, and the keep-alive task. Starts nothing that was not running.
+$script:QuickCheckScript = @'
+printf 'systemd: %s\n' "$(systemctl is-system-running 2>/dev/null)"
+for s in mariadb apache2 memcached rabbitmq-server koha-common; do
+  printf '%s: %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"
+done
+printf 'koha-common package: %s\n' "$(dpkg-query -W -f='${db:Status-Abbrev}${Version}' koha-common 2>/dev/null || echo missing)"
+printf 'koha instance: %s\n' "$(ls /etc/koha/sites 2>/dev/null | tr '\n' ' ')"
+printf 'installation finished: %s\n' "$([ -f /root/koha_credentials.txt ] && echo yes || echo no)"
+printf 'staff page inside Debian: %s\n' "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8080/ 2>/dev/null)"
+printf 'listening: %s\n' "$(ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -E ':(80|8080|3306|11211|16613)$' | tr '\n' ' ')"
+'@
+
+function Get-KohaQuickCheck {
+    $lines = New-Object System.Collections.ArrayList
+    $running = Test-KohaDistroRunning
+    [void]$lines.Add(('Debian ({0}) running: {1}' -f $script:Cfg.Distro, $running))
+    try {
+        $info = Get-ScheduledTaskInfo -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -ErrorAction Stop
+        $task = Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -ErrorAction Stop
+        [void]$lines.Add(('Keep Koha running task: {0}, last result 0x{1:X}, last run {2}' -f $task.State, [int64]$info.LastTaskResult, $info.LastRunTime))
+    } catch {
+        [void]$lines.Add('Keep Koha running task: not found')
+    }
+    if ($running) {
+        $r = Invoke-KohaLinuxScript -Script $script:QuickCheckScript
+        foreach ($l in ([string]$r.Output -split "`n")) { if ($l.Trim()) { [void]$lines.Add($l.TrimEnd()) } }
+    }
+    return @($lines)
+}
+
+# ----------------------------------------------------------------------
 # Diagnostics
 # ----------------------------------------------------------------------
 # Same rules as kei_redact in the installer.
@@ -905,6 +962,8 @@ function Export-KohaDiagnostics {
         }
     }
 
+    Save-KohaText (Join-Path $win 'quick-check.txt') ((Get-KohaQuickCheck) -join "`n")
+
     # Linux side, written straight into the work folder.
     $note = ''
     if (Test-KohaDistroInstalled) {
@@ -921,7 +980,7 @@ function Export-KohaDiagnostics {
         }
         if (-not $wasRunning -and $state.desired -ne 'running') { Invoke-KohaWsl -Arguments @('--terminate', $script:Cfg.Distro) | Out-Null }
     } else {
-        $note = 'The KohaEasy distro is not installed.'
+        $note = ('The {0} distro is not installed.' -f $script:Cfg.Distro)
     }
     if ($note) { Save-KohaText (Join-Path $work 'NOTE.txt') $note }
 
@@ -946,11 +1005,12 @@ function Get-KohaShortcutList {
     $cmd = { param($a, $style) '-NoProfile -WindowStyle {0} -ExecutionPolicy Bypass -File "{1}" {2}' -f $style, $ps1, $a }
     $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
     $list = @(
-        # The one desktop icon: starts Koha when it is off, then opens the staff interface.
-        @{ Name = 'Koha'; Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Open' 'Hidden'); Desktop = $true; StartMenu = $false }
+        # The one desktop icon: the Koha control panel (Koha is started too, so
+        # it keeps running after the panel is closed).
+        @{ Name = 'Koha'; Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Panel' 'Hidden'); Desktop = $true; StartMenu = $false }
         @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
         @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
-        @{ Name = (T 'Koha - Control panel'); Kind = 'lnk'; Target = $wsl; Arguments = ('-d {0} -u root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) }
+        @{ Name = (T 'Koha - Control panel'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Panel' 'Hidden') }
         @{ Name = (T 'Koha - Backups folder'); Kind = 'lnk'; Target = [System.IO.Path]::Combine([string]$env:SystemRoot, 'explorer.exe'); Arguments = ('"{0}"' -f (Get-KohaPath Backups)) }
         @{ Name = (T 'Koha - Start'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Start' 'Hidden') }
         @{ Name = (T 'Koha - Stop'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Stop' 'Hidden') }
