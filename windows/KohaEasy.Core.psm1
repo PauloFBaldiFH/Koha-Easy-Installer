@@ -14,10 +14,14 @@ Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Lang.psm1')
 
 $script:Cfg = @{
     Root        = 'C:\KohaEasy'
-    Distro      = 'KohaEasy'
+    Distro      = 'koha'
+    OldDistros  = @('KohaEasy')
     TaskPath    = '\KohaEasy\'
     KeepTask    = 'Keep Koha running'
     SignInTask  = 'Start Koha at sign-in'
+    NetTask     = 'Koha network'
+    FirewallRule = 'Koha (web, local network)'
+    WebPorts    = @(80, 8080)
     PanelPath   = '/usr/local/bin/config.sh'
     StaffUrl    = 'http://localhost:8080/'
     OpacUrl     = 'http://localhost/'
@@ -434,18 +438,31 @@ function Get-KohaNotifications {
 # ----------------------------------------------------------------------
 # Virtual disk watchdog
 # ----------------------------------------------------------------------
-# Folder of the distro (BasePath in HKCU\...\Lxss) and its ext4.vhdx.
-function Get-KohaVhdxPath {
+# WSL's registration of a distro (HKCU\...\Lxss\{guid}): PSPath, Name,
+# BasePath (its folder) and, on recent WSL, ShortcutPath and
+# TerminalProfilePath. $null when WSL does not know the name.
+function Get-KohaLxssEntry {
+    param([string]$Name = $script:Cfg.Distro)
     $lxss = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
     if (-not (Test-Path $lxss)) { return $null }
     foreach ($k in Get-ChildItem $lxss -ErrorAction SilentlyContinue) {
         $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-        if ($null -ne $p -and $p.PSObject.Properties['DistributionName'] -and $p.DistributionName -eq $script:Cfg.Distro) {
-            $base = ([string]$p.BasePath) -replace '^\\\\\?\\', ''
-            $file = Join-Path $base 'ext4.vhdx'
-            if (Test-Path -LiteralPath $file) { return $file }
+        if ($null -eq $p -or -not $p.PSObject.Properties['DistributionName'] -or $p.DistributionName -ne $Name) { continue }
+        $e = [ordered]@{ PSPath = $k.PSPath; Name = [string]$p.DistributionName; BasePath = ''; ShortcutPath = ''; TerminalProfilePath = '' }
+        foreach ($v in 'BasePath', 'ShortcutPath', 'TerminalProfilePath') {
+            if ($p.PSObject.Properties[$v]) { $e[$v] = ([string]$p.$v) -replace '^\\\\\?\\', '' }
         }
+        return [pscustomobject]$e
     }
+    return $null
+}
+
+# Folder of the distro (BasePath in HKCU\...\Lxss) and its ext4.vhdx.
+function Get-KohaVhdxPath {
+    $e = Get-KohaLxssEntry
+    if ($null -eq $e -or -not $e.BasePath) { return $null }
+    $file = Join-Path $e.BasePath 'ext4.vhdx'
+    if (Test-Path -LiteralPath $file) { return $file }
     return $null
 }
 
@@ -687,6 +704,7 @@ function Invoke-KohaRun {
     $proc = & $Holder
     Start-Sleep -Seconds 2
     Update-KohaHandshake | Out-Null
+    Start-KohaNetworkTask | Out-Null
     if (-not (Wait-KohaHttp)) {
         Write-KohaLog 'keep-alive: the staff interface did not answer in time' 'health'
         Show-KohaNotification -Title (T 'Koha did not start') -Text (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') -Level error | Out-Null
@@ -695,6 +713,119 @@ function Invoke-KohaRun {
     if ((Get-KohaState).desired -ne 'running') { return 0 }
     Write-KohaLog "keep-alive: the WSL holder ended (exit $($proc.ExitCode)); the task will restart it"
     return 1
+}
+
+# ----------------------------------------------------------------------
+# Other PCs of the library network (ports 80 and 8080)
+# ----------------------------------------------------------------------
+# Apache inside Debian listens on every address. What Windows adds, once,
+# with administrator rights (KohaEasy.ps1 SetupNetwork):
+#   * a firewall rule for TCP 80 and 8080 from the local network only;
+#   * mirrored networking (Windows 11): the same ports opened in the Hyper-V
+#     firewall that WSL uses;
+#   * NAT networking (Windows 10): a task "Koha network" that runs with the
+#     user's highest rights and points netsh portproxy at Debian's address,
+#     which changes at every start of WSL. Invoke-KohaRun starts it.
+$script:WslVmCreatorId = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
+
+# Debian's IPv4 address in WSL's NAT network, or '' (never starts the distro).
+function Get-KohaWslIp {
+    if (-not (Test-KohaDistroRunning)) { return '' }
+    $r = Invoke-KohaLinux -Command @('hostname', '-I')
+    if ($r.ExitCode -ne 0) { return '' }
+    foreach ($ip in ($r.Output -split '\s+')) {
+        if (Test-KohaIPv4 $ip) { return $ip }
+    }
+    return ''
+}
+
+function Test-KohaIPv4 {
+    param([string]$Address)
+    if ($Address -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
+    foreach ($i in 1..4) { if ([int]$Matches[$i] -gt 255) { return $false } }
+    return $true
+}
+
+# Pure: the netsh commands that point ports 80 and 8080 of every Windows
+# address at Debian (delete first, so a changed address never stacks up).
+function Get-KohaPortProxyCommands {
+    param([Parameter(Mandatory = $true)][string]$WslIp, [int[]]$Ports = $script:Cfg.WebPorts)
+    $cmds = New-Object System.Collections.ArrayList
+    foreach ($port in $Ports) {
+        [void]$cmds.Add(@('interface', 'portproxy', 'delete', 'v4tov4', ('listenport={0}' -f $port), 'listenaddress=0.0.0.0'))
+        [void]$cmds.Add(@('interface', 'portproxy', 'add', 'v4tov4', ('listenport={0}' -f $port), 'listenaddress=0.0.0.0', ('connectport={0}' -f $port), ('connectaddress={0}' -f $WslIp)))
+    }
+    return @($cmds)
+}
+
+# KohaEasy.ps1 UpdatePortProxy: the action of the "Koha network" task.
+function Update-KohaPortProxy {
+    param([string]$WslIp)
+    if ((Get-KohaNetMode) -ne 'nat') { return 'mirrored' }
+    if (-not $WslIp) { $WslIp = Get-KohaWslIp }
+    if (-not (Test-KohaIPv4 $WslIp)) {
+        Write-KohaLog 'network: Debian has no address yet, port forwarding not changed' 'network'
+        return 'no-address'
+    }
+    foreach ($c in Get-KohaPortProxyCommands -WslIp $WslIp) {
+        $out = & netsh.exe @c 2>&1
+        if ($LASTEXITCODE -ne 0 -and $c[2] -eq 'add') {
+            Write-KohaLog ('network: netsh {0} failed: {1}' -f ($c -join ' '), (@($out) -join ' ')) 'network'
+            return 'failed'
+        }
+    }
+    Write-KohaLog ('network: ports {0} forwarded to {1}' -f ($script:Cfg.WebPorts -join ', '), $WslIp) 'network'
+    return 'forwarded'
+}
+
+# KohaEasy.ps1 SetupNetwork (administrator): firewall rules and, under NAT,
+# the "Koha network" task. Safe to run again.
+function Set-KohaLanAccess {
+    param([string]$Mode = (Get-KohaNetMode))
+    $name = $script:Cfg.FirewallRule
+    Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName $name -Group 'Koha' -Direction Inbound -Action Allow -Protocol TCP `
+        -LocalPort $script:Cfg.WebPorts -RemoteAddress LocalSubnet -Profile Any | Out-Null
+    if ($Mode -eq 'mirrored') {
+        try {
+            Get-NetFirewallHyperVRule -Name 'KohaWeb' -ErrorAction SilentlyContinue | Remove-NetFirewallHyperVRule -ErrorAction SilentlyContinue
+            New-NetFirewallHyperVRule -Name 'KohaWeb' -DisplayName $name -Direction Inbound -VMCreatorId $script:WslVmCreatorId `
+                -Protocol TCP -LocalPorts $script:Cfg.WebPorts -Action Allow | Out-Null
+        } catch {
+            Write-KohaLog ('network: Hyper-V firewall rule not added: ' + $_.Exception.Message) 'network'
+        }
+    } else {
+        $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -Hidden
+        Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -Action (New-KohaAction 'UpdatePortProxy') `
+            -Principal $principal -Settings $settings -Force | Out-Null
+    }
+    Write-KohaLog ('network: local network access set up ({0})' -f $Mode) 'network'
+    return $Mode
+}
+
+# After each start under NAT: the task refreshes the forwarding with the
+# rights it was given once. Nothing to do in mirrored mode or without it.
+function Start-KohaNetworkTask {
+    if ((Get-KohaNetMode) -ne 'nat') { return $false }
+    try {
+        $t = Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -ErrorAction SilentlyContinue
+        if ($null -eq $t) { return $false }
+        Start-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -ErrorAction Stop
+        return $true
+    } catch {
+        Write-KohaLog ('network: task not started: ' + $_.Exception.Message) 'network'
+        return $false
+    }
+}
+
+# Addresses the other PCs use, from this PC's local IPv4 address.
+function Get-KohaLanUrls {
+    $ip = Get-KohaLanIp
+    if (-not $ip) { return $null }
+    return [pscustomobject]@{ Opac = ('http://{0}/' -f $ip); Staff = ('http://{0}:8080/' -f $ip) }
 }
 
 # ----------------------------------------------------------------------
@@ -883,6 +1014,57 @@ function New-KohaShortcuts {
     }
     Write-KohaLog ('shortcuts created: {0}' -f $made.Count)
     return @($made)
+}
+
+# The distro's own entries, made by WSL itself, show Debian's logo: its
+# Start menu shortcut and the Windows Terminal profile it wrote. Both get
+# koha.ico (and so does shortcut.ico, the file WSL points them at). When WSL
+# wrote no terminal profile (older WSL), a Windows Terminal fragment adds a
+# "Koha (Debian)" profile with the icon.
+function Set-KohaDistroIcon {
+    param(
+        [string]$Icon = (Get-KohaIconPath),
+        [string]$FragmentDir = [System.IO.Path]::Combine([string]$env:LOCALAPPDATA, 'Microsoft', 'Windows Terminal', 'Fragments', 'KohaEasy')
+    )
+    $done = New-Object System.Collections.ArrayList
+    $e = Get-KohaLxssEntry
+    if (-not (Test-Path -LiteralPath $Icon) -or $null -eq $e) { return @() }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    if ($e.BasePath -and (Test-Path -LiteralPath $e.BasePath)) {
+        try { Copy-Item -LiteralPath $Icon -Destination (Join-Path $e.BasePath 'shortcut.ico') -Force; [void]$done.Add('shortcut.ico') } catch { }
+    }
+    if ($e.ShortcutPath -and (Test-Path -LiteralPath $e.ShortcutPath)) {
+        try {
+            $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($e.ShortcutPath)
+            $lnk.IconLocation = $Icon + ',0'
+            $lnk.Save()
+            [void]$done.Add('start-menu')
+        } catch { Write-KohaLog ('icon: Start menu shortcut not changed: ' + $_.Exception.Message) }
+    }
+    $hasProfile = $false
+    if ($e.TerminalProfilePath -and (Test-Path -LiteralPath $e.TerminalProfilePath)) {
+        try {
+            $json = [System.IO.File]::ReadAllText($e.TerminalProfilePath) | ConvertFrom-Json
+            foreach ($p in @($json.profiles)) {
+                if ($p.PSObject.Properties['icon']) { $p.icon = $Icon } else { $p | Add-Member -NotePropertyName icon -NotePropertyValue $Icon }
+            }
+            [System.IO.File]::WriteAllText($e.TerminalProfilePath, ($json | ConvertTo-Json -Depth 10), $utf8)
+            $hasProfile = $true
+            [void]$done.Add('terminal')
+        } catch { Write-KohaLog ('icon: terminal profile not changed: ' + $_.Exception.Message) }
+    }
+    if (-not $hasProfile -and $FragmentDir) {
+        try {
+            New-Item -ItemType Directory -Path $FragmentDir -Force | Out-Null
+            $frag = [ordered]@{ profiles = @([ordered]@{
+                        name = 'Koha (Debian)'; commandline = ('wsl.exe -d {0}' -f $script:Cfg.Distro)
+                        icon = $Icon; startingDirectory = '~' }) }
+            [System.IO.File]::WriteAllText((Join-Path $FragmentDir 'koha.json'), ($frag | ConvertTo-Json -Depth 5), $utf8)
+            [void]$done.Add('terminal-fragment')
+        } catch { Write-KohaLog ('icon: terminal fragment not written: ' + $_.Exception.Message) }
+    }
+    Write-KohaLog ('icon: koha.ico set on {0}' -f ($done -join ', '))
+    return @($done)
 }
 
 # ----------------------------------------------------------------------

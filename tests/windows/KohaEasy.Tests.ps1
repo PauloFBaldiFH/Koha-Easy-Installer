@@ -113,7 +113,7 @@ Describe 'Status' {
     }
 
     It 'never starts a stopped distro to read its status' {
-        Mock -ModuleName KohaEasy.Core Get-KohaInstalledDistros { @('Ubuntu', 'KohaEasy') }
+        Mock -ModuleName KohaEasy.Core Get-KohaInstalledDistros { @('Ubuntu', 'koha') }
         Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('Ubuntu') }
         Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { throw 'must not be called' }
         (Get-KohaStatus).State | Should -BeIn @('stopped', 'stopped_by_user')
@@ -240,7 +240,7 @@ Describe 'Start, Stop and automatic start' {
     It 'Stop records "stopped" before ending the task, so it is not restarted' {
         Stop-Koha | Should -Be 'stopped'
         $script:calls | Should -Contain 'stop task:stopped'
-        $script:calls | Should -Contain 'wsl --terminate KohaEasy'
+        $script:calls | Should -Contain 'wsl --terminate koha'
         (Get-KohaState).desired | Should -Be 'stopped'
     }
 
@@ -269,9 +269,11 @@ Describe 'Start, Stop and automatic start' {
         Mock -ModuleName KohaEasy.Core Update-KohaHandshake { $true }
         Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $true }
         Mock -ModuleName KohaEasy.Core Start-Sleep { }
+        Mock -ModuleName KohaEasy.Core Start-KohaNetworkTask { [void]$script:calls.Add('network task'); $true }
         Set-KohaState @{ desired = 'running' } | Out-Null
         $proc = [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
         Invoke-KohaRun -Holder { $proc } | Should -Be 1
+        $script:calls | Should -Contain 'network task'
         $proc2 = [pscustomobject]@{ ExitCode = 0 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { Set-KohaState @{ desired = 'stopped' } | Out-Null } -PassThru
         Invoke-KohaRun -Holder { $proc2 } | Should -Be 0
     }
@@ -320,6 +322,77 @@ Describe 'Shortcuts' {
         $b = [System.IO.File]::ReadAllBytes((Join-Path $repo 'windows/koha.ico'))
         ($b[0] -eq 0 -and $b[1] -eq 0 -and $b[2] -eq 1 -and $b[3] -eq 0) | Should -BeTrue
         $b[6] | Should -Be 16
+    }
+}
+
+Describe 'Distro icon' {
+    BeforeEach {
+        $script:base = Join-Path $TestDrive 'wsl'
+        New-Item -ItemType Directory -Path $script:base -Force | Out-Null
+        $script:ico = Join-Path $TestDrive 'koha.ico'
+        Copy-Item -LiteralPath (Join-Path $repo 'windows/koha.ico') -Destination $script:ico -Force
+        $script:frag = Join-Path $TestDrive 'Fragments/KohaEasy'
+        Remove-Item -LiteralPath $script:frag -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'puts koha.ico on the terminal profile WSL wrote and on shortcut.ico' {
+        $prof = Join-Path $TestDrive 'profile.json'
+        '{"profiles":[{"updates":"{1234}","name":"koha","icon":"C:\\KohaEasy\\wsl\\shortcut.ico"}]}' | Set-Content -LiteralPath $prof
+        $script:p = $prof
+        Mock -ModuleName KohaEasy.Core Get-KohaLxssEntry { [pscustomobject]@{ PSPath = 'x'; Name = 'koha'; BasePath = $script:base; ShortcutPath = ''; TerminalProfilePath = $script:p } }
+        $done = Set-KohaDistroIcon -Icon $script:ico -FragmentDir $script:frag
+        $done | Should -Contain 'shortcut.ico'
+        $done | Should -Contain 'terminal'
+        (Get-Content -Raw $prof | ConvertFrom-Json).profiles[0].icon | Should -Be $script:ico
+        (Get-Content -Raw $prof | ConvertFrom-Json).profiles[0].updates | Should -Be '{1234}'
+        (Get-FileHash (Join-Path $script:base 'shortcut.ico')).Hash | Should -Be (Get-FileHash $script:ico).Hash
+        Test-Path -LiteralPath $script:frag | Should -BeFalse
+    }
+
+    It 'adds a Koha terminal profile when WSL wrote none' {
+        Mock -ModuleName KohaEasy.Core Get-KohaLxssEntry { [pscustomobject]@{ PSPath = 'x'; Name = 'koha'; BasePath = $script:base; ShortcutPath = ''; TerminalProfilePath = '' } }
+        Set-KohaDistroIcon -Icon $script:ico -FragmentDir $script:frag | Should -Contain 'terminal-fragment'
+        $j = Get-Content -Raw (Join-Path $script:frag 'koha.json') | ConvertFrom-Json
+        $j.profiles[0].commandline | Should -Be 'wsl.exe -d koha'
+        $j.profiles[0].icon | Should -Be $script:ico
+    }
+
+    It 'does nothing when WSL does not know the distro' {
+        Mock -ModuleName KohaEasy.Core Get-KohaLxssEntry { $null }
+        @(Set-KohaDistroIcon -Icon $script:ico -FragmentDir $script:frag).Count | Should -Be 0
+    }
+}
+
+Describe 'Library network' {
+    It 'checks IPv4 addresses' {
+        Test-KohaIPv4 '172.28.1.20' | Should -BeTrue
+        foreach ($bad in '', '256.1.1.1', 'fe80::1', '1.2.3', '1.2.3.4; calc') { Test-KohaIPv4 $bad | Should -BeFalse -Because $bad }
+    }
+
+    It 'forwards ports 80 and 8080 of every Windows address to Debian, deleting old rules first' {
+        $c = @(Get-KohaPortProxyCommands -WslIp '172.28.1.20' | ForEach-Object { $_ -join ' ' })
+        $c | Should -Be @(
+            'interface portproxy delete v4tov4 listenport=80 listenaddress=0.0.0.0'
+            'interface portproxy add v4tov4 listenport=80 listenaddress=0.0.0.0 connectport=80 connectaddress=172.28.1.20'
+            'interface portproxy delete v4tov4 listenport=8080 listenaddress=0.0.0.0'
+            'interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=172.28.1.20')
+    }
+
+    It 'needs no forwarding in mirrored mode, and never forwards to a bad address' {
+        Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'mirrored' }
+        Update-KohaPortProxy -WslIp '172.28.1.20' | Should -Be 'mirrored'
+        Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'nat' }
+        Mock -ModuleName KohaEasy.Core Get-KohaWslIp { '' }
+        Update-KohaPortProxy | Should -Be 'no-address'
+    }
+
+    It 'reads Debian''s address without starting a stopped distro' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { throw 'must not start the distro' }
+        Get-KohaWslIp | Should -Be ''
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 0; Output = 'fd00::5 172.28.1.20 10.255.255.254' } }
+        Get-KohaWslIp | Should -Be '172.28.1.20'
     }
 }
 
@@ -392,7 +465,7 @@ Describe 'Diagnostics' {
         Test-Path (Join-Path $x 'windows/wsl.txt') | Should -BeTrue
         Test-Path (Join-Path $x 'windows/state.json') | Should -BeTrue
         Get-Content -Raw (Join-Path $x 'windows/logs/koha-20260928.log') | Should -Not -Match 'hunter2'
-        $script:calls | Should -Contain 'wsl --terminate KohaEasy'
+        $script:calls | Should -Contain 'wsl --terminate koha'
         @(Get-ChildItem $env:TEMP -Filter 'KohaEasy-diagnostics-*').Count | Should -Be 0
     }
 }

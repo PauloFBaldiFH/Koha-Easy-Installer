@@ -1,14 +1,14 @@
 # Koha Easy Installer for Windows - bootstrapper.
 #
-#   One line, in PowerShell (no administrator needed; Windows asks once):
+#   The one way to install Koha on Windows: this line, in PowerShell (no
+#   administrator needed; Windows asks for permission when a step needs it):
 #   [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
 #
-#   Or double-click "Install Koha.cmd" in the repository ZIP.
-#
 # It copies the Windows tools, the panel and its dictionaries to
-# C:\KohaEasy\bin (from the ZIP folder, or downloaded from GitHub with the
+# C:\KohaEasy\bin (downloaded from GitHub with the
 # SHA-256 of the installer checked), then runs "KohaEasy.ps1 Install" in
-# Windows PowerShell 5.1: checks, WSL 2, Debian, systemd, Koha, shortcuts.
+# Windows PowerShell 5.1: checks, the Debian user, WSL 2, Debian, systemd,
+# Koha, shortcuts, the library network.
 # Running it again continues where it stopped.
 #
 # Options (environment variables): KOHAEASY_SOURCE (a local copy of the
