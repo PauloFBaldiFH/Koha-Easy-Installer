@@ -146,6 +146,8 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Koha { [void]$script:calls.Add('start'); 'ready' }
         Mock -ModuleName KohaEasy.Install Start-KohaTray { }
         Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
+        Mock -ModuleName KohaEasy.Install Start-KohaTrayChecked { [void]$script:calls.Add('tray') }
+        Mock -ModuleName KohaEasy.Install Test-KohaLinuxUserExists { $true }
         Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
         Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'none' }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { [void]$script:calls.Add('icons') }
@@ -170,7 +172,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start')
+        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start', 'tray')
         (Get-KohaState).phase | Should -Be 'done'
         (Get-KohaState).autostart | Should -Be 'logon'
     }
@@ -197,8 +199,43 @@ Describe 'Install flow' {
     It 'adds the Debian user to an install that had none, with the restart that applies it' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'windows' } | Out-Null
+        Mock -ModuleName KohaEasy.Install Write-KohaWslConf { [void]$script:calls.Add('wsl.conf ' + $User) }
+        Mock -ModuleName KohaEasy.Install Restart-KohaDistro { [void]$script:calls.Add('restart'); $true }
         Install-Koha -Facts $good -NonInteractive -Account ([pscustomobject]@{ User = 'maria'; Password = 'x' * 8 }) | Should -Be 0
-        $script:calls[0..2] | Should -Be @('copy panel', 'user maria', 'systemd')
+        $script:calls[0..3] | Should -Be @('copy panel', 'user maria', 'wsl.conf maria', 'restart')
+        (Get-KohaState).linuxUser | Should -Be 'maria'
+    }
+
+    It 'asks again for a Debian user that went missing, creates it and restarts Debian' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Test-KohaLinuxUserExists { $false }
+        Mock -ModuleName KohaEasy.Install Read-KohaLinuxAccount { [void]$script:calls.Add('ask ' + $Default); [pscustomobject]@{ User = 'paulo'; Password = 'x' * 8 } }
+        Mock -ModuleName KohaEasy.Install Write-KohaWslConf { [void]$script:calls.Add('wsl.conf ' + $User) }
+        Mock -ModuleName KohaEasy.Install Restart-KohaDistro { [void]$script:calls.Add('restart'); $true }
+        Mock -ModuleName KohaEasy.Install Start-Process { }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'paulo'; lanAccess = $true } | Out-Null
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls[0..4] | Should -Be @('copy panel', 'ask paulo', 'user paulo', 'wsl.conf paulo', 'restart')
+        $script:calls | Should -Contain 'shortcuts'
+        $script:calls | Should -Contain 'tray'
+    }
+
+    It 'never asks when running unattended, even with the Debian user missing' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Test-KohaLinuxUserExists { $false }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'paulo'; lanAccess = $true } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 0
+        $script:calls | Should -Not -Contain 'user paulo'
+    }
+
+    It 'keeps going with the other Windows steps when one fails' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Mock -ModuleName KohaEasy.Install Register-KohaTasks { throw 'Access is denied' }
+        Set-KohaState @{ phase = 'windows'; linuxUser = 'maria' } | Out-Null
+        Install-Koha -Facts $good -NonInteractive | Should -Be 0
+        $script:calls | Should -Contain 'shortcuts'
+        $script:calls | Should -Contain 'tray'
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*Access is denied*' }
     }
 
     It 'opens Koha to the library network in the Windows step' {
@@ -218,11 +255,11 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start', 'lan')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan')
         (Get-KohaState).lanAccess | Should -BeTrue
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start')
     }
 
     It 'renames the KohaEasy distro of an older install and refreshes its shortcuts' {
@@ -255,7 +292,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start', 'diagnostics', 'panel', 'start')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'diagnostics', 'panel', 'start')
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*koha-common package: iF*' }
     }
 

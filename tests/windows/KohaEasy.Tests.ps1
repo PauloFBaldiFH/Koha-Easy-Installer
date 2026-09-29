@@ -306,6 +306,27 @@ Describe 'Shortcuts' {
         ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
     }
 
+    It 'removes the web shortcuts older versions put on the desktop' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        $dt = Join-Path $TestDrive 'OneDrive/Area de Trabalho'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $dt 'Koha - Staff interface.url') -Value 'x'
+        Set-Content -LiteralPath (Join-Path $dt 'Koha - Public catalog.url') -Value 'x'
+        New-KohaShortcuts -StartMenu (Join-Path $TestDrive 'Programs/Koha') -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') | Out-Null
+        Test-Path -LiteralPath (Join-Path $dt 'Koha - Staff interface.url') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $dt 'Koha - Public catalog.url') | Should -BeFalse
+    }
+
+    It 'falls back to a hidden PowerShell once conhost did not start the tray' {
+        $conhost = Join-Path $TestDrive 'conhost.exe'
+        Set-Content -LiteralPath $conhost -Value ''
+        Set-KohaState @{ hiddenLaunch = 'powershell' } | Out-Null
+        try {
+            Get-KohaConhostPath | Should -Be ''
+            (Get-KohaHiddenLaunch -Arguments 'Tray').Target | Should -BeLike '*powershell.exe'
+        } finally { Set-KohaState @{ hiddenLaunch = 'conhost' } | Out-Null }
+    }
+
     It 'starts Koha commands through a console nobody sees when conhost.exe is there' {
         $conhost = Join-Path $TestDrive 'conhost.exe'
         Set-Content -LiteralPath $conhost -Value ''
