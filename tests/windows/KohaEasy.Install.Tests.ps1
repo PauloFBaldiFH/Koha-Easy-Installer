@@ -145,6 +145,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install New-KohaShortcuts { [void]$script:calls.Add('shortcuts') }
         Mock -ModuleName KohaEasy.Install Start-Koha { [void]$script:calls.Add('start'); 'ready' }
         Mock -ModuleName KohaEasy.Install Start-KohaTray { }
+        Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
         Mock -ModuleName KohaEasy.Install Restore-KohaDistro { 'ok' }
         Mock -ModuleName KohaEasy.Install Rename-KohaLegacyDistro { 'none' }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { [void]$script:calls.Add('icons') }
@@ -217,11 +218,11 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'start', 'lan')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start', 'lan')
         (Get-KohaState).lanAccess | Should -BeTrue
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'start')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start')
     }
 
     It 'renames the KohaEasy distro of an older install and refreshes its shortcuts' {
@@ -254,7 +255,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'start', 'diagnostics', 'panel', 'start')
+        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'tray restart', 'start', 'diagnostics', 'panel', 'start')
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*koha-common package: iF*' }
     }
 
@@ -675,5 +676,91 @@ Describe 'Emoji and UTF-8' {
         $text = [System.IO.File]::ReadAllText($f)
         $text.IndexOf('UTF8Encoding($false)') | Should -BeLessThan $text.IndexOf('Write-Host')
         $text | Should -Not -Match '\[System\.Text\.Encoding\]::UTF8'
+    }
+}
+
+Describe 'Koha window' {
+    It 'reads the quick check as one row per service, and the staff page by its HTTP code' {
+        $lines = @(
+            'Debian (koha) running: True'
+            'Keep Koha running task: Running, last result 0x41301, last run 09/29/2026 09:00:00'
+            'systemd: running'
+            'mariadb: active'
+            'apache2: active'
+            'memcached: activating'
+            'rabbitmq-server: failed'
+            'koha-common: inactive'
+            'koha-common package: ii 24.11.03-1'
+            'installation finished: yes'
+            'staff page inside Debian: 302'
+        )
+        $h = ConvertFrom-KohaQuickCheck -Lines $lines
+        $h.DebianRunning | Should -BeTrue
+        $h.Finished | Should -BeTrue
+        $rows = @{}
+        foreach ($r in $h.Services) { $rows[$r.Unit] = $r.State }
+        $rows['wsl'] | Should -Be 'running'
+        $rows['mariadb'] | Should -Be 'running'
+        $rows['memcached'] | Should -Be 'starting'
+        $rows['rabbitmq-server'] | Should -Be 'failed'
+        $rows['koha-common'] | Should -Be 'stopped'
+        $rows['http'] | Should -Be 'running'
+        @($h.Services).Count | Should -Be 7
+    }
+
+    It 'shows every row as stopped while Debian is off, without asking Debian' {
+        $h = ConvertFrom-KohaQuickCheck -Lines @('Debian (koha) running: False', 'Keep Koha running task: not found')
+        $h.DebianRunning | Should -BeFalse
+        @($h.Services | Where-Object { $_.State -ne 'stopped' }).Count | Should -Be 0
+    }
+
+    It 'reports a staff page that does not answer as failed' {
+        $h = ConvertFrom-KohaQuickCheck -Lines @('Debian (koha) running: True', 'staff page inside Debian: 000')
+        ($h.Services | Where-Object { $_.Unit -eq 'http' }).State | Should -Be 'failed'
+        Get-KohaServiceStateText -State 'failed' -Unit 'http' -Detail '000' | Should -Be 'Does not answer'
+        Get-KohaServiceStateText -State 'running' -Unit 'http' -Detail '200' | Should -Be 'Answers (HTTP 200)'
+    }
+
+    It 'restarts the services only when Debian is already running' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { throw 'must not run' }
+        Restart-KohaServices | Should -Be 'not_running'
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { $script:sent = $Script; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $true }
+        Restart-KohaServices | Should -Be 'ready'
+        $script:sent | Should -Match 'systemctl restart'
+        $script:sent | Should -Match 'mariadb memcached rabbitmq-server koha-common apache2'
+    }
+
+    It 'the restart and log scripts are valid sh' {
+        foreach ($name in 'RestartServicesScript', 'ServiceLogScript') {
+            $f = Join-Path $TestDrive "$name.sh"
+            [System.IO.File]::WriteAllText($f, (InModuleScope KohaEasy.Core -Parameters @{ N = $name } { param($N) (Get-Variable -Scope Script -Name $N).Value }))
+            & sh -n $f
+            $LASTEXITCODE | Should -Be 0 -Because $name
+        }
+    }
+
+    It 'saves diagnostico_koha.txt with the services and no password, and starts nothing' {
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { [pscustomobject]@{ ExitCode = 0; Output = 'WSL version: 2.3.26.0' } }
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Get-KohaQuickCheck { @('Debian (koha) running: True', 'mariadb: active') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [pscustomobject]@{ ExitCode = 0; Output = 'db_password=hunter2secret' } }
+        Mock -ModuleName KohaEasy.Core Start-Koha { throw 'must not start' }
+        $file = Export-KohaDiagnosticsText -Destination (Join-Path $TestDrive 'Desktop')
+        Split-Path -Leaf $file | Should -Be 'diagnostico_koha.txt'
+        $text = Get-Content -LiteralPath $file -Raw
+        $text | Should -Match 'mariadb: active'
+        $text | Should -Match 'WSL version'
+        $text | Should -Not -Match 'hunter2secret'
+    }
+
+    It 'asks before closing the tray, with Koha kept running as the first choice' {
+        $tray = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Tray.ps1') -Raw
+        $tray | Should -Match 'Show-KohaChoice'
+        $tray | Should -Match "keep\s+= \(T 'Keep Koha running'\)"
+        $tray | Should -Match "Invoke-KohaCommand 'Stop -Force'"
+        $tray | Should -Match "add_DoubleClick\(\{ Invoke-KohaCommand 'Window' \}\)"
     }
 }

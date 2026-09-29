@@ -28,7 +28,7 @@ AfterAll {
 }
 
 Describe 'Windows PowerShell 5.1 compatibility' {
-    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1', 'KohaEasy.Install.psm1') {
+    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Window.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1', 'KohaEasy.Install.psm1') {
         $file = Join-Path $repo ('windows/' + $_)
         $bytes = [System.IO.File]::ReadAllBytes($file)
         ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeTrue
@@ -299,9 +299,22 @@ Describe 'Shortcuts' {
         $desk = @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop })
         $desk.Count | Should -Be 1
         $desk[0].Name | Should -Be 'Koha'
-        $desk[0].Arguments | Should -BeLike '* Panel'
+        $desk[0].Arguments | Should -BeLike '* Window'
         ($list | Where-Object { $_.Name -like '*Control panel*' }).Arguments | Should -BeLike '* Panel'
+        ($list | Where-Object { $_.Name -like '*Status' -and $_.Kind -eq 'lnk' }).Arguments | Should -BeLike '* Window'
+        ($list | Where-Object { $_.Name -like '*Export diagnostics' }).Arguments | Should -BeLike '* ExportReport'
         ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
+    }
+
+    It 'starts Koha commands through a console nobody sees when conhost.exe is there' {
+        $conhost = Join-Path $TestDrive 'conhost.exe'
+        Set-Content -LiteralPath $conhost -Value ''
+        $l = Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost $conhost
+        $l.Target | Should -Be $conhost
+        $l.Arguments | Should -Match '^--headless ".*powershell\.exe" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ".*KohaEasy\.ps1" Tray$'
+        $f = Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost (Join-Path $TestDrive 'missing.exe')
+        $f.Target | Should -BeLike '*powershell.exe'
+        $f.Arguments | Should -BeLike '-NoProfile -WindowStyle Hidden *'
     }
 
     It 'writes .url files with IconFile, program shortcuts through WScript.Shell, and copies koha.ico' {

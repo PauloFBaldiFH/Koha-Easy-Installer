@@ -830,6 +830,12 @@ function Install-Koha {
     # Running the installer again on a finished install also repairs: Koha is
     # started, and when it does not answer, the same help as above.
     if ($wasDone -and $phase -eq 'done' -and -not $NonInteractive) {
+        # Shortcuts, the tray at sign-in and the tray itself of this version.
+        try {
+            Set-KohaTrayAtSignIn -Enabled $true
+            New-KohaShortcuts | Out-Null
+            Restart-KohaTray
+        } catch { Write-KohaLog ('refreshing shortcuts failed: ' + $_.Exception.Message) 'install' }
         Write-KohaStep (T 'Starting Koha (up to 3 minutes)...')
         if ((Start-Koha -Trigger user -Wait) -eq 'ready') {
             Write-KohaStep ((T 'Done! Staff interface: {0}  Public catalog: {1}') -f (Get-KohaConfig).StaffUrl, (Get-KohaConfig).OpacUrl) 'ok'
@@ -859,9 +865,16 @@ function Install-Koha {
     return 0
 }
 
-function Start-KohaTray {
-    $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    Start-Process $ps -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" Tray' -f (Get-KohaScriptPath)) -WindowStyle Hidden
+function Start-KohaTray { Start-KohaHidden 'Tray' }
+
+# The tray of an older version keeps its old menu until it is restarted.
+function Restart-KohaTray {
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
+            Where-Object { ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Tray' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    Start-KohaTray
 }
 
 Export-ModuleMember -Function *

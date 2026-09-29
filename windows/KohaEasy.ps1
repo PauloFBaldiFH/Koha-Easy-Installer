@@ -5,11 +5,14 @@
     KohaEasy.ps1 Start [-Trigger user|logon]   Koha - Start shortcut, tray, sign-in task
     KohaEasy.ps1 Stop [-Force]                 Koha - Stop shortcut, tray
     KohaEasy.ps1 Restart [-Force]              Koha - Restart shortcut, tray
-    KohaEasy.ps1 Status                        Koha - Status shortcut
+    KohaEasy.ps1 Window                        the Koha window: state, services, actions (desktop icon, Koha - Status, tray)
+    KohaEasy.ps1 Status                        the same summary in a message box
+    KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
     KohaEasy.ps1 Panel                         the "Koha" desktop icon and the tray: starts Koha, opens the control panel
     KohaEasy.ps1 Open                          starts Koha if needed, opens the staff interface
     KohaEasy.ps1 Run                           action of the "Keep Koha running" task
     KohaEasy.ps1 Tray                          notification-area icon (starts at sign-in)
+    KohaEasy.ps1 ExportReport                  diagnostico_koha.txt for support on the desktop
     KohaEasy.ps1 ExportDiagnostics             .zip for support on the desktop
     KohaEasy.ps1 CheckDisk                     free space around the virtual disk
     KohaEasy.ps1 CompactDisk                   give unused space back to Windows (admin)
@@ -25,7 +28,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Panel', 'Open', 'Start', 'Stop', 'Restart', 'Status', 'Run', 'Tray', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
+    [ValidateSet('Window', 'Panel', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -68,6 +71,31 @@ function Invoke-Start {
 }
 
 switch ($Command) {
+    'Window' {
+        if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
+        & (Join-Path $PSScriptRoot 'KohaEasy.Window.ps1')
+    }
+    'RestartServices' {
+        if (-not $Quiet) { Show-KohaNotification -Title 'Koha' -Text (T 'Restarting Koha services...') | Out-Null }
+        $r = Restart-KohaServices -NoWait:$Quiet
+        if (-not $Quiet) {
+            switch ($r) {
+                'ready'       { Show-KohaNotification -Title 'Koha' -Text (T 'Koha services restarted.') | Out-Null }
+                'not_running' { Show-Box (T 'Debian is stopped. Start Koha first.') 'OK' 'Warning' | Out-Null }
+                default       { Show-Box (T 'Koha services restarted, but the staff interface does not answer yet. Export the diagnostics and send them to whoever supports your library.') 'OK' 'Warning' | Out-Null }
+            }
+        }
+        if (@('ready', 'restarted') -notcontains $r) { exit 1 }
+    }
+    'ExportReport' {
+        $file = Export-KohaDiagnosticsText
+        if (-not $Quiet) {
+            Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $file)
+            Show-Box (((T 'Diagnostics saved on the desktop: {0}') -f $file) + "`n`n" + (T 'Send this file to whoever supports your library. Passwords are not included.')) | Out-Null
+        } else {
+            $file
+        }
+    }
     'Panel' {
         if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
         Open-KohaPanel
