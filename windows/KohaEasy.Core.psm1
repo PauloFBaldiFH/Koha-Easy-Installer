@@ -127,6 +127,27 @@ function Get-UnixTime { return [int64][Math]::Floor(([DateTimeOffset]::UtcNow).T
 # ----------------------------------------------------------------------
 # WSL
 # ----------------------------------------------------------------------
+# UTF-8 for this console, both ways, and for text piped into wsl.exe. The
+# encoding carries no BOM: [Text.Encoding]::UTF8 in Windows PowerShell 5.1
+# would put one in front of every script sent to Debian through stdin.
+function Set-KohaUtf8Console {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch { }
+    try { [Console]::OutputEncoding = $utf8 } catch { }
+    try { [Console]::InputEncoding = $utf8 } catch { }
+    $global:OutputEncoding = $utf8
+}
+
+# Windows Terminal (wt.exe), when installed. It draws emoji; the classic
+# console has no emoji font and shows them as boxes. KOHAEASY_NO_WT=1 keeps
+# everything in the classic console.
+function Get-KohaTerminalPath {
+    if ($env:KOHAEASY_NO_WT -eq '1') { return $null }
+    $c = Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return [string]$c.Source }
+    return $null
+}
+
 # Runs wsl.exe with UTF-8 output. Returns ExitCode and Output (one string).
 function Invoke-KohaWsl {
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText)
@@ -576,6 +597,82 @@ function Invoke-KohaDiskpart {
 # ----------------------------------------------------------------------
 # Start, Stop and automatic start (blueprint 2.5.1)
 # ----------------------------------------------------------------------
+# Pure: how a Koha command starts with no console window at all. conhost.exe
+# --headless gives PowerShell a console nobody sees (Windows 10 1903 and
+# later, which WSL 2 needs anyway); powershell.exe -WindowStyle Hidden, the
+# fallback, still shows a black window for a moment.
+function Get-KohaHiddenLaunch {
+    param(
+        [string]$Arguments,
+        [string]$Conhost = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'conhost.exe')
+    )
+    $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $a = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
+    if ($Conhost -and (Test-Path -LiteralPath $Conhost)) {
+        return [pscustomobject]@{ Target = $Conhost; Arguments = ('--headless "{0}" {1}' -f $ps, $a) }
+    }
+    return [pscustomobject]@{ Target = $ps; Arguments = $a }
+}
+
+function Start-KohaHidden {
+    param([string]$Arguments)
+    $l = Get-KohaHiddenLaunch -Arguments $Arguments
+    Start-Process -FilePath $l.Target -ArgumentList $l.Arguments -WindowStyle Hidden | Out-Null
+}
+
+# A small Koha dialog with buttons of its own ([ordered]@{ key = label }),
+# for questions a Yes/No box cannot ask. Returns the key, or the last key
+# when the window is closed.
+function Show-KohaChoice {
+    param([string]$Text, [System.Collections.IDictionary]$Choices, [string]$Title = 'Koha')
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $keys = @($Choices.Keys)
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+    $form.AutoSize = $true
+    $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $icon = Get-KohaIconPath
+    if (Test-Path -LiteralPath $icon) { try { $form.Icon = New-Object System.Drawing.Icon($icon) } catch { } }
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.AutoSize = $true
+    $layout.Padding = New-Object System.Windows.Forms.Padding(12)
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Text
+    $label.AutoSize = $true
+    $label.MaximumSize = New-Object System.Drawing.Size(420, 0)
+    $label.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+    [void]$layout.Controls.Add($label, 0, 0)
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel
+    $row.AutoSize = $true
+    $row.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $form.Tag = $keys[-1]
+    foreach ($k in $keys) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = [string]$Choices[$k]
+        $b.AutoSize = $true
+        $b.Tag = $k
+        $b.add_Click({ param($sender, $e) $form.Tag = $sender.Tag; $form.Close() }.GetNewClosure())
+        [void]$row.Controls.Add($b)
+    }
+    $form.AcceptButton = $row.Controls[0]
+    $form.CancelButton = $row.Controls[$row.Controls.Count - 1]
+    [void]$layout.Controls.Add($row, 0, 1)
+    $form.Controls.Add($layout)
+    [void]$form.ShowDialog()
+    $choice = [string]$form.Tag
+    $form.Dispose()
+    return $choice
+}
+
 # Two tasks of the user (no administrator rights, no stored password):
 #   "Keep Koha running"      action Run: holds the distro open; triggers on
 #                            unlock and on resume only repair a Koha meant to run.
@@ -837,19 +934,23 @@ function Get-KohaLanUrls {
 function Open-KohaPanel {
     param([switch]$NoStart)
     if (-not $NoStart) { Start-Koha -Trigger user | Out-Null }
-    $saved = @{ WSLENV = $env:WSLENV; KEI_PLAIN_GLYPHS = $env:KEI_PLAIN_GLYPHS }
-    try {
-        $env:KEI_PLAIN_GLYPHS = '1'
-        if ($env:WT_SESSION) { $env:KEI_PLAIN_GLYPHS = '0' }
-        $items = @(([string]$env:WSLENV) -split ':' | Where-Object { $_ -and (($_ -split '/')[0] -ne 'KEI_PLAIN_GLYPHS') })
-        $env:WSLENV = (@($items) + 'KEI_PLAIN_GLYPHS') -join ':'
-        $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
-        Start-Process -FilePath $wsl -ArgumentList ('-d {0} -u root --cd /root -- {1}' -f $script:Cfg.Distro, $script:Cfg.PanelPath) | Out-Null
-    } finally {
-        $env:WSLENV = $saved.WSLENV
-        $env:KEI_PLAIN_GLYPHS = $saved.KEI_PLAIN_GLYPHS
-    }
+    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath)
+    Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null
     Write-KohaLog 'control panel opened'
+}
+
+# Pure: how the control panel window opens. In Windows Terminal the panel
+# shows emoji; in the classic console, plain symbols. The choice travels as
+# "env KEI_PLAIN_GLYPHS=..." on the command line, because a Windows Terminal
+# that is already open does not see this process's environment.
+function Get-KohaPanelLaunch {
+    param([string]$Wsl, [string]$Terminal)
+    $plain = '1'
+    if ($Terminal) { $plain = '0' }
+    $cmd = '-d {0} -u root --cd /root -- env KEI_PLAIN_GLYPHS={1} {2}' -f $script:Cfg.Distro, $plain, $script:Cfg.PanelPath
+    if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title Koha "{0}" {1}' -f $Wsl, $cmd) } }
+    return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
 }
 
 # What is running, in a few lines a librarian can paste into a message:
@@ -886,6 +987,108 @@ function Get-KohaQuickCheck {
 }
 
 # ----------------------------------------------------------------------
+# Services (the Koha window)
+# ----------------------------------------------------------------------
+# What the Koha window lists, in the order Koha needs them.
+$script:KohaServices = @(
+    @{ Unit = 'mariadb'; Name = 'MariaDB' }
+    @{ Unit = 'apache2'; Name = 'Apache' }
+    @{ Unit = 'rabbitmq-server'; Name = 'RabbitMQ' }
+    @{ Unit = 'memcached'; Name = 'Memcached' }
+    @{ Unit = 'koha-common'; Name = 'Koha (koha-common)' }
+)
+
+# Pure: systemctl is-active as one of running | starting | failed | stopped | unknown.
+function ConvertTo-KohaServiceState {
+    param([AllowEmptyString()][string]$Active)
+    switch ($Active) {
+        'active'       { return 'running' }
+        'activating'   { return 'starting' }
+        'reloading'    { return 'starting' }
+        'failed'       { return 'failed' }
+        'inactive'     { return 'stopped' }
+        'deactivating' { return 'stopped' }
+        default        { return 'unknown' }
+    }
+}
+
+# Pure: the quick check's lines as the rows of the Koha window. With Debian
+# stopped, nothing inside it runs, so every row reads stopped.
+function ConvertFrom-KohaQuickCheck {
+    param([AllowEmptyCollection()][string[]]$Lines)
+    $map = @{}
+    $debian = $false
+    foreach ($l in @($Lines)) {
+        if ($l -match '^Debian \([^)]*\) running:\s*(\S+)') { $debian = ($Matches[1] -eq 'True'); continue }
+        if ($l -match '^([^:]+):\s*(.*)$') { $map[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    $rows = New-Object System.Collections.ArrayList
+    [void]$rows.Add([pscustomobject]@{ Unit = 'wsl'; Name = 'Debian (WSL)'; State = $(if ($debian) { 'running' } else { 'stopped' }); Detail = '' })
+    foreach ($s in $script:KohaServices) {
+        $state = 'stopped'
+        if ($debian) { $state = ConvertTo-KohaServiceState ([string]$map[$s.Unit]) }
+        [void]$rows.Add([pscustomobject]@{ Unit = $s.Unit; Name = $s.Name; State = $state; Detail = '' })
+    }
+    $code = [string]$map['staff page inside Debian']
+    $web = 'stopped'
+    if ($debian) {
+        $web = 'failed'
+        if ($code -match '^[1-4]\d\d$') { $web = 'running' }
+    }
+    [void]$rows.Add([pscustomobject]@{ Unit = 'http'; Name = 'staff'; State = $web; Detail = $code })
+    return [pscustomobject]@{ DebianRunning = $debian; Services = @($rows); Finished = ([string]$map['installation finished'] -eq 'yes') }
+}
+
+function Get-KohaServiceStateText {
+    param([string]$State, [string]$Unit, [string]$Detail)
+    if ($Unit -eq 'http') {
+        if ($State -eq 'running') { return ((T 'Answers (HTTP {0})') -f $Detail) }
+        if ($State -eq 'failed') { return (T 'Does not answer') }
+    }
+    switch ($State) {
+        'running'  { return (T 'Running') }
+        'starting' { return (T 'Starting') }
+        'failed'   { return (T 'Failed') }
+        'stopped'  { return (T 'Stopped') }
+        default    { return (T 'Unknown') }
+    }
+}
+
+# Read-only, like the tray: a stopped Debian is reported, never started.
+function Get-KohaServiceHealth {
+    $lines = @(Get-KohaQuickCheck)
+    $h = ConvertFrom-KohaQuickCheck -Lines $lines
+    $h | Add-Member -NotePropertyName Lines -NotePropertyValue $lines
+    return $h
+}
+
+# Restarts Koha's services inside Debian, without restarting WSL: faster
+# than Koha - Restart, and what most "Koha stopped answering" cases need.
+$script:RestartServicesScript = @'
+systemctl reset-failed >/dev/null 2>&1
+rc=0
+for s in mariadb memcached rabbitmq-server koha-common apache2; do
+  systemctl cat "$s.service" >/dev/null 2>&1 || continue
+  systemctl restart "$s.service" || { echo "failed: $s"; rc=1; }
+done
+exit $rc
+'@
+
+function Restart-KohaServices {
+    param([switch]$NoWait)
+    if (-not (Test-KohaDistroRunning)) { return 'not_running' }
+    Write-KohaLog 'restarting Koha services'
+    $r = Invoke-KohaLinuxScript -Script $script:RestartServicesScript
+    if ($r.ExitCode -ne 0) { Write-KohaLog ('restart services: ' + $r.Output) }
+    if ($NoWait) {
+        if ($r.ExitCode -eq 0) { return 'restarted' }
+        return 'failed'
+    }
+    if (Wait-KohaHttp -Seconds 120) { return 'ready' }
+    return 'timeout'
+}
+
+# ----------------------------------------------------------------------
 # Diagnostics
 # ----------------------------------------------------------------------
 # Same rules as kei_redact in the installer.
@@ -912,6 +1115,63 @@ function Save-KohaText {
 function Invoke-KohaCapture {
     param([scriptblock]$Block)
     try { return ((& $Block 2>&1 | Out-String -Width 200)) } catch { return ('ERROR: ' + $_.Exception.Message) }
+}
+
+# The last warnings of Koha's services and the tails of its error logs.
+$script:ServiceLogScript = @'
+for s in mariadb apache2 rabbitmq-server memcached koha-common; do
+  echo "--- $s: latest warnings and errors"
+  journalctl -u "$s" -p warning -n 25 --no-pager -o short-iso 2>/dev/null
+done
+for f in /var/log/koha/*/plack-error.log /var/log/koha/*/intranet-error.log /var/log/apache2/error.log; do
+  [ -f "$f" ] || continue
+  echo "--- $f: last 40 lines"
+  tail -n 40 "$f"
+done
+'@
+
+# One text file on the desktop that anyone can open and paste into a
+# message: Windows and WSL versions, the services, the saved choices,
+# Debian's latest service errors and the Windows logs of the last days.
+# Starts nothing (a stopped Debian is reported as stopped). Passwords,
+# tokens and keys are removed, as in the .zip.
+function Export-KohaDiagnosticsText {
+    param([string]$Destination = [Environment]::GetFolderPath('Desktop'), [string]$FileName = 'diagnostico_koha.txt')
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add(('Koha on Windows - diagnostics - {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))
+    $out.Add(('Computer: {0}   Koha Easy Installer for Windows {1}' -f $env:COMPUTERNAME, $script:KohaEasyVersion))
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $out.Add(('Windows: {0} {1} (build {2})' -f $os.Caption, $os.Version, $os.BuildNumber))
+    } catch { }
+    $out.Add('')
+    $out.Add('== WSL')
+    $out.Add((Invoke-KohaWsl -Arguments @('--version')).Output)
+    $out.Add((Invoke-KohaWsl -Arguments @('--list', '--verbose')).Output)
+    $out.Add('')
+    $out.Add('== Koha')
+    $state = Get-KohaState
+    $out.Add(('Wanted: {0}   automatic start: {1}   library network: {2}' -f $state.desired, $state.autostart, [bool]$state['lanAccess']))
+    foreach ($l in @(Get-KohaQuickCheck)) { $out.Add($l) }
+    if (Test-KohaDistroRunning) {
+        $out.Add('')
+        $out.Add('== Debian: service logs')
+        $out.Add((Invoke-KohaLinuxScript -Script $script:ServiceLogScript).Output)
+    }
+    $logs = Get-KohaPath Logs
+    if (Test-Path -LiteralPath $logs) {
+        Get-ChildItem -LiteralPath $logs -Filter '*.log' | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-3) } |
+            Sort-Object LastWriteTime | ForEach-Object {
+                $out.Add('')
+                $out.Add(('== Windows log {0}: last 60 lines' -f $_.Name))
+                foreach ($l in @(Get-Content -LiteralPath $_.FullName -Tail 60)) { $out.Add([string]$l) }
+            }
+    }
+    if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+    $file = Join-Path $Destination $FileName
+    Save-KohaText $file (($out -join "`r`n") + "`r`n")
+    Write-KohaLog "diagnostics report saved: $file"
+    return $file
 }
 
 # Collects the Windows side, asks Linux for its own bundle
@@ -1001,23 +1261,21 @@ function Get-KohaIconPath { return [System.IO.Path]::Combine((Get-KohaPath Bin),
 # "lnk" a program shortcut. Commands run KohaEasy.ps1 in Windows PowerShell 5.1.
 function Get-KohaShortcutList {
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    $ps1 = Get-KohaScriptPath
-    $cmd = { param($a, $style) '-NoProfile -WindowStyle {0} -ExecutionPolicy Bypass -File "{1}" {2}' -f $style, $ps1, $a }
-    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $lnk = { param($name, $a) $l = Get-KohaHiddenLaunch -Arguments $a; @{ Name = $name; Kind = 'lnk'; Target = $l.Target; Arguments = $l.Arguments } }
     $list = @(
-        # The one desktop icon: the Koha control panel (Koha is started too, so
-        # it keeps running after the panel is closed).
-        @{ Name = 'Koha'; Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Panel' 'Hidden'); Desktop = $true; StartMenu = $false }
+        # The one desktop icon: the Koha window (status, services, actions).
+        # It works even when Koha itself does not answer.
+        (& $lnk 'Koha' 'Window') + @{ Desktop = $true; StartMenu = $false }
         @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
         @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
-        @{ Name = (T 'Koha - Control panel'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Panel' 'Hidden') }
+        (& $lnk (T 'Koha - Control panel') 'Panel')
         @{ Name = (T 'Koha - Backups folder'); Kind = 'lnk'; Target = [System.IO.Path]::Combine([string]$env:SystemRoot, 'explorer.exe'); Arguments = ('"{0}"' -f (Get-KohaPath Backups)) }
-        @{ Name = (T 'Koha - Start'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Start' 'Hidden') }
-        @{ Name = (T 'Koha - Stop'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Stop' 'Hidden') }
-        @{ Name = (T 'Koha - Restart'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Restart' 'Hidden') }
-        @{ Name = (T 'Koha - Status'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Status' 'Hidden') }
-        @{ Name = (T 'Koha - Export diagnostics'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'ExportDiagnostics' 'Hidden') }
-        @{ Name = (T 'Koha - Status icon'); Kind = 'lnk'; Target = $ps; Arguments = (& $cmd 'Tray' 'Hidden') }
+        (& $lnk (T 'Koha - Start') 'Start')
+        (& $lnk (T 'Koha - Stop') 'Stop')
+        (& $lnk (T 'Koha - Restart') 'Restart')
+        (& $lnk (T 'Koha - Status') 'Window')
+        (& $lnk (T 'Koha - Export diagnostics') 'ExportReport')
+        (& $lnk (T 'Koha - Status icon') 'Tray')
     )
     foreach ($s in $list) { $s.Icon = Get-KohaIconPath }
     return $list
@@ -1134,8 +1392,8 @@ function Set-KohaTrayAtSignIn {
     param([bool]$Enabled = $true)
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     if ($Enabled) {
-        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $cmd = '"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" Tray' -f $ps, (Get-KohaScriptPath)
+        $l = Get-KohaHiddenLaunch -Arguments 'Tray'
+        $cmd = '"{0}" {1}' -f $l.Target, $l.Arguments
         New-ItemProperty -Path $key -Name 'KohaEasyTray' -Value $cmd -PropertyType String -Force | Out-Null
     } else {
         Remove-ItemProperty -Path $key -Name 'KohaEasyTray' -ErrorAction SilentlyContinue
