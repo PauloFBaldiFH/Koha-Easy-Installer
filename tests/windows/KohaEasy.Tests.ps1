@@ -148,6 +148,41 @@ Describe 'Notifications' {
         $r.Notifications[0].Level | Should -Be 'error'
     }
 
+    It 'tells the librarian about a repair after an unclean stop: once when it starts, once when it ends' {
+        $now = 2000000000
+        $st = @{ desired = 'running'; autostart = 'logon'; lastBackupLogEpoch = $now; lastStaleBackupWarn = 0; firstSeen = 0; lastDiskLevel = 'ok'; lastDiskWarn = 0; notifyBackupOk = $true; lastRecoveryEpoch = 0; lastRecoveryNotice = 0 }
+        $status = New-Status -LogEpoch $now -LastEpoch $now
+        $status.Linux | Add-Member -NotePropertyName recovery -NotePropertyValue ([pscustomobject]@{ epoch = $now - 100; state = 'running'; finished = 0; db = ''; backup = ''; index = '' })
+        $r = Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now
+        @($r.Notifications).Count | Should -Be 1
+        $r.Notifications[0].Level | Should -Be 'warning'
+        $st.lastRecoveryNotice = $r.Changes.lastRecoveryNotice
+        @((Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now).Notifications).Count | Should -Be 0
+
+        $status.Linux.recovery = [pscustomobject]@{ epoch = $now - 100; state = 'done'; finished = $now - 10; db = 'ok'; backup = 'ok'; index = 'updated' }
+        $r = Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now
+        @($r.Notifications).Count | Should -Be 1
+        $r.Notifications[0].Level | Should -Be 'info'
+        $r.Changes.lastRecoveryEpoch | Should -Be ($now - 100)
+        $st.lastRecoveryEpoch = $r.Changes.lastRecoveryEpoch
+        @((Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now).Notifications).Count | Should -Be 0
+
+        $st.lastRecoveryEpoch = 0
+        $status.Linux.recovery = [pscustomobject]@{ epoch = $now - 100; state = 'done'; finished = $now - 10; db = 'errors'; backup = 'ok'; index = 'failed' }
+        $r = Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now
+        $r.Notifications[0].Level | Should -Be 'error'
+        $r.Notifications[0].Text | Should -Match 'database check reported errors; the search index could not be rebuilt'
+    }
+
+    It 'says nothing about a repair older than a week or a status without one' {
+        $now = 2000000000
+        $st = @{ desired = 'running'; autostart = 'logon'; lastBackupLogEpoch = $now; lastStaleBackupWarn = 0; firstSeen = 0; lastDiskLevel = 'ok'; lastDiskWarn = 0; notifyBackupOk = $true; lastRecoveryEpoch = 0; lastRecoveryNotice = 0 }
+        $status = New-Status -LogEpoch $now -LastEpoch $now
+        @((Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now).Notifications).Count | Should -Be 0
+        $status.Linux | Add-Member -NotePropertyName recovery -NotePropertyValue ([pscustomobject]@{ epoch = $now - 8 * 86400; state = 'done'; finished = 0; db = 'ok'; backup = 'ok'; index = 'updated' })
+        @((Get-KohaNotifications -Previous 'running' -Status $status -Disk $null -State $st -Now $now).Notifications).Count | Should -Be 0
+    }
+
     It 'reports service events only while Koha is meant to run' {
         $st = @{ desired = 'running'; autostart = 'logon'; lastBackupLogEpoch = 0; lastStaleBackupWarn = 0; firstSeen = 0; lastDiskLevel = 'ok'; lastDiskWarn = 0; notifyBackupOk = $true }
         $down = [pscustomobject]@{ State = 'not_responding'; Linux = $null }
@@ -205,7 +240,7 @@ Describe 'Virtual disk watchdog' {
         $m.Message | Should -Match 'Compact'
     }
 
-    It 'compacts in order: fstrim, stop, wsl --shutdown, diskpart, start again' {
+    It 'compacts in order: fstrim, stop, Koha stopped cleanly, wsl --shutdown, diskpart, start again' {
         $vhdx = Join-Path $TestDrive 'ext4.vhdx'
         Set-Content -LiteralPath $vhdx -Value 'x'
         $script:calls = New-Object System.Collections.ArrayList
@@ -213,7 +248,9 @@ Describe 'Virtual disk watchdog' {
         Mock -ModuleName KohaEasy.Core Test-KohaAdmin { $true }
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
         Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [void]$script:calls.Add('linux ' + ($Command -join ' ')) }
-        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { [void]$script:calls.Add('wsl ' + ($Arguments -join ' ')) }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { [void]$script:calls.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [void]$script:calls.Add('stop Koha inside Debian'); [pscustomobject]@{ ExitCode = 0; Output = '' } }
         Mock -ModuleName KohaEasy.Core Stop-KohaKeepAlive { [void]$script:calls.Add('stop task') }
         Mock -ModuleName KohaEasy.Core Start-KohaKeepAlive { [void]$script:calls.Add('start task') }
         Mock -ModuleName KohaEasy.Core Invoke-KohaDiskpart { [void]$script:calls.Add('diskpart ' + ((Get-Content -LiteralPath $ScriptFile) -join ';')) }
@@ -221,9 +258,10 @@ Describe 'Virtual disk watchdog' {
         Invoke-KohaDiskCompact -Confirm:$false | Out-Null
         $script:calls[0] | Should -Be 'linux fstrim -av'
         $script:calls[1] | Should -Be 'stop task'
-        $script:calls[2] | Should -Be 'wsl --shutdown'
-        $script:calls[3] | Should -Be ('diskpart select vdisk file="{0}";attach vdisk readonly;compact vdisk;detach vdisk' -f $vhdx)
-        $script:calls[4] | Should -Be 'start task'
+        $script:calls[2] | Should -Be 'stop Koha inside Debian'
+        $script:calls[3] | Should -Be 'wsl --shutdown'
+        $script:calls[4] | Should -Be ('diskpart select vdisk file="{0}";attach vdisk readonly;compact vdisk;detach vdisk' -f $vhdx)
+        $script:calls[5] | Should -Be 'start task'
     }
 }
 
@@ -242,6 +280,65 @@ Describe 'Start, Stop and automatic start' {
         $script:calls | Should -Contain 'stop task:stopped'
         $script:calls | Should -Contain 'wsl --terminate koha'
         (Get-KohaState).desired | Should -Be 'stopped'
+    }
+
+    It 'Stop stops Koha inside Debian first (with a time limit), then WSL' {
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [void]$script:calls.Add(('linux script ({0} s) as {1}' -f $TimeoutSeconds, (Get-KohaState).desired)); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Stop-Koha | Should -Be 'stopped'
+        $script:calls | Should -Be @('stop task:stopped', 'linux script (60 s) as stopped', 'wsl --terminate koha')
+    }
+
+    It 'a Koha that does not stop in time is stopped anyway and the reason logged' {
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [pscustomobject]@{ ExitCode = 124; Output = 'did not stop: mariadb.service' } }
+        Stop-KohaDebianGracefully -TimeoutSeconds 5 | Should -Be 'forced'
+        $script:calls | Should -Contain 'wsl --terminate koha'
+        $log = Get-Content -LiteralPath (Join-Path (Get-KohaPath Logs) ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Raw
+        $log | Should -Match 'Koha did not stop within 5 s'
+    }
+
+    It 'never starts a stopped distro just to stop it; -Shutdown stops all of WSL' {
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('Ubuntu') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { throw 'must not start the distro' }
+        Stop-KohaDebianGracefully -Shutdown | Should -Be 'not_running'
+        $script:calls | Should -Be @('wsl --shutdown')
+        (Get-KohaState).desired | Should -Be 'running'
+    }
+
+    It 'a time limit runs the Linux script under timeout' {
+        $script:wsl = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { [void]$script:wsl.Add($Arguments -join ' '); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Invoke-KohaLinuxScript -Script 'true' -Distro 'KohaEasy' -TimeoutSeconds 60 | Out-Null
+        $script:wsl[1] | Should -Match '^-d KohaEasy -u root -- timeout -k 5 60 sh /run/kohaeasy-[0-9a-f]+\.sh$'
+    }
+
+    It 'the stop inside Debian goes web first, then queue and cache, then MariaDB, then the clean-stop mark' -Skip:(-not (Get-Command bash -ErrorAction SilentlyContinue)) {
+        $bin = Join-Path $TestDrive 'stopbin'
+        New-Item -ItemType Directory -Path $bin -Force | Out-Null
+        $trace = Join-Path $TestDrive 'stop-trace.txt'
+        $stub = "#!/bin/sh`necho `"`$(basename `$0) `$*`" >> '$trace'`n"
+        foreach ($n in @('systemctl', 'koha-plack', 'koha-worker', 'koha-indexer', 'koha-zebra', 'sync', 'koha-stop-guard')) {
+            Set-Content -LiteralPath (Join-Path $bin $n) -Value $stub -NoNewline
+        }
+        Set-Content -LiteralPath (Join-Path $bin 'ps') -Value "#!/bin/sh`necho systemd`n" -NoNewline
+        Set-Content -LiteralPath (Join-Path $bin 'koha-list') -Value "#!/bin/sh`necho library`n" -NoNewline
+        & chmod +x (Get-ChildItem -LiteralPath $bin | ForEach-Object { $_.FullName })
+        $sh = (InModuleScope KohaEasy.Core { $script:GracefulStopScript }) -replace '/usr/local/sbin/koha-stop-guard', (Join-Path $bin 'koha-stop-guard')
+        $sh = $sh -replace 'systemctl cat "\$s.service" >/dev/null 2>&1', 'true'
+        $file = Join-Path $TestDrive 'stop.sh'
+        Set-Content -LiteralPath $file -Value $sh -NoNewline
+        $env:PATH = $bin + ':' + $env:PATH
+        try { & sh $file | Out-Null; $LASTEXITCODE | Should -Be 0 } finally { $env:PATH = $env:PATH.Substring($bin.Length + 1) }
+        $lines = @(Get-Content -LiteralPath $trace)
+        $lines | Should -Be @(
+            'systemctl stop apache2.service koha-common.service'
+            'koha-plack --stop library', 'koha-worker --stop library', 'koha-indexer --stop library', 'koha-zebra --stop library'
+            'systemctl stop rabbitmq-server.service memcached.service elasticsearch.service'
+            'systemctl stop mariadb.service'
+            'sync '
+            'koha-stop-guard stop'
+        )
     }
 
     It 'the sign-in task starts nothing in manual mode; the Start shortcut always does' {

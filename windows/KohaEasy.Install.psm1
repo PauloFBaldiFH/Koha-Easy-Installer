@@ -358,17 +358,14 @@ function Wait-KohaDistroStopped {
 
 # The restart that makes /etc/wsl.conf (and .wslconfig) take effect. WSL
 # reads wsl.conf only when the distro boots, and a command sent right after
-# "wsl --terminate" can still land in the old instance. So: terminate (or
-# shut all of WSL down when .wslconfig changed), wait until WSL lists the
+# "wsl --terminate" can still land in the old instance. So: stop Koha's
+# services and terminate (or shut all of WSL down when .wslconfig changed)
+# through Stop-KohaDebianGracefully, wait until WSL lists the
 # distro as stopped, give WSL its 8 seconds, boot it again and wait until
 # systemd has finished starting. Nothing else runs in Debian before that.
 function Restart-KohaDistro {
     param([switch]$Shutdown, [int]$SettleSeconds = 8)
-    if ($Shutdown) {
-        Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
-    } else {
-        Invoke-KohaWsl -Arguments @('--terminate', (Get-KohaConfig).Distro) | Out-Null
-    }
+    Stop-KohaDebianGracefully -Shutdown:$Shutdown | Out-Null
     if (-not (Wait-KohaDistroStopped)) {
         Write-KohaLog 'the distro was still running 30 s after --terminate; shutting WSL down' 'install'
         Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
@@ -538,8 +535,7 @@ function Rename-KohaLegacyDistro {
         $e = Get-KohaLxssEntry -Name $old
         if ($null -eq $e) { return 'none' }
         try { Stop-KohaKeepAlive } catch { }
-        Invoke-KohaWsl -Arguments @('--terminate', $old) | Out-Null
-        Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+        Stop-KohaDebianGracefully -Distro $old -Shutdown | Out-Null
         Set-ItemProperty -LiteralPath $e.PSPath -Name DistributionName -Value $new
         if (@(Get-KohaInstalledDistros) -notcontains $new) {
             Write-KohaLog ('distro {0} renamed to {1} in the registry; WSL still lists the old name until Windows restarts' -f $old, $new) 'install'
@@ -586,6 +582,15 @@ function Copy-KohaPanelIntoDistro {
     ) -join "`n"
     $r = Invoke-KohaLinuxScript -Script $sh
     if ($r.ExitCode -ne 0) { throw ('copy: ' + $r.Output) }
+}
+
+# The data-safety settings inside Debian (installer, install_data_safety:
+# the clean-stop guard...): the panel installs them with Koha; an existing
+# Koha gets them, or their newer version, here, without opening the panel.
+function Install-KohaDataSafety {
+    $r = Invoke-KohaLinux -Command @($script:LauncherPath, '--install-data-safety')
+    Write-KohaLog ('data-safety settings (exit {0}) {1}' -f $r.ExitCode, ([string]$r.Output).Trim()) 'install'
+    return ($r.ExitCode -eq 0)
 }
 
 # Koha counts as installed only when option 1 went all the way: the
@@ -764,6 +769,8 @@ function Install-Koha {
         if (-not (Test-KohaInstalledInDistro)) {
             Write-KohaStep (T 'Koha was not installed all the way. The control panel opens again to finish it.') 'warn'
             Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha'
+        } else {
+            Invoke-KohaSafeStep { Install-KohaDataSafety | Out-Null }
         }
     }
 

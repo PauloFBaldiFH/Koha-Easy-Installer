@@ -2,6 +2,7 @@
 # Test double for systemctl (tests/ only). The test containers have no
 # systemd; units are "active" when /run/kei-mock/svc/<unit> exists.
 #   svc-fail/<unit>   make start/restart of that unit fail
+#   result/<unit>     what "systemctl show -p Result --value <unit>" prints
 S=/run/kei-mock
 mkdir -p "$S/svc" "$S/svc-fail"
 printf 'systemctl %s\n' "$*" >> "$S/calls.log"
@@ -34,6 +35,8 @@ case "$verb" in
     enable)  [ "$now" = "yes" ] && for u in "${units[@]}"; do touch "$S/svc/$u"; done ;;
     disable) [ "$now" = "yes" ] && for u in "${units[@]}"; do rm -f "$S/svc/$u"; done ;;
     cat)     for u in "${units[@]}"; do [ -e "$S/svc/$u" ] || [ -e "$S/units/$u" ] || rc=1; done ;;
+    # show -p Result --value <unit>: the text of result/<unit>, if any.
+    show)    u="${units[${#units[@]}-1]:-}"; [ -f "$S/result/$u" ] && cat "$S/result/$u" ;;
     *) ;;
 esac
 exit "$rc"

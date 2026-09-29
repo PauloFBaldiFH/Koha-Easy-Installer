@@ -26,6 +26,7 @@ $script:Cfg = @{
     StaffUrl    = 'http://localhost:8080/'
     OpacUrl     = 'http://localhost/'
     StartWaitS  = 180
+    StopWaitS   = 60
     DiskWarnGB  = 10
     DiskCritGB  = 5
     StaleBackupH = 36
@@ -82,6 +83,8 @@ $script:StateDefaults = [ordered]@{
     lastStaleBackupWarn  = 0
     lastDiskLevel        = 'ok'
     lastDiskWarn         = 0
+    lastRecoveryEpoch    = 0
+    lastRecoveryNotice   = 0
     notifyBackupOk       = $true
     handshakePending     = $false
     hiddenLaunch         = 'conhost'
@@ -174,10 +177,10 @@ function Invoke-KohaWsl {
     return [pscustomobject]@{ ExitCode = $code; Output = $text.Replace([string][char]0, '') }
 }
 
-# Command inside the distro, as root.
+# Command inside the distro (Koha's by default), as root.
 function Invoke-KohaLinux {
-    param([Parameter(Mandatory = $true)][string[]]$Command, [string]$InputText)
-    $wslArgs = @('-d', $script:Cfg.Distro, '-u', 'root', '--') + $Command
+    param([Parameter(Mandatory = $true)][string[]]$Command, [string]$InputText, [string]$Distro = $script:Cfg.Distro)
+    $wslArgs = @('-d', $Distro, '-u', 'root', '--') + $Command
     if ($PSBoundParameters.ContainsKey('InputText')) { return Invoke-KohaWsl -Arguments $wslArgs -InputText $InputText }
     return Invoke-KohaWsl -Arguments $wslArgs
 }
@@ -187,19 +190,22 @@ function Invoke-KohaLinux {
 # wsl.exe's command line: Windows PowerShell 5.1 does not escape the double
 # quotes inside a native command's arguments, and "sh -c <script>" arrived
 # in Linux cut into pieces. $InputText, when given, is the script's stdin.
+# With -TimeoutSeconds, Linux's timeout ends the script (exit code 124).
 function Invoke-KohaLinuxScript {
-    param([Parameter(Mandatory = $true)][string]$Script, [string]$InputText)
+    param([Parameter(Mandatory = $true)][string]$Script, [string]$InputText, [string]$Distro = $script:Cfg.Distro, [int]$TimeoutSeconds = 0)
     $file = '/run/kohaeasy-{0}.sh' -f ([guid]::NewGuid().ToString('N'))
     # "exit $?" ends the script before the CR LF that Windows adds after
     # piped text, which sh would otherwise run as a command.
     $body = ($Script -replace "`r", '') + "`nexit `$?`n"
-    $w = Invoke-KohaLinux -Command @('tee', $file) -InputText $body
+    $w = Invoke-KohaLinux -Command @('tee', $file) -InputText $body -Distro $Distro
     if ($w.ExitCode -ne 0) { return $w }
+    $run = @('sh', $file)
+    if ($TimeoutSeconds -gt 0) { $run = @('timeout', '-k', '5', [string]$TimeoutSeconds) + $run }
     try {
-        if ($PSBoundParameters.ContainsKey('InputText')) { return (Invoke-KohaLinux -Command @('sh', $file) -InputText $InputText) }
-        return (Invoke-KohaLinux -Command @('sh', $file))
+        if ($PSBoundParameters.ContainsKey('InputText')) { return (Invoke-KohaLinux -Command $run -InputText $InputText -Distro $Distro) }
+        return (Invoke-KohaLinux -Command $run -Distro $Distro)
     } finally {
-        Invoke-KohaLinux -Command @('rm', '-f', $file) | Out-Null
+        Invoke-KohaLinux -Command @('rm', '-f', $file) -Distro $Distro | Out-Null
     }
 }
 
@@ -448,6 +454,32 @@ function Get-KohaNotifications {
         }
     }
 
+    # Repair after an unclean stop (a power cut, a forced shutdown): told
+    # once when it starts and once when it ends, for repairs of the last week.
+    if ($null -ne $Status.Linux -and $Status.Linux.PSObject.Properties['recovery'] -and $null -ne $Status.Linux.recovery) {
+        $rec = $Status.Linux.recovery
+        $epoch = [int64]$rec.epoch
+        $recent = ($epoch -gt 0) -and (($Now - $epoch) -lt 604800)
+        if ($recent -and $rec.state -eq 'running' -and $epoch -gt [int64]$State.lastRecoveryNotice) {
+            $changes.lastRecoveryNotice = $epoch
+            [void]$out.Add(@{ Level = 'warning'; Title = (T 'Koha was not shut down properly'); Text = (T 'The computer was turned off while Koha was running (for example, a power cut). Koha is checking its database and its search index; searches may be incomplete for a few minutes.') })
+        }
+        if ($recent -and $rec.state -eq 'done' -and $epoch -gt [int64]$State.lastRecoveryEpoch) {
+            $changes.lastRecoveryEpoch = $epoch
+            $changes.lastRecoveryNotice = $epoch
+            $problems = New-Object System.Collections.ArrayList
+            if ($rec.db -eq 'errors') { [void]$problems.Add((T 'the database check reported errors')) }
+            if ($rec.db -eq 'unreachable') { [void]$problems.Add((T 'the database did not start')) }
+            if ($rec.backup -eq 'failed') { [void]$problems.Add((T 'the new backup failed')) }
+            if ($rec.index -eq 'failed') { [void]$problems.Add((T 'the search index could not be rebuilt')) }
+            if ($problems.Count -eq 0) {
+                [void]$out.Add(@{ Level = 'info'; Title = (T 'Koha repaired itself'); Text = (T 'The computer was turned off while Koha was running. Koha checked its database, made a new backup and updated its search index. Everything is working.') })
+            } else {
+                [void]$out.Add(@{ Level = 'error'; Title = (T 'Koha needs attention'); Text = ((T 'The computer was turned off while Koha was running, and the check afterwards found problems: {0}. Export the diagnostics from the tray menu and send them to support.') -f (@($problems) -join '; ')) })
+            }
+        }
+    }
+
     # Disk space: on every level change, and a critical level again every 6 hours.
     if ($null -ne $Disk) {
         $changes.lastDiskLevel = $Disk.Level
@@ -561,8 +593,8 @@ function Test-KohaAdmin {
 }
 
 # Gives the unused space of ext4.vhdx back to Windows: fstrim inside Linux,
-# "wsl --shutdown" (the disk must be detached; this also stops any other WSL
-# distro), diskpart "compact vdisk", then Koha is started again if it was
+# Koha stopped cleanly and "wsl --shutdown" (the disk must be detached; this
+# also stops any other WSL distro), diskpart "compact vdisk", then Koha is started again if it was
 # meant to run. Needs administrator rights (diskpart). [verify] on real WSL.
 function Invoke-KohaDiskCompact {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -575,7 +607,7 @@ function Invoke-KohaDiskCompact {
     if (-not $PSCmdlet.ShouldProcess($vhdx, 'compact')) { return }
     if (Test-KohaDistroRunning) { Invoke-KohaLinux -Command @('fstrim', '-av') | Out-Null }
     Stop-KohaKeepAlive
-    Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+    Stop-KohaDebianGracefully -Shutdown | Out-Null
     $script = @(
         ('select vdisk file="{0}"' -f $vhdx)
         'attach vdisk readonly'
@@ -786,11 +818,79 @@ function Start-Koha {
 # KohaEasy.ps1 Stop: desired=stopped first, so the keep-alive task's
 # restart-on-failure does not bring Koha back a minute later.
 function Stop-Koha {
-    Set-KohaState @{ desired = 'stopped'; startedAt = 0 } | Out-Null
-    Stop-KohaKeepAlive
-    Invoke-KohaWsl -Arguments @('--terminate', $script:Cfg.Distro) | Out-Null
-    Write-KohaLog 'stopped by the user'
+    $how = Stop-KohaDebianGracefully -SetStopped
+    Write-KohaLog "stopped by the user ($how)"
     return 'stopped'
+}
+
+# What Debian runs before WSL stops it: Koha's services in the order a
+# clean shutdown uses (the web first, then the queue and the cache, then
+# MariaDB), Plack, Zebra and the workers of each instance even when the
+# panel started them outside koha-common, then "koha-stop-guard stop",
+# which records the clean stop the next boot looks for. Exit 0 only when
+# everything stopped and the guard recorded it.
+$script:GracefulStopScript = @'
+if [ "$(ps -p 1 -o comm= 2>/dev/null)" != "systemd" ]; then sync; exit 0; fi
+rc=0
+stop_units() {
+  units=""
+  for s in "$@"; do systemctl cat "$s.service" >/dev/null 2>&1 && units="$units $s.service"; done
+  [ -n "$units" ] || return 0
+  systemctl stop $units || { echo "did not stop:$units"; rc=1; }
+}
+stop_units apache2 koha-common
+for i in $(koha-list 2>/dev/null); do
+  for t in koha-plack koha-worker koha-indexer koha-es-indexer koha-zebra; do
+    command -v "$t" >/dev/null 2>&1 && "$t" --stop "$i" >/dev/null 2>&1
+  done
+done
+stop_units rabbitmq-server memcached elasticsearch
+stop_units mariadb
+sync
+if [ -x /usr/local/sbin/koha-stop-guard ]; then
+  /usr/local/sbin/koha-stop-guard stop || { echo "not marked clean (see /var/log/koha-easy-install/stop-guard.log)"; rc=1; }
+else
+  echo "no clean-stop guard in this Debian yet"
+fi
+exit $rc
+'@
+
+# The one way the Windows tools stop Debian (Stop, Restart, disk compaction,
+# diagnostics, the installer's restarts): Koha's services are stopped
+# inside Debian first, so MariaDB and Zebra are never cut off mid-write, and
+# WSL stops the distro only afterwards. When that takes longer than
+# $TimeoutSeconds, Debian is stopped anyway: the clean-stop mark is then
+# missing, and the next start checks and repairs Koha.
+#   -SetStopped  the librarian stopped Koha: desired=stopped and the
+#                keep-alive task ended first, so it does not start Koha again
+#   -Shutdown    "wsl --shutdown" (all of WSL) instead of "--terminate"
+# Returns clean, forced (a service did not stop, or the timeout) or
+# not_running (nothing to stop: a stopped distro is never started for this).
+function Stop-KohaDebianGracefully {
+    param([string]$Distro = $script:Cfg.Distro, [switch]$SetStopped, [switch]$Shutdown, [int]$TimeoutSeconds = $script:Cfg.StopWaitS)
+    if ($SetStopped) {
+        Set-KohaState @{ desired = 'stopped'; startedAt = 0 } | Out-Null
+        Stop-KohaKeepAlive
+    }
+    $how = 'not_running'
+    if (@(Get-KohaRunningDistros) -contains $Distro) {
+        $r = Invoke-KohaLinuxScript -Script $script:GracefulStopScript -Distro $Distro -TimeoutSeconds $TimeoutSeconds
+        if ($r.ExitCode -eq 0) {
+            $how = 'clean'
+        } else {
+            $how = 'forced'
+            $why = ([string]$r.Output).Trim()
+            if ($r.ExitCode -eq 124) { $why = ('Koha did not stop within {0} s. {1}' -f $TimeoutSeconds, $why).Trim() }
+            Write-KohaLog ('graceful stop of {0} incomplete (exit {1}): {2}' -f $Distro, $r.ExitCode, $why)
+        }
+    }
+    if ($Shutdown) {
+        Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
+    } else {
+        Invoke-KohaWsl -Arguments @('--terminate', $Distro) | Out-Null
+    }
+    Write-KohaLog ('{0} stopped: {1}' -f $Distro, $how)
+    return $how
 }
 
 # The keep-alive task's action. Exits at once when Koha is meant to be off
@@ -1251,7 +1351,7 @@ function Export-KohaDiagnostics {
         } else {
             $note = 'Linux diagnostics failed: ' + $r.Output
         }
-        if (-not $wasRunning -and $state.desired -ne 'running') { Invoke-KohaWsl -Arguments @('--terminate', $script:Cfg.Distro) | Out-Null }
+        if (-not $wasRunning -and $state.desired -ne 'running') { Stop-KohaDebianGracefully | Out-Null }
     } else {
         $note = ('The {0} distro is not installed.' -f $script:Cfg.Distro)
     }

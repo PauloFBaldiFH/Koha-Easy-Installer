@@ -536,18 +536,19 @@ Describe 'Restarting Debian for systemd' {
         $script:running = 3
         Mock -ModuleName KohaEasy.Install Start-Sleep { [void]$script:log.Add('sleep ' + $Seconds) }
         Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [void]$script:log.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Install Stop-KohaDebianGracefully { [void]$script:log.Add('stop koha, then ' + $(if ($Shutdown) { 'shutdown' } else { 'terminate' })); 'clean' }
         Mock -ModuleName KohaEasy.Install Test-KohaDistroRunning { $script:running--; [void]$script:log.Add('running?'); ($script:running -gt 0) }
         Mock -ModuleName KohaEasy.Install Test-KohaSystemd { [void]$script:log.Add('systemd?'); $true }
     }
 
-    It 'terminates, waits until WSL lists it as stopped, waits 8 s, then checks systemd' {
+    It 'stops Koha cleanly and terminates, waits until WSL lists it as stopped, waits 8 s, then checks systemd' {
         Restart-KohaDistro | Should -BeTrue
-        $script:log | Should -Be @('wsl --terminate koha', 'running?', 'sleep 1', 'running?', 'sleep 1', 'running?', 'sleep 8', 'systemd?')
+        $script:log | Should -Be @('stop koha, then terminate', 'running?', 'sleep 1', 'running?', 'sleep 1', 'running?', 'sleep 8', 'systemd?')
     }
 
     It 'shuts WSL down when .wslconfig changed' {
         Restart-KohaDistro -Shutdown | Should -BeTrue
-        $script:log[0] | Should -Be 'wsl --shutdown'
+        $script:log[0] | Should -Be 'stop koha, then shutdown'
     }
 
     It 'rewrites wsl.conf keeping its other sections, and tries once more with WSL shut down' {
@@ -561,8 +562,8 @@ Describe 'Restarting Debian for systemd' {
         Set-KohaDistroConfig -User 'maria' | Should -BeTrue
         $script:conf | Should -Match 'useWindowsTimezone=false'
         $script:conf | Should -Match 'default=maria'
-        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq '--terminate' }
-        Should -Invoke -ModuleName KohaEasy.Install Invoke-KohaWsl -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq '--shutdown' }
+        Should -Invoke -ModuleName KohaEasy.Install Stop-KohaDebianGracefully -Times 1 -Exactly -ParameterFilter { -not $Shutdown }
+        Should -Invoke -ModuleName KohaEasy.Install Stop-KohaDebianGracefully -Times 1 -Exactly -ParameterFilter { $Shutdown }
     }
 }
 
@@ -583,6 +584,7 @@ Describe 'Old distro name' {
         $script:log = New-Object System.Collections.ArrayList
         Mock -ModuleName KohaEasy.Install Invoke-KohaWsl { [void]$script:log.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
         Mock -ModuleName KohaEasy.Install Stop-KohaKeepAlive { }
+        Mock -ModuleName KohaEasy.Install Stop-KohaDebianGracefully { [void]$script:log.Add(('stop {0}, then {1}' -f $Distro, $(if ($Shutdown) { 'shutdown' } else { 'terminate' }))); 'clean' }
         Mock -ModuleName KohaEasy.Install Get-KohaLxssEntry { [pscustomobject]@{ PSPath = 'HKCU:\x\{1}'; Name = 'KohaEasy' } }
         Mock -ModuleName KohaEasy.Install Set-ItemProperty { [void]$script:log.Add(('set {0}={1}' -f $Name, $Value)) }
     }
@@ -592,7 +594,7 @@ Describe 'Old distro name' {
         $script:lists.Enqueue(@('Ubuntu', 'koha'))
         Mock -ModuleName KohaEasy.Install Get-KohaInstalledDistros { $script:lists.Dequeue() }
         Rename-KohaLegacyDistro | Should -Be 'renamed'
-        $script:log | Should -Be @('wsl --terminate KohaEasy', 'wsl --shutdown', 'set DistributionName=koha')
+        $script:log | Should -Be @('stop KohaEasy, then shutdown', 'set DistributionName=koha')
     }
 
     It 'asks for a Windows restart when WSL still lists the old name' {

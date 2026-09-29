@@ -700,10 +700,11 @@ REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)"
 # ======================================================================
 PANEL_LOCK_FILE="/var/run/koha_panel.lock"
 
-# Read-only commands for the Windows tools (section 21.5) run next to an
-# open panel: no lock, no dependency install, no menu.
+# Commands for the Windows tools (section 21.5) run next to an open panel:
+# no lock, no dependency install, no menu. All are read-only except
+# --install-data-safety, which only (re)writes the data-safety settings.
 KEI_CLI_MODE=""
-case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat) KEI_CLI_MODE="$1" ;; esac
+case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat|--install-data-safety) KEI_CLI_MODE="$1" ;; esac
 
 if [ -z "$KEI_CLI_MODE" ]; then
     exec 9> "$PANEL_LOCK_FILE"
@@ -1235,6 +1236,282 @@ EOF
     return 0
 }
 
+# ======================================================================
+# CLEAN-STOP GUARD (power cuts, forced shutdowns, crashes)
+# ----------------------------------------------------------------------
+# A clean stop leaves a mark on disk; a boot that does not find it knows
+# MariaDB or Zebra may have been cut off mid-write, and repairs Koha:
+#   koha-stop-guard.service           before MariaDB at boot, so it stops
+#                                     after MariaDB and Koha at shutdown:
+#                                     reads and clears the mark at boot,
+#                                     writes it at a clean stop
+#   koha-stop-guard-recover.service   after an unclean stop only: waits
+#                                     for MariaDB's crash recovery, checks
+#                                     the database, makes a fresh backup
+#                                     and brings the Zebra index up to date
+#                                     (a full rebuild when needed)
+# The Windows tools stop Koha's services in order and call
+# "koha-stop-guard stop" before WSL stops Debian. The result of the last
+# repair goes to --status-json, so Windows can tell the librarian.
+# ======================================================================
+STOP_GUARD_SCRIPT="/usr/local/sbin/koha-stop-guard"
+STOP_GUARD_UNIT="/etc/systemd/system/koha-stop-guard.service"
+STOP_GUARD_RECOVER_UNIT="/etc/systemd/system/koha-stop-guard-recover.service"
+STOP_GUARD_STATE_DIR="/var/lib/koha-easy-install"
+STOP_GUARD_STATUS="${STOP_GUARD_STATE_DIR}/recovery.status"
+
+# Writes stdin to $1 (mode $2) only when the content changed. Returns 0 when
+# the file was written, 1 when it was already up to date.
+write_if_changed() {
+    local dst="$1" mode="$2" tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    cat > "$tmp"
+    if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod "$mode" "$tmp"
+    chown root:root "$tmp" 2>/dev/null
+    mv -f "$tmp" "$dst"
+    return 0
+}
+
+stop_guard_script() {
+    cat << EOF
+#!/bin/bash
+# Koha Easy Installer: remembers whether Koha was stopped cleanly and
+# repairs it after a power cut, a forced shutdown or a crash.
+#   koha-stop-guard boot      at boot, before MariaDB (koha-stop-guard.service)
+#   koha-stop-guard stop      at a clean stop, once MariaDB and Zebra are down
+#   koha-stop-guard recover   after an unclean stop (koha-stop-guard-recover.service)
+#   koha-stop-guard status    the result of the last repair (key=value)
+set -uo pipefail
+INST="${INSTANCE}"
+DB="${DB_NAME}"
+STATE_DIR="${STOP_GUARD_STATE_DIR}"
+STATUS="${STOP_GUARD_STATUS}"
+RUN_DIR="${MARKER_DIR}"
+LOG="${LOG_DIR}/stop-guard.log"
+BACKUP_LOG="${LOG_DIR}/backup_sql.log"
+ZEBRA_LOG="${LOG_DIR}/zebra-rebuild.log"
+EOF
+    cat << 'EOF'
+CLEAN="$STATE_DIR/clean-stop"
+ARMED="$STATE_DIR/stop-guard.armed"
+PENDING="$STATE_DIR/recovery.pending"
+FLAG="$RUN_DIR/unclean-stop"
+
+say() {
+    mkdir -p "${LOG%/*}" 2>/dev/null
+    printf '%s | %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null
+    logger -t koha-stop-guard "$*" 2>/dev/null || true
+}
+
+# The processes whose files a hard kill can damage: MariaDB and Zebra.
+data_daemons_running() { pgrep -x 'mariadbd|mysqld|zebrasrv|zebraidx' >/dev/null 2>&1; }
+
+db_up() { mysqladmin --connect-timeout=2 ping >/dev/null 2>&1; }
+
+write_status() {
+    local tmp="$STATUS.tmp"
+    printf 'epoch=%s\nstate=%s\nfinished=%s\ndb=%s\nbackup=%s\nindex=%s\n' "$@" > "$tmp" && mv -f "$tmp" "$STATUS"
+}
+
+# At boot, before MariaDB: was the last stop clean? A repair that did not
+# finish counts as unclean too. The very first boot with the guard is not.
+guard_boot() {
+    local verdict
+    mkdir -p "$STATE_DIR" "$RUN_DIR"
+    if [ -f "$PENDING" ]; then verdict="unclean (the last repair did not finish)"
+    elif [ -f "$CLEAN" ]; then verdict="clean"
+    elif [ -f "$ARMED" ]; then verdict="unclean"
+    else verdict="first boot with the guard"
+    fi
+    rm -f "$CLEAN"
+    case "$verdict" in unclean*) : > "$FLAG" ;; esac
+    : > "$ARMED"
+    sync
+    say "boot: the last stop was $verdict"
+}
+
+# Marks the stop clean only when MariaDB and Zebra are really down and
+# MariaDB's own stop succeeded (not killed after its timeout).
+guard_stop() {
+    local result
+    mkdir -p "$STATE_DIR"
+    if data_daemons_running; then
+        say "stop: MariaDB or Zebra is still running; this stop is not marked clean"
+        return 1
+    fi
+    result=$(systemctl show -p Result --value mariadb.service 2>/dev/null)
+    case "${result:-success}" in
+        success) ;;
+        *) say "stop: MariaDB's stop ended with '$result'; this stop is not marked clean"; return 1 ;;
+    esac
+    sync
+    : > "$CLEAN"
+    sync
+    say "stop: clean"
+    return 0
+}
+
+guard_recover() {
+    local start db="ok" backup="skipped" index="skipped" engine="" out rc check last i
+    mkdir -p "$STATE_DIR" "$RUN_DIR"
+    # The indexing watchdogs stay away while this runs (maintenance marker).
+    printf '%s\n' "$$" > "$RUN_DIR/recovery.in-progress"
+    : > "$PENDING"
+    sync
+    start=$(date +%s)
+    write_status "$start" running 0 "" "" ""
+    say "recover: the last stop was not clean; checking Koha"
+
+    # MariaDB answers once InnoDB has finished its crash recovery.
+    for i in $(seq 1 "${GUARD_DB_WAIT:-300}"); do db_up && break; sleep 2; done
+    if ! db_up; then
+        db="unreachable"
+    elif [ -z "$(mysql -Nse "SHOW DATABASES LIKE '$DB'" 2>/dev/null)" ]; then
+        db="none"
+    else
+        check=$(command -v mariadb-check || command -v mysqlcheck)
+        out=$("$check" --check --quick --databases "$DB" 2>&1)
+        rc=$?
+        if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qiE '^error|corrupt'; then
+            db="errors"
+            say "recover: the database check found problems:"
+            printf '%s\n' "$out" | grep -viE '[[:space:]]OK$' | head -n 50 | while IFS= read -r l; do say "  $l"; done
+        fi
+    fi
+
+    # A fresh backup while the catalog is known to be readable.
+    if [ "$db" = "ok" ] || [ "$db" = "errors" ]; then
+        if [ -f /root/backup_sql.sh ]; then
+            bash /root/backup_sql.sh >/dev/null 2>&1
+            last=$(grep -E '\| (OK|FAILED|INFO)' "$BACKUP_LOG" 2>/dev/null | tail -n 1)
+            case "$last" in
+                *"| OK: "*) backup="ok" ;;
+                *"| INFO"*) backup="busy" ;;
+                *) backup="failed" ;;
+            esac
+        else
+            backup="none"
+        fi
+        engine=$(mysql -Nse "SELECT value FROM ${DB}.systempreferences WHERE variable='SearchEngine'" 2>/dev/null)
+    fi
+
+    # Zebra's index files are not crash-safe: bring the index up to date,
+    # and rebuild it from scratch when that fails or the database had errors.
+    if [ -n "$engine" ] && [ "$engine" != "Elasticsearch" ] && [ -x /usr/sbin/koha-rebuild-zebra ]; then
+        index="updated"
+        if [ "$db" = "errors" ] || ! /usr/sbin/koha-rebuild-zebra -v -b -a "$INST" >> "$ZEBRA_LOG" 2>&1; then
+            if /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INST" >> "$ZEBRA_LOG" 2>&1; then
+                index="rebuilt"
+                /usr/sbin/koha-zebra --restart "$INST" >/dev/null 2>&1 || true
+            else
+                index="failed"
+            fi
+        fi
+    elif [ "$engine" = "Elasticsearch" ]; then
+        index="elasticsearch"
+    fi
+
+    write_status "$start" done "$(date +%s)" "$db" "$backup" "$index"
+    rm -f "$PENDING" "$FLAG" "$RUN_DIR/recovery.in-progress"
+    sync
+    say "recover: finished (database: $db, backup: $backup, search index: $index)"
+    return 0
+}
+
+case "${1:-}" in
+    boot) guard_boot ;;
+    stop) guard_stop ;;
+    recover) guard_recover ;;
+    status) cat "$STATUS" 2>/dev/null ;;
+    *) echo "usage: koha-stop-guard boot|stop|recover|status" >&2; exit 2 ;;
+esac
+EOF
+}
+
+# Installs (or refreshes) the guard. Safe to run at every panel start: the
+# files are rewritten and systemd reloaded only when something changed.
+install_stop_guard() {
+    local changed=0
+    mkdir -p "${STOP_GUARD_SCRIPT%/*}" "$STOP_GUARD_STATE_DIR" /etc/systemd/system 2>/dev/null
+    stop_guard_script | write_if_changed "$STOP_GUARD_SCRIPT" 755 && changed=1
+    write_if_changed "$STOP_GUARD_UNIT" 644 << EOF && changed=1
+# Koha Easy Installer: remembers whether Koha was stopped cleanly.
+# Ordered before MariaDB and Koha, so that at shutdown it stops after them.
+[Unit]
+Description=Koha Easy: clean-stop guard
+DefaultDependencies=no
+After=local-fs.target
+Before=mariadb.service koha-common.service apache2.service memcached.service rabbitmq-server.service elasticsearch.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${STOP_GUARD_SCRIPT} boot
+ExecStop=-${STOP_GUARD_SCRIPT} stop
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    write_if_changed "$STOP_GUARD_RECOVER_UNIT" 644 << EOF && changed=1
+# Koha Easy Installer: checks and repairs Koha after an unclean stop.
+# Type=exec: the boot does not wait for it (a full reindex can take long).
+[Unit]
+Description=Koha Easy: repair after an unclean stop
+After=koha-stop-guard.service mariadb.service koha-common.service apache2.service
+ConditionPathExists=${MARKER_DIR}/unclean-stop
+
+[Service]
+Type=exec
+ExecStart=${STOP_GUARD_SCRIPT} recover
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if [ "$changed" = "1" ]; then
+        systemctl enable koha-stop-guard.service koha-stop-guard-recover.service >/dev/null 2>&1
+        [ -d "$KEI_SYSTEMD_RUNDIR" ] && systemctl daemon-reload >/dev/null 2>&1
+        log "stop guard installed or updated"
+    fi
+    # The guard must be active to run its stop step at the next shutdown.
+    # Started now, it cannot know how the current boot began: counted clean.
+    if [ -d "$KEI_SYSTEMD_RUNDIR" ] && ! systemctl is-active --quiet koha-stop-guard.service; then
+        mkdir -p "$STOP_GUARD_STATE_DIR" && : > "${STOP_GUARD_STATE_DIR}/clean-stop"
+        systemctl start koha-stop-guard.service >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# Everything that protects Koha's data against sudden stops. Idempotent:
+# run with every install and repair, at panel start and by the Windows
+# installer (--install-data-safety).
+install_data_safety() {
+    install_stop_guard
+}
+
+# Result of the last repair after an unclean stop, for --status-json:
+# "epoch state finished db backup index" ("0 none 0 - - -" when there was none).
+stop_guard_summary() {
+    local epoch=0 state=none finished=0 db=- backup=- index=- k v
+    if [ -r "$STOP_GUARD_STATUS" ]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                epoch) epoch="$v" ;; state) state="$v" ;; finished) finished="$v" ;;
+                db) db="$v" ;; backup) backup="$v" ;; index) index="$v" ;;
+            esac
+        done < "$STOP_GUARD_STATUS"
+    fi
+    printf '%s %s %s %s %s %s\n' "$epoch" "${state:-none}" "$finished" "${db:--}" "${backup:--}" "${index:--}"
+}
+
 # Stops Plack and waits until it is really gone before starting it again:
 # "koha-plack --start" does nothing while the old Plack is still running,
 # which would keep the old workers (and their missing cache) alive.
@@ -1326,6 +1603,7 @@ ensure_koha_services() {
     fi
 
     install_boot_ordering
+    install_data_safety
 
     db_admin_check || db_rc=$?
     if [ "$db_rc" -ne 1 ]; then
@@ -6745,6 +7023,7 @@ kei_overall_state() {
 kei_status_json() {
     local svc state json="" first=1 apache="" db="" koha="" staff opac plack=false
     local b_epoch b_size b_result b_file df_line d_total d_free mem_total mem_avail
+    local r_epoch r_state r_finished r_db r_backup r_index
     for svc in apache2 mariadb memcached koha-common cron elasticsearch cloudflared; do
         state=$(systemctl is-active "$svc" 2>/dev/null | head -n1)
         [ -n "$state" ] || state="unknown"
@@ -6757,6 +7036,7 @@ kei_status_json() {
     opac=$(kei_http_code "http://127.0.0.1/")
     plack_running 2>/dev/null && plack=true
     read -r b_epoch b_size b_result b_file < <(kei_backup_summary)
+    read -r r_epoch r_state r_finished r_db r_backup r_index < <(stop_guard_summary)
     df_line=$(df -P -B1 / 2>/dev/null | awk 'NR==2{print $2" "$4}')
     d_total="${df_line%% *}" d_free="${df_line##* }"
     mem_total=$(awk '/^MemTotal:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
@@ -6768,6 +7048,8 @@ kei_status_json() {
     printf '"http":{"staff":%s,"opac":%s},' "$(json_num "$staff")" "$(json_num "$opac")"
     printf '"backup":{"last_file":%s,"last_epoch":%s,"last_size":%s,"last_result":%s,"log_epoch":%s},' \
         "$(json_str "${b_file##*/}")" "$(json_num "$b_epoch")" "$(json_num "$b_size")" "$(json_str "$b_result")" "$(json_num "$(kei_backup_log_epoch)")"
+    printf '"recovery":{"epoch":%s,"state":%s,"finished":%s,"db":%s,"backup":%s,"index":%s},' \
+        "$(json_num "$r_epoch")" "$(json_str "$r_state")" "$(json_num "$r_finished")" "$(json_str "$r_db")" "$(json_str "$r_backup")" "$(json_str "$r_index")"
     printf '"disk":{"total":%s,"free":%s},' "$(json_num "$d_total")" "$(json_num "$d_free")"
     printf '"memory":{"total":%s,"available":%s}}\n' "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
 }
@@ -6837,7 +7119,7 @@ kei_export_diagnostics() {
     for f in /var/log/apache2/error.log /var/log/mysql/error.log \
              /var/log/koha/"$INSTANCE"/*error*.log /var/log/koha/"$INSTANCE"/worker*.log \
              /var/log/koha/"$INSTANCE"/indexer*.log /var/log/koha/"$INSTANCE"/zebra*.log \
-             "$LOG_DIR"/backup_*.log; do
+             "$LOG_DIR"/backup_*.log "$LOG_DIR"/stop-guard.log; do
         [ -f "$f" ] || continue
         name=$(printf '%s' "${f#/var/log/}" | tr '/' '_')
         kei_diag_tail "$f" 400 "$out/logs/$name"
@@ -12779,6 +13061,9 @@ if [ -n "$KEI_CLI_MODE" ]; then
         --status-json) kei_status_json ;;
         --export-diagnostics) kei_export_diagnostics "${2:-}" ;;
         --broker-heartbeat) broker_heartbeat ;;
+        # Not read-only, but idempotent: the Windows installer refreshes the
+        # data-safety settings of an existing Koha without opening the panel.
+        --install-data-safety) is_koha_installed && install_data_safety ;;
     esac
     exit $?
 fi
@@ -12799,6 +13084,8 @@ fi
 
 # Schedules written by older versions of the panel (see upgrade_cron_tasks).
 is_koha_installed && upgrade_cron_tasks
+# Data-safety settings for installs made before they existed.
+is_koha_installed && install_data_safety
 # Catalogue card enabled (Library tools > Brazil): stylesheets for new languages.
 is_koha_installed && ficha_refresh
 
