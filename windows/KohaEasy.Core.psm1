@@ -31,6 +31,9 @@ $script:Cfg = @{
     DiskCritGB  = 5
     StaleBackupH = 36
     ToastAppId  = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+    AppId       = 'KohaEasy.Koha'
+    WindowPath  = '/usr/local/bin/koha-window'
+    LanSetup    = 2
 }
 if ($env:KOHAEASY_ROOT) { $script:Cfg.Root = $env:KOHAEASY_ROOT }
 
@@ -88,6 +91,13 @@ $script:StateDefaults = [ordered]@{
     notifyBackupOk       = $true
     handshakePending     = $false
     hiddenLaunch         = 'conhost'
+    launcher             = ''
+    launcherHash         = ''
+    appIdShortcut        = $false
+    lanSetup             = 0
+    trayClosed           = $false
+    trayPromoted         = $false
+    trayTipShown         = $false
 }
 
 # state.json as an ordered hashtable, with defaults for missing keys. A
@@ -238,15 +248,53 @@ function ConvertTo-KohaConfValue {
     return $v.Trim()
 }
 
-# Network mode of WSL: mirrored when .wslconfig asks for it on a build that
-# supports it (Windows 11 22H2, build 22621+), NAT otherwise.
-function Get-KohaNetMode {
+# The network mode .wslconfig asks for: mirrored when it says so on a build
+# that supports it (Windows 11 22H2, build 22621+), NAT otherwise.
+function Get-KohaConfiguredNetMode {
     param([int]$Build = [Environment]::OSVersion.Version.Build)
     if (-not $env:USERPROFILE) { return 'nat' }
     $cfg = Join-Path $env:USERPROFILE '.wslconfig'
     if ($Build -ge 22621 -and (Test-Path -LiteralPath $cfg)) {
         if ((Get-Content -LiteralPath $cfg -Raw) -match '(?im)^\s*networkingMode\s*=\s*mirrored\s*$') { return 'mirrored' }
     }
+    return 'nat'
+}
+
+# The network mode WSL really runs in. .wslconfig only asks for one: WSL
+# falls back to NAT when mirrored networking cannot start, and a change
+# waits for the next "wsl --shutdown". So while Debian runs, Debian is asked;
+# when it is stopped, .wslconfig answers (a check never starts the distro).
+function Get-KohaNetMode {
+    param([int]$Build = [Environment]::OSVersion.Version.Build)
+    if (Test-KohaDistroRunning) {
+        $live = Get-KohaLiveNetMode
+        if ($live) { return $live }
+    }
+    return (Get-KohaConfiguredNetMode -Build $Build)
+}
+
+# Asked inside the running Debian: WSL's own answer (wslinfo, WSL 2.0 and
+# later), else whether Debian carries this PC's own network address, which
+# only mirrored networking gives it. '' when neither answers.
+function Get-KohaLiveNetMode {
+    param([string]$LanIp = (Get-KohaLanIp))
+    $info = ''
+    $ips = ''
+    $w = Invoke-KohaLinux -Command @('wslinfo', '--networking-mode')
+    if ($w.ExitCode -eq 0) { $info = [string]$w.Output }
+    $h = Invoke-KohaLinux -Command @('hostname', '-I')
+    if ($h.ExitCode -eq 0) { $ips = [string]$h.Output }
+    return (Resolve-KohaNetMode -WslInfo $info -DebianIps $ips -LanIp $LanIp)
+}
+
+# Pure: mirrored | nat | '' from what Debian reported.
+function Resolve-KohaNetMode {
+    param([string]$WslInfo, [string]$DebianIps, [string]$LanIp)
+    $m = ([string]$WslInfo).Trim().ToLowerInvariant()
+    if (@('mirrored', 'nat') -contains $m) { return $m }
+    $ips = @(([string]$DebianIps).Trim() -split '\s+' | Where-Object { Test-KohaIPv4 $_ })
+    if ($ips.Count -eq 0) { return '' }
+    if ($LanIp -and ($ips -contains $LanIp)) { return 'mirrored' }
     return 'nat'
 }
 
@@ -363,6 +411,14 @@ function Get-KohaStateText {
 # ----------------------------------------------------------------------
 # Notifications
 # ----------------------------------------------------------------------
+# Koha's own name and icon on its notifications once the Koha shortcut in
+# the Start menu carries Koha's AppUserModelID (Windows ties notifications
+# to it); Windows PowerShell's before that.
+function Get-KohaToastAppId {
+    if ([bool](Get-KohaState).appIdShortcut) { return $script:Cfg.AppId }
+    return $script:Cfg.ToastAppId
+}
+
 # Windows toast (WinRT, Windows PowerShell 5.1). Falls back to the tray's
 # balloon tip, and always goes to logs\notifications-*.log.
 function Show-KohaNotification {
@@ -381,7 +437,7 @@ function Show-KohaNotification {
         $xml.LoadXml(('<toast{0}><visual><binding template="ToastGeneric"><text>{1}</text><text>{2}</text></binding></visual></toast>' -f
                 $scenario, [Security.SecurityElement]::Escape($Title), [Security.SecurityElement]::Escape($Text)))
         $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:Cfg.ToastAppId).Show($toast)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier((Get-KohaToastAppId)).Show($toast)
         return 'toast'
     } catch {
         if ($null -ne $script:TrayIcon) {
@@ -635,15 +691,25 @@ function Invoke-KohaDiskpart {
 # ----------------------------------------------------------------------
 # Start, Stop and automatic start (blueprint 2.5.1)
 # ----------------------------------------------------------------------
-# Pure: how a Koha command starts with no console window at all. conhost.exe
-# --headless gives PowerShell a console nobody sees (Windows 10 1903 and
-# later, which WSL 2 needs anyway); powershell.exe -WindowStyle Hidden, the
-# fallback, still shows a black window for a moment.
+# Pure: how a Koha command starts with no window at all, best first:
+#   1. KohaEasy.exe, built on this PC (KohaEasy.Launcher.cs): a Windows
+#      program, so Windows opens no console for it, and it starts PowerShell
+#      with CREATE_NO_WINDOW;
+#   2. conhost.exe --headless: a console nobody sees (Windows 10 1903 and
+#      later, which WSL 2 needs anyway);
+#   3. powershell.exe -WindowStyle Hidden, the last resort: it flashes a
+#      console, and where Windows Terminal is the default terminal (Windows
+#      11) it leaves an empty Windows Terminal window open.
+# The shortcuts, the tray at sign-in and the scheduled tasks all use it.
 function Get-KohaHiddenLaunch {
     param(
         [string]$Arguments,
-        [string]$Conhost = (Get-KohaConhostPath)
+        [string]$Conhost = (Get-KohaConhostPath),
+        [string]$Launcher = (Get-KohaLauncherPath)
     )
+    if ($Launcher -and (Test-Path -LiteralPath $Launcher)) {
+        return [pscustomobject]@{ Target = $Launcher; Arguments = $Arguments }
+    }
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     $a = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
     if ($Conhost -and (Test-Path -LiteralPath $Conhost)) {
@@ -657,6 +723,161 @@ function Get-KohaHiddenLaunch {
 function Get-KohaConhostPath {
     if ((Get-KohaState).hiddenLaunch -eq 'powershell') { return '' }
     return [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'conhost.exe')
+}
+
+# KohaEasy.exe, once the installer built it and Windows let it run
+# (state.json launcher = ok); '' otherwise.
+function Get-KohaLauncherPath {
+    if ((Get-KohaState).launcher -ne 'ok') { return '' }
+    return [System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.exe')
+}
+
+# ----------------------------------------------------------------------
+# KohaEasy.exe (windows\KohaEasy.Launcher.cs)
+# ----------------------------------------------------------------------
+# Built here, on this PC, by the C# compiler of the .NET Framework that
+# Windows 10 and 11 ship: nothing is downloaded, so SmartScreen does not ask,
+# and the source next to it is what runs. Windows can still refuse it (Smart
+# App Control, some antivirus): a program that does not pass its self-test
+# is not used, and everything keeps starting through conhost --headless.
+
+# Pure: the compiler options. A Windows (GUI) program with the Koha icon.
+function Get-KohaLauncherCompilerOptions {
+    param([string]$Icon)
+    $o = '/target:winexe /platform:anycpu /optimize+'
+    if ($Icon) { $o += (' /win32icon:"{0}"' -f $Icon) }
+    return $o
+}
+
+# The C# compiler of the .NET Framework (CodeDom starts csc.exe).
+function Invoke-KohaCsc {
+    param([string]$Source, [string]$Output, [string]$Options)
+    $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $p = New-Object System.CodeDom.Compiler.CompilerParameters
+    $p.GenerateExecutable = $true
+    $p.GenerateInMemory = $false
+    $p.OutputAssembly = $Output
+    $p.CompilerOptions = $Options
+    [void]$p.ReferencedAssemblies.Add('System.dll')
+    $res = $provider.CompileAssemblyFromSource($p, [System.IO.File]::ReadAllText($Source))
+    $errors = @($res.Errors | Where-Object { -not $_.IsWarning } | ForEach-Object { $_.ToString() })
+    if ($errors.Count -gt 0) { throw ('KohaEasy.exe did not compile: ' + ($errors -join '; ')) }
+}
+
+# Whether Windows lets KohaEasy.exe run ("KohaEasy.exe --self-test" exits 0).
+function Test-KohaLauncher {
+    param([string]$Path)
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo($Path, '--self-test')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if (-not $p.WaitForExit(20000)) {
+            try { $p.Kill() } catch { }
+            Write-KohaLog 'KohaEasy.exe: the self-test did not end in 20 s'
+            return $false
+        }
+        if ($p.ExitCode -ne 0) { Write-KohaLog ('KohaEasy.exe: self-test exit {0}' -f $p.ExitCode) }
+        return ($p.ExitCode -eq 0)
+    } catch {
+        Write-KohaLog ('KohaEasy.exe does not run on this PC: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+# Puts a new file in place of $Path. A KohaEasy.exe that is running (the
+# tray, a window) cannot be replaced or deleted, but it can be renamed: the
+# old copy is set aside and removed on a later run.
+function Set-KohaFileInPlace {
+    param([string]$NewFile, [string]$Path)
+    $dir = Split-Path -Parent $Path
+    $name = Split-Path -Leaf $Path
+    Get-ChildItem -LiteralPath $dir -Filter ($name + '.old-*') -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $Path) {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        } catch {
+            Move-Item -LiteralPath $Path -Destination ('{0}.old-{1}' -f $Path, [DateTime]::Now.Ticks) -Force
+        }
+    }
+    Move-Item -LiteralPath $NewFile -Destination $Path -Force
+}
+
+# Builds KohaEasy.exe when its source changed (or it is missing) and checks
+# that Windows lets it run. Returns current | built | failed | refused |
+# no-source; state.json launcher (ok | failed | refused) says whether the
+# Koha tools use it.
+function Install-KohaLauncher {
+    param(
+        [string]$Bin = (Get-KohaPath Bin),
+        [scriptblock]$Compile = { param($Source, $Output, $Options) Invoke-KohaCsc -Source $Source -Output $Output -Options $Options },
+        [scriptblock]$SelfTest = { param($Path) Test-KohaLauncher -Path $Path }
+    )
+    $src = [System.IO.Path]::Combine($Bin, 'KohaEasy.Launcher.cs')
+    $exe = [System.IO.Path]::Combine($Bin, 'KohaEasy.exe')
+    if (-not (Test-Path -LiteralPath $src)) {
+        Set-KohaState @{ launcher = 'failed' } | Out-Null
+        return 'no-source'
+    }
+    $hash = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
+    $state = Get-KohaState
+    if ($state.launcher -eq 'ok' -and $state.launcherHash -eq $hash -and (Test-Path -LiteralPath $exe)) { return 'current' }
+    # The tray did not come up through this KohaEasy.exe (the installer's
+    # check): not tried again until its source changes.
+    if ($state.launcher -eq 'refused' -and $state.launcherHash -eq $hash) { return 'refused' }
+    $tmp = [System.IO.Path]::Combine($Bin, ('KohaEasy.{0}.new.exe' -f [guid]::NewGuid().ToString('N')))
+    try {
+        $icon = [System.IO.Path]::Combine($Bin, 'koha.ico')
+        if (-not (Test-Path -LiteralPath $icon)) { $icon = '' }
+        & $Compile $src $tmp (Get-KohaLauncherCompilerOptions -Icon $icon)
+        if (-not (Test-Path -LiteralPath $tmp)) { throw 'the compiler wrote no KohaEasy.exe' }
+        if (-not (& $SelfTest $tmp)) { throw 'Windows did not let KohaEasy.exe run (Smart App Control or an antivirus)' }
+        Set-KohaFileInPlace -NewFile $tmp -Path $exe
+        Set-KohaState @{ launcher = 'ok'; launcherHash = $hash } | Out-Null
+        Write-KohaLog 'KohaEasy.exe built and checked'
+        return 'built'
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Set-KohaState @{ launcher = 'failed'; launcherHash = $hash } | Out-Null
+        Write-KohaLog ('KohaEasy.exe not used: ' + $_.Exception.Message)
+        return 'failed'
+    }
+}
+
+# KohaEasy.Native (in KohaEasy.exe) for this PowerShell: the Koha identity
+# on the taskbar and on the shortcuts. $false when KohaEasy.exe is not used.
+function Import-KohaNative {
+    if ('KohaEasy.Native' -as [type]) { return $true }
+    $exe = Get-KohaLauncherPath
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { return $false }
+    try {
+        [void][System.Reflection.Assembly]::LoadFrom($exe)
+        return [bool]('KohaEasy.Native' -as [type])
+    } catch {
+        Write-KohaLog ('KohaEasy.exe could not be loaded: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+# The windows of this process group on the taskbar as Koha (with the Koha
+# shortcut's name and icon when pinned), not as Windows PowerShell.
+function Set-KohaProcessAppId {
+    if (-not [bool](Get-KohaState).appIdShortcut) { return $false }
+    if (-not (Import-KohaNative)) { return $false }
+    try { return [bool][KohaEasy.Native]::SetProcessAppId($script:Cfg.AppId) } catch { return $false }
+}
+
+function Set-KohaShortcutAppId {
+    param([string]$Path)
+    if (-not (Import-KohaNative)) { return $false }
+    try {
+        [KohaEasy.Native]::SetShortcutAppId($Path, $script:Cfg.AppId)
+        return $true
+    } catch {
+        Write-KohaLog ('shortcut identity not set on {0}: {1}' -f $Path, $_.Exception.Message)
+        return $false
+    }
 }
 
 function Start-KohaHidden {
@@ -725,11 +946,13 @@ function Show-KohaChoice {
 #                            "logon" mode.
 function Get-KohaScriptPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.ps1') }
 
+# The tasks start like the shortcuts: with no window. A task that ran
+# powershell.exe itself opened an empty Windows Terminal window at sign-in
+# on Windows 11, and the keep-alive task kept it open all day.
 function New-KohaAction {
     param([string]$Arguments)
-    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arg = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
-    return New-ScheduledTaskAction -Execute $ps -Argument $arg
+    $l = Get-KohaHiddenLaunch -Arguments $Arguments
+    return New-ScheduledTaskAction -Execute $l.Target -Argument $l.Arguments -WorkingDirectory (Get-KohaPath Bin)
 }
 
 function Register-KohaTasks {
@@ -752,6 +975,19 @@ function Register-KohaTasks {
     Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.SignInTask -Action (New-KohaAction 'Start -Trigger logon') `
         -Trigger $logon -Principal $principal -Settings $signSettings -Force | Out-Null
     Set-KohaAutostart -Mode $Autostart | Out-Null
+}
+
+# Whether the keep-alive task is running now with another action than this
+# version's (an older version started PowerShell with a window of its own,
+# which stays open until that run ends).
+function Test-KohaKeepAliveOutdated {
+    try {
+        $t = Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -ErrorAction Stop
+    } catch { return $false }
+    if ($null -eq $t -or [string]$t.State -ne 'Running') { return $false }
+    $want = Get-KohaHiddenLaunch -Arguments 'Run'
+    $a = @($t.Actions)[0]
+    return -not ([string]$a.Execute -eq $want.Target -and [string]$a.Arguments -eq $want.Arguments)
 }
 
 function Set-KohaSignInTask {
@@ -904,24 +1140,31 @@ function Stop-KohaDebianGracefully {
     return $how
 }
 
+# Pure: the process that holds Debian open ("sleep infinity" in the distro).
+# CREATE_NO_WINDOW: a wsl.exe started with Start-Process -WindowStyle Hidden
+# could still get a window of its own from Windows Terminal.
+function Get-KohaHolderStartInfo {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $psi.Arguments = '-d {0} -u root --exec /bin/sleep infinity' -f $script:Cfg.Distro
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    return $psi
+}
+
 # The keep-alive task's action. Exits at once when Koha is meant to be off
 # (Stop pressed, or an unlock/resume trigger while it was off). Otherwise it
 # refreshes the handshake, starts the holder that keeps the distro alive and
 # waits on it; a holder that dies ends the task with an error, and the task
 # setting restarts it one minute later.
 function Invoke-KohaRun {
-    param([scriptblock]$Holder)
+    param([scriptblock]$Holder, [int]$WatchMs = 60000)
     $state = Get-KohaState
     if ($state.desired -ne 'running') {
         Write-KohaLog 'keep-alive: Koha is meant to be stopped, exiting'
         return 0
     }
-    if (-not $Holder) {
-        $Holder = {
-            $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-d', $script:Cfg.Distro, '-u', 'root', '--exec', '/bin/sleep', 'infinity') -WindowStyle Hidden -PassThru
-            return $p
-        }
-    }
+    if (-not $Holder) { $Holder = { [System.Diagnostics.Process]::Start((Get-KohaHolderStartInfo)) } }
     $proc = & $Holder
     Start-Sleep -Seconds 2
     Update-KohaHandshake | Out-Null
@@ -930,7 +1173,12 @@ function Invoke-KohaRun {
         Write-KohaLog 'keep-alive: the staff interface did not answer in time' 'health'
         Show-KohaNotification -Title (T 'Koha did not start') -Text (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') -Level error | Out-Null
     }
-    $proc.WaitForExit()
+    # While Koha runs, the Koha icon comes back within a minute if it
+    # crashed or was ended (at most 5 times, so a broken tray cannot loop).
+    $trayRestarts = 0
+    while (-not $proc.WaitForExit($WatchMs)) {
+        if ($trayRestarts -lt 5 -and (Get-KohaState).desired -eq 'running' -and (Repair-KohaTray) -eq 'restarted') { $trayRestarts++ }
+    }
     if ((Get-KohaState).desired -ne 'running') { return 0 }
     Write-KohaLog "keep-alive: the WSL holder ended (exit $($proc.ExitCode)); the task will restart it"
     return 1
@@ -940,13 +1188,19 @@ function Invoke-KohaRun {
 # Other PCs of the library network (ports 80 and 8080)
 # ----------------------------------------------------------------------
 # Apache inside Debian listens on every address. What Windows adds, once,
-# with administrator rights (KohaEasy.ps1 SetupNetwork):
-#   * a firewall rule for TCP 80 and 8080 from the local network only;
-#   * mirrored networking (Windows 11): the same ports opened in the Hyper-V
-#     firewall that WSL uses;
-#   * NAT networking (Windows 10): a task "Koha network" that runs with the
-#     user's highest rights and points netsh portproxy at Debian's address,
-#     which changes at every start of WSL. Invoke-KohaRun starts it.
+# with administrator rights (KohaEasy.ps1 SetupNetwork), for both network
+# modes, so a WSL that falls back from mirrored to NAT (or comes back)
+# needs nothing new:
+#   * a Windows Firewall rule for TCP 80 and 8080 from the local network;
+#   * the same ports in the Hyper-V firewall, which guards WSL in mirrored
+#     mode (Windows 11);
+#   * a task "Koha network" with the user's highest rights, started at each
+#     start of Koha: under NAT it points netsh portproxy at Debian's
+#     address, which changes at every start of WSL; under mirrored it
+#     removes that forwarding, which would take the ports away from Debian.
+# .wslconfig also gets hostAddressLoopback (Merge-KohaWslConfig): in
+# mirrored mode this PC reaches Koha by its own network address only with
+# it, and the library network test (Test-KohaLanAccess) goes that way.
 $script:WslVmCreatorId = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
 
 # Debian's IPv4 address in WSL's NAT network, or '' (never starts the distro).
@@ -979,10 +1233,44 @@ function Get-KohaPortProxyCommands {
     return @($cmds)
 }
 
+# Pure: the rows of "netsh interface portproxy show v4tov4" (listen address
+# and port, connect address and port). The headers, translated by Windows,
+# are skipped.
+function ConvertFrom-KohaPortProxyTable {
+    param([AllowEmptyString()][string]$Text)
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($l in (([string]$Text) -split "`r?`n")) {
+        if ($l -match '^\s*(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*$') {
+            [void]$rows.Add([pscustomobject]@{ ListenAddress = $Matches[1]; ListenPort = [int]$Matches[2]; ConnectAddress = $Matches[3]; ConnectPort = [int]$Matches[4] })
+        }
+    }
+    return @($rows)
+}
+
+# The forwarding Windows has now (reading it needs no administrator rights).
+function Get-KohaPortProxyRules {
+    $out = & netsh.exe interface portproxy show v4tov4 2>&1
+    return @(ConvertFrom-KohaPortProxyTable -Text ((@($out) | ForEach-Object { [string]$_ }) -join "`n"))
+}
+
+# Mirrored mode: Koha's forwarding from a time WSL ran in NAT mode is
+# removed, so ports 80 and 8080 of this PC go to Debian again.
+function Remove-KohaPortProxy {
+    $ours = @(Get-KohaPortProxyRules | Where-Object { $_.ListenAddress -eq '0.0.0.0' -and ($script:Cfg.WebPorts -contains $_.ListenPort) })
+    foreach ($r in $ours) {
+        & netsh.exe interface portproxy delete v4tov4 ('listenport={0}' -f $r.ListenPort) 'listenaddress=0.0.0.0' 2>&1 | Out-Null
+    }
+    if ($ours.Count -gt 0) { Write-KohaLog ('network: mirrored mode, port forwarding of {0} removed' -f (@($ours | ForEach-Object { $_.ListenPort }) -join ', ')) 'network' }
+    return $ours.Count
+}
+
 # KohaEasy.ps1 UpdatePortProxy: the action of the "Koha network" task.
 function Update-KohaPortProxy {
-    param([string]$WslIp)
-    if ((Get-KohaNetMode) -ne 'nat') { return 'mirrored' }
+    param([string]$WslIp, [string]$Mode = (Get-KohaNetMode))
+    if ($Mode -eq 'mirrored') {
+        Remove-KohaPortProxy | Out-Null
+        return 'mirrored'
+    }
     if (-not $WslIp) { $WslIp = Get-KohaWslIp }
     if (-not (Test-KohaIPv4 $WslIp)) {
         Write-KohaLog 'network: Debian has no address yet, port forwarding not changed' 'network'
@@ -999,38 +1287,41 @@ function Update-KohaPortProxy {
     return 'forwarded'
 }
 
-# KohaEasy.ps1 SetupNetwork (administrator): firewall rules and, under NAT,
-# the "Koha network" task. Safe to run again.
+# KohaEasy.ps1 SetupNetwork (administrator): the firewall rules, the
+# "Koha network" task and the forwarding the current mode needs. Safe to
+# run again.
 function Set-KohaLanAccess {
     param([string]$Mode = (Get-KohaNetMode))
     $name = $script:Cfg.FirewallRule
     Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName $name -Group 'Koha' -Direction Inbound -Action Allow -Protocol TCP `
         -LocalPort $script:Cfg.WebPorts -RemoteAddress LocalSubnet -Profile Any | Out-Null
-    if ($Mode -eq 'mirrored') {
+    $hv = Get-Command New-NetFirewallHyperVRule -ErrorAction SilentlyContinue
+    if ($hv) {
         try {
             Get-NetFirewallHyperVRule -Name 'KohaWeb' -ErrorAction SilentlyContinue | Remove-NetFirewallHyperVRule -ErrorAction SilentlyContinue
-            New-NetFirewallHyperVRule -Name 'KohaWeb' -DisplayName $name -Direction Inbound -VMCreatorId $script:WslVmCreatorId `
-                -Protocol TCP -LocalPorts $script:Cfg.WebPorts -Action Allow | Out-Null
+            $rule = @{ Name = 'KohaWeb'; DisplayName = $name; Direction = 'Inbound'; VMCreatorId = $script:WslVmCreatorId
+                Protocol = 'TCP'; LocalPorts = $script:Cfg.WebPorts; Action = 'Allow' }
+            if ($hv.Parameters.ContainsKey('Profiles')) { $rule['Profiles'] = 'Any' }
+            New-NetFirewallHyperVRule @rule | Out-Null
         } catch {
             Write-KohaLog ('network: Hyper-V firewall rule not added: ' + $_.Exception.Message) 'network'
         }
-    } else {
-        $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew `
-            -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -Hidden
-        Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -Action (New-KohaAction 'UpdatePortProxy') `
-            -Principal $principal -Settings $settings -Force | Out-Null
     }
-    Write-KohaLog ('network: local network access set up ({0})' -f $Mode) 'network'
+    $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -Hidden
+    Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -Action (New-KohaAction 'UpdatePortProxy') `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    $now = Update-KohaPortProxy -Mode $Mode
+    Write-KohaLog ('network: local network access set up ({0}, forwarding: {1})' -f $Mode, $now) 'network'
     return $Mode
 }
 
-# After each start under NAT: the task refreshes the forwarding with the
-# rights it was given once. Nothing to do in mirrored mode or without it.
+# After each start: the task sets the forwarding for the mode WSL really
+# runs in, with the rights it was given once. Nothing when it is missing.
 function Start-KohaNetworkTask {
-    if ((Get-KohaNetMode) -ne 'nat') { return $false }
     try {
         $t = Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -ErrorAction SilentlyContinue
         if ($null -eq $t) { return $false }
@@ -1042,24 +1333,250 @@ function Start-KohaNetworkTask {
     }
 }
 
-# Addresses the other PCs use, from this PC's local IPv4 address.
+# Addresses the other PCs use: by this PC's name, which stays the same when
+# the router hands out a new address, and by its local IPv4 address.
 function Get-KohaLanUrls {
-    $ip = Get-KohaLanIp
-    if (-not $ip) { return $null }
-    return [pscustomobject]@{ Opac = ('http://{0}/' -f $ip); Staff = ('http://{0}:8080/' -f $ip) }
+    param([string]$Ip = (Get-KohaLanIp), [string]$ComputerName = $env:COMPUTERNAME)
+    if (-not $Ip) { return $null }
+    $o = [pscustomobject]@{ Opac = ('http://{0}/' -f $Ip); Staff = ('http://{0}:8080/' -f $Ip); OpacByName = ''; StaffByName = '' }
+    $n = ([string]$ComputerName).ToLowerInvariant()
+    if ($n -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$') {
+        $o.OpacByName = 'http://{0}/' -f $n
+        $o.StaffByName = 'http://{0}:8080/' -f $n
+    }
+    return $o
+}
+
+# One request, with no proxy (a library's web proxy cannot reach this PC's
+# own address): whether anything answered below 500.
+function Test-KohaHttpUrl {
+    param([string]$Url, [int]$TimeoutMs = 5000)
+    try {
+        $req = [System.Net.WebRequest]::Create($Url)
+        $req.Proxy = $null
+        $req.Timeout = $TimeoutMs
+        $req.AllowAutoRedirect = $false
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+        return [pscustomobject]@{ Ok = ($code -lt 500); Code = $code; Error = '' }
+    } catch {
+        $ex = $_.Exception
+        while ($null -ne $ex.InnerException -and -not ($ex -is [System.Net.WebException])) { $ex = $ex.InnerException }
+        if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
+            $code = [int]$ex.Response.StatusCode
+            try { $ex.Response.Close() } catch { }
+            return [pscustomobject]@{ Ok = ($code -lt 500); Code = $code; Error = '' }
+        }
+        return [pscustomobject]@{ Ok = $false; Code = 0; Error = [string]$ex.Message }
+    }
+}
+
+# What could stop the other PCs at this PC's door: Koha's Windows Firewall
+# rule, its Hyper-V firewall rule ($null where Windows has no Hyper-V
+# firewall) and any other firewall product (Windows Security Center), whose
+# own rules our Windows Firewall rule does not change.
+function Get-KohaFirewallFacts {
+    $f = [ordered]@{ Rule = $false; HyperVRule = $null; Others = @() }
+    try {
+        $r = @(Get-NetFirewallRule -DisplayName $script:Cfg.FirewallRule -ErrorAction Stop)
+        $f.Rule = (@($r | Where-Object { [string]$_.Enabled -eq 'True' }).Count -gt 0)
+    } catch { }
+    if (Get-Command Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue) {
+        try { $f.HyperVRule = (@(Get-NetFirewallHyperVRule -Name 'KohaWeb' -ErrorAction Stop).Count -gt 0) } catch { $f.HyperVRule = $false }
+    }
+    try {
+        $f.Others = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName FirewallProduct -ErrorAction Stop |
+                ForEach-Object { [string]$_.displayName } | Where-Object { $_ })
+    } catch { }
+    return [pscustomobject]$f
+}
+
+# Whether .wslconfig turns on hostAddressLoopback (it takes effect when WSL
+# starts again).
+function Test-KohaLoopbackConfigured {
+    if (-not $env:USERPROFILE) { return $false }
+    $cfg = Join-Path $env:USERPROFILE '.wslconfig'
+    if (-not (Test-Path -LiteralPath $cfg)) { return $false }
+    return ((Get-Content -LiteralPath $cfg -Raw) -match '(?im)^\s*hostAddressLoopback\s*=\s*true\s*$')
+}
+
+# Pure: what the library network test tells the librarian. Ok when Koha
+# answered on this PC's network address (staff interface and catalog);
+# Lines are { Kind = ok | warn | info; Text }: the result, what to fix,
+# then the addresses for the other computers.
+function Resolve-KohaLanCheck {
+    param($Urls, $Staff, $Opac, [string]$Mode, $Firewall, [bool]$Loopback = $true, [bool]$Running = $true)
+    $lines = New-Object System.Collections.ArrayList
+    $add = { param($kind, $text) [void]$lines.Add([pscustomobject]@{ Kind = $kind; Text = $text }) }
+    if (-not $Running) {
+        & $add 'warn' (T 'Debian is stopped. Start Koha first.')
+        return [pscustomobject]@{ Ok = $false; Lines = @($lines) }
+    }
+    if ($null -eq $Urls) {
+        & $add 'warn' (T 'This PC has no local network address: check its network cable or Wi-Fi.')
+        return [pscustomobject]@{ Ok = $false; Lines = @($lines) }
+    }
+    $ip = ([uri]$Urls.Staff).Host
+    $ok = ($null -ne $Staff -and [bool]$Staff.Ok -and $null -ne $Opac -and [bool]$Opac.Ok)
+    if ($ok) {
+        & $add 'ok' ((T 'Library network test passed: Koha answers on this PC''s network address ({0}).') -f $ip)
+    } else {
+        & $add 'warn' ((T 'Library network test failed: Koha does not answer on this PC''s network address ({0}).') -f $ip)
+        if ($Mode -eq 'mirrored' -and -not $Loopback) {
+            & $add 'warn' (T 'In mirrored mode this PC reaches its own address only with hostAddressLoopback. Run the installer again, or test from another computer.')
+        }
+        if ($Mode -eq 'nat') {
+            & $add 'warn' (T 'WSL runs in NAT mode here, so the port forwarding may be missing. Run the installer again and allow the Windows permission prompt.')
+        }
+    }
+    if ($null -ne $Firewall) {
+        if (-not [bool]$Firewall.Rule) {
+            & $add 'warn' ((T 'The Windows Firewall rule "{0}" is missing or turned off. Run the installer again and allow the Windows permission prompt.') -f $script:Cfg.FirewallRule)
+        }
+        if ($Mode -eq 'mirrored' -and $Firewall.HyperVRule -eq $false) {
+            & $add 'warn' (T 'The Hyper-V firewall rule for WSL is missing. Run the installer again and allow the Windows permission prompt.')
+        }
+        foreach ($o in @($Firewall.Others)) {
+            & $add 'warn' ((T 'Another firewall is active ({0}). Allow TCP ports 80 and 8080 from the local network in it too.') -f $o)
+        }
+    }
+    if ($Urls.StaffByName) {
+        & $add 'info' ((T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $Urls.StaffByName, $Urls.OpacByName)
+    }
+    & $add 'info' ((T 'By this PC''s address (it can change when the router restarts): staff interface {0}  public catalog {1}') -f $Urls.Staff, $Urls.Opac)
+    return [pscustomobject]@{ Ok = $ok; Lines = @($lines) }
+}
+
+# The library network test: Koha asked through this PC's own network
+# address (the way the other PCs come, minus the cable), and Windows checked
+# for what would stop them. Never starts a stopped Debian.
+function Test-KohaLanAccess {
+    $running = Test-KohaDistroRunning
+    $urls = Get-KohaLanUrls
+    $mode = Get-KohaNetMode
+    $staff = $null
+    $opac = $null
+    if ($running -and $null -ne $urls) {
+        $staff = Test-KohaHttpUrl $urls.Staff
+        $opac = Test-KohaHttpUrl $urls.Opac
+    }
+    $check = Resolve-KohaLanCheck -Urls $urls -Staff $staff -Opac $opac -Mode $mode -Firewall (Get-KohaFirewallFacts) -Loopback (Test-KohaLoopbackConfigured) -Running $running
+    $detail = ''
+    if ($null -ne $staff) { $detail = (' staff {0} {1}, catalog {2} {3}' -f $staff.Code, $staff.Error, $opac.Code, $opac.Error) }
+    Write-KohaLog ('network test ({0}): ok={1}{2}' -f $mode, $check.Ok, $detail) 'network'
+    return $check
+}
+
+# The library network part of the diagnostics.
+function Get-KohaLanReport {
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add(('Network mode: {0} (.wslconfig asks for {1}, hostAddressLoopback: {2})   this PC: {3} ({4})' -f (Get-KohaNetMode), (Get-KohaConfiguredNetMode), (Test-KohaLoopbackConfigured), (Get-KohaLanIp), $env:COMPUTERNAME))
+    $fw = Get-KohaFirewallFacts
+    $out.Add(('Windows Firewall rule: {0}   Hyper-V firewall rule: {1}   other firewalls: {2}' -f $fw.Rule, $fw.HyperVRule, (@($fw.Others) -join ', ')))
+    $rules = @(Get-KohaPortProxyRules)
+    if ($rules.Count -eq 0) { $out.Add('Port forwarding: none') }
+    foreach ($r in $rules) { $out.Add(('Port forwarding: {0}:{1} -> {2}:{3}' -f $r.ListenAddress, $r.ListenPort, $r.ConnectAddress, $r.ConnectPort)) }
+    foreach ($l in @((Test-KohaLanAccess).Lines)) { $out.Add(('[{0}] {1}' -f $l.Kind, $l.Text)) }
+    return @($out)
 }
 
 # ----------------------------------------------------------------------
 # Control panel window and a quick check
 # ----------------------------------------------------------------------
-# Opens the Koha control panel in its own console window, as root, and
-# starts Koha as well (the panel alone would keep Debian up only while it is
-# open). The window gets UTF-8 and the symbol mode through WSLENV.
+# koha-window, inside Debian: what every Windows window of Koha runs (the
+# control panel from the Windows tools and from the installer, and the
+# "Debian terminal (advanced)" button), so the window ends cleanly when the
+# panel or the shell ends. Anything they left holding the terminal is
+# stopped: wsl.exe waits for every process that still has the terminal
+# open, so one background process kept the window open and black after
+# Exit. The exit code is 0, so Windows Terminal closes the window; when
+# KEI_WINDOW_PAUSE (base64 text) is set and the panel failed, that text is
+# shown until Enter is pressed. With --shell, the user's login shell runs
+# instead of the panel.
+$script:WindowScript = @'
+#!/bin/sh
+# Written by Koha Easy Installer for Windows (KohaEasy.Core.psm1).
+# koha-window [--shell | command...]: see Install-KohaWindowScript.
+shell=0
+if [ "${1:-}" = "--shell" ]; then shell=1; shift; fi
+# Ctrl+C reaches the panel (or the shell), not this script, which still
+# has to clean up after it.
+trap ':' INT
+if [ "$shell" = 1 ]; then
+  login=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+  [ -x "$login" ] || login=/bin/bash
+  "$login" -l
+  rc=$?
+else
+  [ $# -gt 0 ] || set -- /usr/local/bin/koha-panel
+  "$@"
+  rc=$?
+fi
+tty=$(readlink "/proc/$$/fd/0" 2>/dev/null)
+case "$tty" in
+  /dev/pts/*|/dev/tty*)
+    # This script and the WSL processes above it keep the terminal.
+    keep=" $$ "
+    p=$$
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+      p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)
+      [ -n "$p" ] && keep="$keep$p "
+    done
+    left=""
+    for p in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$tty" 2>/dev/null </dev/null | sed -n 's|^/proc/\([0-9]*\)/fd/.*|\1|p' | sort -u); do
+      case "$keep" in *" $p "*) continue ;; esac
+      left="$left $p"
+    done
+    if [ -n "$left" ]; then
+      kill -HUP $left 2>/dev/null
+      sleep 1
+      for p in $left; do [ -d "/proc/$p" ] && kill -KILL "$p" 2>/dev/null; done
+    fi
+    ;;
+esac
+# 130: left with Ctrl+C, not a failure.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ] && [ -n "${KEI_WINDOW_PAUSE:-}" ] && [ -t 0 ]; then
+  printf '\n[%s] ' "$rc"
+  printf '%s' "$KEI_WINDOW_PAUSE" | base64 -d 2>/dev/null
+  printf ' '
+  read -r _ || true
+fi
+exit 0
+'@
+
+# Writes koha-window into Debian (as root, through stdin). The installer
+# does it on every run; the Windows tools do it when it is missing.
+$script:WindowScriptInstall = @'
+umask 022
+f='__PATH__'
+mkdir -p "$(dirname "$f")" || exit 1
+t=$(mktemp "$f.XXXXXX") || exit 1
+if tr -d '\r' > "$t" && chmod 755 "$t" && mv -f "$t" "$f"; then exit 0; fi
+rm -f "$t"
+exit 1
+'@
+
+function Install-KohaWindowScript {
+    $r = Invoke-KohaLinuxScript -Script ($script:WindowScriptInstall.Replace('__PATH__', $script:Cfg.WindowPath)) -InputText $script:WindowScript
+    if ($r.ExitCode -ne 0) { Write-KohaLog ('koha-window not written: ' + $r.Output); return $false }
+    return $true
+}
+
+function Confirm-KohaWindowScript {
+    if ((Invoke-KohaLinux -Command @('test', '-x', $script:Cfg.WindowPath)).ExitCode -eq 0) { return $true }
+    return (Install-KohaWindowScript)
+}
+
+# Opens the Koha control panel in its own window, as root, and starts Koha
+# as well (the panel alone would keep Debian up only while it is open). The
+# window gets UTF-8 and the symbol mode, and closes when the panel ends.
 function Open-KohaPanel {
     param([switch]$NoStart)
     if (-not $NoStart) { Start-Koha -Trigger user | Out-Null }
+    Confirm-KohaWindowScript | Out-Null
     $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
-    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath)
+    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath) -Pause (T 'The control panel ended with an error. Press Enter to close this window.')
     Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null
     Write-KohaLog 'control panel opened'
 }
@@ -1067,13 +1584,35 @@ function Open-KohaPanel {
 # Pure: how the control panel window opens. In Windows Terminal the panel
 # shows emoji; in the classic console, plain symbols. The choice travels as
 # "env KEI_PLAIN_GLYPHS=..." on the command line, because a Windows Terminal
-# that is already open does not see this process's environment.
+# that is already open does not see this process's environment; the text
+# shown after a failure travels in base64 (no spaces or ";" for wt.exe).
 function Get-KohaPanelLaunch {
-    param([string]$Wsl, [string]$Terminal)
+    param([string]$Wsl, [string]$Terminal, [string]$Pause = '')
     $plain = '1'
     if ($Terminal) { $plain = '0' }
-    $cmd = '-d {0} -u root --cd /root -- env KEI_PLAIN_GLYPHS={1} {2}' -f $script:Cfg.Distro, $plain, $script:Cfg.PanelPath
+    $vars = 'KEI_PLAIN_GLYPHS=' + $plain
+    if ($Pause) { $vars += ' KEI_WINDOW_PAUSE=' + [Convert]::ToBase64String((New-Object System.Text.UTF8Encoding($false)).GetBytes($Pause)) }
+    $cmd = '-d {0} -u root --cd /root -- env {1} {2} {3}' -f $script:Cfg.Distro, $vars, $script:Cfg.WindowPath, $script:Cfg.PanelPath
     if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title Koha "{0}" {1}' -f $Wsl, $cmd) } }
+    return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
+}
+
+# The Koha window's "Debian terminal (advanced)": a shell in Debian as the
+# Debian user chosen at install (sudo for root), in its own window. Exit
+# closes the window.
+function Open-KohaDebianTerminal {
+    Confirm-KohaWindowScript | Out-Null
+    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    $launch = Get-KohaDebianTerminalLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath)
+    Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null
+    Write-KohaLog 'Debian terminal opened'
+}
+
+# Pure: how the Debian terminal opens.
+function Get-KohaDebianTerminalLaunch {
+    param([string]$Wsl, [string]$Terminal)
+    $cmd = '-d {0} --cd ~ -- {1} --shell' -f $script:Cfg.Distro, $script:Cfg.WindowPath
+    if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title "Koha - Debian" "{0}" {1}' -f $Wsl, $cmd) } }
     return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
 }
 
@@ -1328,6 +1867,9 @@ function Export-KohaDiagnosticsText {
     $out.Add(('Wanted: {0}   automatic start: {1}   library network: {2}' -f $state.desired, $state.autostart, [bool]$state['lanAccess']))
     foreach ($l in @(Get-KohaQuickCheck)) { $out.Add($l) }
     $out.Add((Get-KohaWriteCacheCheck).Text)
+    $out.Add('')
+    $out.Add('== Library network')
+    try { foreach ($l in @(Get-KohaLanReport)) { $out.Add([string]$l) } } catch { $out.Add('ERROR: ' + $_.Exception.Message) }
     if (Test-KohaDistroRunning) {
         $out.Add('')
         $out.Add('== Debian: service logs')
@@ -1439,8 +1981,10 @@ function Get-KohaShortcutList {
     $lnk = { param($name, $a) $l = Get-KohaHiddenLaunch -Arguments $a; @{ Name = $name; Kind = 'lnk'; Target = $l.Target; Arguments = $l.Arguments } }
     $list = @(
         # The one desktop icon: the Koha window (status, services, actions).
-        # It works even when Koha itself does not answer.
-        (& $lnk 'Koha' 'Window') + @{ Desktop = $true; StartMenu = $false }
+        # It works even when Koha itself does not answer. Also in the Start
+        # menu, where it carries Koha's identity (AppId): the taskbar pins
+        # the Koha window as Koha, and notifications show Koha's name.
+        (& $lnk 'Koha' 'Window') + @{ Desktop = $true; StartMenu = $true; AppId = $true }
         @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
         @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
         (& $lnk (T 'Koha - Control panel') 'Panel')
@@ -1499,6 +2043,7 @@ function New-KohaShortcuts {
         }
     }
     $made = New-Object System.Collections.ArrayList
+    $identity = $false
     foreach ($s in Get-KohaShortcutList) {
         $dirs = @()
         if (-not $s.ContainsKey('StartMenu') -or $s.StartMenu) { $dirs += $StartMenu }
@@ -1509,11 +2054,15 @@ function New-KohaShortcuts {
                 Save-KohaUrlShortcut -Path $file -Url $s.Target -Icon $s.Icon
             } else {
                 Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
+                if ($s.ContainsKey('AppId') -and $s.AppId -and (Set-KohaShortcutAppId -Path $file) -and $d -eq $StartMenu) { $identity = $true }
             }
             [void]$made.Add($file)
         }
     }
-    Write-KohaLog ('shortcuts created: {0}' -f $made.Count)
+    # Only with the Start menu shortcut does Windows know Koha's name and
+    # icon for its notifications and the taskbar.
+    Set-KohaState @{ appIdShortcut = $identity } | Out-Null
+    Write-KohaLog ('shortcuts created: {0}, Koha identity on the taskbar: {1}' -f $made.Count, $identity)
     return @($made)
 }
 
@@ -1581,6 +2130,54 @@ function Set-KohaTrayAtSignIn {
     } else {
         Remove-ItemProperty -Path $key -Name 'KohaEasyTray' -ErrorAction SilentlyContinue
     }
+}
+
+# The tray is the PowerShell running "KohaEasy.ps1 Tray" (whatever started it:
+# KohaEasy.exe, conhost or PowerShell itself).
+function Test-KohaTrayRunning {
+    try {
+        return (@(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
+                Where-Object { ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Tray' }).Count -gt 0)
+    } catch { return $false }
+}
+
+# The keep-alive task's watch: the Koha icon starts at every sign-in, so a
+# missing one crashed or was ended. The librarian's own "Close this icon"
+# is respected until the next sign-in.
+function Repair-KohaTray {
+    if ([bool](Get-KohaState).trayClosed) { return 'closed' }
+    if (Test-KohaTrayRunning) { return 'running' }
+    Write-KohaLog 'keep-alive: the Koha icon was not running; starting it again'
+    Start-KohaHidden 'Tray'
+    return 'restarted'
+}
+
+# Windows 11 puts a new notification-area icon in the hidden overflow (^).
+# When the Koha icon first appears, Windows records it under
+# HKCU\Control Panel\NotifyIconSettings (one key per icon, with its program
+# and its first tooltip, "Koha"); IsPromoted=1 shows it next to the clock.
+# Done once: if the librarian hides it again, that choice stays. Windows 10
+# has no such key. [verify] undocumented, on Windows 11 23H2 and 24H2.
+function Set-KohaTrayPromoted {
+    param([string]$Root = 'HKCU:\Control Panel\NotifyIconSettings')
+    if ([bool](Get-KohaState).trayPromoted) { return 'done' }
+    if (-not (Test-Path -LiteralPath $Root)) { return 'unsupported' }
+    $found = $false
+    foreach ($k in @(Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue)) {
+        $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+        if ($null -eq $p) { continue }
+        $exe = ''
+        $tip = ''
+        if ($p.PSObject.Properties['ExecutablePath']) { $exe = [string]$p.ExecutablePath }
+        if ($p.PSObject.Properties['InitialTooltip']) { $tip = [string]$p.InitialTooltip }
+        if ($tip -ne 'Koha' -or $exe -notmatch '(?i)\\(powershell|KohaEasy)\.exe$') { continue }
+        New-ItemProperty -LiteralPath $k.PSPath -Name IsPromoted -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+        $found = $true
+    }
+    if (-not $found) { return 'not-found' }
+    Set-KohaState @{ trayPromoted = $true } | Out-Null
+    Write-KohaLog 'tray: the Koha icon is shown next to the clock'
+    return 'promoted'
 }
 
 $script:KohaEasyVersion = '0.1.0'

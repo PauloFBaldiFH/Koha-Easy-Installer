@@ -80,6 +80,18 @@ Describe 'Debian image and WSL settings' {
         Merge-KohaWslConfig -Text $new -Build 22631 | Should -Be $new
     }
 
+    It 'turns on hostAddressLoopback in [experimental] on Windows 11 22H2+, keeping the user''s own choice' {
+        $new = Merge-KohaWslConfig -Text '' -Build 22631
+        $new | Should -Match '(?s)\[wsl2\]\r\n.*\r\n\r\n\[experimental\]\r\nhostAddressLoopback=true\r\n$'
+        Merge-KohaWslConfig -Text $new -Build 22631 | Should -Be $new
+        Merge-KohaWslConfig -Text '' -Build 19045 | Should -Not -Match 'experimental'
+        $mine = "[experimental]`r`nhostAddressLoopback=false`r`n"
+        $m = Merge-KohaWslConfig -Text $mine -Build 22631
+        $m | Should -Match 'hostAddressLoopback=false'
+        $m | Should -Not -Match 'hostAddressLoopback=true'
+        $m | Should -Match '(?m)^networkingMode=mirrored\r?$'
+    }
+
     It 'turns C:\ paths into /mnt/c paths' {
         ConvertTo-KohaWslPath 'C:\KohaEasy\bin' | Should -Be '/mnt/c/KohaEasy/bin'
     }
@@ -156,6 +168,11 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Get-KohaLanUrls { $null }
         Mock -ModuleName KohaEasy.Install New-KohaLinuxUser { [void]$script:calls.Add('user ' + $User) }
         Mock -ModuleName KohaEasy.Install Read-KohaLinuxAccount { throw 'must not ask' }
+        Mock -ModuleName KohaEasy.Install Install-KohaLauncherStep { [void]$script:calls.Add('launcher') }
+        Mock -ModuleName KohaEasy.Install Show-KohaLanCheck { [void]$script:calls.Add('lan check') }
+        Mock -ModuleName KohaEasy.Install Update-KohaWslConfig { $false }
+        Mock -ModuleName KohaEasy.Install Test-KohaKeepAliveOutdated { $false }
+        Mock -ModuleName KohaEasy.Install Stop-KohaDebianGracefully { [void]$script:calls.Add('stop koha' + $(if ($Shutdown) { ', shutdown' } else { '' })); 'clean' }
     }
 
     It 'stops before touching Windows when a check fails' {
@@ -173,7 +190,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start', 'tray')
+        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start', 'tray', 'lan check')
         (Get-KohaState).phase | Should -Be 'done'
         (Get-KohaState).autostart | Should -Be 'logon'
     }
@@ -244,23 +261,55 @@ Describe 'Install flow' {
         Set-KohaState @{ phase = 'windows' } | Out-Null
         Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
         Mock -ModuleName KohaEasy.Install Start-Process { }
-        Mock -ModuleName KohaEasy.Install Get-KohaLanUrls { [pscustomobject]@{ Opac = 'http://192.168.0.9/'; Staff = 'http://192.168.0.9:8080/' } }
         Set-KohaState @{ linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Contain 'lan'
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'lan', 'start', 'tray', 'lan check')
         (Get-KohaState).lanAccess | Should -BeTrue
-        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*http://192.168.0.9:8080/*' }
+        (Get-KohaState).lanSetup | Should -Be 2
     }
 
     It 'offers the library network again to a finished install that does not have it' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan', 'lan check')
         (Get-KohaState).lanAccess | Should -BeTrue
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan check')
+    }
+
+    It 'updates the library network rules an older version set up, once' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true; lanSetup = 1 } | Out-Null
+        Mock -ModuleName KohaEasy.Install Enable-KohaLanAccess { [void]$script:calls.Add('lan'); $false }
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Contain 'lan'
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*were not updated*' }
+        (Get-KohaState).lanAccess | Should -BeTrue
+        (Get-KohaState).lanSetup | Should -Be 1
+        $script:calls | Should -Contain 'lan check'
+        Mock -ModuleName KohaEasy.Install Enable-KohaLanAccess { [void]$script:calls.Add('lan'); $true }
+        $script:calls.Clear()
+        Install-Koha -Facts $good | Should -Be 0
+        (Get-KohaState).lanSetup | Should -Be 2
+        $script:calls.Clear()
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Not -Contain 'lan'
+    }
+
+    It 'restarts Koha cleanly once when the keep-alive task ran with an older action, or WSL got new settings' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true; lanSetup = 2 } | Out-Null
+        Mock -ModuleName KohaEasy.Install Test-KohaKeepAliveOutdated { $true }
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'stop koha', 'tray', 'start', 'lan check')
+        Mock -ModuleName KohaEasy.Install Update-KohaWslConfig { $true }
+        $script:calls.Clear()
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Contain 'stop koha, shutdown'
+        $script:calls | Should -Not -Contain 'stop koha'
+        $script:calls.IndexOf('stop koha, shutdown') | Should -BeLessThan $script:calls.IndexOf('start')
     }
 
     It 'renames the KohaEasy distro of an older install and refreshes its shortcuts' {
@@ -293,7 +342,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'diagnostics', 'panel', 'start')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'diagnostics', 'panel', 'start', 'lan')
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*koha-common package: iF*' }
     }
 
@@ -308,7 +357,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Process { [pscustomobject]@{ ExitCode = 0 } }
         Invoke-KohaPanel | Should -Be 0
         Should -Invoke -ModuleName KohaEasy.Install Start-Process -Times 1 -Exactly -ParameterFilter {
-            $FilePath -eq 'wsl.exe' -and $NoNewWindow -and $Wait -and $ArgumentList -like '-d koha -u root --cd /root/koha-easy-installer -- bash ./installer'
+            $FilePath -eq 'wsl.exe' -and $NoNewWindow -and $Wait -and $ArgumentList -like '-d koha -u root --cd /root/koha-easy-installer -- /usr/local/bin/koha-window bash ./installer'
         }
     }
 
@@ -333,6 +382,52 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Set-KohaDistroConfig { $false }
         Install-Koha -Facts $good -NonInteractive | Should -Be 1
         (Get-KohaState).phase | Should -Be 'systemd'
+    }
+}
+
+Describe 'Install messages' {
+    BeforeEach {
+        Remove-Item -LiteralPath (Get-KohaPath Root) -Recurse -Force -ErrorAction SilentlyContinue
+        $script:calls = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Install Write-Host { }
+    }
+
+    It 'prints the library network test: what works, what to fix, and the addresses' {
+        Mock -ModuleName KohaEasy.Install Test-KohaLanAccess { [pscustomobject]@{ Ok = $false; Lines = @(
+                    [pscustomobject]@{ Kind = 'warn'; Text = 'test failed' }
+                    [pscustomobject]@{ Kind = 'info'; Text = 'staff interface http://192.168.0.9:8080/' }) } }
+        Show-KohaLanCheck
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*test failed*' }
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*http://192.168.0.9:8080/*' }
+    }
+
+    It 'tells the librarian whether KohaEasy.exe is used, and nothing when it did not change' {
+        Mock -ModuleName KohaEasy.Install Install-KohaLauncher { 'built' }
+        Install-KohaLauncherStep | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*KohaEasy.exe is ready*' }
+        Mock -ModuleName KohaEasy.Install Install-KohaLauncher { 'failed' }
+        Install-KohaLauncherStep
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*hidden console instead*' }
+        Mock -ModuleName KohaEasy.Install Install-KohaLauncher { 'current' }
+        Install-KohaLauncherStep
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 2 -Exactly
+    }
+
+    It 'goes back to conhost for good when the tray does not start through KohaEasy.exe' {
+        Set-KohaState @{ launcher = 'ok'; hiddenLaunch = 'conhost' } | Out-Null
+        $script:running = [System.Collections.Queue]::new(@($false, $true, $true))
+        Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
+        Mock -ModuleName KohaEasy.Install Start-KohaTray { [void]$script:calls.Add('tray ' + (Get-KohaState).launcher) }
+        Mock -ModuleName KohaEasy.Install Start-Sleep { }
+        Mock -ModuleName KohaEasy.Install Test-KohaTrayRunning { $script:running.Dequeue() }
+        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { [void]$script:calls.Add('tray at sign-in') }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { [void]$script:calls.Add('shortcuts') }
+        Mock -ModuleName KohaEasy.Install Register-KohaTasks { [void]$script:calls.Add('tasks') }
+        Start-KohaTrayChecked
+        $script:calls | Should -Be @('tray restart', 'tray at sign-in', 'shortcuts', 'tasks', 'tray refused')
+        (Get-KohaState).launcher | Should -Be 'refused'
+        (Get-KohaState).hiddenLaunch | Should -Be 'conhost'
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*notification area*' }
     }
 }
 
@@ -405,6 +500,7 @@ Describe 'Panel copy into Debian' {
             [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
         }
         $launcher = Join-Path $TestDrive 'koha-panel'
+        Mock -ModuleName KohaEasy.Install Install-KohaWindowScript { $true }
         InModuleScope KohaEasy.Install -Parameters @{ Dst = $dst; L = $launcher } { param($Dst, $L) $script:DistroDir = $Dst; $script:LauncherPath = $L }
         try {
             Copy-KohaPanelIntoDistro
@@ -412,6 +508,7 @@ Describe 'Panel copy into Debian' {
             (& sh $launcher --status-json 2>&1) | Should -Be 'panel'
             [System.IO.File]::ReadAllText($launcher) | Should -Match ([regex]::Escape("cd '$dst' && exec bash ./installer"))
             Test-Path -LiteralPath (Join-Path $dst 'lang/pt.cache') | Should -BeTrue
+            Should -Invoke -ModuleName KohaEasy.Install Install-KohaWindowScript -Times 1 -Exactly
 
             Set-Content -LiteralPath (Join-Path $src 'installer') -Value 'tampered' -NoNewline
             { Copy-KohaPanelIntoDistro } | Should -Throw '*copy:*'
@@ -669,16 +766,19 @@ Describe 'Checks inside Debian' {
         Mock -ModuleName KohaEasy.Core Start-Koha { 'started' }
         Mock -ModuleName KohaEasy.Core Get-KohaTerminalPath { $null }
         Mock -ModuleName KohaEasy.Core Start-Process { $script:file = $FilePath; $script:args = $ArgumentList }
+        Mock -ModuleName KohaEasy.Core Confirm-KohaWindowScript { $true }
         Open-KohaPanel
         Should -Invoke -ModuleName KohaEasy.Core Start-Koha -Times 1 -Exactly
+        Should -Invoke -ModuleName KohaEasy.Core Confirm-KohaWindowScript -Times 1 -Exactly
         $script:file | Should -Match 'wsl\.exe$'
-        $script:args | Should -Be '-d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=1 /usr/local/bin/koha-panel'
+        ([string]$script:args) -match '^-d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=1 KEI_WINDOW_PAUSE=([A-Za-z0-9+/=]+) /usr/local/bin/koha-window /usr/local/bin/koha-panel$' | Should -BeTrue
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1])) | Should -Be 'The control panel ended with an error. Press Enter to close this window.'
     }
 
     It 'opens the control panel in Windows Terminal, with emoji, when it is installed' {
         $l = Get-KohaPanelLaunch -Wsl 'C:\Windows\System32\wsl.exe' -Terminal 'C:\Users\a\AppData\Local\Microsoft\WindowsApps\wt.exe'
         $l.File | Should -Match 'wt\.exe$'
-        $l.Arguments | Should -Be '-w new --title Koha "C:\Windows\System32\wsl.exe" -d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=0 /usr/local/bin/koha-panel'
+        $l.Arguments | Should -Be '-w new --title Koha "C:\Windows\System32\wsl.exe" -d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=0 /usr/local/bin/koha-window /usr/local/bin/koha-panel'
     }
 }
 

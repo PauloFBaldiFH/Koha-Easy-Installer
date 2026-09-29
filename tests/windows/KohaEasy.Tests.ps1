@@ -392,11 +392,61 @@ Describe 'Start, Stop and automatic start' {
         Mock -ModuleName KohaEasy.Core Start-Sleep { }
         Mock -ModuleName KohaEasy.Core Start-KohaNetworkTask { [void]$script:calls.Add('network task'); $true }
         Set-KohaState @{ desired = 'running' } | Out-Null
-        $proc = [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { } -PassThru
+        $proc = [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true } -PassThru
         Invoke-KohaRun -Holder { $proc } | Should -Be 1
         $script:calls | Should -Contain 'network task'
-        $proc2 = [pscustomobject]@{ ExitCode = 0 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { Set-KohaState @{ desired = 'stopped' } | Out-Null } -PassThru
+        $proc2 = [pscustomobject]@{ ExitCode = 0 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) Set-KohaState @{ desired = 'stopped' } | Out-Null; $true } -PassThru
         Invoke-KohaRun -Holder { $proc2 } | Should -Be 0
+    }
+
+    It 'while the holder runs, the keep-alive task brings the Koha icon back, at most 5 times' {
+        Mock -ModuleName KohaEasy.Core Update-KohaHandshake { $true }
+        Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $true }
+        Mock -ModuleName KohaEasy.Core Start-Sleep { }
+        Mock -ModuleName KohaEasy.Core Start-KohaNetworkTask { $true }
+        Mock -ModuleName KohaEasy.Core Repair-KohaTray { [void]$script:calls.Add('tray check'); 'restarted' }
+        Set-KohaState @{ desired = 'running' } | Out-Null
+        $script:waits = 0
+        $proc = [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $script:waits++; ($script:waits -gt 8) } -PassThru
+        Invoke-KohaRun -Holder { $proc } -WatchMs 5 | Should -Be 1
+        $script:waits | Should -Be 9
+        @($script:calls | Where-Object { $_ -eq 'tray check' }).Count | Should -Be 5
+    }
+
+    It 'the holder that keeps Debian running has no window of its own' {
+        $psi = Get-KohaHolderStartInfo
+        $psi.FileName | Should -BeLike '*wsl.exe'
+        $psi.Arguments | Should -Be '-d koha -u root --exec /bin/sleep infinity'
+        $psi.UseShellExecute | Should -BeFalse
+        $psi.CreateNoWindow | Should -BeTrue
+    }
+
+    It 'the Koha icon is started again only when it is missing and the librarian did not close it' {
+        Mock -ModuleName KohaEasy.Core Start-KohaHidden { [void]$script:calls.Add('start ' + $Arguments) }
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayRunning { $true }
+        Set-KohaState @{ trayClosed = $false } | Out-Null
+        Repair-KohaTray | Should -Be 'running'
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayRunning { $false }
+        Repair-KohaTray | Should -Be 'restarted'
+        $script:calls | Should -Contain 'start Tray'
+        $script:calls.Clear()
+        Set-KohaState @{ trayClosed = $true } | Out-Null
+        Repair-KohaTray | Should -Be 'closed'
+        $script:calls.Count | Should -Be 0
+    }
+
+    It 'restarts a keep-alive task that still runs with an older version''s action' {
+        if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { function global:Get-ScheduledTask { param($TaskPath, $TaskName) } }
+        $want = Get-KohaHiddenLaunch -Arguments 'Run'
+        $script:task = [pscustomobject]@{ State = 'Running'; Actions = @([pscustomobject]@{ Execute = 'powershell.exe'; Arguments = '-NoProfile -WindowStyle Hidden -File "x" Run' }) }
+        Mock -ModuleName KohaEasy.Core Get-ScheduledTask { $script:task }
+        Test-KohaKeepAliveOutdated | Should -BeTrue
+        $script:task.Actions = @([pscustomobject]@{ Execute = $want.Target; Arguments = $want.Arguments })
+        Test-KohaKeepAliveOutdated | Should -BeFalse
+        $script:task = [pscustomobject]@{ State = 'Ready'; Actions = @([pscustomobject]@{ Execute = 'powershell.exe'; Arguments = '' }) }
+        Test-KohaKeepAliveOutdated | Should -BeFalse
+        Mock -ModuleName KohaEasy.Core Get-ScheduledTask { throw 'no such task' }
+        Test-KohaKeepAliveOutdated | Should -BeFalse
     }
 
     It 'the automatic start toggle changes the sign-in task and waits to tell a stopped Koha' {
@@ -459,8 +509,25 @@ Describe 'Shortcuts' {
         $f.Arguments | Should -BeLike '-NoProfile -WindowStyle Hidden *'
     }
 
+    It 'starts Koha commands through KohaEasy.exe once the installer built it and Windows let it run' {
+        $exe = Join-Path $TestDrive 'KohaEasy.exe'
+        Set-Content -LiteralPath $exe -Value ''
+        $conhost = Join-Path $TestDrive 'conhost.exe'
+        Set-Content -LiteralPath $conhost -Value ''
+        $l = Get-KohaHiddenLaunch -Arguments 'Start -Trigger logon' -Conhost $conhost -Launcher $exe
+        $l.Target | Should -Be $exe
+        $l.Arguments | Should -Be 'Start -Trigger logon'
+        (Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost $conhost -Launcher (Join-Path $TestDrive 'missing.exe')).Target | Should -Be $conhost
+        Set-KohaState @{ launcher = 'failed' } | Out-Null
+        Get-KohaLauncherPath | Should -Be ''
+        Set-KohaState @{ launcher = 'ok' } | Out-Null
+        Get-KohaLauncherPath | Should -Be ([System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.exe'))
+        Set-KohaState @{ launcher = '' } | Out-Null
+    }
+
     It 'writes .url files with IconFile, program shortcuts through WScript.Shell, and copies koha.ico' {
         Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { $true }
         $sm = Join-Path $TestDrive 'Programs/Koha'
         $dt = Join-Path $TestDrive 'Desktop'
         New-Item -ItemType Directory -Path $dt -Force | Out-Null
@@ -469,9 +536,27 @@ Describe 'Shortcuts' {
         $url = Get-ChildItem -LiteralPath $sm -Filter '*.url' | Select-Object -First 1
         @(Get-ChildItem -LiteralPath $sm -Filter '*.url').Count | Should -Be 2
         Get-Content -Raw -LiteralPath $url.FullName | Should -Match ('IconFile=' + [regex]::Escape((Get-KohaIconPath)))
-        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 9 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 10 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
         Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 1 -Exactly -ParameterFilter { $Path -eq [System.IO.Path]::Combine($dt, 'Koha.lnk') }
-        $made.Count | Should -Be 11
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 1 -Exactly -ParameterFilter { $Path -eq [System.IO.Path]::Combine($sm, 'Koha.lnk') }
+        $made.Count | Should -Be 12
+        (Get-KohaState).appIdShortcut | Should -BeTrue
+    }
+
+    It 'gives the Koha shortcuts Koha''s identity, and says so only when the Start menu one took it' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        $script:ids = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { [void]$script:ids.Add($Path); $false }
+        $sm = Join-Path $TestDrive 'Programs2/Koha'
+        $dt = Join-Path $TestDrive 'Desktop2'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') | Out-Null
+        $script:ids | Should -Be @([System.IO.Path]::Combine($sm, 'Koha.lnk'), [System.IO.Path]::Combine($dt, 'Koha.lnk'))
+        (Get-KohaState).appIdShortcut | Should -BeFalse
+        Get-KohaToastAppId | Should -Be (Get-KohaConfig).ToastAppId
+        Set-KohaState @{ appIdShortcut = $true } | Out-Null
+        Get-KohaToastAppId | Should -Be 'KohaEasy.Koha'
+        Set-KohaState @{ appIdShortcut = $false } | Out-Null
     }
 
     It 'ships koha.ico as a real Windows icon with a 16x16 image' {
@@ -534,9 +619,11 @@ Describe 'Library network' {
             'interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=172.28.1.20')
     }
 
-    It 'needs no forwarding in mirrored mode, and never forwards to a bad address' {
+    It 'needs no forwarding in mirrored mode (and removes an old one), and never forwards to a bad address' {
         Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'mirrored' }
+        Mock -ModuleName KohaEasy.Core Remove-KohaPortProxy { 2 }
         Update-KohaPortProxy -WslIp '172.28.1.20' | Should -Be 'mirrored'
+        Should -Invoke -ModuleName KohaEasy.Core Remove-KohaPortProxy -Times 1 -Exactly
         Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'nat' }
         Mock -ModuleName KohaEasy.Core Get-KohaWslIp { '' }
         Update-KohaPortProxy | Should -Be 'no-address'
@@ -554,6 +641,7 @@ Describe 'Library network' {
 
 Describe 'Handshake file' {
     It 'writes only KEY=value lines the panel parser accepts' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
         Set-KohaState @{ autostart = 'manual' } | Out-Null
         $env:COMPUTERNAME = 'BIBLIO$(reboot)'
         $env:USERNAME = 'ana;rm -rf'
@@ -568,6 +656,7 @@ Describe 'Handshake file' {
 
     It 'is sent through stdin to a root-owned file replaced in one step' {
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'nat' }
         $script:linux = New-Object System.Collections.ArrayList
         Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [void]$script:linux.Add([pscustomobject]@{ Command = $Command; InputText = $InputText }); [pscustomobject]@{ ExitCode = 0; Output = '' } }
         Update-KohaHandshake | Should -BeTrue
@@ -636,5 +725,287 @@ Describe 'Diagnostics' {
         Get-Content -Raw (Join-Path $x 'windows/logs/koha-20260928.log') | Should -Not -Match 'hunter2'
         $script:calls | Should -Contain 'wsl --terminate koha'
         @(Get-ChildItem $env:TEMP -Filter 'KohaEasy-diagnostics-*').Count | Should -Be 0
+    }
+}
+
+Describe 'Network mode WSL really runs in' {
+    It 'takes WSL''s own answer, else whether Debian carries this PC''s address' {
+        Resolve-KohaNetMode -WslInfo "mirrored`n" -DebianIps '' -LanIp '' | Should -Be 'mirrored'
+        Resolve-KohaNetMode -WslInfo 'NAT' -DebianIps '192.168.0.9' -LanIp '192.168.0.9' | Should -Be 'nat'
+        Resolve-KohaNetMode -WslInfo '' -DebianIps '192.168.0.9 fe80::1' -LanIp '192.168.0.9' | Should -Be 'mirrored'
+        Resolve-KohaNetMode -WslInfo 'wslinfo: command not found' -DebianIps '172.28.1.20' -LanIp '192.168.0.9' | Should -Be 'nat'
+        Resolve-KohaNetMode -WslInfo '' -DebianIps '' -LanIp '192.168.0.9' | Should -Be ''
+    }
+
+    It 'asks the running Debian, even when .wslconfig asks for mirrored, and never starts a stopped one' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Get-KohaConfiguredNetMode { 'mirrored' }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux {
+            if ($Command[0] -eq 'wslinfo') { return [pscustomobject]@{ ExitCode = 0; Output = 'nat' } }
+            [pscustomobject]@{ ExitCode = 0; Output = '172.28.1.20' }
+        }
+        Get-KohaNetMode | Should -Be 'nat'
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { [pscustomobject]@{ ExitCode = 1; Output = '' } }
+        Get-KohaNetMode | Should -Be 'mirrored'
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinux { throw 'must not start the distro' }
+        Get-KohaNetMode | Should -Be 'mirrored'
+    }
+
+    It 'reads the forwarding table of netsh in any language' {
+        $en = "`r`nListen on ipv4:             Connect to ipv4:`r`n`r`nAddress         Port        Address         Port`r`n--------------- ----------  --------------- ----------`r`n0.0.0.0         80          172.28.1.20     80`r`n0.0.0.0         8080        172.28.1.20     8080`r`n"
+        $rows = @(ConvertFrom-KohaPortProxyTable -Text $en)
+        $rows.Count | Should -Be 2
+        $rows[1].ListenPort | Should -Be 8080
+        $rows[1].ConnectAddress | Should -Be '172.28.1.20'
+        $pt = "Escutar em ipv4:           Conectar a ipv4:`nEndereço        Porta       Endereço        Porta`n--------------- ----------  --------------- ----------`n0.0.0.0         80          172.28.1.20     80`n"
+        @(ConvertFrom-KohaPortProxyTable -Text $pt).Count | Should -Be 1
+        @(ConvertFrom-KohaPortProxyTable -Text '').Count | Should -Be 0
+    }
+
+    It 'removes only Koha''s own forwarding' {
+        Mock -ModuleName KohaEasy.Core Get-KohaPortProxyRules {
+            @([pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 80; ConnectAddress = '172.28.1.20'; ConnectPort = 80 }
+              [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 3389; ConnectAddress = '10.0.0.5'; ConnectPort = 3389 }
+              [pscustomobject]@{ ListenAddress = '0.0.0.0'; ListenPort = 8080; ConnectAddress = '172.28.1.20'; ConnectPort = 8080 })
+        }
+        $script:netsh = New-Object System.Collections.ArrayList
+        if (-not (Get-Command netsh.exe -ErrorAction SilentlyContinue)) { function global:netsh.exe { } }
+        Mock -ModuleName KohaEasy.Core netsh.exe { [void]$script:netsh.Add($args -join ' ') }
+        Remove-KohaPortProxy | Should -Be 2
+        $script:netsh | Should -Be @('interface portproxy delete v4tov4 listenport=80 listenaddress=0.0.0.0', 'interface portproxy delete v4tov4 listenport=8080 listenaddress=0.0.0.0')
+    }
+}
+
+Describe 'Library network test' {
+    BeforeAll {
+        $script:ok = [pscustomobject]@{ Ok = $true; Code = 302; Error = '' }
+        $script:bad = [pscustomobject]@{ Ok = $false; Code = 0; Error = 'timed out' }
+        $script:fwOk = [pscustomobject]@{ Rule = $true; HyperVRule = $true; Others = @() }
+    }
+
+    It 'gives the addresses by this PC''s name and by its IPv4 address' {
+        $u = Get-KohaLanUrls -Ip '192.168.0.9' -ComputerName 'BIBLIOTECA-01'
+        $u.Staff | Should -Be 'http://192.168.0.9:8080/'
+        $u.Opac | Should -Be 'http://192.168.0.9/'
+        $u.StaffByName | Should -Be 'http://biblioteca-01:8080/'
+        $u.OpacByName | Should -Be 'http://biblioteca-01/'
+        (Get-KohaLanUrls -Ip '192.168.0.9' -ComputerName 'BIBLIO$(x)').StaffByName | Should -Be ''
+        Get-KohaLanUrls -Ip '' -ComputerName 'PC' | Should -BeNullOrEmpty
+    }
+
+    It 'passes when Koha answers on this PC''s address, and prints the name first' {
+        $u = Get-KohaLanUrls -Ip '192.168.0.9' -ComputerName 'PC-BIB'
+        $r = Resolve-KohaLanCheck -Urls $u -Staff $script:ok -Opac $script:ok -Mode 'mirrored' -Firewall $script:fwOk -Loopback $true
+        $r.Ok | Should -BeTrue
+        @($r.Lines | Where-Object { $_.Kind -eq 'warn' }).Count | Should -Be 0
+        $r.Lines[0].Text | Should -Match 'passed.*\(192\.168\.0\.9\)'
+        $r.Lines[1].Text | Should -Match 'http://pc-bib:8080/'
+        $r.Lines[2].Text | Should -Match 'http://192\.168\.0\.9:8080/'
+    }
+
+    It 'says what to fix: loopback in mirrored mode, forwarding in NAT, firewall rules, another firewall' {
+        $u = Get-KohaLanUrls -Ip '192.168.0.9' -ComputerName 'PC'
+        $r = Resolve-KohaLanCheck -Urls $u -Staff $script:bad -Opac $script:ok -Mode 'mirrored' -Firewall ([pscustomobject]@{ Rule = $false; HyperVRule = $false; Others = @('ACME Firewall') }) -Loopback $false
+        $r.Ok | Should -BeFalse
+        $w = @($r.Lines | Where-Object { $_.Kind -eq 'warn' } | ForEach-Object { $_.Text }) -join "`n"
+        $w | Should -Match 'failed'
+        $w | Should -Match 'hostAddressLoopback'
+        $w | Should -Match 'Koha \(web, local network\)'
+        $w | Should -Match 'Hyper-V'
+        $w | Should -Match 'ACME Firewall'
+        $n = Resolve-KohaLanCheck -Urls $u -Staff $script:bad -Opac $script:bad -Mode 'nat' -Firewall ([pscustomobject]@{ Rule = $true; HyperVRule = $false; Others = @() }) -Loopback $false
+        $t = @($n.Lines | ForEach-Object { $_.Text }) -join "`n"
+        $t | Should -Match 'NAT mode'
+        $t | Should -Not -Match 'Hyper-V'
+        $t | Should -Not -Match 'hostAddressLoopback'
+    }
+
+    It 'asks for Koha to be started, or for a network, before testing' {
+        $r = Resolve-KohaLanCheck -Urls $null -Staff $null -Opac $null -Mode 'nat' -Firewall $null -Running $false
+        $r.Ok | Should -BeFalse
+        $r.Lines[0].Kind | Should -Be 'warn'
+        (Resolve-KohaLanCheck -Urls $null -Staff $null -Opac $null -Mode 'nat' -Firewall $null).Lines[0].Text | Should -Match 'no local network address'
+    }
+
+    It 'tests through this PC''s own address and never starts a stopped Debian' {
+        $script:u = Get-KohaLanUrls -Ip '192.168.0.9' -ComputerName 'PC'
+        Mock -ModuleName KohaEasy.Core Get-KohaLanUrls { $script:u }
+        Mock -ModuleName KohaEasy.Core Get-KohaNetMode { 'nat' }
+        Mock -ModuleName KohaEasy.Core Get-KohaFirewallFacts { $script:fwOk }
+        Mock -ModuleName KohaEasy.Core Test-KohaLoopbackConfigured { $true }
+        Mock -ModuleName KohaEasy.Core Test-KohaHttpUrl { [void]$script:urls.Add($Url); $script:ok }
+        $script:urls = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        (Test-KohaLanAccess).Ok | Should -BeTrue
+        $script:urls | Should -Be @('http://192.168.0.9:8080/', 'http://192.168.0.9/')
+        $script:urls.Clear()
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        (Test-KohaLanAccess).Ok | Should -BeFalse
+        $script:urls.Count | Should -Be 0
+    }
+}
+
+Describe 'KohaEasy.exe' {
+    BeforeEach {
+        $script:bin = Join-Path $TestDrive ('bin-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:bin -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repo 'windows/KohaEasy.Launcher.cs') -Destination $script:bin
+        Copy-Item -LiteralPath (Join-Path $repo 'windows/koha.ico') -Destination $script:bin
+        Set-KohaState @{ launcher = ''; launcherHash = '' } | Out-Null
+        $script:compiles = 0
+        $script:compile = { param($Source, $Output, $Options) $script:compiles++; $script:options = $Options; Set-Content -LiteralPath $Output -Value 'exe' }
+    }
+    AfterAll { Set-KohaState @{ launcher = ''; launcherHash = '' } | Out-Null }
+
+    It 'is built once, checked, and built again only when its source changes' {
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'built'
+        Test-Path -LiteralPath (Join-Path $script:bin 'KohaEasy.exe') | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $script:bin -Filter '*.new.exe').Count | Should -Be 0
+        (Get-KohaState).launcher | Should -Be 'ok'
+        $script:options | Should -Match '/target:winexe'
+        $script:options | Should -Match ([regex]::Escape('/win32icon:"' + (Join-Path $script:bin 'koha.ico') + '"'))
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'current'
+        $script:compiles | Should -Be 1
+        Add-Content -LiteralPath (Join-Path $script:bin 'KohaEasy.Launcher.cs') -Value '// changed'
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'built'
+        $script:compiles | Should -Be 2
+    }
+
+    It 'is not used when it does not compile or Windows does not let it run' {
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $false } | Should -Be 'failed'
+        (Get-KohaState).launcher | Should -Be 'failed'
+        Test-Path -LiteralPath (Join-Path $script:bin 'KohaEasy.exe') | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:bin -Filter '*.new.exe').Count | Should -Be 0
+        Install-KohaLauncher -Bin $script:bin -Compile { throw 'csc.exe not found' } -SelfTest { param($Path) $true } | Should -Be 'failed'
+        Get-KohaLauncherPath | Should -Be ''
+    }
+
+    It 'is not tried again after the tray did not start through it, until its source changes' {
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'built'
+        Set-KohaState @{ launcher = 'refused' } | Out-Null
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'refused'
+        $script:compiles | Should -Be 1
+        Add-Content -LiteralPath (Join-Path $script:bin 'KohaEasy.Launcher.cs') -Value '// changed'
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'built'
+    }
+
+    It 'says so when its source is missing' {
+        Remove-Item -LiteralPath (Join-Path $script:bin 'KohaEasy.Launcher.cs')
+        Install-KohaLauncher -Bin $script:bin -Compile $script:compile -SelfTest { param($Path) $true } | Should -Be 'no-source'
+        (Get-KohaState).launcher | Should -Be 'failed'
+    }
+
+    It 'replaces a copy in use by renaming it, and removes the old copies later' {
+        $exe = Join-Path $script:bin 'KohaEasy.exe'
+        Set-Content -LiteralPath $exe -Value 'old'
+        Set-Content -LiteralPath ($exe + '.old-1') -Value 'older'
+        $new = Join-Path $script:bin 'new.exe'
+        Set-Content -LiteralPath $new -Value 'new'
+        Set-KohaFileInPlace -NewFile $new -Path $exe
+        Get-Content -LiteralPath $exe | Should -Be 'new'
+        Test-Path -LiteralPath ($exe + '.old-1') | Should -BeFalse
+        Test-Path -LiteralPath $new | Should -BeFalse
+    }
+
+    It 'compiles as C# 5 (the compiler of Windows'' .NET Framework) and passes arguments as Windows reads them' {
+        $src = [System.IO.File]::ReadAllText((Join-Path $repo 'windows/KohaEasy.Launcher.cs'))
+        @([System.Text.Encoding]::UTF8.GetBytes($src) | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        if (-not ('KohaEasy.Launcher' -as [type])) { Add-Type -TypeDefinition $src -Language CSharp -CompilerOptions '-langversion:5' }
+        [KohaEasy.Launcher]::Quote('Tray') | Should -Be 'Tray'
+        [KohaEasy.Launcher]::Quote('') | Should -Be '""'
+        [KohaEasy.Launcher]::Quote('C:\Program Files\x') | Should -Be '"C:\Program Files\x"'
+        [KohaEasy.Launcher]::Quote('C:\a b\') | Should -Be '"C:\a b\\"'
+        [KohaEasy.Launcher]::Quote('say "hi"') | Should -Be '"say \"hi\""'
+        [KohaEasy.Launcher]::BuildArguments('C:\Koha Easy\bin\KohaEasy.ps1', @('Start', '-Trigger', 'logon')) |
+            Should -Be '-NoProfile -ExecutionPolicy Bypass -File "C:\Koha Easy\bin\KohaEasy.ps1" Start -Trigger logon'
+        $src | Should -Match 'psi\.CreateNoWindow = true'
+        $src | Should -Match 'psi\.UseShellExecute = false'
+    }
+}
+
+Describe 'Koha windows that close cleanly' {
+    BeforeAll {
+        $script:kw = Join-Path $TestDrive 'koha-window'
+        [System.IO.File]::WriteAllText($script:kw, (InModuleScope KohaEasy.Core { $script:WindowScript }))
+    }
+
+    It 'koha-window is valid sh and always ends with exit 0, so the window closes' {
+        & sh -n $script:kw
+        $LASTEXITCODE | Should -Be 0
+        '' | & sh $script:kw sh -c 'exit 3'
+        $LASTEXITCODE | Should -Be 0
+        & sh $script:kw true
+        $LASTEXITCODE | Should -Be 0
+    }
+
+    It 'koha-window stops what the panel left holding the terminal' -Skip:(-not (Get-Command script -ErrorAction SilentlyContinue)) {
+        $cmd = "sh '$($script:kw)' sh -c 'trap \`"\`" HUP; sleep 3099 & exit 0'"
+        & timeout 30 script -qec $cmd /dev/null | Out-Null
+        Start-Sleep -Milliseconds 300
+        @(& pgrep -f '^sleep 3099$').Count | Should -Be 0
+    }
+
+    It 'is written into Debian as root, executable and with Linux line ends (script run by a real sh)' {
+        $target = Join-Path $TestDrive 'usr/local/bin/koha-window'
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript {
+            $f = Join-Path $TestDrive 'kw-install.sh'
+            [System.IO.File]::WriteAllText($f, $Script)
+            $out = ($InputText -replace "`n", "`r`n") | & sh $f 2>&1
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+        }
+        $saved = (Get-KohaConfig).WindowPath
+        Set-KohaConfig @{ WindowPath = $target }
+        try {
+            Install-KohaWindowScript | Should -BeTrue
+            [System.IO.File]::ReadAllText($target) | Should -Not -Match "`r"
+            (& sh -c "test -x '$target' && echo yes") | Should -Be 'yes'
+        } finally { Set-KohaConfig @{ WindowPath = $saved } }
+    }
+
+    It 'opens the Debian terminal in its own window as the Debian user, through koha-window' {
+        $l = Get-KohaDebianTerminalLaunch -Wsl 'C:\Windows\System32\wsl.exe' -Terminal ''
+        $l.File | Should -Be 'C:\Windows\System32\wsl.exe'
+        $l.Arguments | Should -Be '-d koha --cd ~ -- /usr/local/bin/koha-window --shell'
+        $w = Get-KohaDebianTerminalLaunch -Wsl 'C:\Windows\System32\wsl.exe' -Terminal 'C:\wt.exe'
+        $w.File | Should -Be 'C:\wt.exe'
+        $w.Arguments | Should -Be '-w new --title "Koha - Debian" "C:\Windows\System32\wsl.exe" -d koha --cd ~ -- /usr/local/bin/koha-window --shell'
+    }
+
+    It 'the Koha window has the Debian terminal and the library network test' {
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match "Start-KohaHidden 'Terminal'"
+        $w | Should -Match "'lan'\s+\{ \`$result = Test-KohaLanAccess \}"
+        $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
+        $t | Should -Match "Invoke-KohaCommand 'RebuildIndex'"
+    }
+}
+
+Describe 'Koha icon next to the clock' {
+    BeforeEach { Set-KohaState @{ trayPromoted = $false } | Out-Null }
+    AfterAll { Set-KohaState @{ trayPromoted = $false } | Out-Null }
+
+    It 'shows the Koha icon next to the clock once, on Windows 11 only' {
+        $root = 'HKCU:\Control Panel\NotifyIconSettings'
+        $script:set = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Test-Path { $true } -ParameterFilter { $LiteralPath -eq $root }
+        Mock -ModuleName KohaEasy.Core Get-ChildItem { @([pscustomobject]@{ PSPath = 'k1' }, [pscustomobject]@{ PSPath = 'k2' }, [pscustomobject]@{ PSPath = 'k3' }) } -ParameterFilter { $LiteralPath -eq $root }
+        Mock -ModuleName KohaEasy.Core Get-ItemProperty {
+            switch ($LiteralPath) {
+                'k1' { [pscustomobject]@{ ExecutablePath = 'C:\Windows\explorer.exe'; InitialTooltip = 'Koha' } }
+                'k2' { [pscustomobject]@{ ExecutablePath = 'C:\KohaEasy\bin\KohaEasy.exe'; InitialTooltip = 'Koha' } }
+                'k3' { [pscustomobject]@{ ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; InitialTooltip = 'Other' } }
+            }
+        }
+        Mock -ModuleName KohaEasy.Core New-ItemProperty { [void]$script:set.Add(('{0} {1}={2} {3}' -f ($LiteralPath -join ','), $Name, $Value, $PropertyType)) }
+        Set-KohaTrayPromoted -Root $root | Should -Be 'promoted'
+        $script:set | Should -Be @('k2 IsPromoted=1 DWord')
+        Set-KohaTrayPromoted -Root $root | Should -Be 'done'
+        $script:set.Count | Should -Be 1
+    }
+
+    It 'does nothing where Windows has no such list' {
+        Set-KohaTrayPromoted -Root (Join-Path $TestDrive 'no-such-key') | Should -Be 'unsupported'
+        (Get-KohaState).trayPromoted | Should -BeFalse
     }
 }

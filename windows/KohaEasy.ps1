@@ -8,7 +8,9 @@
     KohaEasy.ps1 Window                        the Koha window: state, services, actions (desktop icon, Koha - Status, tray)
     KohaEasy.ps1 Status                        the same summary in a message box
     KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
-    KohaEasy.ps1 Panel                         the "Koha" desktop icon and the tray: starts Koha, opens the control panel
+    KohaEasy.ps1 Panel                         the Koha window and the tray: starts Koha, opens the control panel
+    KohaEasy.ps1 Terminal                      the Koha window: a Debian shell as the Debian user (advanced)
+    KohaEasy.ps1 RebuildIndex                  the tray: rebuilds the search index, with notifications
     KohaEasy.ps1 Open                          starts Koha if needed, opens the staff interface
     KohaEasy.ps1 Run                           action of the "Keep Koha running" task
     KohaEasy.ps1 Tray                          notification-area icon (starts at sign-in)
@@ -17,7 +19,7 @@
     KohaEasy.ps1 CheckDisk                     free space around the virtual disk
     KohaEasy.ps1 CompactDisk                   give unused space back to Windows (admin)
     KohaEasy.ps1 SetAutostart -Mode logon|manual
-    KohaEasy.ps1 RegisterTasks [-Mode logon|manual]   tasks, tray at sign-in and shortcuts
+    KohaEasy.ps1 RegisterTasks [-Mode logon|manual]   KohaEasy.exe, tasks, tray at sign-in and shortcuts
     KohaEasy.ps1 Install                       the whole installation (windows\install.ps1 starts it)
     KohaEasy.ps1 CreateShortcuts               Start menu "Koha" and desktop, with koha.ico
     KohaEasy.ps1 SetupNetwork                  firewall and port forwarding for the library network (admin)
@@ -28,7 +30,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Window', 'Panel', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
+    [ValidateSet('Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -99,6 +101,22 @@ switch ($Command) {
     'Panel' {
         if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
         Open-KohaPanel
+    }
+    'Terminal' {
+        if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
+        Open-KohaDebianTerminal
+    }
+    'RebuildIndex' {
+        if (-not $Quiet) { Show-KohaNotification -Title 'Koha' -Text (T 'Rebuilding the search index... On large catalogs this takes several minutes.') | Out-Null }
+        $r = Invoke-KohaSearchReindex
+        if (-not $Quiet) {
+            switch ($r) {
+                'rebuilt'     { Show-KohaNotification -Title 'Koha' -Text (T 'The search index was rebuilt.') | Out-Null }
+                'not_running' { Show-Box (T 'Debian is stopped. Start Koha first.') 'OK' 'Warning' | Out-Null }
+                default       { Show-KohaNotification -Title 'Koha' -Text (T 'Rebuilding the search index failed. Export the diagnostics and send them to whoever supports your library.') -Level error | Out-Null }
+            }
+        }
+        if ($r -ne 'rebuilt') { exit 1 }
     }
     'Start' {
         if (-not $Quiet) { Show-KohaNotification -Title 'Koha' -Text (T 'Starting Koha... (up to 3 minutes)') | Out-Null }
@@ -197,6 +215,7 @@ switch ($Command) {
         }
     }
     'RegisterTasks' {
+        Install-KohaLauncher | Out-Null
         if ($Mode) { Register-KohaTasks -Autostart $Mode } else { Register-KohaTasks }
         Set-KohaTrayAtSignIn -Enabled $true
         New-KohaShortcuts | Out-Null

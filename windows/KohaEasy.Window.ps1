@@ -6,6 +6,10 @@
 #   * Start, Stop, Restart Koha services, Restart Debian and Koha
 #   * staff interface, public catalog, the control panel (terminal menus)
 #   * diagnostics as one text file on the desktop (diagnostico_koha.txt)
+#   * the library network: the addresses for the other PCs and a test
+#   * a Debian terminal for advanced users (the Debian user, with sudo)
+# On the taskbar it is Koha (Koha's AppUserModelID, KohaEasy.exe), not
+# Windows PowerShell.
 # Opened by the Koha icon on the desktop, Koha - Status and the tray. Like
 # the tray, it never starts Debian by itself: only its Start buttons do.
 # Every check and action runs in a background runspace, so the window never
@@ -22,6 +26,8 @@ if (-not $mutex.WaitOne(0)) {
     try { [void](New-Object -ComObject WScript.Shell).AppActivate($title) } catch { }
     return
 }
+# Before any window exists: Windows reads it when the first one opens.
+Set-KohaProcessAppId | Out-Null
 
 $cfg = Get-KohaConfig
 $here = $PSScriptRoot
@@ -165,6 +171,13 @@ $btnReindex = New-Button (T 'Rebuild search index') {
 foreach ($b in $btnReport, $btnZip, $btnPanel, $btnReindex) { [void]$row2.Controls.Add($b) }
 [void]$root.Controls.Add($row2)
 
+# The library network, and Debian itself for advanced users.
+$row3 = New-Row
+$btnLan = New-Button (T 'Test the library network') { Invoke-Action 'lan' }
+$btnTerminal = New-Button (T 'Debian terminal (advanced)') { Start-KohaHidden 'Terminal' }
+foreach ($b in $btnLan, $btnTerminal) { [void]$row3.Controls.Add($b) }
+[void]$root.Controls.Add($row3)
+
 $form.Controls.Add($root)
 
 # ----------------------------------------------------------------------
@@ -193,8 +206,11 @@ $worker = {
         'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
         'report'   { $result = Export-KohaDiagnosticsText }
         'reindex'  { $result = Invoke-KohaSearchReindex }
+        'lan'      { $result = Test-KohaLanAccess }
     }
-    return [pscustomobject]@{ Action = $Action; Result = $result; Status = (Get-KohaStatus); Health = (Get-KohaServiceHealth) }
+    $lan = $null
+    if ([bool](Get-KohaState)['lanAccess']) { $lan = Get-KohaLanUrls }
+    return [pscustomobject]@{ Action = $Action; Result = $result; Status = (Get-KohaStatus); Health = (Get-KohaServiceHealth); Lan = $lan }
 }
 
 $busyText = @{
@@ -205,6 +221,7 @@ $busyText = @{
     debian   = (T 'Restarting Debian and Koha... (up to 3 minutes)')
     report   = (T 'Collecting diagnostics... This can take a minute.')
     reindex  = (T 'Rebuilding the search index... On large catalogs this takes several minutes.')
+    lan      = (T 'Testing the library network...')
 }
 
 function Set-Buttons {
@@ -217,6 +234,8 @@ function Set-Buttons {
     $btnServices.Enabled = (-not $Busy) -and $on
     $btnDebian.Enabled = (-not $Busy) -and $on
     $btnReindex.Enabled = (-not $Busy) -and $on
+    $btnLan.Enabled = (-not $Busy) -and $on
+    $btnTerminal.Enabled = $installed
     $btnRefresh.Enabled = -not $Busy
     $btnReport.Enabled = -not $Busy
     $btnPanel.Enabled = $installed
@@ -235,7 +254,7 @@ function Invoke-Action {
 }
 
 function Update-View {
-    param($Status, $Health)
+    param($Status, $Health, $Lan)
     $script:status = $Status
     $script:health = $Health
     $lblState.Text = Get-KohaStateText $Status.State
@@ -262,6 +281,12 @@ function Update-View {
         } else {
             $info += T 'Latest backup: none yet'
         }
+    }
+    if ($null -ne $Lan) {
+        $staff = $Lan.StaffByName
+        $opac = $Lan.OpacByName
+        if (-not $staff) { $staff = $Lan.Staff; $opac = $Lan.Opac }
+        $info += (T 'Other computers of the library network: staff interface {0}  public catalog {1}') -f $staff, $opac
     }
     $info += (T 'Checked at {0}') -f (Get-Date).ToString('T')
     $lblInfo.Text = $info -join "`n"
@@ -295,6 +320,10 @@ function Show-Result {
                 default       { $text = T 'Rebuilding the search index failed. Export the diagnostics and send them to whoever supports your library.'; $color = $bad }
             }
         }
+        'lan' {
+            $text = @($Result.Lines | ForEach-Object { $_.Text }) -join "`n"
+            if (-not $Result.Ok -or @($Result.Lines | Where-Object { $_.Kind -eq 'warn' }).Count -gt 0) { $color = $bad }
+        }
         'report' {
             $text = ((T 'Diagnostics saved on the desktop: {0}') -f $Result) + "`n" + (T 'Send this file to whoever supports your library. Passwords are not included.')
             try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $Result) } catch { }
@@ -315,7 +344,7 @@ $timer.add_Tick({
                 $r = $null
                 if ($res.Count -gt 0) { $r = $res[-1] }
                 if ($null -ne $r) {
-                    Update-View $r.Status $r.Health
+                    Update-View $r.Status $r.Health $r.Lan
                     if ($action -eq 'refresh') { $lblBusy.Text = '' } else { Show-Result $action $r.Result }
                 } elseif ($script:job.PS.Streams.Error.Count -gt 0) {
                     throw $script:job.PS.Streams.Error[0].Exception

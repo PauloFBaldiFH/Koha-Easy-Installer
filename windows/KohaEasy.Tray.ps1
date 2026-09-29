@@ -4,9 +4,13 @@
 # the distro by itself: the status is read only while Koha is already running.
 #   * icon colour: green running, yellow starting, red not responding, grey stopped
 #   * menu: Service status (the Koha window), staff interface, catalog,
-#     Start, Stop, Restart Koha services, diagnostics (.txt and .zip), disk
-#     space, backups folder, control panel, automatic start, and a Close
-#     that asks whether Koha keeps running
+#     Start, Stop, Restart Koha services, Rebuild search index, diagnostics
+#     (.txt and .zip), disk space, backups folder, control panel, automatic
+#     start, and a Close that asks whether Koha keeps running
+#   * shown next to the clock the first time on Windows 11 (which hides new
+#     icons behind ^), with a one-time tip where it is
+#   * brought back by the keep-alive task within a minute if it crashed or
+#     was ended; after its own Close, only at the next sign-in
 #   * notifications: service events, nightly backups, disk space, the
 #     repair after an unclean stop
 #   * Windows shutdown, restart or sign-out while Koha runs: Koha is stopped
@@ -19,6 +23,7 @@ Add-Type -AssemblyName System.Drawing
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\KohaEasyTray')
 if (-not $mutex.WaitOne(0)) { return }
+Set-KohaState @{ trayClosed = $false } | Out-Null
 
 $cfg = Get-KohaConfig
 $here = $PSScriptRoot
@@ -140,6 +145,10 @@ Add-Separator
 $miStart = Add-Item (T 'Start Koha') { Invoke-KohaCommand 'Start'; Request-Check 5 }
 $miStop = Add-Item (T 'Stop Koha') { Invoke-KohaCommand 'Stop'; Request-Check 5 }
 $miRestart = Add-Item (T 'Restart Koha services') { Invoke-KohaCommand 'RestartServices'; Request-Check 20 }
+$miReindex = Add-Item (T 'Rebuild search index') {
+    $q = (T 'Rebuild the search index from scratch?') + "`n`n" + (T 'Searches in the catalog may be incomplete until it finishes. On large catalogs this takes several minutes.')
+    if ([string][System.Windows.Forms.MessageBox]::Show($q, 'Koha', 'YesNo', 'Question') -eq 'Yes') { Invoke-KohaCommand 'RebuildIndex' }
+}
 Add-Separator
 Add-Item (T 'Export diagnostics (.txt)') { Invoke-KohaCommand 'ExportReport' } | Out-Null
 Add-Item (T 'Export diagnostics (.zip)') { Invoke-KohaCommand 'ExportDiagnostics' } | Out-Null
@@ -171,6 +180,8 @@ Add-Item (T 'Close this icon') {
             cancel = (T 'Cancel')
         })
     if ($choice -eq 'cancel') { return }
+    # The keep-alive task does not bring it back before the next sign-in.
+    Set-KohaState @{ trayClosed = $true } | Out-Null
     if ($choice -eq 'stop') { Invoke-KohaCommand 'Stop -Force' }
     $tray.Visible = $false
     [System.Windows.Forms.Application]::Exit()
@@ -219,6 +230,7 @@ function Update-Menu {
     $miStart.Enabled = (-not $on) -and $s -ne 'not_installed'
     $miStop.Enabled = $on
     $miRestart.Enabled = $on
+    $miReindex.Enabled = $on
     if ($on) { $session.Block($blockReason) } else { $session.Unblock() }
     $miStaff.Enabled = ($s -eq 'running')
     $miOpac.Enabled = ($s -eq 'running')
@@ -259,6 +271,24 @@ $timer.add_Tick({
         }
     })
 $timer.Start()
+
+# Windows 11 hides a new icon behind ^: once Windows has recorded this one,
+# it is shown next to the clock, and a one-time tip says where it is.
+$firstRun = New-Object System.Windows.Forms.Timer
+$firstRun.Interval = 15000
+$firstRun.add_Tick({
+        $firstRun.Stop()
+        try {
+            Set-KohaTrayPromoted | Out-Null
+            if (-not [bool](Get-KohaState).trayTipShown) {
+                Set-KohaState @{ trayTipShown = $true } | Out-Null
+                Show-KohaNotification -Title 'Koha' -Text (T 'The Koha icon is in the notification area, next to the clock. If you do not see it, click the ^ arrow there: you can drag the icon next to the clock.') | Out-Null
+            }
+        } catch {
+            Write-KohaLog ('tray: first-run tip failed: ' + $_.Exception.Message)
+        }
+    })
+$firstRun.Start()
 
 # The session ends: Koha is stopped cleanly in its own runspace while this
 # thread keeps answering Windows, then the block reason is released and
