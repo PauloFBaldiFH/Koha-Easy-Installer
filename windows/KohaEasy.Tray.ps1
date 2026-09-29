@@ -78,6 +78,7 @@ function Add-Separator { [void]$menu.Items.Add((New-Object System.Windows.Forms.
 $header = Add-Item (Get-KohaStateText 'stopped') $null
 $header.Enabled = $false
 Add-Separator
+Add-Item (T 'Open the control panel') { Invoke-KohaCommand 'Panel'; Request-Check 5 } | Out-Null
 $miStaff = Add-Item (T 'Open the staff interface') { Start-Process $cfg.StaffUrl }
 $miOpac = Add-Item (T 'Open the public catalog') { Start-Process $cfg.OpacUrl }
 Add-Separator

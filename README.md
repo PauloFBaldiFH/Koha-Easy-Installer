@@ -91,12 +91,12 @@ Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux),
   - Screens are always UTF-8. In the classic Windows console, which has no emoji font, the panel shows plain symbols instead of icons; Windows Terminal shows the icons.
   - The Windows side talks to the panel through `/etc/koha-easy-install/windows.conf`. It is read with a whitelist of keys and never executed.
 - **Networking**: Apache listens on every address, on ports 80 (catalog) and 8080 (staff interface). The installer opens both ports in the Windows firewall to the local network only, so other PCs of the library reach Koha at this PC's address. On Windows 11 (mirrored networking) that is all it needs. On Windows 10 (NAT) a *Koha network* task points `netsh interface portproxy` at Debian's address each time Koha starts. To publish Koha on the internet, use the panel's built-in **Cloudflare Tunnel**.
-- **Koha icon and shortcuts**: one **Koha** icon on the desktop, which starts Koha when it is off and opens the staff interface, and a *Koha* folder in the Start menu, all with the official `koha.ico`. The folder holds:
+- **Koha icon and shortcuts**: one **Koha** icon on the desktop, which starts Koha when it is off and opens the control panel, and a *Koha* folder in the Start menu, all with the official `koha.ico`. The folder holds:
   - Staff interface, Public catalog, Control panel and Backups folder
   - **Start**, **Stop** and **Restart**
   - Status, Export diagnostics and Status icon
 - **Start and stop**: Koha can start automatically when you sign in to Windows, or only when you click *Koha - Start*. Change this at any time from the tray menu. After **Stop**, Koha stays off until you start it again, and nothing starts it behind your back.
-- **Status icon (notification area)**: the Koha icon with a coloured dot (green running, yellow starting, red not responding, grey stopped). The menu opens the staff interface and catalog, starts, stops and restarts Koha, and exports diagnostics.
+- **Status icon (notification area)**: the Koha icon with a coloured dot (green running, yellow starting, red not responding, grey stopped). The menu opens the control panel, the staff interface and the catalog, starts, stops and restarts Koha, and exports diagnostics.
 - **Windows notifications**:
   - Koha stops responding, stops unexpectedly or recovers
   - the nightly backup succeeds (can be switched off), fails, or has not run for 36 hours
@@ -123,7 +123,7 @@ The installer does everything else and shows each step in plain language:
 4. It has WSL install Debian from Microsoft's own WSL list as `koha` in `C:\KohaEasy\wsl`. On an older WSL it downloads the same image itself, checks its SHA-256 and imports it.
 5. It creates your Debian user with `sudo` rights and enables systemd. On Windows 11 22H2 or later it also adds mirrored networking to your `.wslconfig`, keeping your own settings and a backup. Then it restarts Debian and waits until systemd is fully running before going on.
 6. It opens the Koha control panel. Choose your language, then **1 – Install Koha server** (it asks for the timezone), and leave the panel with **Exit** when it finishes.
-7. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, gives Debian's own Start menu entry and Windows Terminal profile the Koha icon, opens Koha to the library network (Windows asks for permission once), starts Koha, and opens the staff interface. It shows the addresses other PCs use. From then on, the **Koha** icon on the desktop starts Koha if it is off and opens the staff interface.
+7. It asks whether Koha should start when you sign in to Windows. Then it creates the shortcuts and the status icon, gives Debian's own Start menu entry and Windows Terminal profile the Koha icon, opens Koha to the library network (Windows asks for permission once), starts Koha, and opens the staff interface. It shows the addresses other PCs use. From then on, the **Koha** icon on the desktop starts Koha if it is off and opens the control panel. Running the one-line command again is safe: it finishes a Koha install that stopped half-way, and if Koha does not start it prints what Debian reports and saves the diagnostics on the desktop.
 
 Running it again is safe: it continues from the last step it finished. An install made by an earlier version, whose Debian was called `KohaEasy`, is renamed to `koha` with its data kept. The first-access user and password are in the control panel, option 2. Everything is kept in `C:\KohaEasy`, with the installer's log in `C:\KohaEasy\logs`.
 
