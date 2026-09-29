@@ -413,6 +413,22 @@ Describe 'Start, Stop and automatic start' {
         @($script:calls | Where-Object { $_ -eq 'tray check' }).Count | Should -Be 5
     }
 
+    It 'a start that Stop ended meanwhile is not reported as a failure' {
+        Mock -ModuleName KohaEasy.Core Update-KohaHandshake { $true }
+        Mock -ModuleName KohaEasy.Core Start-Sleep { }
+        Mock -ModuleName KohaEasy.Core Start-KohaNetworkTask { $true }
+        Mock -ModuleName KohaEasy.Core Show-KohaNotification { }
+        Mock -ModuleName KohaEasy.Core Wait-KohaHttp { Set-KohaState @{ desired = 'stopped' } | Out-Null; $false }
+        Set-KohaState @{ desired = 'running' } | Out-Null
+        $proc = [pscustomobject]@{ ExitCode = 1 } | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true } -PassThru
+        Invoke-KohaRun -Holder { $proc } | Should -Be 0
+        Should -Invoke -ModuleName KohaEasy.Core Show-KohaNotification -Times 0 -Exactly
+        Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $false }
+        Set-KohaState @{ desired = 'running' } | Out-Null
+        Invoke-KohaRun -Holder { $proc } | Should -Be 1
+        Should -Invoke -ModuleName KohaEasy.Core Show-KohaNotification -Times 1 -Exactly
+    }
+
     It 'the holder that keeps Debian running has no window of its own' {
         $psi = Get-KohaHolderStartInfo
         $psi.FileName | Should -BeLike '*wsl.exe'
@@ -846,6 +862,45 @@ Describe 'Library network test' {
     }
 }
 
+Describe 'Library network setup' {
+    BeforeAll {
+        foreach ($n in 'Get-NetFirewallRule', 'Get-CimInstance') {
+            if (-not (Get-Command $n -ErrorAction SilentlyContinue)) { New-Item -Path ('function:global:' + $n) -Value { param($DisplayName, $Namespace, $ClassName, $Filter) } | Out-Null }
+        }
+    }
+
+    It 'names another firewall only when its firewall is on' {
+        Mock -ModuleName KohaEasy.Core Get-NetFirewallRule { [pscustomobject]@{ Enabled = 'True' } }
+        Mock -ModuleName KohaEasy.Core Get-CimInstance { @([pscustomobject]@{ displayName = 'ACME Firewall'; productState = 266240 }, [pscustomobject]@{ displayName = 'Old Trial'; productState = 262144 }) }
+        $f = Get-KohaFirewallFacts
+        $f.Rule | Should -BeTrue
+        @($f.Others) | Should -Be @('ACME Firewall')
+    }
+
+    It 'asks for the administrator setup again only when something is missing or out of date' {
+        $script:fw = [pscustomobject]@{ Rule = $true; HyperVRule = $true; Others = @() }
+        Mock -ModuleName KohaEasy.Core Get-KohaFirewallFacts { $script:fw }
+        Mock -ModuleName KohaEasy.Core Test-KohaNetTaskRegistered { $true }
+        $now = (Get-KohaHiddenLaunch -Arguments 'UpdatePortProxy').Target
+        Set-KohaState @{ lanAccess = $false; lanSetup = 0; netLaunch = '' } | Out-Null
+        Get-KohaLanSetupNeed | Should -Be 'open'
+        Set-KohaState @{ lanAccess = $true } | Out-Null
+        Get-KohaLanSetupNeed | Should -Be 'update'
+        Set-KohaState @{ lanSetup = 2 } | Out-Null
+        Get-KohaLanSetupNeed | Should -Be 'update'
+        Set-KohaState @{ netLaunch = $now } | Out-Null
+        Get-KohaLanSetupNeed | Should -Be ''
+        $script:fw.HyperVRule = $null
+        Get-KohaLanSetupNeed | Should -Be ''
+        $script:fw.HyperVRule = $false
+        Get-KohaLanSetupNeed | Should -Be 'repair'
+        $script:fw.HyperVRule = $true
+        Mock -ModuleName KohaEasy.Core Test-KohaNetTaskRegistered { $false }
+        Get-KohaLanSetupNeed | Should -Be 'repair'
+        Set-KohaState @{ lanAccess = $false; lanSetup = 0; netLaunch = '' } | Out-Null
+    }
+}
+
 Describe 'KohaEasy.exe' {
     BeforeEach {
         $script:bin = Join-Path $TestDrive ('bin-' + [guid]::NewGuid().ToString('N'))
@@ -975,6 +1030,7 @@ Describe 'Koha windows that close cleanly' {
     It 'the Koha window has the Debian terminal and the library network test' {
         $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
         $w | Should -Match "Start-KohaHidden 'Terminal'"
+        $w | Should -Match '\$btnTerminal.Enabled = \(-not \$Busy\) -and \$on'
         $w | Should -Match "'lan'\s+\{ \`$result = Test-KohaLanAccess \}"
         $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
         $t | Should -Match "Invoke-KohaCommand 'RebuildIndex'"

@@ -173,6 +173,12 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Update-KohaWslConfig { $false }
         Mock -ModuleName KohaEasy.Install Test-KohaKeepAliveOutdated { $false }
         Mock -ModuleName KohaEasy.Install Stop-KohaDebianGracefully { [void]$script:calls.Add('stop koha' + $(if ($Shutdown) { ', shutdown' } else { '' })); 'clean' }
+        Mock -ModuleName KohaEasy.Install Get-KohaLanSetupNeed {
+            $s = Get-KohaState
+            if (-not [bool]$s['lanAccess']) { return 'open' }
+            if ([int]$s['lanSetup'] -lt 2) { return 'update' }
+            ''
+        }
     }
 
     It 'stops before touching Windows when a check fails' {
@@ -190,7 +196,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'start', 'tray', 'lan check')
+        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan check')
         (Get-KohaState).phase | Should -Be 'done'
         (Get-KohaState).autostart | Should -Be 'logon'
     }
@@ -263,7 +269,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Process { }
         Set-KohaState @{ linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'lan', 'start', 'tray', 'lan check')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'lan', 'start', 'lan check')
         (Get-KohaState).lanAccess | Should -BeTrue
         (Get-KohaState).lanSetup | Should -Be 2
     }
@@ -293,6 +299,19 @@ Describe 'Install flow' {
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
         (Get-KohaState).lanSetup | Should -Be 2
+        $script:calls.Clear()
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Not -Contain 'lan'
+    }
+
+    It 'sets the library network up again when a firewall rule or its task went missing' {
+        Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
+        Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true; lanSetup = 2 } | Out-Null
+        Mock -ModuleName KohaEasy.Install Get-KohaLanSetupNeed { 'repair' }
+        Install-Koha -Facts $good | Should -Be 0
+        $script:calls | Should -Contain 'lan'
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*Updating the library network settings*' }
+        Mock -ModuleName KohaEasy.Install Get-KohaLanSetupNeed { '' }
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
         $script:calls | Should -Not -Contain 'lan'
@@ -428,6 +447,22 @@ Describe 'Install messages' {
         (Get-KohaState).launcher | Should -Be 'refused'
         (Get-KohaState).hiddenLaunch | Should -Be 'conhost'
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*notification area*' }
+    }
+
+    It 'goes to a hidden PowerShell for the tray, the shortcuts and the tasks when conhost does not start the tray' {
+        Set-KohaState @{ launcher = 'failed'; hiddenLaunch = 'conhost' } | Out-Null
+        $script:running = [System.Collections.Queue]::new(@($false, $false, $true, $true))
+        Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
+        Mock -ModuleName KohaEasy.Install Start-KohaTray { [void]$script:calls.Add('tray ' + (Get-KohaState).hiddenLaunch) }
+        Mock -ModuleName KohaEasy.Install Start-Sleep { }
+        Mock -ModuleName KohaEasy.Install Test-KohaTrayRunning { $script:running.Dequeue() }
+        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { [void]$script:calls.Add('tray at sign-in') }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { [void]$script:calls.Add('shortcuts') }
+        Mock -ModuleName KohaEasy.Install Register-KohaTasks { [void]$script:calls.Add('tasks') }
+        Start-KohaTrayChecked
+        $script:calls | Should -Be @('tray restart', 'tray at sign-in', 'shortcuts', 'tasks', 'tray powershell')
+        (Get-KohaState).hiddenLaunch | Should -Be 'powershell'
+        Set-KohaState @{ launcher = ''; hiddenLaunch = 'conhost' } | Out-Null
     }
 }
 

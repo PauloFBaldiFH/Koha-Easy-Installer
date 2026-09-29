@@ -98,6 +98,7 @@ $script:StateDefaults = [ordered]@{
     trayClosed           = $false
     trayPromoted         = $false
     trayTipShown         = $false
+    netLaunch            = ''
 }
 
 # state.json as an ordered hashtable, with defaults for missing keys. A
@@ -1001,6 +1002,13 @@ function Set-KohaSignInTask {
 function Start-KohaKeepAlive { Start-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask }
 function Stop-KohaKeepAlive {
     Stop-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.KeepTask -ErrorAction SilentlyContinue
+    # Started through KohaEasy.exe, the task's PowerShell is a child process,
+    # which Task Scheduler leaves running when it ends the task.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
+            Where-Object { $_.ProcessId -ne $PID -and ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Run(\s|$)' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
 }
 
 # "Start Koha automatically when I sign in to Windows": Yes (logon) / No (manual).
@@ -1169,7 +1177,8 @@ function Invoke-KohaRun {
     Start-Sleep -Seconds 2
     Update-KohaHandshake | Out-Null
     Start-KohaNetworkTask | Out-Null
-    if (-not (Wait-KohaHttp)) {
+    # Stop pressed meanwhile: not a failure.
+    if (-not (Wait-KohaHttp) -and (Get-KohaState).desired -eq 'running') {
         Write-KohaLog 'keep-alive: the staff interface did not answer in time' 'health'
         Show-KohaNotification -Title (T 'Koha did not start') -Text (T 'Koha did not start. Open Koha - Status, or export the diagnostics from the tray menu.') -Level error | Out-Null
     }
@@ -1314,6 +1323,9 @@ function Set-KohaLanAccess {
         -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -Hidden
     Register-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -Action (New-KohaAction 'UpdatePortProxy') `
         -Principal $principal -Settings $settings -Force | Out-Null
+    # The task keeps this start (KohaEasy.exe, conhost...) until the next
+    # SetupNetwork: Get-KohaLanSetupNeed compares it with the current one.
+    Set-KohaState @{ netLaunch = (Get-KohaHiddenLaunch -Arguments 'UpdatePortProxy').Target } | Out-Null
     $now = Update-KohaPortProxy -Mode $Mode
     Write-KohaLog ('network: local network access set up ({0}, forwarding: {1})' -f $Mode, $now) 'network'
     return $Mode
@@ -1331,6 +1343,28 @@ function Start-KohaNetworkTask {
         Write-KohaLog ('network: task not started: ' + $_.Exception.Message) 'network'
         return $false
     }
+}
+
+function Test-KohaNetTaskRegistered {
+    try {
+        return ($null -ne (Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.NetTask -ErrorAction Stop))
+    } catch { return $false }
+}
+
+# Why the library network needs SetupNetwork (administrator) again, read
+# without administrator rights: open (never set up, or refused), update (set
+# up by an older version, or its task starts Koha's tools in a way this PC
+# no longer uses), repair (a firewall rule or the task is gone); '' when all
+# is in place.
+function Get-KohaLanSetupNeed {
+    $st = Get-KohaState
+    if (-not [bool]$st.lanAccess) { return 'open' }
+    if ([int]$st.lanSetup -lt $script:Cfg.LanSetup) { return 'update' }
+    if ([string]$st.netLaunch -ne (Get-KohaHiddenLaunch -Arguments 'UpdatePortProxy').Target) { return 'update' }
+    $fw = Get-KohaFirewallFacts
+    if (-not [bool]$fw.Rule -or $fw.HyperVRule -eq $false) { return 'repair' }
+    if (-not (Test-KohaNetTaskRegistered)) { return 'repair' }
+    return ''
 }
 
 # Addresses the other PCs use: by this PC's name, which stays the same when
@@ -1386,7 +1420,9 @@ function Get-KohaFirewallFacts {
         try { $f.HyperVRule = (@(Get-NetFirewallHyperVRule -Name 'KohaWeb' -ErrorAction Stop).Count -gt 0) } catch { $f.HyperVRule = $false }
     }
     try {
+        # productState bits 12-15: 1 when the product's firewall is on.
         $f.Others = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName FirewallProduct -ErrorAction Stop |
+                Where-Object { (([int64]$_.productState -shr 12) -band 0xF) -eq 1 } |
                 ForEach-Object { [string]$_.displayName } | Where-Object { $_ })
     } catch { }
     return [pscustomobject]$f
@@ -1526,6 +1562,8 @@ case "$tty" in
     left=""
     for p in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$tty" 2>/dev/null </dev/null | sed -n 's|^/proc/\([0-9]*\)/fd/.*|\1|p' | sort -u); do
       case "$keep" in *" $p "*) continue ;; esac
+      # The find, sed and sort above have ended already.
+      [ -d "/proc/$p" ] || continue
       left="$left $p"
     done
     if [ -n "$left" ]; then
