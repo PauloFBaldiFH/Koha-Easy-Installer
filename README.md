@@ -97,9 +97,11 @@ Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux),
   - **Start**, **Stop** and **Restart**
   - Status, Export diagnostics and Status icon
 - **Start and stop**: Koha can start automatically when you sign in to Windows, or only when you click *Koha - Start*. Change this at any time from the tray menu. After **Stop**, Koha stays off until you start it again, and nothing starts it behind your back.
+- **Clean stops and repair after a power cut**: Stop, Restart and every other step that stops Debian first stop Koha's services inside it in order (the web server, then the queue and the cache, then MariaDB) and only then let WSL stop Debian, so the database and the search index are never cut off mid-write. A clean stop leaves a mark. When Debian starts without it (a power cut, a forced Windows shutdown, a crash), Koha checks its database, makes a fresh backup and brings the Zebra search index up to date, rebuilding it from scratch when needed, and a Windows notification says how it went. Linux servers get the same check after an unclean reboot.
 - **Status icon (notification area)**: the Koha icon with a coloured dot (green running, yellow starting, red not responding, grey stopped). Double-click it, or pick **Service status**, to open the Koha window. The menu also opens the staff interface, the catalog and the control panel, starts and stops Koha, restarts Koha's services and exports diagnostics. **Close this icon** asks whether Koha keeps running in the background or stops too.
 - **Windows notifications**:
   - Koha stops responding, stops unexpectedly or recovers
+  - Koha was not shut down properly, and what the repair afterwards found
   - the nightly backup succeeds (can be switched off), fails, or has not run for 36 hours
   - disk space runs low
 - **Diagnostics in one click**, both ready to send to whoever supports your library, with passwords, tokens and keys removed:

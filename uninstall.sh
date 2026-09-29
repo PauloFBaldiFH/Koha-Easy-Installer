@@ -191,6 +191,8 @@ rm -f /root/backup_sql.sh /root/backup_marc.sh /usr/local/bin/koha-es-watchdog.s
 rm -f /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh
 rm -f /usr/local/bin/config.sh /usr/local/bin/config.sh.bak-* /usr/local/bin/.config.sh.*
 rm -f /usr/local/bin/koha-foreach /tmp/koha-foreach
+systemctl disable --now koha-stop-guard-recover.service koha-stop-guard.service >/dev/null 2>&1 || true
+rm -f /usr/local/sbin/koha-stop-guard /etc/systemd/system/koha-stop-guard.service /etc/systemd/system/koha-stop-guard-recover.service
 rm -f /etc/systemd/system/koha-es-indexer@.service
 rm -rf /etc/systemd/system/multi-user.target.wants/koha-* /etc/systemd/system/koha-*.service.d
 rm -f /etc/systemd/system/apache2.service.d/koha-easy-install.conf
@@ -221,7 +223,7 @@ step "[7/9] Apagando diretórios, credenciais, backups e caches..."
 # instalado) era o que fazia o koha-create falhar na reinstalação.
 rm -rf /etc/koha /var/lib/koha /var/log/koha /var/run/koha /run/koha /var/lock/koha \
        /var/cache/koha /var/spool/koha /usr/share/koha
-rm -rf /etc/koha-easy-install /var/log/koha-easy-install /run/koha-easy-install
+rm -rf /etc/koha-easy-install /var/log/koha-easy-install /run/koha-easy-install /var/lib/koha-easy-install
 rm -rf /var/backups/koha_sql /var/backups/koha_marc
 rm -rf /etc/cloudflared /root/.cloudflared /home/*/.cloudflared
 rm -f /root/koha_credentials.txt /root/credenciais_koha.txt /root/koha_patrons_template.csv

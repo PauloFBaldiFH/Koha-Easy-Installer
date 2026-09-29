@@ -186,7 +186,8 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
 
 @test "P14 uninstall.sh removes everything the panel now installs" {
     local f
-    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf /root/koha_patrons_template.csv; do
+    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf /root/koha_patrons_template.csv \
+             /usr/local/sbin/koha-stop-guard /etc/systemd/system/koha-stop-guard.service /etc/systemd/system/koha-stop-guard-recover.service /var/lib/koha-easy-install; do
         assert 'grep -qF "$f" "$KEI_REPO/uninstall.sh"' "uninstall.sh must remove $f"
     done
 }

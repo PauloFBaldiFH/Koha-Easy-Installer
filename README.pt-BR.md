@@ -97,9 +97,11 @@ O Koha roda dentro de um sistema Debian no **WSL 2** (Subsistema do Windows para
   - **Iniciar**, **Parar** e **Reiniciar**
   - Status, Exportar diagnóstico e Ícone de status
 - **Iniciar e parar**: o Koha pode iniciar sozinho quando você entra no Windows ou só quando você clica em *Koha - Iniciar*. Isso pode ser trocado a qualquer momento pelo menu do ícone. Depois de **Parar**, o Koha fica desligado até você iniciá-lo de novo, e nada o liga sem você saber.
+- **Paradas limpas e reparo depois de uma queda de energia**: Parar, Reiniciar e todos os outros passos que param o Debian primeiro param os serviços do Koha dentro dele, em ordem (o servidor web, depois a fila e o cache, depois o MariaDB), e só então deixam o WSL parar o Debian. Assim o banco de dados e o índice de busca nunca são cortados no meio de uma gravação. Uma parada limpa deixa uma marca. Quando o Debian inicia sem ela (queda de energia, desligamento forçado do Windows, travamento), o Koha verifica o banco de dados, faz um backup novo e atualiza o índice de busca do Zebra, reconstruindo-o do zero quando preciso, e uma notificação do Windows conta como foi. Servidores Linux ganham a mesma verificação depois de um reinício inesperado.
 - **Ícone de status (área de notificação)**: o ícone do Koha com um ponto colorido (verde funcionando, amarelo iniciando, vermelho sem resposta, cinza parado). Um clique duplo, ou **Status dos serviços**, abre a janela do Koha. O menu também abre a interface da equipe, o catálogo e o painel de controle, inicia e para o Koha, reinicia os serviços do Koha e exporta o diagnóstico. **Fechar este ícone** pergunta se o Koha continua funcionando em segundo plano ou se para também.
 - **Notificações do Windows**:
   - o Koha para de responder, para sem aviso ou volta a funcionar
+  - o Koha não foi desligado corretamente, e o que o reparo feito depois encontrou
   - o backup noturno é concluído (dá para desligar esse aviso), falha ou não roda há 36 horas
   - o espaço em disco fica baixo
 - **Diagnóstico com um clique**, os dois prontos para enviar a quem dá suporte à biblioteca, sem senhas, tokens nem chaves:
