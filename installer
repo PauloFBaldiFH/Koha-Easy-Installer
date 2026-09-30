@@ -9979,6 +9979,667 @@ _lt_br_bfdb_circ() {
 }
 
 # ----------------------------------------------------------------------
+# ISIS catalogue: the PostgreSQL export ("backup") of the CDS/ISIS database,
+# a pg_dump of the acervo table (one row per MFN, the tombos of every copy
+# in "registro") and of the occurrences. Read with its noise, compression and
+# encoding detected, cleaned (tombos split on hyphens, commas and carets) and
+# turned into MARC 21 with one 952 item per tombo, then handed to the staged
+# MARC import (its own preview, confirmation and PRE-* backup). The format is
+# described in docs/isis-format.md.
+# ----------------------------------------------------------------------
+isis_write_reader() {
+    cat > "$1" <<'ISISDB'
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long;
+use Encode qw( decode encode );
+use POSIX qw( strftime );
+
+# koha-easy-installer: reads the ISIS catalogue from its PostgreSQL export
+# (a pg_dump "backup": plain SQL text with COPY or INSERT data, also gzip,
+# bzip2, zlib or zip compressed; a custom-format dump goes through
+# pg_restore when it is installed) and builds MARC 21 records, one per MFN,
+# with one 952 item per tombo (accession number) of the "registro" field.
+# The format and the cleaning rules are described in docs/isis-format.md.
+#   --marc FILE  write the records (ISO 2709, UTF-8)
+#   --dry-run    print the report and a sample
+# Exit codes: 4 = not a PostgreSQL dump, 5 = no catalogue table in it.
+my %o = ( sample => 2, lang => 'por', country => 'bl ' );
+GetOptions( \%o, 'in=s', 'marc=s', 'branch=s', 'itype=s', 'dry-run', 'sample=i', 'lang=s' ) or exit 2;
+$o{branch} //= ''; $o{itype} //= '';
+
+binmode STDOUT, ':encoding(UTF-8)';
+sub fail { my ( $code, $msg ) = @_; print "$msg\n"; exit $code }
+sub norm { my $s = lc( shift // '' ); $s =~ tr/áàâãäéèêëíìîïóòôõöúùûüçñ/aaaaaeeeeiiiiooooouuuucn/; $s =~ s/[^a-z0-9]+/ /g; $s =~ s/^ | $//g; return $s }
+my ( %stat, @warn, %review );
+
+# ---------------------------------------------------------------- file
+open( my $fh, '<:raw', $o{in} // '' ) or fail( 1, "Cannot read " . ( $o{in} // '(no file)' ) );
+my $d = do { local $/; <$fh> };
+close $fh;
+my @layers;
+for ( 1 .. 4 ) {
+    my ( $out, $how );
+    if ( $d =~ /^\x1f\x8b/ ) {
+        require IO::Uncompress::Gunzip; $how = 'gzip';
+        IO::Uncompress::Gunzip::gunzip( \$d => \$out, MultiStream => 1, Transparent => 0 ) or undef $out;
+    } elsif ( $d =~ /^BZh[1-9]/ ) {
+        require IO::Uncompress::Bunzip2; $how = 'bzip2';
+        IO::Uncompress::Bunzip2::bunzip2( \$d => \$out ) or undef $out;
+    } elsif ( $d =~ /^PK\x03\x04/ ) {
+        require IO::Uncompress::Unzip; $how = 'zip';
+        IO::Uncompress::Unzip::unzip( \$d => \$out ) or undef $out;
+    } elsif ( $d =~ /^\x78[\x01\x5e\x9c\xda]/ ) {
+        require Compress::Zlib; $how = 'zlib';
+        $out = Compress::Zlib::uncompress($d);
+    } elsif ( $d =~ /^PGDMP/ ) {
+        # Custom-format dump (pg_dump -Fc): pg_restore writes it back as SQL without a database.
+        $how = 'pg_dump custom format';
+        my $pr = ( grep { -x } map {"$_/pg_restore"} split( /:/, $ENV{PATH} // '' ), glob('/usr/lib/postgresql/*/bin') )[0];
+        fail( 4, "This is a PostgreSQL custom-format dump (pg_dump -Fc). Install postgresql-client, or export it again as plain SQL (pg_dump -Fp), then try again." ) unless $pr;
+        open( my $p, '-|', $pr, '-f', '-', $o{in} ) or fail( 4, "This is a PostgreSQL custom-format dump (pg_dump -Fc) that pg_restore could not open." );
+        $out = do { local $/; <$p> };
+        close $p;
+        fail( 4, "This is a PostgreSQL custom-format dump (pg_dump -Fc) that pg_restore could not read (damaged or cut short)." ) unless defined $out && length $out;
+    } else { last }
+    fail( 4, "Damaged file: the $how data cannot be decompressed." ) unless defined $out && length $out;
+    push @layers, $how;
+    $d = $out;
+}
+
+# Text layout: byte order mark, UTF-16, line ends, the dump's own encoding.
+my $bom = '';
+if    ( $d =~ s/^\xef\xbb\xbf// )     { $bom = 'UTF-8 BOM' }
+elsif ( $d =~ /^\xff\xfe(?:[^\x00]\x00){8}/ )         { $d = encode( 'UTF-8', decode( 'UTF-16LE', substr( $d, 2 ) ) ); $bom = 'UTF-16LE' }
+elsif ( $d =~ /^\xfe\xff(?:\x00[^\x00]){8}/ )         { $d = encode( 'UTF-8', decode( 'UTF-16BE', substr( $d, 2 ) ) ); $bom = 'UTF-16BE' }
+my $crlf = ( $d =~ tr/\r// ) > ( $d =~ tr/\n// ) / 2 ? 1 : 0;
+my ($declared) = $d =~ /SET client_encoding = '([\w-]+)'/;
+$declared //= '';
+my $single = $declared =~ /^(LATIN1|WIN1252|ISO_8859_1|SQL_ASCII)$/i ? 'cp1252' : '';
+my ($pgver)  = $d =~ /-- Dumped from database version (\S+)/;
+my ($pgdump) = $d =~ /-- Dumped by pg_dump version (\S+)/;
+
+# Noise before the dump and after its end: everything outside the SQL is left out.
+my $start = -1;
+for my $re ( qr/^--\s*\r?\n--\s*PostgreSQL database dump/m, qr/^(?:SET |CREATE TABLE |COPY |INSERT INTO )/m ) {
+    if ( $d =~ $re ) { $start = $-[0]; last }
+}
+fail( 4, 'This is not a PostgreSQL dump: no SQL statement was found in the file.' ) if $start < 0;
+my $end = length $d;
+$end = $+[0] if $d =~ /^--\s*PostgreSQL database dump complete\s*\r?\n(?:--\s*\r?\n)?/m;
+$stat{junk_head} = $start;
+$stat{junk_tail} = length($d) - $end;
+$stat{junk_tail} = 0 if substr( $d, $end ) =~ /^\s*\z/;
+$d = substr( $d, $start, $end - $start );
+
+sub text_line {
+    my $b = shift;
+    return decode( 'cp1252', $b ) if $single;
+    my $s = eval { decode( 'UTF-8', $b, Encode::FB_CROAK | Encode::LEAVE_SRC ) };
+    return $s if defined $s;
+    $stat{latin1_lines}++;
+    return decode( 'cp1252', $b );
+}
+
+# ---------------------------------------------------------------- SQL
+my ( %cols_of, %rows_of, @table_order );
+sub tname { my $n = shift; $n =~ s/"//g; $n =~ s/^.*\.//; return lc $n }
+sub unescape_copy {
+    my $f = shift;
+    return undef if $f eq '\N';
+    my %e = ( b => "\b", f => "\f", n => "\n", r => "\r", t => "\t", v => "\x0b" );
+    $f =~ s{\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|(.))}{defined $1 ? chr(oct $1) : defined $2 ? chr(hex $2) : ( $e{$3} // $3 )}ge;
+    return $f;
+}
+# Values of an INSERT: 'text' (with '' and E'\n'), numbers, NULL, true/false.
+sub sql_values {
+    my $s = shift;
+    my ( @rows, @cur );
+    pos($s) = 0;
+    my $depth = 0;
+    while ( pos($s) < length $s ) {
+        if    ( $s =~ /\G\s+/gc ) { }
+        elsif ( $s =~ /\G\(/gc )  { $depth++; @cur = () }
+        elsif ( $s =~ /\G\)/gc )  { $depth--; push @rows, [@cur] }
+        elsif ( $s =~ /\G,/gc )   { }
+        elsif ( $s =~ /\G(E?)'((?:[^']|'')*)'(?:::[\w ]+)?/gc ) {
+            my ( $esc, $v ) = ( $1, $2 );
+            $v =~ s/''/'/g;
+            $v = unescape_copy($v) if $esc;
+            push @cur, $v;
+        }
+        elsif ( $s =~ /\GNULL/gci ) { push @cur, undef }
+        elsif ( $s =~ /\G(true|false)/gci ) { push @cur, lc($1) eq 'true' ? 't' : 'f' }
+        elsif ( $s =~ /\G(-?[\d.]+(?:e-?\d+)?)(?:::[\w ]+)?/gci ) { push @cur, $1 }
+        elsif ( $s =~ /\G;/gc ) { last }
+        else { return undef }
+    }
+    return \@rows;
+}
+my @lines = split /\n/, $d;
+my ( $copy, $insert );
+for ( my $i = 0; $i < @lines; $i++ ) {
+    my $l = $lines[$i];
+    $l =~ s/\r\z//;
+    if ($copy) {
+        if ( $l eq '\.' ) { undef $copy; next }
+        $l = text_line($l);
+        my @f = split /\t/, $l, -1;
+        if ( @f != @{ $cols_of{$copy} } ) { $stat{bad_rows}++; $stat{"bad_rows_$copy"}++; next }
+        push @{ $rows_of{$copy} }, [ map { unescape_copy($_) } @f ];
+        next;
+    }
+    if ( $l =~ /^CREATE TABLE\s+([\w."]+)\s*\(/i ) {
+        my $t = tname($1);
+        my @c;
+        while ( ++$i < @lines && $lines[$i] !~ /^\s*\)/ ) {
+            push @c, lc $1 if $lines[$i] =~ /^\s*"?(\w+)"?\s+\w/ && $lines[$i] !~ /^\s*(CONSTRAINT|PRIMARY|UNIQUE|CHECK|FOREIGN)\b/i;
+        }
+        $cols_of{$t} //= \@c;
+        push @table_order, $t unless grep { $_ eq $t } @table_order;
+        next;
+    }
+    if ( $l =~ /^COPY\s+([\w."]+)\s*\(([^)]*)\)\s+FROM\s+stdin/i ) {
+        $copy = tname($1);
+        $cols_of{$copy} = [ map { s/"//gr } map { lc s/^\s+|\s+$//gr } split /,/, $2 ];
+        $rows_of{$copy} //= [];
+        push @table_order, $copy unless grep { $_ eq $copy } @table_order;
+        next;
+    }
+    if ( $l =~ /^INSERT INTO\s+([\w."]+)\s*(?:\(([^)]*)\))?\s*VALUES\s*(.*)$/i ) {
+        my ( $t, $cl, $rest ) = ( tname($1), $2, $3 );
+        # An INSERT can go on for several lines (text with line breaks).
+        until ( $rest =~ /\)\s*;\s*\r?\z/ || $i + 1 >= @lines ) { $rest .= "\n" . $lines[ ++$i ] }
+        $rest =~ s/\r\z//;
+        $cols_of{$t} = [ map { s/"//gr } map { lc s/^\s+|\s+$//gr } split /,/, $cl ] if defined $cl;
+        push @table_order, $t unless grep { $_ eq $t } @table_order;
+        my $v = sql_values( text_line($rest) );
+        if ( !$v || !$cols_of{$t} ) { $stat{bad_rows}++; next }
+        for my $r (@$v) {
+            if ( @$r != @{ $cols_of{$t} } ) { $stat{bad_rows}++; next }
+            push @{ $rows_of{$t} }, $r;
+        }
+        next;
+    }
+}
+push @warn, "The dump ends inside the data of table $copy: the file is cut short, so its last rows may be missing." if $copy;
+
+# ---------------------------------------------------------------- columns
+# Columns are recognised by name (accents, case and punctuation ignored).
+my %alias = (
+    mfn => 'mfn', id => 'mfn', codigo => 'mfn', tipo => 'tipo', tipo_literatura => 'tipo', idioma => 'idioma', lingua => 'idioma',
+    centro_cooperante => 'centro', n_chamada => 'chamada', numero_chamada => 'chamada', chamada => 'chamada', classificacao => 'chamada',
+    registro => 'registro', registros => 'registro', tombo => 'registro', tombos => 'registro', n_registro => 'registro', n_tombo => 'registro',
+    aut_pes => 'aut_pes', autor => 'aut_pes', autores => 'aut_pes', autor_pessoal => 'aut_pes', aut_ent => 'aut_ent', autor_entidade => 'aut_ent',
+    aut_ev => 'aut_ev', autor_evento => 'aut_ev', titulo => 'titulo', title => 'titulo', subtitulo => 'subtitulo', edicao => 'edicao',
+    local_editor => 'imprenta', imprenta => 'imprenta', editora => 'editora', local => 'local', data => 'data', ano => 'data',
+    colacao_mon_e_an_mon => 'colacao', colacao => 'colacao', paginas => 'colacao', colacao_an_per => 'colacao_per', serie => 'serie',
+    notas_gerais => 'nota', notas => 'nota', nota => 'nota', nota_de_publ_c => 'nota_publ', nota_de_tese => 'nota_tese',
+    nota_de_cont => 'nota_cont', nota_de_convenio => 'nota_conv', aut_pes_todo => 'todo_pes', aut_ent_todo => 'todo_ent',
+    aut_ev_todo => 'todo_ev', titulo_todo => 'todo_titulo', assunto => 'assunto', assuntos => 'assunto', descritores => 'assunto',
+    palavras_chave => 'assunto', aut_sec_pes => 'sec_pes', aut_sec_ent => 'sec_ent', aut_sec_ev => 'sec_ev', isbn => 'isbn', issn => 'issn',
+);
+my %marc_of = ( mfn => '035, 952 $x', tipo => 'leader', idioma => '008, 041', centro => '500', chamada => '082, 090, 952 $o',
+    registro => '952 $p $h (one item per tombo)', aut_pes => '100', aut_ent => '110', aut_ev => '111', titulo => '245', subtitulo => '245 $b',
+    edicao => '250', imprenta => '260', editora => '260 $b', local => '260 $a', data => '260 $c, 008 (a full date: 952 $d)', colacao => '300',
+    colacao_per => '362', serie => '490', nota => '500', nota_publ => '500', nota_tese => '502', nota_cont => '505', nota_conv => '536',
+    todo_pes => '773 $a', todo_ent => '773 $a', todo_ev => '773 $a', todo_titulo => '773 $t', assunto => '650', sec_pes => '700',
+    sec_ent => '710', sec_ev => '711', isbn => '020', issn => '022' );
+sub colkey { my $c = norm(shift); $c =~ s/ /_/g; return $c }
+my ($cat) = sort { @{ $rows_of{$b} // [] } <=> @{ $rows_of{$a} // [] } }
+    grep { my $t = $_; grep { ( $alias{ colkey($_) } // '' ) eq 'titulo' } @{ $cols_of{$t} } } @table_order;
+fail( 5, 'No catalogue table (a table with a "titulo" column) was found in this dump: it is not an ISIS export that the panel can read.' ) unless $cat;
+my ( %ci, @unmapped );
+for my $i ( 0 .. $#{ $cols_of{$cat} } ) {
+    my $k = $alias{ colkey( $cols_of{$cat}[$i] ) };
+    if ( defined $k && !exists $ci{$k} ) { $ci{$k} = $i } else { push @unmapped, $cols_of{$cat}[$i] }
+}
+my ($occ) = grep { my %c = map { colkey($_) => 1 } @{ $cols_of{$_} }; $c{cod_livro} || ( $c{ocorrencia} && ( $c{registro} || $c{tombo} ) ) } @table_order;
+
+# ---------------------------------------------------------------- cleaning
+# ª and º read as ISO-8859-14 (Ẃ ẃ) and the other letters that code page moves.
+my %latin14 = ( "\x{1E82}" => 'ª', "\x{1E83}" => 'º', "\x{1E02}" => '¡', "\x{1E03}" => '¢', "\x{010A}" => '¤', "\x{010B}" => '¥',
+    "\x{1E0A}" => '¦', "\x{1E80}" => '¨', "\x{1E0B}" => '«', "\x{1EF2}" => '¬', "\x{0178}" => '¯', "\x{1E1E}" => '°', "\x{1E1F}" => '±',
+    "\x{0120}" => '²', "\x{0121}" => '³', "\x{1E40}" => '´', "\x{1E41}" => 'µ', "\x{1E56}" => '·', "\x{1E81}" => '¸', "\x{1E57}" => '¹',
+    "\x{1EF3}" => '»', "\x{1E84}" => '¼', "\x{1E85}" => '½', "\x{1E61}" => '¾', "\x{1E60}" => '¿' );
+my $latin14 = join '', keys %latin14;
+my $upper_accent = sub { my $w = shift; return $w if $w =~ /[a-z]/ || $w !~ /[A-Z]/ || $w !~ /[à-ÿ]/; $stat{fix_case}++; return uc $w };
+# clean(VALUE, MFN, FIELD): text without control characters, escape leftovers,
+# "Informação não encontrada" or empty fillers; carets inside text become
+# SEP (the ISIS subfield delimiter between two parts) and are reported.
+sub clean {
+    my ( $s, $mfn, $field, $sep ) = @_;
+    return undef unless defined $s;
+    if ( $s =~ s/([$latin14])/$latin14{$1}/g ) { $stat{fix_ordinal}++ }
+    $stat{control}++ if $s =~ s/[\x00-\x08\x0b-\x1f\x7f-\x9f\x{fffd}]+/ /g;
+    $s =~ s/[\t\n]+/ /g;
+    $s = '' if $s =~ /^\s*\\+N\s*$/;
+    $stat{escapes}++ if $s =~ s/\\+[tnr](?![a-z])|\\+/ /g;
+    $s =~ s/\s+/ /g; $s =~ s/^[\s\-,;.^~\$]+|[\s\-,;^~\$]+$//g;
+    if ( $s =~ /^informa[cç][aã]o n[aã]o encontrada\W*$/i ) { $stat{not_found}++; return undef }
+    return undef if $s !~ /\w/;
+    if ( $s =~ /\^/ ) {
+        $s =~ s{\s*\^\s*}{$sep // ' '}ge;
+        $stat{caret_text}++;
+        push @{ $review{$field} }, $mfn if defined $field;
+    }
+    $s =~ s/(\S+)/$upper_accent->($1)/ge;
+    return $s;
+}
+
+# ---------------------------------------------------------------- tombos
+# The "registro" field holds the accession numbers (tombos) of every copy:
+# "-1655 v1 - 1656 v2", "-2134 I^f2135 II", "10441, 10442 v1", "669 a 694",
+# "3404^3462", "18705^", "d^12452", "2717$", "12730(Baixa)". Returns the
+# copies as { tombo, vol, flags } and what was dropped.
+my %roman = map { $_ => 1 } qw( I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII XVIII XIX XX );
+sub parse_registro {
+    my ( $raw, $mfn ) = @_;
+    my ( @copies, @dropped, %status );
+    my $s = $raw // '';
+    $s =~ s/([$latin14])/$latin14{$1}/g;
+    $s =~ s/\\+N//g; $s =~ s/[\x00-\x1f\x7f\\]+/ /g;
+    return ( [], [] ) if $s =~ /^\s*informa[cç][aã]o n[aã]o encontrada/i;
+    # Status written next to a tombo: "12730(Baixa)", "516 (atrasado)".
+    $s =~ s/(\d+)\s*\(\s*([^()]{1,40}?)\s*\)/ push @{ $status{$1} }, lc $2; $1 /ge;
+    # Call numbers typed into the tombo field ("863 M42", "306.43 M57").
+    $s =~ s/(?<![\d.])(\d{3}(?:\.\d+)?\s+[A-HJ-UW-Z]\d{1,3}[a-z]?)(?![\d.])/ push @dropped, $1; $stat{callno_in_tombo}++; ' - ' /ge;
+    # Ranges: "669 a 694", "7670 v1 a 7673 v4".
+    $s =~ s{(\d+)(?:\s*[vV]\.?\s*(\d{1,3}))?\s+a\s+(\d+)(?:\s*[vV]\.?\s*(\d{1,3}))?}{
+        my ( $a, $va, $b, $vb ) = ( $1, $2, $3, $4 );
+        if ( $b >= $a && $b - $a <= 100 && ( !defined $va || !defined $vb || $vb - $va == $b - $a ) ) {
+            $stat{ranges}++;
+            join ' - ', map { $_ . ( defined $va && defined $vb ? ' v' . ( $va + $_ - $a ) : '' ) } $a .. $b;
+        } else {
+            $stat{ranges_kept}++; push @{ $review{'tombo range'} }, $mfn;
+            "$a" . ( defined $va ? " v$va" : '' ) . " - $b" . ( defined $vb ? " v$vb" : '' );
+        }
+    }ge;
+    # Tokens: volumes, tombos, separators; anything else is noise.
+    my ( @groups, $g ) = ();
+    $g = { nums => [], vols => [] };
+    my $close = sub { push @groups, $g if @{ $g->{nums} } || @{ $g->{vols} }; $g = { nums => [], vols => [] } };
+    pos($s) = 0;
+    my ( $noise, $last_len ) = ( '', 0 );
+    while ( pos($s) < length $s ) {
+        if    ( $s =~ /\G\s+/gc ) { }
+        elsif ( $s =~ /\G(\d{1,2})\s*[ªº°]\s*s[ée]rie\b/gci ) { push @{ $g->{vols} }, "$1ª série" }
+        elsif ( $s =~ /\G[vV]\.?\s*(\d{1,3})(?!\d)/gc ) { push @{ $g->{vols} }, "v. $1" }
+        # A volume glued to the next tombo: "4779 v54495 v6" is v. 5, then tombo 4495.
+        elsif ( $last_len && $s =~ /\G[vV](\d{5,8})(?!\d)/gc && length($1) - $last_len >= 1 && length($1) - $last_len <= 2 ) {
+            my $cut = length($1) - $last_len;
+            push @{ $g->{vols} }, 'v. ' . substr( $1, 0, $cut );
+            $close->();
+            push @{ $g->{nums} }, { tombo => substr( $1, $cut ), dollar => 0 };
+            $stat{glued_volume}++;
+        }
+        elsif ( $s =~ /\G\b([IVX]+)\b(?!\d)/gc ) { if ( $roman{$1} ) { push @{ $g->{vols} }, "v. $1" } else { $noise .= $1 } }
+        elsif ( $s =~ /\G\^[a-z]?(?=\d|\s|$)/gc || $s =~ /\G\^/gc ) { $stat{caret_sep}++; $close->() }
+        elsif ( $s =~ /\G-+/gc ) { $close->() }
+        elsif ( $s =~ /\G,/gc ) { }
+        elsif ( $s =~ /\G(\d+)(\$?)/gc ) {
+            my ( $n, $dollar ) = ( $1, $2 );
+            if ( length $n > 9 || $n =~ /^0+$/ ) { push @dropped, $n; next }
+            # A new tombo after a volume starts a new copy ("13964 v6 13965 v7").
+            $close->() if @{ $g->{vols} };
+            push @{ $g->{nums} }, { tombo => $n, dollar => $dollar ? 1 : 0 };
+            $last_len = length $n;
+        }
+        elsif ( $s =~ /\G([^\s\d,^-]+)/gc ) { $noise .= $1 }
+    }
+    $close->();
+    if ( $noise ne '' ) { $stat{noise_in_tombo}++; push @dropped, $noise }
+    for my $grp (@groups) {
+        if ( !@{ $grp->{nums} } ) { push @dropped, join ' ', @{ $grp->{vols} }; next }
+        my $vol = join ', ', @{ $grp->{vols} };
+        for my $n ( @{ $grp->{nums} } ) {
+            push @copies, { tombo => $n->{tombo}, vol => $vol, dollar => $n->{dollar}, status => $status{ $n->{tombo} } // [] };
+        }
+    }
+    return ( \@copies, \@dropped );
+}
+
+# ---------------------------------------------------------------- imprint
+my @places = ( 'Sao Paulo', 'Rio de Janeiro', 'Belo Horizonte', 'Porto Alegre', 'Curitiba', 'Brasilia', 'Salvador', 'Recife', 'Fortaleza',
+    'Petropolis', 'Campinas', 'Florianopolis', 'Londrina', 'Maringa', 'Cascavel', 'Toledo', 'Foz do Iguacu', 'Ponta Grossa', 'Goiania',
+    'Belem', 'Manaus', 'Niteroi', 'Santos', 'Aparecida', 'Bauru', 'Blumenau', 'Joinville', 'Caxias do Sul', 'Passo Fundo', 'Ijui',
+    'Santa Maria', 'Pelotas', 'Vitoria', 'Natal', 'Joao Pessoa', 'Maceio', 'Aracaju', 'Teresina', 'Sao Luis', 'Cuiaba', 'Campo Grande',
+    'Palmas', 'Porto Velho', 'Rio Branco', 'Macapa', 'Boa Vista', 'Juiz de Fora', 'Uberlandia', 'Ribeirao Preto', 'Sao Leopoldo',
+    'Chapeco', 'Guarapuava', 'Pato Branco', 'Francisco Beltrao', 'Umuarama', 'Palotina', 'Lisboa', 'Porto', 'Coimbra', 'Braga',
+    'Madrid', 'Barcelona', 'Buenos Aires', 'Mexico', 'Paris', 'London', 'Londres', 'New York', 'Nova York', 'Rio Grande do Sul',
+    'Parana', 'Santa Catarina', 'Minas Gerais', 'Bahia', 'Pernambuco', 'Goias', 'SP', 'RJ', 'PR', 'MG', 'RS', 'SC', 'DF' );
+my %place_ok = map { norm($_) => 1 } @places;
+# Imprints written with a separator teach the place names of the others.
+sub split_imprint {
+    my $s = shift;
+    my $year;
+    $year = $1 if $s =~ s/[,.;\s]*\b(1[5-9]\d\d|20\d\d)\s*\.?\s*$//;
+    my ( $place, $pub ) = ( '', '' );
+    $s =~ s/^[a-zâ](?=[A-Z])//;
+    if    ( $s =~ /^([^:,.]{3,40}?)\s*[:,.]\s*(.+)$/ )                  { ( $place, $pub ) = ( $1, $2 ) }
+    elsif ( $s =~ /^(\D{3,40}?[-_]\s?[A-Za-z]{2})(?:[\s_-]+(.+))?$/ ) { ( $place, $pub ) = ( $1, $2 // '' ) }
+    else {
+        my @w = split / /, $s;
+        for my $n ( reverse 1 .. ( @w > 4 ? 4 : @w ) ) {
+            if ( $place_ok{ norm( join ' ', @w[ 0 .. $n - 1 ] ) } ) { $place = join ' ', @w[ 0 .. $n - 1 ]; $pub = join ' ', @w[ $n .. $#w ]; last }
+        }
+        ( $place, $pub ) = ( '', $s ) if $place eq '';
+    }
+    s/^[\s,:;.]+|[\s,:;.]+$//g for $place, $pub;
+    return ( $place, $pub, $year );
+}
+
+# ---------------------------------------------------------------- records
+my %lang = ( por => 'por', pot => 'por', pro => 'por', 'pór' => 'por', po => 'por', pt => 'por', eng => 'eng', ing => 'eng', en => 'eng',
+    spa => 'spa', esp => 'spa', es => 'spa', cub => 'spa', fra => 'fre', fre => 'fre', fr => 'fre', ger => 'ger', ale => 'ger', deu => 'ger',
+    ita => 'ita', it => 'ita', lat => 'lat', jpn => 'jpn', chi => 'chi', rus => 'rus' );
+sub get { my ( $r, $k ) = @_; return exists $ci{$k} ? $r->[ $ci{$k} ] : undef }
+my ( @recs, %seen_barcode, %item_of_tombo );
+if ( exists $ci{imprenta} ) {
+    my %n;
+    for my $r ( @{ $rows_of{$cat} } ) { $n{ norm($1) }++ if ( $r->[ $ci{imprenta} ] // '' ) =~ /^\W*([^:,\d^]{2,30}?)\s*[:,^]/ }
+    $place_ok{$_} = 1 for grep { $n{$_} >= 2 && $_ ne '' } keys %n;
+}
+for my $r ( @{ $rows_of{$cat} } ) {
+    my $mfn = get( $r, 'mfn' ) // '';
+    $mfn =~ s/\D//g;
+    my %v;
+    my %sep = ( titulo => ' : ', imprenta => ' : ', chamada => ' ' );
+    for my $k ( keys %ci ) { next if $k eq 'registro' || $k eq 'mfn'; $v{$k} = clean( $r->[ $ci{$k} ], $mfn, $k, $sep{$k} ) }
+    if ( !defined $v{titulo} ) {
+        $stat{no_title}++;
+        push @{ $review{'no title, has a tombo'} }, $mfn if ( get( $r, 'registro' ) // '' ) =~ /\d/;
+        next;
+    }
+    my %rec = ( mfn => $mfn, v => \%v, items => [] );
+    my ( $copies, $dropped ) = parse_registro( get( $r, 'registro' ), $mfn );
+    my $raw = get( $r, 'registro' ) // '';
+    $raw =~ s/([$latin14])/$latin14{$1}/g; $raw =~ s/\\+N|[\x00-\x1f\x7f\\]+/ /g; $raw =~ s/\s+/ /g; $raw =~ s/^ | $//g;
+    $stat{dropped_tombo_bits}++ if @$dropped;
+    my $n = 0;
+    for my $c (@$copies) {
+        my @notes;
+        my $bc = $c->{tombo};
+        if ( $seen_barcode{$bc} ) {
+            push @notes, "tombo $bc repetido (já usado no MFN $seen_barcode{$bc})";
+            $bc = "ISIS$mfn-" . ( ++$n );
+            $stat{dup_barcodes}++;
+        } else {
+            $seen_barcode{$bc} = $mfn || '?';
+            $stat{tombo_barcodes}++;
+        }
+        push @notes, "tombo marcado com \$ no ISIS" if $c->{dollar};
+        my $withdrawn = grep {/^baix/} @{ $c->{status} };
+        push @notes, map {"($_)"} grep { !/^baix/ } @{ $c->{status} };
+        $stat{withdrawn}++ if $withdrawn;
+        $stat{with_volume}++ if $c->{vol} ne '';
+        my $it = { barcode => $bc, vol => $c->{vol}, withdrawn => $withdrawn, notes => \@notes };
+        $item_of_tombo{ $c->{tombo} } //= $it;
+        push @{ $rec{items} }, $it;
+    }
+    if ( !@{ $rec{items} } ) {
+        push @{ $rec{items} }, { barcode => "ISIS$mfn", vol => '', notes => ['sem tombo no ISIS'] };
+        $stat{isis_barcodes}++;
+    }
+    $rec{raw} = $raw;
+    push @recs, \%rec;
+}
+
+# Occurrences (lost copies and other remarks) go to the item they name.
+if ($occ) {
+    my %c = map { colkey( $cols_of{$occ}[$_] ) => $_ } 0 .. $#{ $cols_of{$occ} };
+    my ( $kc, $tc, $lc, $dc ) = ( $c{cod_livro} // $c{registro} // $c{tombo}, $c{ocorrencia}, $c{extraviado}, $c{data_registro} // $c{data} );
+    for my $r ( @{ $rows_of{$occ} } ) {
+        ( my $k = $r->[$kc] // '' ) =~ s/\D//g;
+        my $it = $k ne '' ? $item_of_tombo{$k} : undef;
+        if ( !$it ) { $stat{occ_orphan}++; next }
+        my $text = clean( defined $tc ? $r->[$tc] : undef, '', undef, ' ' ) // '';
+        $text = substr( $text, 0, 500 ) . '...' if length $text > 500;
+        my $when = defined $dc ? ( $r->[$dc] // '' ) : '';
+        push @{ $it->{notes} }, 'Ocorrência' . ( $when ne '' ? " $when" : '' ) . ( $text ne '' ? ": $text" : '' );
+        $stat{occ_linked}++;
+        if ( defined $lc && ( $r->[$lc] // '' ) =~ /^(t|true|1|s|y)/i ) { $it->{lost} = 1; $stat{occ_lost}++ }
+    }
+}
+
+# ---------------------------------------------------------------- MARC
+sub names { my $s = shift // return (); return grep { $_ ne '' } map { s/^\s+|\s+$//gr } split /\s*;\s*/, $s }
+sub name_sub {
+    my $n = shift;
+    my @s;
+    $n =~ s/^<(\w+)>\s*/$1 /;
+    if ( $n =~ s/\s*<([^<>]+)>\s*$// ) { @s = ( a => $n, c => $1 ) } else { $n =~ s/[<>]//g; @s = ( a => $n ) }
+    return @s;
+}
+sub subjects {
+    my $s = shift // return ();
+    my @h = $s =~ /</ ? ( $s =~ /<([^<>]+)>/g ) : split /\s*;\s*/, $s;
+    my %seen;
+    return grep { $_ ne '' && !$seen{ norm($_) }++ } map { s/^\s+|\s+$//gr } @h;
+}
+my @records;
+my $today = strftime( '%y%m%d', localtime );
+if ( $o{marc} || $o{'dry-run'} ) {
+    require MARC::Record; require MARC::Field;
+    for my $rec (@recs) {
+        my $v = $rec->{v};
+        my ( @f, $year, $acq );
+        my $data = $v->{data} // '';
+        if    ( $data =~ /^(\d{1,2})\/(\d{1,2})\/(\d{4})/ && $2 <= 12 ) { $acq = sprintf '%04d-%02d-%02d', $3, $2, $1 }
+        elsif ( $data =~ /^(\d{4})-(\d\d)-(\d\d)/ )           { $acq = "$1-$2-$3" }
+        elsif ( $data =~ /\b(1[5-9]\d\d|20\d\d)\b/ )          { $year = $1 }
+        my ( $place, $pub, $iy ) = defined $v->{imprenta} ? split_imprint( $v->{imprenta} ) : ( $v->{local} // '', $v->{editora} // '', undef );
+        $year //= $iy;
+        $stat{imprint_unsplit}++ if defined $v->{imprenta} && $place eq '';
+        my $tipo = lc substr( $v->{tipo} // 'm', 0, 1 );
+        my $m = MARC::Record->new();
+        $m->leader( '00000na' . ( $tipo eq 's' ? 's' : 'm' ) . ' a22000007a 4500' );
+        my $lg = $lang{ norm( $v->{idioma} // '' ) };
+        $stat{lang_unknown}++ if defined $v->{idioma} && !$lg;
+        $lg //= $o{lang};
+        push @f, MARC::Field->new( '008', $today . ( $year ? "s$year" : 'nuuuu' ) . '    ' . $o{country} . ( '|' x 17 ) . $lg . ' d' );
+        push @f, MARC::Field->new( '020', ' ', ' ', a => $v->{isbn} ) if defined $v->{isbn};
+        push @f, MARC::Field->new( '022', ' ', ' ', a => $v->{issn} ) if defined $v->{issn};
+        push @f, MARC::Field->new( '035', ' ', ' ', a => "(ISIS)$rec->{mfn}" ) if $rec->{mfn} ne '';
+        push @f, MARC::Field->new( '041', '0', ' ', a => $lg ) if defined $v->{idioma};
+        my ( $class, $cutter ) = ( '', '' );
+        ( $class, $cutter ) = ( $1, $2 // '' ) if ( $v->{chamada} // '' ) =~ /^(\S+)(?:\s+(.+))?$/;
+        push @f, MARC::Field->new( '082', '0', '4', a => $class ) if $class =~ /^\D?\d/;
+        push @f, MARC::Field->new( '090', ' ', ' ', a => $class, ( $cutter ne '' ? ( b => $cutter ) : () ) ) if $class ne '';
+        my @main;
+        for ( [ aut_pes => '100', '1' ], [ aut_ent => '110', '2' ], [ aut_ev => '111', '2' ] ) {
+            my @n = names( $v->{ $_->[0] } );
+            next unless @n;
+            if ( !@main ) { @main = ( $_->[1], $_->[2], shift @n ) }
+            push @{ $rec->{added}{ $_->[1] } }, @n;
+        }
+        push @f, MARC::Field->new( $main[0], ( $main[0] eq '100' && $main[2] !~ /,/ ? '0' : $main[1] ), ' ', name_sub( $main[2] ) ) if @main;
+        my $t = $v->{titulo};
+        my $nf = 0;
+        if ( $t =~ s/^<([^<>=]+)>\s*/$1 / ) { $nf = length($1) + 1 }
+        $t =~ s/<([^<>=]+)=[^<>]*>/$1/g; $t =~ s/[<>]//g;
+        my ( $ta, $tb ) = split / : /, $t, 2;
+        push @f, MARC::Field->new( '245', ( @main ? '1' : '0' ), ( $nf > 9 ? 0 : $nf ), a => $ta . ( defined $tb ? ' :' : '' ), ( defined $tb ? ( b => $tb ) : () ) );
+        push @f, MARC::Field->new( '250', ' ', ' ', a => $v->{edicao} ) if defined $v->{edicao};
+        my @imp;
+        push @imp, ( a => $place . ( $pub ne '' ? ' :' : ( $year ? ',' : '' ) ) ) if $place ne '';
+        push @imp, ( b => $pub . ( $year ? ',' : '' ) ) if $pub ne '';
+        push @imp, ( c => $year ) if $year;
+        push @f, MARC::Field->new( '260', ' ', ' ', @imp ) if @imp;
+        if ( defined( my $c = $v->{colacao} ) ) { $c =~ s/^(\d+)\s*p(g|ag)?\.?$/$1 p./i; push @f, MARC::Field->new( '300', ' ', ' ', a => $c ) }
+        push @f, MARC::Field->new( '362', '1', ' ', a => $v->{colacao_per} ) if defined $v->{colacao_per};
+        push @f, MARC::Field->new( '490', '0', ' ', a => $v->{serie} ) if defined $v->{serie};
+        push @f, MARC::Field->new( '500', ' ', ' ', a => $_ ) for grep {defined} $v->{nota}, $v->{nota_publ};
+        push @f, MARC::Field->new( '500', ' ', ' ', a => "Centro cooperante: $v->{centro}" ) if defined $v->{centro};
+        push @f, MARC::Field->new( '502', ' ', ' ', a => $v->{nota_tese} ) if defined $v->{nota_tese};
+        push @f, MARC::Field->new( '505', '0', ' ', a => $v->{nota_cont} ) if defined $v->{nota_cont};
+        push @f, MARC::Field->new( '536', ' ', ' ', a => $v->{nota_conv} ) if defined $v->{nota_conv};
+        for my $h ( subjects( $v->{assunto} ) ) {
+            my ( $a, @x ) = split m{\s*/\s*|\s+-\s+}, $h;
+            push @f, MARC::Field->new( '650', ' ', '4', a => $a, map { ( x => $_ ) } grep { $_ ne '' } @x );
+        }
+        for ( [ sec_pes => '700', '1' ], [ sec_ent => '710', '2' ], [ sec_ev => '711', '2' ] ) {
+            push @{ $rec->{added}{ $_->[1] =~ s/^7/1/r } }, names( $v->{ $_->[0] } );
+        }
+        for my $tag (qw( 100 110 111 )) {
+            ( my $at = $tag ) =~ s/^1/7/;
+            push @f, MARC::Field->new( $at, ( $tag eq '100' && !/,/ ? '0' : ( $tag eq '100' ? '1' : '2' ) ), ' ', name_sub($_) ) for @{ $rec->{added}{$tag} || [] };
+        }
+        my $host = join ', ', grep {defined} @$v{qw( todo_pes todo_ent todo_ev )};
+        push @f, MARC::Field->new( '773', '0', ' ', ( $host ne '' ? ( a => $host ) : () ), ( defined $v->{todo_titulo} ? ( t => $v->{todo_titulo} ) : () ) )
+            if $host ne '' || defined $v->{todo_titulo};
+        push @f, MARC::Field->new( '942', ' ', ' ', c => $o{itype} ) if $o{itype} ne '';
+        for my $it ( @{ $rec->{items} } ) {
+            my @s = ( a => $o{branch}, b => $o{branch} );
+            push @s, ( y => $o{itype} ) if $o{itype} ne '';
+            push @s, ( o => $v->{chamada} ) if defined $v->{chamada};
+            push @s, ( p => $it->{barcode} );
+            push @s, ( h => $it->{vol} ) if $it->{vol} ne '';
+            push @s, ( d => $acq ) if $acq;
+            push @s, ( 0 => 1 ) if $it->{withdrawn};
+            push @s, ( 1 => 1 ) if $it->{lost};
+            my $x = "ISIS MFN $rec->{mfn}" . ( $rec->{raw} ne '' ? "; registro: " . substr( $rec->{raw}, 0, 200 ) : '' );
+            $x .= '; ' . join( '; ', @{ $it->{notes} } ) if @{ $it->{notes} };
+            push @s, ( x => $x );
+            push @f, MARC::Field->new( '952', ' ', ' ', @s );
+        }
+        $m->append_fields( sort { $a->tag cmp $b->tag } @f );
+        push @records, $m;
+    }
+}
+
+# ---------------------------------------------------------------- output
+if ( $o{marc} ) {
+    open( my $out, '>:raw', $o{marc} ) or fail( 1, "cannot write $o{marc}" );
+    print {$out} encode( 'UTF-8', $_->as_usmarc ) for @records;
+    close($out) or fail( 1, "cannot write $o{marc}" );
+}
+my $items = 0; $items += @{ $_->{items} } for @recs;
+my %what = ( $cat => 'collection' );
+$what{$occ} = 'occurrences (notes and lost copies of the items)' if $occ;
+print 'File: ', join( ' + ', @layers, 'PostgreSQL plain SQL dump' ), ( $crlf ? ', Windows line ends' : '' ), ( $bom ? ", $bom" : '' ), "\n";
+print 'Dump: PostgreSQL ', $pgver // '?', ', pg_dump ', $pgdump // '?', ', encoding ', ( $declared || 'not declared' ), "\n";
+printf "Noise left out: %d byte(s) before the dump, %d byte(s) after it\n", $stat{junk_head}, $stat{junk_tail};
+printf "Lines that were not valid UTF-8 (read as Windows-1252): %d\n", $stat{latin1_lines} if $stat{latin1_lines};
+print "Tables:\n";
+printf "  %-24s %7d row(s)  %s\n", $_, scalar @{ $rows_of{$_} // [] }, $what{$_} // 'not migrated' for @table_order;
+print "Columns of $cat:\n";
+for my $i ( 0 .. $#{ $cols_of{$cat} } ) {
+    my $k = $alias{ colkey( $cols_of{$cat}[$i] ) };
+    printf "  %-24s -> %s\n", $cols_of{$cat}[$i], ( defined $k && $ci{$k} == $i ) ? $marc_of{$k} : '- (not used)';
+}
+printf "Rows with the wrong number of columns (skipped): %d\n", $stat{bad_rows} // 0;
+print "Warnings:\n", map( {"  $_\n"} @warn ) if @warn;
+print "\n";
+printf "Rows without title (skipped): %d\n", $stat{no_title} // 0;
+print "Records: ", scalar(@recs), "\n";
+print "Items created: $items\n";
+printf "Barcodes from the tombo: %d\n", $stat{tombo_barcodes} // 0;
+printf "Barcodes ISIS<MFN> (no tombo in the record): %d\n", $stat{isis_barcodes} // 0;
+printf "Barcodes ISIS<MFN>-<n> (tombo already used): %d\n", $stat{dup_barcodes} // 0;
+printf "Items with a volume (952 \$h): %d\n", $stat{with_volume} // 0;
+printf "Withdrawn (baixa): %d    Lost (occurrences): %d\n", $stat{withdrawn} // 0, $stat{occ_lost} // 0;
+print "\n";
+print "Tombo field cleaning:\n";
+printf "  carets (^, ^f) read as separators between copies: %d\n", $stat{caret_sep} // 0;
+printf "  volumes glued to the next tombo (\"v54495\"): %d\n", $stat{glued_volume} // 0;
+printf "  ranges expanded (\"669 a 694\"): %d    ranges kept as two tombos: %d\n", $stat{ranges} // 0, $stat{ranges_kept} // 0;
+printf "  call numbers typed in the tombo field (left out): %d\n", $stat{callno_in_tombo} // 0;
+printf "  records with stray letters or symbols (left out): %d\n", $stat{noise_in_tombo} // 0;
+print "  the original field is kept in each item's internal note (952 \$x)\n";
+print "Text cleaning:\n";
+printf "  \"Informação não encontrada\" and empty fillers removed: %d\n", $stat{not_found} // 0;
+printf "  control characters removed: %d    escape leftovers (\\N, \\t): %d\n", $stat{control} // 0, $stat{escapes} // 0;
+printf "  ª and º repaired: %d    capital words with small accented letters fixed: %d\n", $stat{fix_ordinal} // 0, $stat{fix_case} // 0;
+printf "  carets inside text read as separators: %d\n", $stat{caret_text} // 0;
+printf "  imprints without a place name found (whole text as publisher): %d\n", $stat{imprint_unsplit} // 0;
+printf "  unknown language codes (%s used): %d\n", $o{lang}, $stat{lang_unknown} // 0;
+my %review_label = ( 'no title, has a tombo' => 'Not imported (no title, but a tombo in the row)', 'tombo range' => 'Check in Koha, tombo range too long to expand',
+    titulo => 'Check in Koha, title with a caret (an ISIS subfield letter may be glued to the next word)', chamada => 'Check in Koha, call number with a caret',
+    imprenta => 'Check in Koha, imprint with a caret' );
+for my $k ( sort keys %review ) {
+    my @m = grep { $_ ne '' } @{ $review{$k} };
+    next unless @m;
+    printf "%s: MFN %s%s\n", $review_label{$k} // "Check in Koha, $k with a caret", join( ', ', @m[ 0 .. ( $#m > 9 ? 9 : $#m ) ] ), ( @m > 10 ? sprintf( ' and %d more', @m - 10 ) : '' );
+}
+if ($occ) {
+    printf "Occurrences linked to items: %d    without a known tombo (skipped): %d\n", $stat{occ_linked} // 0, $stat{occ_orphan} // 0;
+}
+my @other = grep { $_ ne $cat && ( !$occ || $_ ne $occ ) } @table_order;
+print "Patrons, loans and holds: ", ( @other ? 'not migrated (tables ' . join( ', ', @other ) . ')' : 'not in this backup' ), "\n";
+if ( $o{'dry-run'} ) {
+    my $n = 0;
+    for my $m (@records) {
+        last if $n++ >= $o{sample};
+        print "\n--- Sample ---\n" if $n == 1;
+        print $m->as_formatted, "\n";
+    }
+}
+exit 0;
+ISISDB
+}
+
+lt_br_migrate_isis() {
+    require_database || return 0
+    local file branch itype mode
+    file=$(select_file "/root" "backup sql dump gz bz2 zip" "$(t "Pick the ISIS backup (PostgreSQL export: .backup, .sql or .gz):")" "$(t "Backup file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    branch=$(tools_pick "$(t "Legacy migration")" "$(t "Library of the items:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    itype=$(tools_pick "$(t "Legacy migration")" "$(t "Item type of the items:")" "SELECT itemtype, description FROM ${DB_NAME}.itemtypes ORDER BY description;") || return 0
+    mode=$(ui_menu "$(t "Records already in the catalog")" "$(t "When an incoming record matches one in the catalog (ISBN and title):")" \
+        "keep"    "$(t "Keep the catalog record, add only new items")" \
+        "replace" "$(t "Replace the catalog record with the incoming one")" \
+        "new"     "$(t "Do not compare: every record becomes a new title")") || return 0
+    tools_locked _lt_br_isis_run "$file" "$branch" "$itype" "$mode"
+}
+
+_lt_br_isis_run() {
+    local file="$1" branch="$2" itype="$3" mode="$4" log src script rc=0 recs items
+    local mrc="$TOOLS_WORK/isis-koha.mrc"
+    local args=()
+    log=$(tools_log isis-database)
+    script="$TOOLS_WORK/isis2koha.pl"
+    if ! src=$(tools_copy "$file" isis-backup.dump); then
+        msg_error "" "$(t "The file could not be copied to the work folder.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    isis_write_reader "$script"
+    args=(--in "$src" --branch "$branch" --itype "$itype")
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    koha_exec "$log" isis2koha /usr/bin/perl "$script" "${args[@]}" --dry-run || rc=$?
+    case "$rc" in
+        0) ;;
+        4|5)
+            ui_textbox "$(t "Legacy migration")" "$log"
+            msg_error "" "$(t 'This is not an ISIS backup (PostgreSQL export) that the panel can read.\nNothing was changed.\n\nLog: ${log}')" 11 76
+            return 1 ;;
+        *)
+            ui_textbox "$(t "Legacy migration")" "$log"
+            msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+            return 1 ;;
+    esac
+    recs=$(tools_num "$log" "Records:"); items=$(tools_num "$log" "Items created:")
+    tools_output "$log" > "$TOOLS_WORK/isis-preview.txt"
+    ui_textbox "$(t "Preview (dry run)")" "$TOOLS_WORK/isis-preview.txt"
+    if [ "${recs:-0}" -eq 0 ]; then
+        msg_info "$(t "Legacy migration")" "$(t 'The backup has no catalogue records.\nNothing was changed.\n\nLog: ${log}')" 11 72
+        return 0
+    fi
+    prompt_yes_no "$(t "Legacy migration")" "$(t 'Records: ${recs}\nItems: ${items}\n\nBuild the MARC file and go on to the MARC import? Nothing enters the catalog before you confirm the import.')" 13 72 defaultno || return 0
+    if ! koha_exec "$log" isis2koha /usr/bin/perl "$script" "${args[@]}" --marc "$mrc" || [ ! -s "$mrc" ]; then
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    chmod 600 "$mrc" 2>/dev/null || true
+    log "tools: ISIS backup read ($recs records, $items items)"
+    _lt_marc_import_run "$mrc" "ISO2709" "UTF-8" "$mode"
+}
+
+# ----------------------------------------------------------------------
 # Legacy patron spreadsheets -> import_patrons.pl CSV (with CPF checks).
 # Columns are recognised by their usual Portuguese or English names.
 # ----------------------------------------------------------------------
@@ -11283,7 +11944,8 @@ function_brazil_tools() {
             "7" "$(t "⇩  Migrate a collection spreadsheet (Biblioteca Fácil)")" \
             "8" "$(t "▤  Government census reports (MEC/INEP/IBGE)")" \
             "9" "$(t "▤  ABNT references and bibliographies (NBR 6023)")" \
-            "10" "$(t "⇩  Migrate the Biblioteca Fácil database (backup .bkp)")" 3>&1 1>&2 2>&3) || return 0
+            "10" "$(t "⇩  Migrate the Biblioteca Fácil database (backup .bkp)")" \
+            "11" "$(t "⇩  Migrate the ISIS catalogue (PostgreSQL backup)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_br_migrate_marc ;;
             2) lt_br_patrons ;;
@@ -11295,6 +11957,7 @@ function_brazil_tools() {
             8) lt_br_census ;;
             9) lt_br_abnt ;;
             10) lt_br_migrate_bfdb ;;
+            11) lt_br_migrate_isis ;;
         esac
         clear
     done
