@@ -279,7 +279,7 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 | `/etc/koha-easy-install/windows.conf` | Só no Windows: o que as ferramentas do Windows informam ao painel (modo de rede, início automático...) |
 | `C:\KohaEasy\` | Só no Windows: `bin\` (scripts, `KohaEasy.exe` e `koha.ico`), `logs\`, `Backups\`, `state.json` |
 
-Se a instalação parar, o painel mostra a etapa que falhou. A saída completa do gerenciador de pacotes fica em `/var/log/koha-easy-install/apt.log`.
+A instalação mostra sete etapas numeradas, uma linha por tarefa com uma pequena barra de progresso do Pac-Man, e uma tela final com os endereços do catálogo e da interface da equipe. A saída dos comandos nunca aparece na tela: ela fica em `/var/log/koha-easy-install/apt.log`. Se uma tarefa falhar, o painel mostra a etapa que falhou, o que verificar e as últimas linhas desse log, que é o arquivo a enviar ao suporte de TI.
 
 ## Desinstalação
 

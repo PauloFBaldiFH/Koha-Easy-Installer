@@ -59,6 +59,9 @@ on_exit() {
     rm -f /tmp/koha_tmp_* 2>/dev/null || true
     # No colour or attribute of the dialogs is left behind in the shell.
     [ -t 1 ] && printf '\033[0m'
+    # The installation screens hide the cursor while Pac-Man runs.
+    declare -F tui_stop_anim >/dev/null && tui_stop_anim
+    [ -t 1 ] && printf '\033[?25h'
     return 0
 }
 # CTRL+C only returns to the menu inside screens that explicitly allow it
@@ -643,9 +646,13 @@ apt_install() {
     mkdir -p "$(dirname "$APT_LOG")" 2>/dev/null
     while [ "$attempt" -le "$max" ]; do
         printf '\n===== %s | apt-get install %s (attempt %s) =====\n' "$(date '+%F %T')" "${packages[*]}" "$attempt" >>"$APT_LOG"
-        if DEBIAN_FRONTEND=noninteractive apt-get install "${APT_OPTS[@]}" "${packages[@]}" 2>&1 | tee -a "$APT_LOG"; then
-            return 0
-        fi
+        # On a terminal the output is also shown; under tui_run it already
+        # goes to the log (once).
+        if [ -t 1 ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install "${APT_OPTS[@]}" "${packages[@]}" 2>&1 | tee -a "$APT_LOG"
+        else
+            DEBIAN_FRONTEND=noninteractive apt-get install "${APT_OPTS[@]}" "${packages[@]}" >>"$APT_LOG" 2>&1
+        fi && return 0
         apt_update_indices >/dev/null 2>&1
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$APT_LOG" 2>&1
         DEBIAN_FRONTEND=noninteractive apt-get -f install "${APT_OPTS[@]}" >>"$APT_LOG" 2>&1
@@ -1098,6 +1105,346 @@ prompt_yes_no() {
 # Progress line printed on the terminal (the text is translated here).
 display_explanation() { printf '\e[1;36m>>> %s\e[0m\n' "$(t "$1")"; }
 pause_terminal() { read -r -p "$(t "Press [ENTER] to return to menu...")"; }
+pause_terminal_continue() { read -r -p "   $(t "Press [ENTER] to continue...")"; }
+
+# ======================================================================
+# TERMINAL LOOK (installation screens)
+# ----------------------------------------------------------------------
+# Long tasks show one friendly line each; the commands' own output goes to
+# $TUI_LOG (the installation log) and never reaches the screen.
+#   tui_header                          title of the screen
+#   tui_step N TOTAL ICON "Title" [long]  numbered step with a calm note
+#   tui_run "Label" cmd [args...]       Pac-Man eats dots while cmd runs
+#                                       (any length of time); the line ends
+#                                       as Done! or Failed! and cmd's exit
+#                                       code is returned
+#   tui_progress CUR TOTAL "Label"      0-100% bar headed by Pac-Man, for
+#   tui_progress_end                    tasks that can be counted
+#   tui_fail_card "Step" [log]          calm troubleshooting card
+#   tui_celebrate IP                    final screen with the real addresses
+# cmd runs in the panel's own shell (the variables it sets are kept); the
+# animation is a small background process that follows the panel's life.
+# Plain terminals (the Linux console, the classic Windows console) get
+# ASCII symbols; without a terminal (pipes, tests) nothing is animated.
+# ======================================================================
+TUI_LOG="$APT_LOG"
+TUI_TRACK=20
+TUI_ANIM_PID=""
+TUI_MOUTH=0
+
+tui_init() {
+    TUI_ANIM=0
+    [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && TUI_ANIM=1
+    if [ "$TUI_ANIM" = "1" ] && [ -z "${NO_COLOR:-}" ]; then
+        TUI_YEL=$'\e[1;33m' TUI_GRN=$'\e[32m' TUI_CYN=$'\e[36m' TUI_RED=$'\e[31m'
+        TUI_BLD=$'\e[1m' TUI_DIM=$'\e[2m' TUI_RST=$'\e[0m'
+    else
+        TUI_YEL="" TUI_GRN="" TUI_CYN="" TUI_RED="" TUI_BLD="" TUI_DIM="" TUI_RST=""
+    fi
+    TUI_PLAIN="${KEI_PLAIN_GLYPHS:-0}"
+    [ "${TERM:-}" = "linux" ] && TUI_PLAIN=1
+    if [ "$TUI_PLAIN" = "1" ]; then
+        TUI_DOT="." TUI_OK="[OK]" TUI_KO="[X]" TUI_LINE="-" TUI_BAR="|" TUI_TOP="+-" TUI_BOT="+-"
+    else
+        TUI_DOT="·" TUI_OK="✅" TUI_KO="❌" TUI_LINE="─" TUI_BAR="│" TUI_TOP="╭─" TUI_BOT="╰─"
+    fi
+}
+
+# REPLY = "$1 " on terminals that draw emoji, "" on plain ones.
+tui_icon() { if [ "$TUI_PLAIN" = "1" ]; then REPLY=""; else REPLY="$1 "; fi; }
+
+# Columns a text takes on screen (accents count once, CJK twice).
+tui_width() { printf '%s' "$1" | LC_ALL=C.UTF-8 wc -L 2>/dev/null || printf '%s' "${#1}"; }
+
+# REPLY = $2 copies of $1.
+tui_rep() { local s; printf -v s '%*s' "$2" ""; REPLY="${s// /$1}"; }
+
+# REPLY = $1 cut or padded to exactly $2 columns.
+tui_fit() {
+    local s="$1" w="$2" n cut=0
+    n=$(tui_width "$s")
+    if [ "$n" -gt "$w" ]; then
+        s="${s:0:w}"
+        n=$(tui_width "$s")
+        while [ "$n" -gt $((w - 1)) ]; do s="${s%?}"; n=$(tui_width "$s"); done
+        s+="${TUI_DOT}"
+        n=$((n + 1))
+        cut=1
+    fi
+    printf -v REPLY '%s%*s' "$s" $((w - n)) ""
+    return "$cut"
+}
+
+tui_cols() {
+    local c
+    c=$(tput cols 2>/dev/null)
+    [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 40 ] || c=80
+    printf '%s' "$c"
+}
+
+tui_cursor_hide() { [ "$TUI_ANIM" = "1" ] && { tput civis 2>/dev/null || printf '\e[?25l'; }; return 0; }
+tui_cursor_show() { [ -t 1 ] && { tput cnorm 2>/dev/null || printf '\e[?25h'; }; return 0; }
+
+# Stops the animation (also called on exit, CTRL+C included).
+tui_stop_anim() {
+    [ -n "$TUI_ANIM_PID" ] || return 0
+    kill "$TUI_ANIM_PID" 2>/dev/null
+    wait "$TUI_ANIM_PID" 2>/dev/null
+    TUI_ANIM_PID=""
+    tui_cursor_show
+}
+
+# Label column of the task lines: what is left of the terminal after the
+# indentation, the bar and the result.
+tui_label_width() {
+    local w a b
+    a=$(tui_width "$(t "Done!")"); b=$(tui_width "$(t "Failed!")")
+    [ "$b" -gt "$a" ] && a=$b
+    # "   " label "  [" track "] " icon " " result, one column spare.
+    w=$(( $(tui_cols) - 3 - 3 - TUI_TRACK - 2 - 3 - a - 1 ))
+    [ "$w" -gt 36 ] && w=36
+    [ "$w" -lt 12 ] && w=12
+    printf '%s' "$w"
+}
+
+tui_header() {
+    local rule sub
+    tui_rep "$TUI_LINE" 60; rule=$REPLY
+    tui_icon "📚"
+    printf '\n   %s%s%sKoha Easy Installer%s\n' "$REPLY" "$TUI_CYN" "$TUI_BLD" "$TUI_RST"
+    printf '   %s%s%s\n' "$TUI_DIM" "$rule" "$TUI_RST"
+    sub="$(t "Setting up your library, step by step. We take care of the technical part.")"
+    printf '   %s\n' "$sub"
+}
+
+# tui_step N TOTAL ICON "Title" [long]
+tui_step() {
+    local note
+    tui_icon "$3"
+    printf '\n %s%s%s[%s/%s]%s %s%s%s\n' "$REPLY" "$TUI_CYN" "$TUI_BLD" "$1" "$2" "$TUI_RST" "$TUI_BLD" "$4" "$TUI_RST"
+    if [ "${5:-}" = "long" ]; then
+        note="$(t "This is the longest step: it can take 10 to 20 minutes. Please keep this window open.")"
+    else
+        note="$(t "This might take a few minutes. Please keep this window open.")"
+    fi
+    tui_icon "☕"
+    printf '   %s%s%s%s\n' "$TUI_DIM" "$REPLY" "$note" "$TUI_RST"
+    log "step $1/$2: $4"
+}
+
+# REPLY = the looping track: dots Pac-Man has not eaten yet in this lap.
+tui_track_loop() {
+    local pos="$1" mouth="$2" eaten dots
+    printf -v eaten '%*s' "$pos" ""
+    tui_rep "$TUI_DOT" $((TUI_TRACK - pos - 1)); dots=$REPLY
+    REPLY="${eaten}${TUI_YEL}${mouth}${TUI_RST}${TUI_DIM}${dots}${TUI_RST}"
+}
+
+# tui_task_line LABEL RC: the finished line.
+tui_task_line() {
+    local label="$2" bar
+    tui_rep "=" "$TUI_TRACK"; bar=$REPLY
+    if [ "$1" -eq 0 ]; then
+        printf '\r\e[K   %s  %s[%s%s%s%s]%s %s %s%s%s\n' "$label" "$TUI_DIM" "$TUI_RST" "$TUI_GRN" "$bar" "$TUI_DIM" "$TUI_RST" \
+            "$TUI_OK" "$TUI_GRN" "$(t "Done!")" "$TUI_RST"
+    else
+        tui_rep "-" "$TUI_TRACK"; bar=$REPLY
+        printf '\r\e[K   %s  %s[%s%s%s%s]%s %s %s%s%s\n' "$label" "$TUI_DIM" "$TUI_RST" "$TUI_RED" "$bar" "$TUI_DIM" "$TUI_RST" \
+            "$TUI_KO" "$TUI_RED" "$(t "Failed!")" "$TUI_RST"
+    fi
+}
+
+# tui_run "Label" cmd [args...]  (Mode A: unknown duration)
+tui_run() {
+    local label="$1" rc
+    shift
+    tui_fit "$label" "$(tui_label_width)"; label=$REPLY
+    mkdir -p "$(dirname "$TUI_LOG")" 2>/dev/null
+    printf '\n===== %s | %s =====\n' "$(date '+%F %T')" "$1" >>"$TUI_LOG" 2>/dev/null
+    if [ "$TUI_ANIM" = "1" ]; then
+        tui_cursor_hide
+        (
+            trap 'exit 0' TERM
+            pos=0 frame=0
+            while kill -0 "$$" 2>/dev/null; do
+                if [ $((frame % 2)) -eq 0 ]; then m="C"; else m="c"; fi
+                tui_track_loop "$pos" "$m"
+                printf '\r\e[K   %s  %s[%s%s%s]%s' "$label" "$TUI_DIM" "$TUI_RST" "$REPLY" "$TUI_DIM" "$TUI_RST"
+                frame=$((frame + 1))
+                pos=$(( (pos + 1) % TUI_TRACK ))
+                sleep 0.15
+            done
+        ) &
+        TUI_ANIM_PID=$!
+    fi
+    "$@" >>"$TUI_LOG" 2>&1 </dev/null
+    rc=$?
+    tui_stop_anim
+    tui_task_line "$rc" "$label"
+    log "task '${1}': exit $rc"
+    return "$rc"
+}
+
+# REPLY = $1 with the thousands separator of the panel language.
+tui_thousands() {
+    local n="$1" out="" sep=","
+    case "${SYS_LANG:-en}" in
+        pt|es|de|it|nl|id|tr|vi) sep="." ;;
+        fr|ru|uk|pl|cs|sv) sep=" " ;;
+    esac
+    while [ "${#n}" -gt 3 ]; do out="${sep}${n: -3}${out}"; n="${n:0:${#n}-3}"; done
+    REPLY="${n}${out}"
+}
+
+# tui_progress CUR TOTAL "Label"  (Mode B: 45% [=========C··········] (5,625 / 12,500))
+# Call it as often as wanted; end the line with tui_progress_end.
+tui_progress() {
+    local cur="${1:-0}" total="${2:-0}" label pct head done_n bar rest counts a b
+    [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+    [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -gt 0 ] || total=1
+    [ "$cur" -gt "$total" ] && cur=$total
+    # Without a terminal only the finished line is printed.
+    [ "$TUI_ANIM" = "1" ] || [ "$cur" -eq "$total" ] || return 0
+    pct=$((cur * 100 / total))
+    done_n=$((cur * TUI_TRACK / total))
+    tui_rep "=" "$done_n"; bar=$REPLY
+    if [ "$cur" -lt "$total" ]; then
+        TUI_MOUTH=$((1 - TUI_MOUTH))
+        if [ "$TUI_MOUTH" = "1" ]; then head="C"; else head="c"; fi
+        tui_rep "$TUI_DOT" $((TUI_TRACK - done_n - 1)); rest=$REPLY
+        bar="${TUI_GRN}${bar}${TUI_RST}${TUI_YEL}${head}${TUI_RST}${TUI_DIM}${rest}${TUI_RST}"
+        tui_cursor_hide
+    else
+        bar="${TUI_GRN}${bar}${TUI_RST}"
+    fi
+    tui_thousands "$cur"; a=$REPLY
+    tui_thousands "$total"; b=$REPLY
+    counts="${TUI_DIM}(${a} / ${b})${TUI_RST}"
+    tui_fit "$3" "$(tui_label_width)"; label=$REPLY
+    printf '\r\e[K   %s  %3d%% %s[%s%s%s]%s %s' "$label" "$pct" "$TUI_DIM" "$TUI_RST" "$bar" "$TUI_DIM" "$TUI_RST" "$counts"
+    TUI_PROGRESS_OPEN=1
+}
+
+tui_progress_end() {
+    [ "${TUI_PROGRESS_OPEN:-0}" = "1" ] && printf '\n'
+    TUI_PROGRESS_OPEN=0
+    tui_cursor_show
+}
+
+# Last lines of a log, readable: no carriage returns or colour codes.
+tui_log_tail() {
+    tail -n "$(( ${2:-6} * 3 ))" "$1" 2>/dev/null | tr -d '\r' | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' \
+        | grep -v -e '^[[:space:]]*$' -e '^===== ' | cut -c1-66 | tail -n "${2:-6}"
+}
+
+# tui_fail_card "Step" [log]: a calm card instead of a wall of text.
+tui_fail_card() {
+    local step="$1" file="${2:-$TUI_LOG}" rule line
+    tui_stop_anim
+    tui_rep "$TUI_LINE" 60; rule=$REPLY
+    tui_icon "🧰"
+    printf '\n   %s%s%s %s%s%s%s\n' "$TUI_DIM" "$TUI_TOP" "$TUI_RST" "$REPLY" "$TUI_BLD" "$(t "Something needs attention")" "$TUI_RST"
+    tui_card_text ""
+    tui_card_text "$(t 'The step "${step}" could not be completed.')"
+    tui_card_text "$(t "Nothing was lost. This usually comes from the internet connection, a full disk or another installation running at the same time.")"
+    tui_card_text ""
+    tui_card_text "$(t "Check the internet connection and the free disk space, then run option 1 again.")"
+    tui_card_text "$(t "If it happens again, send this file to your IT support:")"
+    printf '   %s%s%s     %s%s%s\n' "$TUI_DIM" "$TUI_BAR" "$TUI_RST" "$TUI_CYN" "$file" "$TUI_RST"
+    if [ -s "$file" ]; then
+        tui_card_text ""
+        tui_card_text "$(t "Last lines of the log:")"
+        while IFS= read -r line; do
+            printf '   %s%s     %s%s\n' "$TUI_DIM" "$TUI_BAR" "$line" "$TUI_RST"
+        done < <(tui_log_tail "$file" 6)
+    fi
+    printf '   %s%s%s%s\n\n' "$TUI_DIM" "$TUI_BOT" "$rule" "$TUI_RST"
+}
+
+# One paragraph of the card, wrapped at 64 columns behind its left border.
+tui_card_text() {
+    local line
+    if [ -z "$1" ]; then printf '   %s%s%s\n' "$TUI_DIM" "$TUI_BAR" "$TUI_RST"; return 0; fi
+    while IFS= read -r line; do
+        printf '   %s%s%s  %s\n' "$TUI_DIM" "$TUI_BAR" "$TUI_RST" "$line"
+    done < <(tui_wrap "$1" 64)
+}
+
+# tui_wrap TEXT WIDTH: TEXT in lines of WIDTH columns, broken between words
+# (inside a word only when it is longer than a line, as CJK sentences are).
+# Counts characters, not bytes; CJK characters take two columns.
+tui_wrap() {
+    local width="$2" word cur="" k=1 max words=()
+    case "${SYS_LANG:-en}" in ja|zh|ko) k=2 ;; esac
+    max=$((width / k))
+    read -ra words <<< "$1"
+    for word in "${words[@]}"; do
+        while [ "${#word}" -gt "$max" ]; do
+            [ -n "$cur" ] && { printf '%s\n' "$cur"; cur=""; }
+            printf '%s\n' "${word:0:max}"
+            word="${word:max}"
+        done
+        if [ -z "$cur" ]; then
+            cur="$word"
+        elif [ $(( (${#cur} + 1 + ${#word}) * k )) -le "$width" ]; then
+            cur+=" $word"
+        else
+            printf '%s\n' "$cur"; cur="$word"
+        fi
+    done
+    [ -n "$cur" ] && printf '%s\n' "$cur"
+    return 0
+}
+
+# tui_celebrate IP [FAILURES]: the addresses come from this machine's own
+# configuration (network address, WSL network mode, Cloudflare Tunnel).
+tui_celebrate() {
+    local ip="${1:-$(get_server_ip)}" fails="${2:-0}" cf_opac="" cf_staff="" rule i w=0 n lab
+    local -a labels=() urls=() icons=()
+    read -r cf_opac cf_staff < <(tunnel_public_hosts 2>/dev/null)
+    [ "$cf_opac" = "-" ] && cf_opac=""
+    [ "$cf_staff" = "-" ] && cf_staff=""
+
+    [ -n "$cf_opac" ] && { icons+=("🌐"); labels+=("$(t "Public catalog (internet)")"); urls+=("https://${cf_opac}"); }
+    [ -n "$cf_staff" ] && { icons+=("🌐"); labels+=("$(t "Staff interface (internet)")"); urls+=("https://${cf_staff}"); }
+    if host_can lan_direct && [ "$ip" != "127.0.0.1" ]; then
+        icons+=("📖"); labels+=("$(t "Public catalog (library network)")"); urls+=("http://${ip}")
+        icons+=("🔑"); labels+=("$(t "Staff interface (library network)")"); urls+=("http://${ip}:8080")
+    fi
+    icons+=("💻"); labels+=("$(t "Public catalog (this computer)")"); urls+=("http://localhost")
+    icons+=("💻"); labels+=("$(t "Staff interface (this computer)")"); urls+=("http://localhost:8080")
+
+    for i in "${!labels[@]}"; do
+        n=$(tui_width "${labels[i]}")
+        [ "$n" -gt "$w" ] && w=$n
+    done
+    tui_rep "$TUI_LINE" 60; rule=$REPLY
+
+    echo ""
+    if [ "$fails" -eq 0 ] 2>/dev/null; then
+        tui_icon "🎉"
+        printf '   %s%s%s%s%s' "$REPLY" "$TUI_GRN" "$TUI_BLD" "$(t "Your library is ready!")" "$TUI_RST"
+        tui_icon "✨"; printf ' %s\n' "$REPLY"
+    else
+        tui_icon "⚠"
+        printf '   %s%s%s%s\n' "$REPLY" "$TUI_YEL" "$(t 'Koha was installed, but the final check found ${fails} problem(s).')" "$TUI_RST"
+    fi
+    printf '   %s%s%s\n\n' "$TUI_DIM" "$rule" "$TUI_RST"
+    printf '   %s\n\n' "$(t "Open these addresses in the browser:")"
+    for i in "${!labels[@]}"; do
+        tui_fit "${labels[i]}" "$w"; lab=$REPLY
+        tui_icon "${icons[i]}"
+        printf '   %s%s  %s%s%s\n' "$REPLY" "$lab" "$TUI_CYN" "${urls[i]}" "$TUI_RST"
+    done
+    echo ""
+    tui_icon "🔐"
+    printf '   %s%s %s%s%s\n' "$REPLY" "$(t "Username and password:")" "$TUI_CYN" "sudo cat $CREDENTIALS_FILE" "$TUI_RST"
+    tui_icon "👉"
+    printf '   %s%s\n' "$REPLY" "$(t "Next step: open the staff interface to finish Koha's web installer.")"
+    printf '   %s%s%s\n\n' "$TUI_DIM" "$rule" "$TUI_RST"
+}
+
+tui_init
 
 get_server_ip() {
     local ip
@@ -3311,6 +3658,60 @@ configure_firewall() {
     fi
 }
 
+# banner_center TEXT WIDTH [FILL]: REPLY = TEXT centred in WIDTH columns.
+banner_center() {
+    local s="$1" w="$2" f="${3:- }" n l r
+    tui_fit "$s" "$w" >/dev/null; s="${REPLY%"${REPLY##*[! ]}"}"
+    n=$(tui_width "$s")
+    l=$(( (w - n) / 2 )); r=$(( w - n - l ))
+    tui_rep "$f" "$l"; s="${REPLY}${s}"
+    tui_rep "$f" "$r"; REPLY="${s}${REPLY}"
+}
+
+# banner_art LINE...: the library building in plain ASCII: pediment with
+# the name, columns, a plaque with LINE... ("-" draws a divider) and the
+# steps. Every row is measured on screen columns, so accents and long
+# translations never push a wall out of line. 68 to 80 columns wide.
+banner_art() {
+    local r n w=0 F k inner pad fill cols TUI_DOT="."
+    for r in "$@"; do n=$(tui_width "$r"); [ "$n" -gt "$w" ] && w=$n; done
+    F=$((w + 6))
+    [ "$F" -lt 64 ] && F=64
+    [ "$F" -gt 76 ] && F=76
+    # Pediment: four rows, each 16 columns wider than the one above.
+    local -a text=("" "KOHA LIBRARY" "Koha Easy Installer & Tools" "")
+    for k in 0 1 2 3; do
+        inner=$((F - 16 * (3 - k) - 16))
+        if [ "$k" -eq 3 ]; then fill="_"; else fill=" "; fi
+        banner_center "${text[k]}" "$inner" "$fill"
+        printf -v pad '%*s' $((2 + 8 * (3 - k))) ""
+        printf "%s__..--''%s''--..__\n" "$pad" "$REPLY"
+    done
+    tui_rep "=" $((F - 2)); printf '  |%s|\n' "$REPLY"
+    # Columns (capital, shaft, base) every 6 columns, centred.
+    n=$(( (F - 2) / 6 ))
+    pad=$(( F - 2 - 6 * n ))
+    local unit edge
+    for unit in " _||_ " "  ||  " "  ||  " "_[__]_"; do
+        edge=" "; [ "$unit" = "_[__]_" ] && edge="_"
+        tui_rep "$unit" "$n"; cols=$REPLY
+        tui_rep "$edge" $((pad / 2)); r="${REPLY}${cols}"
+        tui_rep "$edge" $((pad - pad / 2)); r+="$REPLY"
+        printf '  |%s|\n' "$r"
+    done
+    for r in "$@"; do
+        if [ "$r" = "-" ]; then
+            tui_rep "-" $((F - 2)); printf '  |%s|\n' "$REPLY"
+        else
+            tui_fit "$r" $((F - 6)) >/dev/null
+            printf '  |  %s  |\n' "$REPLY"
+        fi
+    done
+    tui_rep "_" $((F - 2)); printf '  |%s|\n' "$REPLY"
+    tui_rep "=" "$F"; printf ' [%s]\n' "$REPLY"
+    tui_rep "=" $((F + 2)); printf '[%s]\n' "$REPLY"
+}
+
 write_banner() {
     local ip="${1:-}"
     [ -z "$ip" ] && ip="$(get_server_ip 2>/dev/null || hostname -I | awk '{print $1}')"
@@ -3348,49 +3749,14 @@ write_banner() {
     l_user="$(t "- User (Admin)    : \${user}")"
     l_pass="$(t "- Password (Root) : cat /root/koha_credentials.txt")"
 
-    # Formata para exatamente 52 caracteres úteis para fechar alinhado com as colunas
-    local f_ctrl f_ssh f_staff f_opac f_staff_loc f_opac_loc f_staff_cf f_opac_cf f_user f_pass
-    f_ctrl=$(printf "%-52.52s" "$l_ctrl")
-    f_ssh=$(printf "%-52.52s" "$l_ssh")
-    f_staff=$(printf "%-52.52s" "$l_staff")
-    f_opac=$(printf "%-52.52s" "$l_opac")
-    f_staff_loc=$(printf "%-52.52s" "$l_staff_loc")
-    f_opac_loc=$(printf "%-52.52s" "$l_opac_loc")
-    f_staff_cf=$(printf "%-52.52s" "$l_staff_cf")
-    f_opac_cf=$(printf "%-52.52s" "$l_opac_cf")
-    f_user=$(printf "%-52.52s" "$l_user")
-    f_pass=$(printf "%-52.52s" "$l_pass")
-
-cat > /etc/issue << EOF
-\S
-
-             ___________________________________
-           //===================================\\
-          //       .---------------------.       \\
-         //        |     KOHA LIBRARY    |        \\
-        //    .----'---------------------'----.    \\
-      _//_====[  Koha Easy Installer & Tools  ]====_\\_
-    |____|_________________________________________|____|
-     |--|  ${f_ctrl}  |--|
-     |  |  ${f_ssh}  |  |
-     |  |============================================|  |
-     |  |  ${l_urls}                                 |  |
-     |  |  ${f_staff}  |  |
-     |  |  ${f_opac}  |  |
-     |  |  ${f_staff_loc}  |  |
-     |  |  ${f_opac_loc}  |  |
-     |  |  ${f_staff_cf}  |  |
-     |  |  ${f_opac_cf}  |  |
-     |  |--------------------------------------------|  |
-     |  |  ${f_user}  |  |
-     |  |  ${f_pass}  |  |
-     |  |============================================|  |
-    /===/============================================\\==\\
-   /___/______________________________________________\\__\\
-
-EOF
-    cp -f /etc/issue /etc/issue.net 2>/dev/null
-    sed '1{/^\\S$/d}' /etc/issue > /etc/motd 2>/dev/null
+    # The art is plain ASCII with no backslash: agetty reads "\x" in
+    # /etc/issue as an escape and would eat the character after it.
+    local art
+    art=$(banner_art "$l_ctrl" "$l_ssh" - "$l_urls" "$l_staff" "$l_opac" "$l_staff_loc" "$l_opac_loc" \
+        "$l_staff_cf" "$l_opac_cf" - "$l_user" "$l_pass")
+    printf '\\S\n\n%s\n\n' "$art" > /etc/issue
+    printf '\n%s\n\n' "$art" > /etc/issue.net 2>/dev/null
+    printf '\n%s\n\n' "$art" > /etc/motd 2>/dev/null
 }
 
 # ======================================================================
@@ -3449,15 +3815,14 @@ EOF
     fi
 }
 
-# Shows why the installation stopped, with the end of the APT log, instead of
-# silently going back to the menu.
+# Shows why the installation stopped (a calm card with the end of the log)
+# instead of silently going back to the menu.
 install_step_failed() {
-    local step="$1" details
+    local step="$1" file="${2:-$TUI_LOG}"
     restore_apt_timers
-    details=$(apt_log_tail 8)
     log "installation aborted at step: $step"
-    msg_error "$(t "Installation interrupted")" \
-        "$(t 'The installation stopped at the step:\n${step}\n\nLast lines of ${APT_LOG}:\n${details}\n\nFix the cause (internet, disk space, locked APT) and run option 1 again.')" 22 80
+    tui_fail_card "$step" "$file"
+    pause_terminal
     return 1
 }
 
@@ -3553,7 +3918,6 @@ install_clock_sync() {
         log "install: NTP skipped (clock kept by Windows)"
         return 0
     fi
-    display_explanation "Synchronizing the clock (NTP)..."
     apt_install systemd-timesyncd >/dev/null 2>&1
     systemctl enable --now systemd-timesyncd >/dev/null 2>&1
     timeout 15 bash -c 'until timedatectl show -p NTPSynchronized --value | grep -q yes; do sleep 1; done' >/dev/null 2>&1
@@ -3568,7 +3932,6 @@ install_swap() {
         log "install: swapfile skipped (swap managed by Windows)"
         return 0
     fi
-    display_explanation "Creating virtual memory (4 GB SWAP)..."
     if [ -z "$(swapon --noheadings --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
         if [ "$(get_free_space_mb /)" -ge 8192 ] 2>/dev/null; then
             fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
@@ -3609,26 +3972,12 @@ apache_listen_all() {
     return 0
 }
 
-function_install_koha() {
-    validate_pre_installation || return 1
-
-    # Asked on Windows (WSL) too: the zone WSL copied from Windows is offered
-    # first, so due dates and circulation logs follow the library's clock.
-    local tz
-    if tz=$(choose_timezone) && [ -n "$tz" ]; then
-        apply_timezone "$tz" || echo "$(t '[WARN] Could not apply the timezone ${tz}.')"
-    fi
-
-    clear
-    INSTALL_STARTED_AT=$(date '+%F %T')
-    log "installation started"
-
-    wait_for_apt_locks || { msg_error "" "$(t "APT is locked by another process or dpkg failed. Cannot continue.")"; return 1; }
-
-    display_explanation "Configuring locales and UTF-8..."
-    apt_update_indices || { install_step_failed "apt-get update"; return 1; }
-    apt_install locales || { install_step_failed "locales"; return 1; }
-
+# Installation tasks. Each one runs under tui_run: its output goes to the
+# installation log and a non-zero exit code stops the installation with the
+# troubleshooting card.
+install_task_locales() {
+    apt_update_indices || return 1
+    apt_install locales || return 1
     local sys_locale="${LANG:-en_US.UTF-8}"
     case "$sys_locale" in
         C|POSIX|C.*|POSIX.*|"") sys_locale="en_US.UTF-8" ;;
@@ -3636,179 +3985,105 @@ function_install_koha() {
     sys_locale="${sys_locale%%.*}.UTF-8"
     # Debian's locale-gen ignores its arguments and only reads /etc/locale.gen.
     sed -i -E "s/^#[[:space:]]*(${sys_locale}[[:space:]]+UTF-8)/\1/i; s/^#[[:space:]]*(en_US\.UTF-8[[:space:]]+UTF-8)/\1/" /etc/locale.gen 2>/dev/null || true
-    locale-gen "$sys_locale" en_US.UTF-8 >/dev/null 2>&1 || locale-gen >/dev/null 2>&1
-    update-locale LANG="$sys_locale" >/dev/null 2>&1 || true
+    locale-gen "$sys_locale" en_US.UTF-8 || locale-gen
+    update-locale LANG="$sys_locale" || true
+    return 0
+}
 
-    install_clock_sync
-    install_swap
+install_task_upgrade() {
+    wait_for_apt_locks || return 1
+    apt_update_indices || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade "${APT_OPTS[@]}"
+}
 
-    wait_for_apt_locks || { install_step_failed "dpkg --configure -a"; return 1; }
-    display_explanation "Upgrading the system..."
-    apt_update_indices || { install_step_failed "apt-get update"; return 1; }
-    if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade "${APT_OPTS[@]}" 2>&1 | tee -a "$APT_LOG"; then
-        restore_apt_timers
-        msg_error "" "$(t "System upgrade failed. Koha will not be changed at this stage.")" 10 74
-        return 1
-    fi
-
-    display_explanation "Installing essential dependencies..."
+install_task_essentials() {
     local essentials=()
     mapfile -t essentials < <(essential_packages)
-    apt_install "${essentials[@]}" || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
-
+    apt_install "${essentials[@]}" || return 1
     # Labels utility installed separately to prevent batch failure if missing from repository
-    apt_install glabels >/dev/null 2>&1 || true
-
-    systemctl enable --now memcached >/dev/null 2>&1
-    host_can mdns && systemctl enable --now avahi-daemon >/dev/null 2>&1
+    apt_install glabels || true
+    systemctl enable --now memcached
+    host_can mdns && systemctl enable --now avahi-daemon
     configure_fail2ban
+    return 0
+}
 
-    display_explanation "Adding Koha and Elasticsearch repositories..."
+install_task_repositories() {
     mkdir -p /usr/share/keyrings
     if ! curl -fsSL --retry 3 --max-time 60 https://debian.koha-community.org/koha/gpg.asc \
-        | gpg --dearmor --yes -o /usr/share/keyrings/koha-keyring.gpg 2>/dev/null; then
-        restore_apt_timers
-        msg_error "" "$(t "Could not download the Koha repository key. Check your internet connection.")" 9 74
+        | gpg --dearmor --yes -o /usr/share/keyrings/koha-keyring.gpg; then
+        echo "$(t "Could not download the Koha repository key. Check your internet connection.")"
         return 1
     fi
     apt_source_line /usr/share/keyrings/koha-keyring.gpg https://debian.koha-community.org/koha stable main > /etc/apt/sources.list.d/koha.list
-
     if ! ensure_elastic_repo; then
         echo "$(t "[WARN] Elasticsearch repository unavailable; continuing with Zebra only.")"
     fi
+    apt_update_indices
+}
 
-    apt_update_indices || { install_step_failed "apt-get update (Koha)"; return 1; }
-    display_explanation "Installing MariaDB and Koha (longest step)..."
-    prepare_wsl_broker || echo "[WARN] RabbitMQ could not be prepared for WSL." >>"$APT_LOG"
-    apt_install mariadb-server koha-common || { install_step_failed "mariadb-server koha-common"; return 1; }
-    ensure_koha_conffiles || { install_step_failed "$(t "Restoring missing Koha configuration files...")"; return 1; }
-    systemctl enable --now mariadb >/dev/null 2>&1
-    if ! mysql -e "SELECT 1;" >/dev/null 2>&1; then
-        systemctl restart mariadb >/dev/null 2>&1 || koha_ctl service mariadb start >/dev/null 2>&1 || true
+install_task_koha_packages() {
+    prepare_wsl_broker || echo "[WARN] RabbitMQ could not be prepared for WSL."
+    apt_install mariadb-server koha-common || return 1
+    ensure_koha_conffiles
+}
+
+install_task_database() {
+    systemctl enable --now mariadb
+    if ! mysql -e "SELECT 1;"; then
+        systemctl restart mariadb || koha_ctl service mariadb start || true
         sleep 2
     fi
-    if ! mysql -e "SELECT 1;" >/dev/null 2>&1; then
-        restore_apt_timers
-        msg_error "" "$(t "MariaDB was installed but is not accepting connections.\n\nCheck: systemctl status mariadb")" 11 76
-        return 1
-    fi
+    mysql -e "SELECT 1;"
+}
 
-    display_explanation "Configuring Apache and Koha defaults..."
+install_task_web() {
     define_koha_sites_conf
-    a2enmod rewrite cgi deflate headers proxy proxy_http >/dev/null 2>&1
+    a2enmod rewrite cgi deflate headers proxy proxy_http
     apache_listen_all
-    systemctl restart apache2 memcached >/dev/null 2>&1
+    systemctl restart apache2 memcached
+    return 0
+}
 
-    local exists="no"
-    [ -d "/etc/koha/sites/${INSTANCE}" ] && exists="yes"
-    [ "$(run_sql "SELECT 1 FROM information_schema.schemata WHERE schema_name='${DB_NAME}';")" = "1" ] && exists="yes"
-
-    if [ "$exists" = "yes" ]; then
-        prompt_yes_no "$(t "Instance already exists")" \
-            "$(t "A Koha installation already exists on this machine.\n\nREINSTALLING DELETES the \${DB_NAME} database and all configuration.\nThis CANNOT be undone by this script.\n\nContinue to the final confirmation?")" 16 76 || { restore_apt_timers; return 0; }
-
-        local confirm
-        confirm=$(whiptail --title "$(t "FINAL CONFIRMATION")" --inputbox \
-            "$(t "Type exactly the word below to erase everything:\n\nREINSTALL")" 12 66 3>&1 1>&2 2>&3) || { restore_apt_timers; return 0; }
-        if [ "$confirm" != "REINSTALL" ]; then
-            restore_apt_timers
-            msg_info "$(t "Cancelled")" "$(t "Wrong confirmation. Nothing was deleted.")" 8 62
-            return 0
-        fi
-
-        display_explanation "Saving a safety backup before deleting..."
-        if ! backup_lock_acquire; then
-            restore_apt_timers
-            msg_error "" "$(t "Another backup or restore is already running. Reinstallation was cancelled.")" 9 74
-            return 1
-        fi
-        local rescue db_has_tables
-        rescue="${DIR_SQL}/PRE-REINSTALLATION_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
-        # "Could not count" is not "empty": no DROP without a verified copy.
-        db_has_tables=$(koha_table_count) || db_has_tables="unknown"
-        if [ "$db_has_tables" != "0" ]; then
-            if ! create_safety_backup "$rescue"; then
-                backup_lock_release
-                restore_apt_timers
-                msg_error "$(t "Safety backup failed")" \
-                    "$(t "The pre-reinstallation backup could not be validated.\n\nFor safety, the previous installation will NOT be deleted.")" 11 74
-                return 1
-            fi
-            echo "$(t "Safety backup:") $rescue"
-        fi
-
-        display_explanation "Removing the previous installation..."
-        manage_koha_indexers stop
-        if [ -d "/etc/koha/sites/${INSTANCE}" ]; then
-            if ! /usr/sbin/koha-remove "$INSTANCE" >/dev/null 2>&1; then
-                backup_lock_release
-                restore_apt_timers
-                msg_error "" "$(t "Koha could not remove the previous instance. No additional DROP was executed.")" 10 74
-                return 1
-            fi
-        fi
-        if ! mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; DROP USER IF EXISTS '${DB_NAME}'@'localhost'; DROP USER IF EXISTS '${DB_NAME}'@'%'; FLUSH PRIVILEGES;" >/dev/null 2>&1; then
-            backup_lock_release
-            restore_apt_timers
-            msg_error "" "$(t "Could not completely clean the previous database/user.")" 9 74
-            return 1
-        fi
-        rm -rf "/etc/koha/sites/${INSTANCE}"
-        backup_lock_release
-    fi
-
-    display_explanation "Creating the '\${INSTANCE}' Koha instance..."
-
-    # C.UTF-8 keeps the tools' messages readable in the error box (some of
-    # them print badly encoded accents in other locales).
+# koha-create keeps its own log: its last lines explain a failure.
+install_task_instance() {
+    # C.UTF-8 keeps the tools' messages readable in the log (some of them
+    # print badly encoded accents in other locales).
     mkdir -p /var/lib/koha
-    if ! LC_ALL=C.UTF-8 LANGUAGE=en koha_ctl /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1; then
-        local err_msg
-        err_msg=$(tail -n 15 "${LOG_DIR}/koha-create.log" 2>/dev/null)
-        [ -z "$err_msg" ] && err_msg="$(t "Empty log.")"
-        restore_apt_timers
-        msg_error "" "$(t "Failed to create the Koha instance.\n\nDetails:\n\$err_msg")" 22 80
-        return 1
-    fi
+    LC_ALL=C.UTF-8 LANGUAGE=en koha_ctl /usr/sbin/koha-create --create-db "$INSTANCE" > "${LOG_DIR}/koha-create.log" 2>&1 || return 1
 
-    sed -i 's/__MEMCACHED_SERVERS__/127.0.0.1:11211/g; s/__MEMCACHED_PREFIX__/koha_library:/g' "$KOHA_CONF" 2>/dev/null
+    sed -i 's/__MEMCACHED_SERVERS__/127.0.0.1:11211/g; s/__MEMCACHED_PREFIX__/koha_library:/g' "$KOHA_CONF"
 
     # Disable the Debian/Ubuntu default site so that port 80 serves the OPAC.
-    a2dissite 000-default default-ssl >/dev/null 2>&1
+    a2dissite 000-default default-ssl
     rm -f /var/www/html/index.html
 
-    a2enmod headers proxy proxy_http >/dev/null 2>&1
-    a2ensite "$INSTANCE" >/dev/null 2>&1
+    a2enmod headers proxy proxy_http
+    a2ensite "$INSTANCE"
     # Memcached first: a Plack started before it runs without cache.
-    systemctl enable memcached >/dev/null 2>&1
-    systemctl restart memcached >/dev/null 2>&1
-    systemctl restart apache2 koha-common >/dev/null 2>&1
+    systemctl enable memcached
+    systemctl restart memcached
+    systemctl restart apache2 koha-common
+    return 0
+}
 
-    # Automatic detection and installation of system language package in Koha
-    local auto_lang
-    auto_lang=$(detect_koha_locale)
-    [ -z "$auto_lang" ] && [ "$KOHA_PANEL_LANG_FULL" != "en-GB" ] && auto_lang="$KOHA_PANEL_LANG_FULL"
-    if [ -n "$auto_lang" ] && [ "${auto_lang%%-*}" != "en" ]; then
-        display_explanation "Installing Koha system language pack (\${auto_lang})..."
-        /usr/sbin/koha-translate --install "$auto_lang" >>"${LOG_DIR}/koha-translate.log" 2>&1 || true
-    fi
+install_task_plack() {
+    koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE"
+    koha_ctl /usr/sbin/koha-plack --start "$INSTANCE"
+    systemctl restart apache2
+    return 0
+}
 
-    koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
-    koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
-    systemctl restart apache2 >/dev/null 2>&1
-
-    display_explanation "Enabling Zebra and incremental indexing..."
-    zebra_start >/dev/null 2>&1
+install_task_indexing() {
+    zebra_start
     write_cron_zebra
-    zebra_indexer_start >/dev/null 2>&1
+    zebra_indexer_start
     start_koha_workers
+    return 0
+}
 
-    display_explanation "Creating automatic backups and credentials..."
-    local db_pass ip
-    db_pass=$(get_database_password)
-    ip=$(get_server_ip)
-    local ssh_login
-    ssh_login=$(get_ssh_login "$ip")
+install_task_backups() {
+    local ip="$1" db_pass="$2" ssh_login="$3"
     write_backup_scripts
     write_cron_tasks
     koha_email_enable || log "koha-email-enable failed (e-mail notices stay off)"
@@ -3840,39 +4115,169 @@ EOF
     configure_firewall
     write_banner "$ip" "$DB_NAME"
     install_panel_copy
+    return 0
+}
 
-    display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
-    ensure_koha_services >/dev/null 2>&1
+install_task_cleanup() {
+    apt-get clean -y
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+    journalctl --vacuum-time=7d
+    return 0
+}
 
-    display_explanation "Cleaning temporary files..."
-    apt-get clean -y >/dev/null 2>&1
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >/dev/null 2>&1
-    journalctl --vacuum-time=7d >/dev/null 2>&1
-    restore_apt_timers
-
-    clear
+# The final check never stops the installation: its result is shown on the
+# last screen and in the validation report.
+install_task_check() {
     validate_complete_system "$(t "installation complete")"
-    log "installation complete (ok=$V_OK warn=$V_WARN fail=$V_FAIL)"
+    return 0
+}
 
-    local result_msg
-    if [ "$V_FAIL" -eq 0 ]; then
-        result_msg="$(t "INSTALLATION COMPLETE WITH NO CRITICAL ERRORS.\n\n")"
-    else
-        result_msg="$(t "INSTALLATION COMPLETE, BUT WITH FAILURES (\$V_FAIL).\nThe system may have issues.\n\n")"
+# Previous installation: removed only after a verified safety backup.
+install_task_remove_previous() {
+    manage_koha_indexers stop
+    if [ -d "/etc/koha/sites/${INSTANCE}" ]; then
+        /usr/sbin/koha-remove "$INSTANCE" || return 2
+    fi
+    mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; DROP USER IF EXISTS '${DB_NAME}'@'localhost'; DROP USER IF EXISTS '${DB_NAME}'@'%'; FLUSH PRIVILEGES;" || return 3
+    rm -rf "/etc/koha/sites/${INSTANCE}"
+    return 0
+}
+
+function_install_koha() {
+    validate_pre_installation || return 1
+
+    # Asked on Windows (WSL) too: the zone WSL copied from Windows is offered
+    # first, so due dates and circulation logs follow the library's clock.
+    local tz
+    if tz=$(choose_timezone) && [ -n "$tz" ]; then
+        apply_timezone "$tz" || echo "$(t '[WARN] Could not apply the timezone ${tz}.')"
     fi
 
-    local report_text="${result_msg}"
-    report_text+="$(t "ACCESS:")\n"
-    report_text+="  Staff: http://${ip}:8080\n"
-    report_text+="  OPAC:  http://${ip}:80\n\n"
-    report_text+="$(t "CREDENTIALS (saved in /root/koha_credentials.txt):")\n"
-    report_text+="  $(t "User:") ${DB_NAME}\n"
-    report_text+="  $(t "Pass:") ${db_pass}\n\n"
-    report_text+="$(t "NEXT STEP: open Staff in browser for the Web Installer (or use option 3 with a backup).")\n\n"
-    report_text+="$(t "Validation:") OK=$V_OK  $(t "Warnings:") $V_WARN  $(t "Failures:") $V_FAIL"
+    clear
+    INSTALL_STARTED_AT=$(date '+%F %T')
+    log "installation started"
+    local steps=7
+    tui_header
 
-    whiptail --title "$(t "Installation Complete")" \
-        --scrolltext --msgbox "$report_text" 22 78 || true
+    tui_step 1 "$steps" "📦" "$(t "Preparing the system")"
+    tui_run "$(t "Checking the package manager")" wait_for_apt_locks \
+        || { install_step_failed "$(t "Checking the package manager")"; return 1; }
+    tui_run "$(t "Setting up language and UTF-8")" install_task_locales \
+        || { install_step_failed "$(t "Setting up language and UTF-8")"; return 1; }
+    if host_can ntp; then
+        tui_run "$(t "Syncing the clock")" install_clock_sync
+    fi
+    if host_can swap; then
+        tui_run "$(t "Creating virtual memory (swap)")" install_swap
+    fi
+    tui_run "$(t "Updating the system")" install_task_upgrade \
+        || { install_step_failed "$(t "Updating the system")"; return 1; }
+
+    tui_step 2 "$steps" "🧰" "$(t "Essential tools")"
+    tui_run "$(t "Installing essential packages")" install_task_essentials \
+        || { install_step_failed "$(t "Installing essential packages")"; return 1; }
+    tui_run "$(t "Adding the Koha repositories")" install_task_repositories \
+        || { install_step_failed "$(t "Adding the Koha repositories")"; return 1; }
+
+    tui_step 3 "$steps" "💾" "$(t "Database and Koha")" long
+    tui_run "$(t "Downloading and installing Koha")" install_task_koha_packages \
+        || { install_step_failed "$(t "Downloading and installing Koha")"; return 1; }
+    tui_run "$(t "Starting the database")" install_task_database \
+        || { install_step_failed "$(t "Starting the database")"; return 1; }
+
+    tui_step 4 "$steps" "🔧" "$(t "Web server")"
+    tui_run "$(t "Configuring Apache and Koha")" install_task_web
+
+    local exists="no"
+    [ -d "/etc/koha/sites/${INSTANCE}" ] && exists="yes"
+    [ "$(run_sql "SELECT 1 FROM information_schema.schemata WHERE schema_name='${DB_NAME}';")" = "1" ] && exists="yes"
+
+    if [ "$exists" = "yes" ]; then
+        prompt_yes_no "$(t "Instance already exists")" \
+            "$(t "A Koha installation already exists on this machine.\n\nREINSTALLING DELETES the \${DB_NAME} database and all configuration.\nThis CANNOT be undone by this script.\n\nContinue to the final confirmation?")" 16 76 || { restore_apt_timers; return 0; }
+
+        local confirm
+        confirm=$(whiptail --title "$(t "FINAL CONFIRMATION")" --inputbox \
+            "$(t "Type exactly the word below to erase everything:\n\nREINSTALL")" 12 66 3>&1 1>&2 2>&3) || { restore_apt_timers; return 0; }
+        if [ "$confirm" != "REINSTALL" ]; then
+            restore_apt_timers
+            msg_info "$(t "Cancelled")" "$(t "Wrong confirmation. Nothing was deleted.")" 8 62
+            return 0
+        fi
+
+        if ! backup_lock_acquire; then
+            restore_apt_timers
+            msg_error "" "$(t "Another backup or restore is already running. Reinstallation was cancelled.")" 9 74
+            return 1
+        fi
+        local rescue db_has_tables
+        rescue="${DIR_SQL}/PRE-REINSTALLATION_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
+        # "Could not count" is not "empty": no DROP without a verified copy.
+        db_has_tables=$(koha_table_count) || db_has_tables="unknown"
+        if [ "$db_has_tables" != "0" ]; then
+            if ! tui_run "$(t "Saving a safety backup")" create_safety_backup "$rescue"; then
+                backup_lock_release
+                restore_apt_timers
+                msg_error "$(t "Safety backup failed")" \
+                    "$(t "The pre-reinstallation backup could not be validated.\n\nFor safety, the previous installation will NOT be deleted.")" 11 74
+                return 1
+            fi
+            echo "   $(t "Safety backup:") $rescue"
+        fi
+
+        local rm_rc=0
+        tui_run "$(t "Removing the old installation")" install_task_remove_previous || rm_rc=$?
+        if [ "$rm_rc" -ne 0 ]; then
+            backup_lock_release
+            restore_apt_timers
+            if [ "$rm_rc" -eq 2 ]; then
+                msg_error "" "$(t "Koha could not remove the previous instance. No additional DROP was executed.")" 10 74
+            else
+                msg_error "" "$(t "Could not completely clean the previous database/user.")" 9 74
+            fi
+            return 1
+        fi
+        backup_lock_release
+    fi
+
+    tui_step 5 "$steps" "📖" "$(t "Your library")"
+    if ! tui_run "$(t "Creating the Koha instance")" install_task_instance; then
+        install_step_failed "$(t "Creating the Koha instance")" "${LOG_DIR}/koha-create.log"
+        return 1
+    fi
+
+    # Automatic detection and installation of system language package in Koha
+    local auto_lang
+    auto_lang=$(detect_koha_locale)
+    [ -z "$auto_lang" ] && [ "$KOHA_PANEL_LANG_FULL" != "en-GB" ] && auto_lang="$KOHA_PANEL_LANG_FULL"
+    if [ -n "$auto_lang" ] && [ "${auto_lang%%-*}" != "en" ]; then
+        tui_run "$(t "Installing the Koha language pack")" \
+            /usr/sbin/koha-translate --install "$auto_lang" || true
+    fi
+    tui_run "$(t "Starting Koha (Plack)")" install_task_plack
+
+    tui_step 6 "$steps" "🔎" "$(t "Search and safety")"
+    tui_run "$(t "Turning on the search index")" install_task_indexing
+
+    local db_pass ip
+    db_pass=$(get_database_password)
+    ip=$(get_server_ip)
+    local ssh_login
+    ssh_login=$(get_ssh_login "$ip")
+    tui_run "$(t "Setting up backups and credentials")" install_task_backups "$ip" "$db_pass" "$ssh_login"
+
+    tui_step 7 "$steps" "🌐" "$(t "Services")"
+    tui_run "$(t "Restarting Koha services")" ensure_koha_services
+    tui_run "$(t "Cleaning temporary files")" install_task_cleanup
+    restore_apt_timers
+    tui_run "$(t "Checking that everything works")" install_task_check
+    log "installation complete (ok=$V_OK warn=$V_WARN fail=$V_FAIL)"
+
+    tui_celebrate "$ip" "$V_FAIL"
+    printf '   %s %s\n' "$(t "User:")" "${DB_NAME}"
+    printf '   %s %s\n\n' "$(t "Pass:")" "${db_pass}"
+    pause_terminal_continue
+
     if [ "$V_FAIL" -gt 0 ] || [ "$V_WARN" -gt 0 ]; then
         local diag_msg
         if [ "$V_FAIL" -gt 0 ]; then
@@ -3887,8 +4292,8 @@ EOF
     fi
 
     if ! host_can reboot; then
-        display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
-        restart_koha_stack || true
+        clear
+        tui_run "$(t "Restarting Koha services")" restart_koha_stack || true
         msg_info "$(t "Koha is ready")" "$(t "All set! Koha services were restarted.\n\nCredentials have been saved to /root/koha_credentials.txt.")" 11 74
         return 0
     fi
