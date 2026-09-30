@@ -2,7 +2,7 @@
 
 A Cloudflare Worker that gives each library its own address under one central domain, for example `palotina-pr.koha.page`. It creates a Cloudflare Tunnel for each library and publishes it, without the Cloudflare API token ever leaving Cloudflare.
 
-**Status:** baseline. The Worker builds, and its unit tests and a local end-to-end test pass against a fake Cloudflare API. It has **not yet run against a real Cloudflare account**. The installer's **Free address** menu (Cloudflare Tunnel Manager) uses it; `tests/free_address.bats` runs that menu against this Worker in local workerd. The automatic verification gates on the sign-up page (Turnstile, email code, CNPJ and institutional-domain checks) are not built yet. For now an admin approves each request (`AUTO_APPROVE = "false"`).
+**Status:** baseline. The Worker builds, and its unit tests and a local end-to-end test pass against a fake Cloudflare API. It has **not yet run against a real Cloudflare account**. The installer's **Free address** menu (Cloudflare Tunnel Manager) uses it; `tests/free_address.bats` runs that menu against this Worker in local workerd. Sign-up is instant and unreviewed (`AUTO_APPROVE = "true"`): every request gets the first free valid name at once, and there is no daily cap (`MAX_LIBRARIES_PER_DAY = "0"`). Set `AUTO_APPROVE = "false"` to approve each request by hand again.
 
 Design documents in the project folder: `analysis/scenario-b-broker-blueprint.md` and `analysis/cloudflare-subdomain-automation.md`.
 
@@ -10,9 +10,9 @@ Design documents in the project folder: `analysis/scenario-b-broker-blueprint.md
 
 ```
 Koha panel (installer)                 Worker (this folder)                         Cloudflare API
- device/start ───────────────────────► enrollment request (pending)
- shows QR / browser / link to /join
- device/poll ◄────────────────────────  admin approves the name
+ device/start ───────────────────────► request approved at once under the first free name
+                                       (AUTO_APPROVE=false: pending until an admin approves;
+                                        the panel shows the /join link and polls)
  enroll + Ed25519 public key ────────► library row + queued job
                                        Queue ─► Provisioner Durable Object (one per library)
                                                   create tunnel (remotely managed)  ─────► POST cfd_tunnel
@@ -26,8 +26,10 @@ Koha panel (installer)                 Worker (this folder)                     
 - **Atomic, resumable provisioning:** there is one Durable Object per library. Its `blockConcurrencyWhile` serializes create, rotate, suspend and remove. Steps are idempotent: a retry adopts the tunnel and records that already exist. A DNS name that exists and belongs to someone else is **never overwritten**. After 6 failed attempts, what was created is rolled back.
 - **Reconciliation (hourly cron):** deletes tunnels named `kei-lib-<id>` and CNAMEs commented `kei:lib:<id>` whose library is gone. Records without that comment are never touched, so your zone's other DNS entries are safe. The test zone also uses the `t-` name prefix.
 - **Suspension:** switches the tunnel's ingress to `503`. DNS is unchanged, so restoring is instant.
-- **Names:** flat names only, because free SSL covers one level (`t-palotina-pr` and `t-palotina-pr-admin`). There is a reserved list, and a blocklist of phishing words that includes look-alike spellings (`l0g1n`, `rnicrosoft`). A released name is held for 180 days.
-- **Circuit breaker:** more than `MAX_LIBRARIES_PER_DAY` new libraries pauses enrollment.
+- **Names:** flat names only, because free SSL covers one level (`t-palotina-pr` and `t-palotina-pr-admin`). Technical names (`www`, `join`, `broker`, `mail`, ...) are reserved. Automatic approval takes the requested name, else the institution name, else a numbered variant (`palotina-pr-2`), else `biblioteca-<random>`. The phishing-word blocklist (with look-alike spellings such as `l0g1n`) only applies to manual approval (`AUTO_APPROVE = "false"`). A released name is held for 180 days.
+- **Rate limits:** 3 new requests per minute per IP address, 30 API calls per minute per IP or library, 20 staff-login attempts per minute.
+- **Optional circuit breaker:** `MAX_LIBRARIES_PER_DAY` above 0 pauses enrollment after that many new libraries in 24 hours. `0` (the default) turns it off.
+- **After the fact:** the admin API can still suspend, restore or remove any library.
 
 ## Files
 
@@ -163,7 +165,7 @@ npm run test:e2e      # bundles the Worker and runs the full flow in local worke
 
 ## Installer side
 
-The panel's **Free address** item (menu 6, Cloudflare Tunnel Manager) is the client. It asks for the library name, contact e-mail and wanted name, shows the request page as a QR code, browser or link, and continues on its own once the request is approved. It creates the server key (`/etc/koha-easy-install/broker.key`, 0600), keeps the tunnel token only in `/etc/cloudflared/koha-broker.env` (0600) and runs `cloudflared tunnel run` as a service. It sends a daily signed heartbeat (`/etc/cron.d/koha_broker`) and has menu items for remote staff access, reconnect, token renewal, sharing the catalog link (QR code on screen, printable PNG, browser, link) and giving the address up. A server uses either a free address or its own domain, never both.
+The panel's **Free address** item (menu 6, Cloudflare Tunnel Manager) is the client. It asks for the library name, contact e-mail and wanted name, and connects right away when the broker approves at once (the default). With manual approval it shows the request page as a QR code, browser or link and continues on its own once the request is approved. It creates the server key (`/etc/koha-easy-install/broker.key`, 0600), keeps the tunnel token only in `/etc/cloudflared/koha-broker.env` (0600) and runs `cloudflared tunnel run` as a service. It sends a daily signed heartbeat (`/etc/cron.d/koha_broker`) and has menu items for remote staff access, reconnect, token renewal, sharing the catalog link (QR code on screen, printable PNG, browser, link) and giving the address up. A server uses either a free address or its own domain, never both.
 
 The installer points at `https://koha-broker.bibliotecamunicipalpalotina.org` (the test zone). `KEI_BROKER_URL` overrides it.
 
@@ -171,5 +173,4 @@ To run the installer tests: `npm install` here, then `sudo KEI_TEST_SANDBOX=1 te
 
 ## Next steps
 
-1. Verification gates on `/join`: Turnstile, email code, institutional-domain and CNPJ checks. Then `AUTO_APPROVE` can be turned on for requests that pass.
-2. Monitoring: Koha fingerprint check, reputation feeds, and automatic suspension.
+1. Monitoring: Koha fingerprint check, reputation feeds, and automatic suspension.

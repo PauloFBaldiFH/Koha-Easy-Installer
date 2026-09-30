@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hostnamesFor, maxSlugLength, slugFromStaffHost, slugify, validateSlug } from "../src/names";
+import { hostnamesFor, maxSlugLength, slugCandidates, slugFromStaffHost, slugify, validateSlug } from "../src/names";
 
 const cfg = { NAME_PREFIX: "t-", STAFF_SUFFIX: "-admin", ZONE_NAME: "bibliotecamunicipalpalotina.org" };
 const opts = { prefix: "t-", staffSuffix: "-admin" };
@@ -40,5 +40,15 @@ describe("names", () => {
     expect(slugFromStaffHost(h.opac, cfg)).toBeNull();
     expect(slugFromStaffHost("koha-broker.bibliotecamunicipalpalotina.org", cfg)).toBeNull();
     expect(slugFromStaffHost("x-admin.other.org", cfg)).toBeNull();
+  });
+
+  it("lists automatic name candidates: requested, institution, then numbered", () => {
+    const c = slugCandidates("Palotina PR", "Biblioteca Pública de Palotina", 20);
+    expect(c.slice(0, 3)).toEqual(["palotina-pr", "palotina-pr-2", "palotina-pr-3"]);
+    expect(c).toContain("biblioteca-publica-d");
+    expect(c).toContain("biblioteca-publica-2");
+    expect(c.every((x) => x.length <= 20 && !x.endsWith("-"))).toBe(true);
+    expect(slugCandidates("", "Biblioteca", 20)[0]).toBe("biblioteca");
+    expect(slugCandidates("", "", 20)).toEqual([]);
   });
 });

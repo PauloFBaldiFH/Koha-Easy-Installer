@@ -32,9 +32,9 @@ ZONE_NAME = "bibliotecamunicipalpalotina.org"
 BROKER_HOST = "koha-broker.bibliotecamunicipalpalotina.org"
 NAME_PREFIX = "t-"          # test zone: every library name starts with t- so real records are never touched
 STAFF_SUFFIX = "-admin"
-AUTO_APPROVE = "false"      # keep false until the verification gates on /join exist
+AUTO_APPROVE = "true"       # instant approval under the first free name; "false" = an admin approves each request
 PBKDF2_ITERATIONS = "100000"
-MAX_LIBRARIES_PER_DAY = "20"   # circuit breaker for new registrations
+MAX_LIBRARIES_PER_DAY = "0"    # 0 = no daily cap; a number above 0 pauses sign-ups after that many in 24 h
 
 [[d1_databases]]
 binding = "DB"
