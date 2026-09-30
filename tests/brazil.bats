@@ -314,15 +314,16 @@ ficha_env() {
     assert 'echo "$card" | grep -qx "1. Romance brasileiro – Século XIX. I. Silva, João. II. Título."' "$card"
     assert 'echo "$card" | grep -qx "CDD 869.3"'
     assert 'echo "$output" | grep -q "class=\"kei-entrada\"" && echo "$output" | grep -q "text-indent: -2.2em"' "hanging indentation"
+    assert 'echo "$output" | grep -q "<details class=\"kei-ficha-box\" id=\"kei-ficha\">" && echo "$output" | grep -q "<summary class=\"kei-ficha-show\">Show the AACR2 catalogue card</summary>" && ! echo "$output" | grep -q "<details[^>]* open"' "the card starts collapsed behind its button"
     # The ABNT reference under the card (the organizer with $e is not a co-author).
     local ref
-    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
+    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | sed 's/.*id="kei-abnt"/<div id="kei-abnt"/' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
     assert '[ "$ref" = "ASSIS, Machado de. Dom Casmurro. 3. ed. São Paulo: Ática, 1997." ]' "ABNT reference: $ref"
     assert 'echo "$output" | grep -q "<strong>Dom Casmurro</strong>"' "the title is in bold"
     printf '%s\n' '<record xmlns="http://www.loc.gov/MARC21/slim"><leader>00000nam a2200000 a 4500</leader><controlfield tag="008">090101s2009    bl            000 0 por d</controlfield>
       <datafield tag="245" ind1="0" ind2="2"><subfield code="a">O pequeno príncipe /</subfield></datafield></record>' > "$W/rec2.xml"
     run xsltproc "$W/ficha/pt-BR/opac-detail.xsl" "$W/rec2.xml"
-    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
+    ref=$(echo "$output" | sed -n '/id="kei-abnt"/,/<\/p>/p' | sed 's/.*id="kei-abnt"/<div id="kei-abnt"/' | tr '\n' ' ' | sed 's/<h3[^>]*>[^<]*<\/h3>//; s/<[^>]*>//g; s/  */ /g; s/^ //; s/ $//')
     assert '[ "$ref" = "O PEQUENO príncipe. [S. l.: s. n.], 2009." ]' "entry by title, date of the 008: $ref"
     # Off: the previous values come back.
     inputs "off"; answer yes
