@@ -348,8 +348,12 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Process { }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls[0..2] | Should -Be @('copy panel', 'copy panel', 'panel')
+        # The Koha icon, the tasks and the tray come before the panel, and
+        # are not made twice once Koha is installed.
+        $script:calls[0..8] | Should -Be @('copy panel', 'copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'panel')
+        @($script:calls | Where-Object { $_ -eq 'shortcuts' }).Count | Should -Be 1
         (Get-KohaState).phase | Should -Be 'done'
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*/root/koha_credentials.txt is missing*' -or "$Object" -like '*Debian could not be checked*' }
     }
 
     It 'shows what Debian reports, saves the diagnostics and offers the panel when Koha does not start' {
@@ -488,15 +492,34 @@ Describe 'Install messages' {
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { }
         Mock -ModuleName KohaEasy.Install Get-KohaShortcutErrors { @('X\Koha.lnk: Unable to save shortcut') }
         Mock -ModuleName KohaEasy.Install New-KohaShortcuts { }
+        $script:places = [System.Collections.Queue]::new(@('', 'startmenu', 'public', 'desktop'))
+        Mock -ModuleName KohaEasy.Install Get-KohaIconPlace { $script:places.Dequeue() }
         Install-KohaShortcuts -StartMenu $sm
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*shortcuts could not be created*Unable to save shortcut*' }
-        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $StartMenu 'Koha.lnk') -Value '' }
         Install-KohaShortcuts -StartMenu $sm
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*could not be put on the desktop*Start menu*Unable to save shortcut*' }
+        Install-KohaShortcuts -StartMenu $sm
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*desktop of all users*Unable to save shortcut*' }
         # The sign-in entry failing does not stop the shortcuts.
-        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $Desktop 'Koha.lnk') -Value '' }
         Install-KohaShortcuts -StartMenu $sm
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like ('*Shortcuts created*' + $dt + '*') }
+    }
+
+    It 'says plainly when Windows restricts PowerShell' {
+        Test-KohaLanguageMode -Mode 'FullLanguage' | Should -BeTrue
+        Test-KohaLanguageMode -Mode 'ConstrainedLanguage' | Should -BeFalse
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*restricts PowerShell*ConstrainedLanguage*' }
+    }
+
+    It 'says why the tray did not come up, from the tray''s own error' {
+        Set-KohaState @{ launcher = 'failed'; hiddenLaunch = 'powershell' } | Out-Null
+        Mock -ModuleName KohaEasy.Install Restart-KohaTray { }
+        Mock -ModuleName KohaEasy.Install Test-KohaTrayRunning { $false }
+        Mock -ModuleName KohaEasy.Install Get-KohaLastFailure { 'Add-Type: the C# of the tray did not compile' }
+        Mock -ModuleName KohaEasy.Install Start-Sleep { }
+        Start-KohaTrayChecked -WaitSeconds 0
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*tray stopped with this error*did not compile*' }
+        Set-KohaState @{ launcher = ''; hiddenLaunch = 'conhost' } | Out-Null
     }
 
     It 'goes to a hidden PowerShell for the tray, the shortcuts and the tasks when conhost does not start the tray' {

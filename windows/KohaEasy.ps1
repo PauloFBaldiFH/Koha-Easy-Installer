@@ -44,6 +44,29 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Anything that ends this script with an error goes into the Koha log with
+# its stack ("<Command> failed: ..."), and a window, the tray or the Koha
+# icon shows it in a message: started hidden, they have no console to show
+# it in, and the installer reads it back when the tray does not come up.
+trap {
+    $failure = '{0} failed: {1} | stack: {2}' -f $Command, $_.Exception.Message, ([string]$_.ScriptStackTrace -replace "`r?`n", ' <- ')
+    try { Write-KohaLog $failure } catch {
+        try {
+            $logDir = 'C:\KohaEasy\logs'
+            if ($env:KOHAEASY_ROOT) { $logDir = Join-Path $env:KOHAEASY_ROOT 'logs' }
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            Add-Content -LiteralPath (Join-Path $logDir ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Value ('{0} | {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $failure)
+        } catch { }
+    }
+    if (@('Launch', 'Window', 'Tray', 'Panel', 'Terminal') -contains $Command -and -not $Quiet) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            [void][System.Windows.Forms.MessageBox]::Show(('Koha: {0}{1}{1}C:\KohaEasy\logs' -f $_.Exception.Message, [Environment]::NewLine), 'Koha', 'OK', 'Error')
+        } catch { }
+    }
+    break
+}
 Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Lang.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'KohaEasy.Core.psm1') -Force
 $langDir = Join-Path $PSScriptRoot 'lang'

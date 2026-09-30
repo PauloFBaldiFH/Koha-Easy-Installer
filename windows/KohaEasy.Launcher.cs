@@ -216,6 +216,26 @@ namespace KohaEasy
             }
         }
 
+        // A program shortcut written through the shell's own IShellLink, the
+        // second way when WScript.Shell cannot write one on this PC.
+        public static void CreateShortcut(string lnkPath, string target, string arguments, string workingDirectory, string icon)
+        {
+            object link = new CShellLink();
+            try
+            {
+                IShellLinkW l = (IShellLinkW)link;
+                l.SetPath(target);
+                l.SetArguments(arguments ?? "");
+                l.SetWorkingDirectory(workingDirectory ?? "");
+                if (!string.IsNullOrEmpty(icon)) { l.SetIconLocation(icon, 0); }
+                ((IPersistFile)link).Save(lnkPath, true);
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(link);
+            }
+        }
+
         static void Check(int hr)
         {
             if (hr < 0) { Marshal.ThrowExceptionForHR(hr); }
@@ -223,6 +243,29 @@ namespace KohaEasy
 
         [ComImport, Guid("00021401-0000-0000-C000-000000000046"), ClassInterface(ClassInterfaceType.None)]
         class CShellLink { }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+        interface IShellLinkW
+        {
+            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int size, IntPtr findData, uint flags);
+            void GetIDList(out IntPtr idList);
+            void SetIDList(IntPtr idList);
+            void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder name, int size);
+            void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);
+            void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder dir, int size);
+            void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string dir);
+            void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder args, int size);
+            void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string args);
+            void GetHotkey(out short hotkey);
+            void SetHotkey(short hotkey);
+            void GetShowCmd(out int showCmd);
+            void SetShowCmd(int showCmd);
+            void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconPath, int size, out int icon);
+            void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string iconPath, int icon);
+            void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string relPath, int reserved);
+            void Resolve(IntPtr hwnd, int flags);
+            void SetPath([MarshalAs(UnmanagedType.LPWStr)] string file);
+        }
 
         [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
         interface IPropertyStore

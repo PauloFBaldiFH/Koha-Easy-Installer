@@ -613,10 +613,35 @@ dpkg-query -W -f='${db:Status-Abbrev}' koha-common 2>/dev/null | grep -q '^ii' |
 exit 0
 '@
 
+$script:InstalledCheck = 0
 function Test-KohaInstalledInDistro {
     $r = Invoke-KohaLinuxScript -Script $script:InstalledProbe
+    $script:InstalledCheck = [int]$r.ExitCode
     if ($r.ExitCode -ne 0) { Write-KohaLog ('Koha not fully installed (check {0})' -f $r.ExitCode) 'install' }
     return ($r.ExitCode -eq 0)
+}
+
+# Which of the three checks above failed, said in words.
+function Show-KohaInstalledCheck {
+    switch ($script:InstalledCheck) {
+        1 { $what = T 'The Koha instance "library" was not created (/etc/koha/sites/library/koha-conf.xml is missing).' }
+        2 { $what = T 'Option 1 did not reach its last step: /root/koha_credentials.txt is missing.' }
+        3 { $what = T 'The koha-common package is not fully configured (its setup stopped half-way).' }
+        default { $what = (T 'Debian could not be checked (exit code {0}).') -f $script:InstalledCheck }
+    }
+    Write-KohaStep $what 'warn'
+}
+
+# The ways into Koha on Windows: KohaEasy.exe, the tasks, the Koha icon
+# (desktop and Start menu), the tray at sign-in and the tray itself. Made as
+# soon as Debian is ready, before Koha is installed.
+function Install-KohaEntryPoints {
+    $mode = [string](Get-KohaState).autostart
+    if (@('logon', 'manual') -notcontains $mode) { $mode = 'logon' }
+    Invoke-KohaSafeStep { Install-KohaLauncherStep }
+    Invoke-KohaSafeStep { Register-KohaTasks -Autostart $mode }
+    Invoke-KohaSafeStep { Install-KohaShortcuts }
+    Invoke-KohaSafeStep { Start-KohaTrayChecked }
 }
 
 # Koha did not answer: what Debian reports, the diagnostics .zip on the
@@ -779,6 +804,7 @@ function Install-Koha {
         Copy-KohaPanelIntoDistro
         if (-not (Test-KohaInstalledInDistro)) {
             Write-KohaStep (T 'Koha was not installed all the way. The control panel opens again to finish it.') 'warn'
+            Show-KohaInstalledCheck
             Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha'
         } else {
             Invoke-KohaSafeStep { Install-KohaDataSafety | Out-Null }
@@ -842,10 +868,17 @@ function Install-Koha {
         if (-not (Test-KohaPhaseDone 'systemd' $phase)) { Set-KohaState @{ phase = 'koha' } | Out-Null; $phase = 'koha' }
     }
 
+    $entryDone = $false
     if (-not (Test-KohaPhaseDone 'koha' $phase)) {
         Copy-KohaPanelIntoDistro
         if (-not (Test-KohaInstalledInDistro)) {
             if ($NonInteractive) { return 1 }
+            # The Koha icon, the tray and the tasks do not wait for Koha: an
+            # install that stops here (Koha half-installed, the panel left
+            # early) still leaves the librarian a way in, and the Koha window
+            # says what is missing.
+            Install-KohaEntryPoints
+            $entryDone = $true
             Write-Host ''
             Write-KohaStep (T 'The Koha control panel opens now. Choose your language, then 1 - Install Koha server. When it finishes, leave the panel with Exit.')
             Read-Host (T 'Press Enter to continue') | Out-Null
@@ -853,6 +886,7 @@ function Install-Koha {
             Write-KohaStep (T 'Back in the Windows installer. Checking the installation...')
             if (-not (Test-KohaInstalledInDistro)) {
                 Write-KohaStep (T 'Koha was not installed. Run the installer again to continue from here.') 'error'
+                Show-KohaInstalledCheck
                 return 1
             }
         }
@@ -867,14 +901,17 @@ function Install-Koha {
         if ($auto) { $mode = 'logon' }
         Set-KohaState @{ autostart = $mode; desired = 'running' } | Out-Null
         # One step that fails must not skip the others. KohaEasy.exe first:
-        # the tasks and shortcuts start through it.
-        Invoke-KohaSafeStep { Install-KohaLauncherStep }
+        # the tasks and shortcuts start through it. Made already in this run
+        # when Koha was installed in the panel just now (above).
+        if (-not $entryDone) { Invoke-KohaSafeStep { Install-KohaLauncherStep } }
         Invoke-KohaSafeStep { Register-KohaTasks -Autostart $mode }
-        Invoke-KohaSafeStep { Install-KohaShortcuts }
-        # The tray settles how Koha's tools start on this PC (KohaEasy.exe,
-        # conhost, PowerShell) before the Koha network task and the
-        # keep-alive task are started with it.
-        Invoke-KohaSafeStep { Start-KohaTrayChecked }
+        if (-not $entryDone) {
+            Invoke-KohaSafeStep { Install-KohaShortcuts }
+            # The tray settles how Koha's tools start on this PC (KohaEasy.exe,
+            # conhost, PowerShell) before the Koha network task and the
+            # keep-alive task are started with it.
+            Invoke-KohaSafeStep { Start-KohaTrayChecked }
+        }
         Write-KohaStep (T 'Opening Koha to the other computers of the library network (Windows asks for permission once)...')
         $lan = $true
         if (-not $NonInteractive) { $lan = Enable-KohaLanAccess }
@@ -1009,26 +1046,35 @@ function Invoke-KohaSafeStep {
 # disk, with Windows' own reason when a shortcut is missing.
 function Install-KohaShortcuts {
     param([string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'))
+    Test-KohaLanguageMode | Out-Null
     $desktop = Get-KohaDesktopPath
     New-KohaShortcuts -StartMenu $StartMenu -Desktop $desktop | Out-Null
     $errors = @(Get-KohaShortcutErrors)
     try { Set-KohaTrayAtSignIn -Enabled $true } catch { Write-KohaLog ('tray at sign-in not set: ' + $_.Exception.Message) 'install' }
     try { Set-KohaDistroIcon | Out-Null } catch { Write-KohaLog ('Debian entries keep their icon: ' + $_.Exception.Message) 'install' }
-    $onDesktop = $false
-    if ($desktop) { $onDesktop = Test-Path -LiteralPath ([System.IO.Path]::Combine($desktop, 'Koha.lnk')) }
-    $menu = [System.IO.Path]::Combine($StartMenu, 'Koha.lnk')
-    $inMenu = Test-Path -LiteralPath $menu
+    $place = Get-KohaIconPlace
     $reason = ($errors | Select-Object -First 1)
     if (-not $desktop) { $reason = 'Windows reported no desktop folder for this account' }
     if (-not $reason) { $reason = '?' }
-    Write-KohaLog ('Koha icon: desktop {0} ({1}), Start menu {2}' -f $onDesktop, $desktop, $inMenu) 'install'
-    if ($onDesktop) {
-        Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f $desktop) 'ok'
-    } elseif ($inMenu) {
-        Write-KohaStep ((T 'The Koha icon could not be put on the desktop ({0}). Open Koha from the Start menu (folder Koha). Reason: {1}') -f $desktop, $reason) 'warn'
-    } else {
-        Write-KohaStep ((T 'The Koha shortcuts could not be created. Reason: {0}. The log is in C:\KohaEasy\logs.') -f $reason) 'error'
+    Write-KohaLog ('Koha icon: {0} (desktop {1}, Start menu {2})' -f $place, $desktop, $StartMenu) 'install'
+    foreach ($e in $errors) { Write-KohaLog ('shortcut not created: ' + $e) 'install' }
+    switch ($place) {
+        'desktop' { Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f $desktop) 'ok' }
+        'public' { Write-KohaStep ((T 'Your own desktop refused the Koha icon, so it is on the desktop of all users. Reason: {0}') -f $reason) 'warn' }
+        'startmenu' { Write-KohaStep ((T 'The Koha icon could not be put on the desktop ({0}). Open Koha from the Start menu (folder Koha). Reason: {1}') -f $desktop, $reason) 'warn' }
+        default { Write-KohaStep ((T 'The Koha shortcuts could not be created. Reason: {0}. The log is in C:\KohaEasy\logs.') -f $reason) 'error' }
     }
+}
+
+# PowerShell restricted by Windows (AppLocker, WDAC, Smart App Control:
+# ConstrainedLanguage) cannot write shortcuts or show the tray. Said once,
+# plainly, instead of failing later without a word. $true when it is fine.
+function Test-KohaLanguageMode {
+    param([string]$Mode = [string]$ExecutionContext.SessionState.LanguageMode)
+    if ($Mode -eq 'FullLanguage') { return $true }
+    Write-KohaLog ('PowerShell language mode is {0}' -f $Mode) 'install'
+    Write-KohaStep ((T 'Windows restricts PowerShell on this PC ({0} mode), so the Koha icon and the Koha tray cannot work. Ask whoever manages this PC to allow the scripts in C:\KohaEasy.') -f $Mode) 'error'
+    return $false
 }
 
 # Starts the tray and checks it is there. When KohaEasy.exe does not bring
@@ -1068,10 +1114,16 @@ function Start-KohaTrayChecked {
     }
     $l = Get-KohaHiddenLaunch -Arguments 'Tray'
     Write-KohaLog ('hidden launch in use: {0} {1} (launcher {2}, hiddenLaunch {3})' -f $l.Target, $l.Arguments, (Get-KohaState).launcher, (Get-KohaState).hiddenLaunch) 'install'
+    # Checked once more after a pause: a tray that starts and then ends at
+    # once (a missing part, a PowerShell Windows restricts) is not up.
+    Start-Sleep -Seconds 2
     if (Test-KohaTrayRunning) {
         Write-KohaStep (T 'The Koha icon is in the notification area, next to the clock.') 'ok'
     } else {
+        $why = Get-KohaLastFailure 'Tray'
+        Write-KohaLog ('the tray is not running after every hidden launch; last tray error: {0}' -f $why) 'install'
         Write-KohaStep (T 'The Koha icon did not start. Open Koha - Status icon in the Start menu (folder Koha).') 'warn'
+        if ($why) { Write-KohaStep ((T 'The tray stopped with this error: {0}') -f $why) 'warn' }
     }
 }
 
