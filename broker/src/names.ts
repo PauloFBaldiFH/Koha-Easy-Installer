@@ -73,6 +73,23 @@ export function validateSlug(
   return { ok: true };
 }
 
+// Names tried, in order, for an automatic approval: the requested name, then
+// the institution name, each also with -2 ... -9 when taken. Truncated to
+// the room left by the prefix and the staff suffix.
+export function slugCandidates(requested: string, institution: string, max: number): string[] {
+  const out: string[] = [];
+  for (const raw of [requested, institution]) {
+    const base = slugify(raw).slice(0, max).replace(/-+$/, "");
+    if (!base) continue;
+    for (let n = 1; n <= 9; n++) {
+      const tail = n === 1 ? "" : `-${n}`;
+      const c = base.slice(0, max - tail.length).replace(/-+$/, "") + tail;
+      if (!out.includes(c)) out.push(c);
+    }
+  }
+  return out;
+}
+
 export interface Hostnames {
   opac: string;
   staff: string;

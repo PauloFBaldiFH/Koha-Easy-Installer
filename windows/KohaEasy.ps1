@@ -5,7 +5,7 @@
     KohaEasy.ps1 Start [-Trigger user|logon]   Koha - Start shortcut, tray, sign-in task
     KohaEasy.ps1 Stop [-Force]                 Koha - Stop shortcut, tray
     KohaEasy.ps1 Restart [-Force]              Koha - Restart shortcut, tray
-    KohaEasy.ps1 Window                        the Koha window: state, services, actions (desktop icon, Koha - Status, tray)
+    KohaEasy.ps1 Window                        the Koha window: banner, quick access, components, actions, terminal area (desktop icon, Koha - Status, tray)
     KohaEasy.ps1 Status                        the same summary in a message box
     KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
     KohaEasy.ps1 Panel                         the Koha window and the tray: starts Koha, opens the control panel

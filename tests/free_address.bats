@@ -72,7 +72,6 @@ EOF
 }
 
 teardown() {
-    pkill -f "$BATS_TEST_TMPDIR/approver" 2>/dev/null || true
     rm -f /root/.kei-broker-*
     kei_kill_daemons
 }
@@ -85,26 +84,8 @@ fake() {
 state() { /usr/bin/curl -s "$INSPECT"; }
 pref() { mysql -Nse "SELECT value FROM ${DB}.systempreferences WHERE variable='$1';"; }
 
-# Approves (or denies) the next pending request, like the service admin would.
-approver() {   # approver approve|deny
-    cat > "$BATS_TEST_TMPDIR/approver" <<EOF
-#!/bin/bash
-for i in \$(seq 1 60); do
-    code=\$(/usr/bin/curl -s -H "$ADMIN" "$BROKER/admin/enrollments" | grep -o '"user_code":"[A-Z-]*"' | head -n1 | cut -d'"' -f4)
-    if [ -n "\$code" ]; then
-        /usr/bin/curl -s -X POST -H "$ADMIN" -H 'Content-Type: application/json' -d '{}' "$BROKER/admin/enrollments/\$code/$1" > /dev/null
-        exit 0
-    fi
-    sleep 0.5
-done
-EOF
-    chmod 755 "$BATS_TEST_TMPDIR/approver"
-    "$BATS_TEST_TMPDIR/approver" 3>&- &
-}
-
-@test "B01 free address: request, approval, tunnel installed with the token out of sight" {
-    inputs "Biblioteca Pública Municipal de Palotina" "biblioteca@palotina.pr.gov.br" "Palotina PR" link CANCEL
-    approver approve
+@test "B01 free address: approved on the spot, tunnel installed with the token out of sight" {
+    inputs "Biblioteca Pública Municipal de Palotina" "biblioteca@palotina.pr.gov.br" "Palotina PR" CANCEL
     panel function_cloudflare_free_address
     assert '[ "$status" -eq 0 ]' "$output"
 
@@ -129,7 +110,7 @@ EOF
     assert 'grep -q -- "--broker-heartbeat" /etc/cron.d/koha_broker'
     assert '[ "$(pref OPACBaseURL)" = "https://t-palotina-pr.example.org" ]' "$(pref OPACBaseURL)"
     assert 'dialogs | grep -q "OK .*Your catalog is online"' "$(dialogs)"
-    assert 'echo "$output" | grep -qF "https://127.0.0.1/join?c="' "the request link is offered: $output"
+    assert '! echo "$output" | grep -qF "/join?c=" && ! dialogs | grep -q "MENU \[Authorization\]"' "no link to open, no wait: $output"
     assert '[ -z "$(ls /root/.kei-broker-* 2>/dev/null)" ]' "temporary files removed"
 }
 
@@ -233,12 +214,13 @@ EOF
     assert '[ "$(pref OPACBaseURL)" = "http://192.168.0.10" ]'
 }
 
-@test "B09 a denied request is dropped and can be sent again" {
-    inputs "Biblioteca Teste" "x@example.org" "teste-negado" link
-    approver deny
+@test "B09 a name that is taken gets a close variant, still without review" {
+    # B08 gave palotina-pr up; the broker holds a released name for a while.
+    inputs "Biblioteca Pública Municipal de Palotina" "biblioteca@palotina.pr.gov.br" "Palotina PR" CANCEL
     panel function_cloudflare_free_address
-    assert 'dialogs | grep -q "not approved or has expired"' "$(dialogs)"
-    assert '[ ! -e $CONF/broker-enroll.conf ] && [ ! -e $CONF/tunnel.conf ]'
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'grep -qx "OPAC_HOST=t-palotina-pr-2.example.org" $CONF/tunnel.conf' "$(cat $CONF/tunnel.conf 2>/dev/null)"
+    assert 'dialogs | grep -q "OK .*https://t-palotina-pr-2.example.org"' "$(dialogs)"
 }
 
 @test "B10 own domain: an existing DNS record is replaced only when the person agrees" {

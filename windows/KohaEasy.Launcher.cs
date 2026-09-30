@@ -129,6 +129,18 @@ namespace KohaEasy
         [DllImport("ole32.dll")]
         static extern int PropVariantClear(ref PropVariant pvar);
 
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        // A dark title bar on a window (Windows 10 1809 and later; attribute
+        // 20 since 20H1, 19 before). False where Windows has neither.
+        public static bool SetDarkTitleBar(IntPtr hwnd)
+        {
+            int on = 1;
+            if (DwmSetWindowAttribute(hwnd, 20, ref on, 4) >= 0) { return true; }
+            return DwmSetWindowAttribute(hwnd, 19, ref on, 4) >= 0;
+        }
+
         // This process's windows group on the taskbar under appId.
         public static bool SetProcessAppId(string appId)
         {
