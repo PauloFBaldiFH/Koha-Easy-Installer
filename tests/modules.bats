@@ -396,6 +396,103 @@ EOF
     assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
 }
 
+# --- Biblioteca Fácil database (.bkp and data folder) -----------------------------
+
+# Synthetic backup (tests/lib/bf_backup.py): the program's 15 DBISAM tables
+# with made-up patrons, copies, loans and holds, compressed like the real one.
+bf_backup() { python3 "$KEI_REPO/tests/lib/bf_backup.py" "$@"; }
+# Columns and tables of Koha that the loans and holds are written to.
+bf_circ_schema() {
+    tools_sql "ALTER TABLE items ADD COLUMN itemnotes_nonpublic longtext, ADD COLUMN onloan date;
+      CREATE TABLE reserves (reserve_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11) NOT NULL, reservedate date,
+        biblionumber int(11) NOT NULL, branchcode varchar(10), priority smallint(6) NOT NULL DEFAULT 1, expirationdate date)
+        DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
+}
+
+@test "F03 Biblioteca Fácil database: the backup's tables become MARC 21 records, patrons and a preview, never the operators' passwords" {
+    bf_backup "$W/biblioteca.bkp"
+    bf_circ_schema
+    tools_sql "INSERT INTO borrower_attribute_types VALUES ('CPF', 'CPF');"
+    export KEI_SELECT_FILE="$W/biblioteca.bkp"
+    inputs CPL LIVRO PT new
+    answer yes yes no yes
+    panel lt_br_migrate_bfdb
+    assert '[ "$status" -eq 0 ]' "$output"
+    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
+    assert 'grep -q "Tables read: 15 of 15" "$p" && grep -q "Backup: Backup do dia 30/09/2026 08:15:18 (2026-09-30 08:15)" "$p"' "$(cat "$p")"
+    assert 'grep -q "T09  collection (one row per copy)  105 row(s), 1 deleted, 1 removed in the program" "$p" && grep -q "T04_LEIT: 1 record(s) failed the checksum" "$p"'
+    assert 'grep -q "^Records: 103$" "$p" && grep -q "^Items created: 104$" "$p" && grep -q "BF<number> (tombo missing or repeated): 1" "$p"'
+    assert 'grep -q "^Patrons ready: 3$" "$p" && grep -q "Invalid CPF (not kept): 1    Repeated CPF (kept on the first only): 1" "$p"'
+    assert 'grep -q "^Open loans: 1$" "$p" && grep -q "^Returned loans: 1$" "$p" && grep -q "^Holds still valid: 2$" "$p" && grep -q "Item types: LIVRO -> LIVRO, Revista -> REV" "$p"'
+    assert 'grep -q "loan period 7 days; up to 3 items per patron" "$p"'
+    assert '! grep -rq "segredo123" "$p" /var/log/koha-easy-install 2>/dev/null' "the operators' passwords never reach a screen or a log"
+    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "103" ]' "$(marc_dump "$f" | head -40)"
+    assert 'marc_dump "$f" | grep -qx "245 12 \$a O cortiço" && marc_dump "$f" | grep -qx "100 1  \$a Azevedo, Aluísio"'
+    assert 'marc_dump "$f" | grep -qx "505 0  \$a Capítulo I (p. 9) -- Capítulo II (p. 21)" && marc_dump "$f" | grep -qx "655  4 \$a ROMANCE"'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 1001 \$t 1 \$c EST1 \$d 2020-03-05 \$x Biblioteca Fácil: acervo 1"' "$(marc_dump "$f" | grep ^952 | head -3)"
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$p 1002 \$t 2 \$c EST1 \$d 2020-03-05 \$x Biblioteca Fácil: acervo 2" || marc_dump "$f" | grep -q "\$p 1002 .*acervo 2"'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$p BF5 \$0 1 \$x Biblioteca Fácil: acervo 5"' "repeated tombo, withdrawn: $(marc_dump "$f" | grep 'acervo 5')"
+    assert 'marc_dump "$f" | grep -qx "700 0  \$a Coautora Teste" && marc_dump "$f" | grep -qx "041 0  \$a eng" && ! marc_dump "$f" | grep -q "Autor Apagado\|Livro apagado\|Registro excluído"'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y REV \$p 1003 \$7 1 \$x Biblioteca Fácil: acervo 3"' "not for loan, item type from its description"
+    assert '[ "$(tools_sql "SELECT GROUP_CONCAT(cardnumber ORDER BY cardnumber) FROM borrowers WHERE categorycode = \"PT\" AND cardnumber IN (\"1\",\"2\",\"4\",\"3\",\"5\");")" = "1,2,4" ]' "$(tools_sql "SELECT cardnumber, surname, categorycode FROM borrowers;")"
+    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log" && grep -q "^import_patrons.pl .*--matchpoint cardnumber .*--confirm \[pre=2\]" "$KEI_S/calls.log"' "$(calls)"
+    assert 'dialogs | grep -q "No loan or hold to add"' "the mock import has no Biblioteca Fácil items: $(dialogs | tail -3)"
+    assert '[ "$(pre_backups CIRCULATION)" = "0" ] && [ -z "$(ls -A /tmp/koha_tools.* 2>/dev/null)" ]' "no circulation change; the work copies (patron data) are gone"
+}
+
+@test "F04 Biblioteca Fácil loans and holds: linked by card number and barcode, one transaction, ids above old_issues" {
+    bf_backup "$W/biblioteca.bkp"
+    bf_circ_schema
+    "$KEI_SH" "$PANEL" bf_write_dbreader "$W/bfdb2koha.pl"
+    perl "$W/bfdb2koha.pl" --in "$W/biblioteca.bkp" --branch CPL --itype LIVRO --today 2026-09-30 --circ "$W/circ.sql" --circ-check "$W/check.sql" > /dev/null
+    tools_sql "INSERT INTO borrowers (cardnumber, surname, branchcode, categorycode) VALUES ('1', 'Silva', 'CPL', 'PT'), ('2', 'Pereira', 'CPL', 'PT'), ('4', 'Duplicado', 'CPL', 'PT');
+      INSERT INTO biblio (title, datecreated) VALUES ('O cortiço', CURDATE()); SET @b1 = LAST_INSERT_ID();
+      INSERT INTO biblio (title, datecreated) VALUES ('A menina', CURDATE()); SET @b2 = LAST_INSERT_ID();
+      INSERT INTO items (biblionumber, barcode, homebranch, itemnotes_nonpublic) VALUES (@b1, '1001', 'CPL', 'Biblioteca Fácil: acervo 1'),
+        (@b1, '1002', 'CPL', 'Biblioteca Fácil: acervo 2'), (@b2, 'BF5', 'CPL', 'Biblioteca Fácil: acervo 5');
+      INSERT INTO old_issues (issue_id, borrowernumber, itemnumber) VALUES (500, 1, 1);
+      INSERT INTO reserves (borrowernumber, reservedate, biblionumber, priority) VALUES (1, '2026-01-01', @b1, 1);"
+    answer yes
+    panel tools_locked _lt_br_bfdb_circ "$W/circ.sql" "$W/check.sql"
+    assert '[ "$status" -eq 0 ]' "$output $(tail -30 /var/log/koha-easy-install/tools/bf-circulation-*.log)"
+    assert 'grep -q "^Loans linked: 2 of 2" "$KEI_S/textboxes.log" && grep -q "^Holds linked: 2 of 2" "$KEI_S/textboxes.log"' "$(cat "$KEI_S/textboxes.log")"
+    assert 'dialogs | grep -q "^OK .*Returned loans: 1.*Open loans: 1.*Holds: 2" || dialogs | grep -A0 "^OK" | grep -q "Loans and holds added"' "$(dialogs | tail -3)"
+    local open
+    open=$(tools_sql "SELECT CONCAT(c.issue_id, '|', b.cardnumber, '|', i.barcode, '|', DATE(c.issuedate), '|', c.date_due, '|', i.onloan, '|', i.issues) FROM issues c JOIN borrowers b USING (borrowernumber) JOIN items i USING (itemnumber) WHERE i.barcode = '1001';")
+    assert '[ "$open" = "502|1|1001|2026-09-20|2026-09-27 23:59:00|2026-09-27|1" ]' "open loan: $open"
+    assert '[ "$(tools_sql "SELECT CONCAT(o.issue_id, \"|\", b.cardnumber, \"|\", i.barcode, \"|\", DATE(o.returndate)) FROM old_issues o JOIN borrowers b USING (borrowernumber) JOIN items i USING (itemnumber) WHERE o.issue_id > 500;")" = "501|2|1002|2025-03-07" ]'
+    assert '[ "$(tools_sql "SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = \"issues\";")" -ge 503 ]' "the next check-out never reuses an old_issues id"
+    assert '[ "$(tools_sql "SELECT GROUP_CONCAT(CONCAT(b.cardnumber, \":\", r.priority, \":\", r.expirationdate) ORDER BY r.reserve_id) FROM reserves r JOIN borrowers b USING (borrowernumber) WHERE r.reserve_id > 1;")" = "4:2:2099-12-31,1:1:2099-12-31" ]' "$(tools_sql "SELECT * FROM reserves;")"
+    assert '[ "$(pre_backups CIRCULATION)" = "1" ]'
+    # Run again: the same loans and holds are not added twice.
+    panel tools_locked _lt_br_bfdb_circ "$W/circ.sql" "$W/check.sql"
+    assert 'grep -q "^Loans already in Koha (skipped): 2" "$KEI_S/textboxes.log" && grep -q "^Holds already in Koha (skipped): 2" "$KEI_S/textboxes.log" && dialogs | grep -q "No loan or hold to add"' "$(dialogs | tail -3)"
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM old_issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM reserves;")" = "3" ] && [ "$(pre_backups CIRCULATION)" = "1" ]' "$(tools_sql "SELECT * FROM reserves;")"
+}
+
+@test "F05 Biblioteca Fácil: data folder read like the backup; a file that is not a backup, or a declined preview, changes nothing" {
+    bf_backup --folder "$W/Dados"
+    bf_circ_schema
+    export KEI_SELECT_FILE="$W/Dados/T09_ACER.dat"
+    inputs CPL LIVRO PT new
+    answer no
+    panel lt_br_migrate_bfdb
+    assert 'grep -q "^Records: 103$" "$KEI_S/textboxes.log" && grep -q "^Patrons ready: 3$" "$KEI_S/textboxes.log"' "$(cat "$KEI_S/textboxes.log")"
+    head -c 4000 /dev/urandom > "$W/estragado.bkp"
+    export KEI_SELECT_FILE="$W/estragado.bkp"
+    inputs CPL LIVRO PT new
+    panel lt_br_migrate_bfdb
+    assert 'dialogs | grep -q "not a Biblioteca Fácil backup"' "$(dialogs | tail -3)"
+    bf_backup "$W/biblioteca.bkp"
+    head -c 6000 "$W/biblioteca.bkp" > "$W/cortado.bkp"
+    export KEI_SELECT_FILE="$W/cortado.bkp"
+    inputs CPL LIVRO PT new
+    panel lt_br_migrate_bfdb
+    assert '[ "$(dialogs | grep -c "not a Biblioteca Fácil backup")" = "2" ]' "a cut backup is refused: $(dialogs | tail -3)"
+    assert '! grep -q "bfdb2koha.pl.*--marc" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl\|^import_patrons.pl" "$KEI_S/calls.log"' "$(calls)"
+    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
+}
+
 # --- marc_replace.pl ---------------------------------------------------------------
 
 KS=/run/kei-mock/koha
