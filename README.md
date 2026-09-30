@@ -122,7 +122,7 @@ Open **PowerShell** (Start menu, type *PowerShell*; no need to run it as adminis
 [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
 ```
 
-This line is the only way to install Koha on Windows.
+If you prefer double-clicking, download [**Install-Koha.cmd**](https://github.com/PauloFBaldiFH/Koha-Easy-Installer/blob/main/windows/Install-Koha.cmd) (**Download raw file**, the arrow at the top right of that page) and double-click it. It runs exactly the same line, so the install is identical. The file is not signed: if Windows shows "Windows protected your PC", click **More info > Run anyway**. It is plain text, so you can open it in Notepad and read it first.
 
 The installer does everything else and shows each step in plain language:
 
