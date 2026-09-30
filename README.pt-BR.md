@@ -152,7 +152,7 @@ O comportamento em um Windows real (o instalador, notificações, ícone de stat
 | 7 | Diagnóstico e manutenção | Status, verificação, logs, otimização |
 | 8 | Central de segurança | Fail2ban, firewall, troca de senha |
 | 9 | Configurações e parâmetros do Koha | Dimensionamento, e-mail, superbibliotecário, SIP2/Z39.50, relógio |
-| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração, mensagens por WhatsApp / Telegram, auxílio à catalogação, substituir um registro MARC |
+| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração, mensagens por WhatsApp / Telegram, auxílio à catalogação, substituir um registro MARC, consulta à CDD |
 | 11 | Ferramentas gerais | htop/nethogs, navegador de terminal, gerenciador de arquivos |
 | 12 | Agendamentos e tarefas (cron) | Ver, entender, regenerar ou editar as tarefas automáticas |
 | 13 | Idiomas do Koha e do painel | Pacotes de idioma do Koha e idioma do painel |
@@ -252,6 +252,16 @@ Mais duas abas da mesma página catalogam um livro a partir de fotos da capa, da
 - O bibliotecário corrige o rascunho ao lado das fotos e segue uma **prévia obrigatória**. Só então o registro é incluído com o `AddBiblio` do Koha, numa única transação sob uma trava do banco, depois de conferir de novo o ISBN no catálogo (um registro com o mesmo ISBN exige marcar uma caixa), com uma cópia do registro e da resposta do modelo guardada em `kei-marc-replace/vision/`. Um formulário enviado duas vezes não inclui nada. Com um biblionumber, o rascunho vai para a substituição acima (com a trava e a versão guardada dela).
 
 Os dois módulos são instalados com a página em `/usr/local/lib/site_perl/KohaEasy/Cataloguing/` e removidos com ela (a configuração fica junto das versões guardadas).
+
+### Consulta à CDD na catalogação (interface da equipe)
+
+**Ferramentas da biblioteca > Consulta à CDD** coloca a CDD inteira na catalogação do Koha, em `/cgi-bin/koha/cataloguing/cdd_lookup.pl`.
+
+- **A CDD não é distribuída com o painel**: a CDD tem direitos autorais da OCLC. **Gerar o índice** pede o exemplar da própria biblioteca (o PDF, ou um `.txt` com o texto dele; o PDF é lido com o `pdftotext`) e gera um índice SQLite no servidor (`/var/lib/koha/<instância>/kei-cdd/cdd.sqlite`, legível só pelo root e pela instância). São lidas as tabelas principais, as Tabelas 1 a 6 e o índice alfabético de assuntos, com os números entre colchetes (não usados) e opcionais marcados. Um arquivo com menos de 100 entradas nas tabelas principais é recusado e o índice anterior é mantido. PDF digitalizado não tem texto: use o texto de um OCR.
+- **A página** pesquisa por número (`869.3`, `869,3`, `T1—09`) ou por palavras do assunto (acentos e plurais não importam). Cada número mostra o lugar na hierarquia, as notas (com os números citados como links), as subdivisões, os assuntos do índice e, para um número que não está impresso nas tabelas, **como provavelmente foi construído** (número base mais Tabela 1, Tabela 2 via —09, Tabela 3 em 810–899, Tabela 4 em 420–499), marcado como sugestão. **Construir um número** acrescenta a notação de uma tabela ao número enquanto você digita.
+- **Na sua biblioteca**: ao lado de cada resultado, quantos títulos e exemplares do catálogo usam aquela classe (com e sem as subdivisões, pelo número de chamada dos exemplares), os próprios títulos e como a biblioteca classificou títulos com as palavras pesquisadas.
+- **Instalar a página** pode adicionar um botão **CDD** ao lado dos campos 082, 083, 090, 092 `$a` e do número de chamada do exemplar (952 `$o`) nos formulários de catalogação, e **Consulta à CDD** nas ferramentas da página inicial da catalogação (um bloco marcado no `IntranetUserJS`, com backup verificado `PRE-CDD` antes). O botão abre a consulta com o número que já está no campo ou com os assuntos e o título do registro como sugestões; **Usar no registro** coloca o número no campo (082 e 083 recebem o número e o `$2` com a edição quando vazio; 090, 092 e 952 mantêm a notação de autor depois dele). **Copiar** copia o número.
+- **Remover a página** remove a página, os botões e o módulo `KohaEasy/CDD.pm`; o índice é mantido.
 
 ## Tarefas automáticas
 

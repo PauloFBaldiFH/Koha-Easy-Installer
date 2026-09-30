@@ -8761,7 +8761,8 @@ function_library_tools() {
             "10" "$(t "◆  Brazil: localization & migration")" \
             "11" "$(t "✉  Messaging: WhatsApp and Telegram")" \
             "12" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
-            "13" "$(t "⇄  Replace a MARC record (staff tool)")" 3>&1 1>&2 2>&3) || return 0
+            "13" "$(t "⇄  Replace a MARC record (staff tool)")" \
+            "14" "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_marc_import ;;
             2) lt_marc_undo ;;
@@ -8776,6 +8777,7 @@ function_library_tools() {
             11) function_messaging ;;
             12) function_cataloguing ;;
             13) function_marc_replace ;;
+            14) function_cdd ;;
         esac
         clear
     done
@@ -15624,6 +15626,1476 @@ lt_mr_versions() {
         find "$MR_DIR" -maxdepth 1 -name '*.xml' -printf '%TY-%Tm-%Td %TH:%TM  %f\n' 2>/dev/null | sort -r | head -n 200
     } > "$out"
     ui_textbox "$(t "Versions saved by the page")" "$out"
+}
+
+# ======================================================================
+# 34. CDD LOOKUP IN THE CATALOGUING (STAFF INTERFACE)
+# ----------------------------------------------------------------------
+# cataloguing/cdd_lookup.pl: the CDD (Dewey) searched while cataloguing, by
+# number or by subject, with the hierarchy, the list of subjects, a hint of
+# how built numbers were made and the numbers the library already uses. A
+# CDD button next to the class fields of the cataloguing form opens it and
+# puts the chosen number in the field. The DDC is copyrighted by OCLC and
+# is not distributed with the panel: the library builds the index from its
+# own copy (the PDF, or the text of the PDF) under Library tools > CDD
+# lookup, and the index stays on its server (kei-cdd in the folder of the
+# instance). The page only
+# reads Koha; removing it keeps the index.
+# ======================================================================
+CDD_DIR="/var/lib/koha/${INSTANCE}/kei-cdd"
+CDD_DB="${CDD_DIR}/cdd.sqlite"
+CDD_INFO="${CDD_DIR}/cdd.info"
+CDD_FILE="${KOHA_INTRA_CGI}/cataloguing/cdd_lookup.pl"
+CDD_PM="${KEI_PERL_DIR}/KohaEasy/CDD.pm"
+CDD_STATE="${CONF_DIR}/cdd_lookup.state"
+CDD_JS_BEGIN="/* koha-easy-installer cdd begin */"
+CDD_JS_END="/* koha-easy-installer cdd end */"
+# Texts of the page (see cdd_text).
+CDD_KEYS="title search_ph search main_classes table no_index index_info edition results no_results in_library titles items \
+    with_sub incl_sub apply copy copied narrower subjects subjects_below built analysis analysis_hint rest st_bracket st_option st_index \
+    within lib_titles words suggest from build build_hint lookup gone cataloguing"
+
+# The reader of the CDD and the searches of the page (KohaEasy::CDD).
+cdd_pm() {
+    cat <<'CDDPM'
+package KohaEasy::CDD;
+
+# koha-easy-installer: the CDD (Dewey Decimal Classification) lookup.
+#
+# Reads the text of the library's own copy of the CDD (the text of the PDF,
+# as pdftotext gives it) and builds a small SQLite index with three parts:
+#
+#   - the schedules and the tables (entries): number, caption, notes, the
+#     number above it in the hierarchy;
+#   - the alphabetical list of subjects with their numbers (terms), when the
+#     copy has one ("Tabela Resumida": "869.3 - POESIA BRASILEIRA");
+#   - facts about the file (meta): edition, name, date, counts.
+#
+# The DDC is copyrighted by OCLC: nothing of it is distributed with the
+# panel. Each library builds the index from the copy it owns, on its server.
+#
+# The reader follows the conventions of the printed schedules: a line that
+# starts with a number starts an entry (the lines after it are its notes);
+# ".5" means the last three-digit number plus ".5"; numbers in [brackets] are
+# not used; numbers in (parentheses) are options; "—01" lines are table
+# notation. A number is taken only if it keeps the order of the schedules,
+# so a number at the start of a wrapped line of notes does not become an
+# entry. The summaries ("RESUMO") repeat numbers: the longest text wins.
+#
+# Used by the panel (build) and by cataloguing/cdd_lookup.pl (the rest).
+# Nothing here talks to Koha: text in, index out; index in, answers out.
+
+use strict;
+use warnings;
+use utf8;
+use DBI;
+use Encode qw( decode );
+use POSIX ();
+use Unicode::Normalize qw( NFD );
+
+our $VERSION = '1';
+our $SCHEMA  = '1';
+
+# ----------------------------------------------------------------------
+# Text helpers
+# ----------------------------------------------------------------------
+
+# Lower case, no accents, only letters and digits (for searching).
+sub norm {
+    my $s = lc( NFD( shift // '' ) );
+    $s =~ s/\p{Mn}+//g;
+    $s =~ s/[^\p{L}\p{N}]+/ /g;
+    $s =~ s/^ +| +$//g;
+    return $s;
+}
+
+my %STOP = map { $_ => 1 } qw(
+    a o e as os um uma de da do das dos em no na nos nas para por com sem ao aos
+    the of and in on for to by with an
+    el la los las y en del con por para
+    le les des du et au aux
+);
+
+# Search words of a query: stop words out and the ending of longer words
+# dropped, so one form finds the others ("infantis" finds "infantil" and
+# "infanto-juvenil", "livros" finds "livro").
+sub tokens {
+    my %seen;
+    my @t;
+    for my $w ( split / /, norm(shift) ) {
+        next if $STOP{$w} || ( length($w) < 2 && $w !~ /^\d$/ );
+        if    ( length($w) >= 7 ) { substr( $w, -2 ) = '' }
+        elsif ( length($w) >= 5 ) { $w =~ s/s$// }
+        push @t, $w unless $seen{$w}++;
+    }
+    return @t;
+}
+
+# A class number as typed ("869,3", " 869.3 ", "T1-09", "t2—81") in the form
+# of the index ("869.3", "T1-09"); undef when it is not one.
+sub clean_number {
+    my $s = shift // '';
+    $s =~ s/^\s+|\s+$//g;
+    if ( $s =~ /^T\s*([1-6])\s*[-—–]?\s*(\d+)$/i ) {
+        return "T$1-$2";
+    }
+    $s =~ s/,/./;
+    $s =~ s/(?<=\d) (?=\d)//g;
+    return $1 if $s =~ /^(\d{3}(?:\.\d+)?)\.?$/;
+    return sprintf( '%s00', $1 ) if $s =~ /^(\d)$/;
+    return sprintf( '%s0', $1 ) if $s =~ /^(\d\d)$/;
+    return undef;
+}
+
+# Display form: table notation with the dash of the printed tables.
+sub display_number {
+    my $n = shift // '';
+    $n =~ s/^(T\d)-/$1—/;
+    $n =~ s/^(\d{3}(?:\.\d+)?)-(\d{3}(?:\.\d+)?)$/$1–$2/;
+    return $n;
+}
+
+# Caption and notes of an entry: the caption ends at the first full stop,
+# semicolon, " - " or ", incluindo" (", including").
+sub split_text {
+    my $t = shift // '';
+    $t =~ s/^\*+\s*//;
+    $t =~ s/\s+/ /g;
+    $t =~ s/^\s+|\s+$//g;
+    my ( $h, $n ) = ( $t, '' );
+    if ( $t =~ /^(.+?)(?:\.\s+(?=\S)|;\s+|\s+(?=\*\p{Lu})|\s+-\s+(?=\p{Lu})|\s*,\s+(?i:incluindo|including|inclusive|incluyendo)\b\s*)(.*)$/s ) {
+        ( $h, $n ) = ( $1, $2 );
+        $n = "$1 $n" if $t =~ /^\Q$h\E\s*,\s+((?i:incluindo|including|inclusive|incluyendo))\b/;
+    }
+    if ( length($h) > 160 ) {
+        my $cut = rindex( substr( $h, 0, 160 ), ' ' );
+        $cut = 160 if $cut < 40;
+        $n = substr( $h, $cut ) . ( $n ne '' ? ". $n" : '' );
+        $h = substr( $h, 0, $cut ) . '…';
+    }
+    $h =~ s/[\s.,;:]+$//;
+    $n =~ s/^[\s.,;:]+//;
+    return ( $h, $n );
+}
+
+# ----------------------------------------------------------------------
+# Hierarchy
+# ----------------------------------------------------------------------
+
+# Numbers above a schedule number, nearest first: 641.59 -> 641.5, 641,
+# 640, 600. Table notation: T2-81 -> T2-8.
+sub broader {
+    my $n = shift // '';
+    my @c;
+    if ( $n =~ /^(T\d)-(\d+)$/ ) {
+        my ( $t, $d ) = ( $1, $2 );
+        push @c, "$t-" . substr( $d, 0, $_ ) for reverse 1 .. length($d) - 1;
+        return @c;
+    }
+    my ( $i, $d ) = $n =~ /^(\d{3})(?:\.(\d+))?/ or return ();
+    if ( defined $d ) {
+        push @c, "$i." . substr( $d, 0, $_ ) for reverse 1 .. length($d) - 1;
+        push @c, $i;
+    }
+    push @c, substr( $i, 0, 2 ) . '0' if substr( $i, 2, 1 ) ne '0';
+    push @c, substr( $i, 0, 1 ) . '00' if substr( $i, 1, 2 ) ne '00';
+    return @c;
+}
+
+# Digits of a schedule number without the point (641.59 -> 64159).
+sub digits { my $n = shift // ''; $n =~ s/\D//g; return $n }
+
+# Digits back to a number: a point after the third digit.
+sub from_digits {
+    my $d = shift // '';
+    $d .= '0' x ( 3 - length $d ) if length $d < 3;
+    return length $d > 3 ? substr( $d, 0, 3 ) . '.' . substr( $d, 3 ) : $d;
+}
+
+# ----------------------------------------------------------------------
+# Reading the text of the CDD
+# ----------------------------------------------------------------------
+
+my $UP  = qr/[\p{Lu}]/;
+my $DEC = qr/\.(?:\d{3}(?: \d{1,3})+|\d+)/;    # ".5", ".900 01" (DDC groups of three)
+my $ABS = qr/\d{3}(?:$DEC)?/;
+
+# parse(\@lines) -> { entries => { num => {...} }, terms => [ [num, term] ], meta => {...} }
+sub parse {
+    my ($lines) = @_;
+    my ( %e, @terms, %meta );
+    my $mode = 'intro';
+    my ( $class, $base, $last, $cur, $term, $table ) = ( undef, undef, '', undef, undef, 0 );
+    my ( $summary, $sum_last ) = ( 0, '' );
+    my $order = 0;
+
+    my $add = sub {
+        my ( $num, $kind, $text, %o ) = @_;
+        my $x = $e{$num};
+        if ( !$x ) {
+            $x = $e{$num} = { num => $num, kind => $kind, text => $text, order => ++$order, %o };
+        } elsif ( length($text) > length( $x->{text} ) || $x->{kind} eq 'main' ) {
+            @$x{ keys %o } = values %o;
+            $x->{text} = $text;
+            $x->{kind} = $kind;
+        }
+        return $x;
+    };
+
+    for my $raw (@$lines) {
+        my $l = $raw // '';
+        $l =~ s/[\x{00a0}\t\x{2002}-\x{200b}]/ /g;
+        $l =~ s/\s+/ /g;
+        $l =~ s/^ +| +$//g;
+        next if $l eq '' || $l =~ /^\d{1,4}$/;    # blank lines, page numbers
+        next if $l =~ /\.{6,}/;                   # table of contents
+        my $n = norm($l);
+
+        $meta{edition} //= $1 if $n =~ /^(\d{2}) ?(?:a )?(?:edicao|edition|edicion)\b/ || $n =~ /^(?:cdd|ddc) (\d{2})\b/;
+
+        # Section headings.
+        if ( $n =~ /tabela resumida|relative index|indice relativo/ && length($n) < 80 ) {
+            ( $mode, $term, $cur ) = ( 'index', undef, undef );
+            next;
+        }
+        if ( $l =~ /^(?:Tabela|Table|Tabla) ([1-6])\. ($UP.*)$/ ) {
+            ( $mode, $table, $cur, $summary ) = ( 'table', $1, undef, 0 );
+            ( $meta{"t$1"} //= $2 ) =~ s/\s*\(.*$//;
+            next;
+        }
+        if ( $n =~ /^(?:classe|class|clase) (\d)00\b/ && length($n) < 80 ) {
+            ( $mode, $class, $base, $last, $cur, $summary ) = ( 'schedule', $1, undef, '', undef, 0 );
+            next;
+        }
+        # The heading of the schedules on each page ends the entry before it.
+        if ( $mode ne 'intro' && $mode ne 'index' && $l =~ /^(?:CDD|DDC)\s*[–—-]\s*CLASSIFICA/i ) {
+            undef $cur;
+            next;
+        }
+        if ( $n =~ /^(?:resumo|summary|resumen|sumario)$/ ) {
+            if ( $mode eq 'schedule' || $mode eq 'table' ) {
+                ( $summary, $sum_last, $cur ) = ( 1, '', undef );
+            }
+            next;
+        }
+
+        # Main classes ("CDD 23 – Resumo das Classes Básicas": "800 Literatura").
+        if ( $mode eq 'intro' && $l =~ /^(\d)00 ($UP.*)$/ ) {
+            $add->( "${1}00", 'main', $2 );
+            next;
+        }
+
+        # The alphabetical list: "869.3 - POESIA BRASILEIRA", a few written
+        # the other way round, and captions wrapped on the next line.
+        if ( $mode eq 'intro' || $mode eq 'index' ) {
+            my ( $num, $t );
+            if ( $l =~ /^(\d{3}(?:[.,]\d+)?) ?[-–—] ?(\S.*)$/ || $l =~ /^(\d{3}(?:[.,]\d+)?)\t(\S.*)$/ ) {
+                ( $num, $t ) = ( $1, $2 );
+            } elsif ( $l =~ /^(\S.*?) [-–—] (\d{3}(?:[.,]\d+)?)$/ ) {
+                ( $num, $t ) = ( $2, $1 );
+            }
+            if ( defined $num ) {
+                $mode = 'index';
+                $num =~ tr/,/./;
+                $term = [ $num, $t ];
+                push @terms, $term;
+            } elsif ( $mode eq 'index' && $term && $l !~ /\p{Ll}/ ) {
+                $term->[1] .= ' ' . $l;
+            }
+            next;
+        }
+
+        if ( $mode eq 'table' ) {
+            if ( $l =~ /^>? ?(?:T[1-6] ?)?[—–] ?([\[(]?) ?(\d[\d ]*?)(?: ?[–—-]+ ?(?:T[1-6] ?)?[—–]? ?(\d[\d ]*?))? ?[\])]? ([\p{Lu}*\[(].*)$/ ) {
+                my ( $br, $from, $to, $t ) = ( $1, $2, $3, $4 );
+                s/ //g for grep { defined } $from, $to;
+                my $num = "T$table-$from";
+                $num .= "-$to" if defined $to && $to ne $from;
+                $cur = $add->(
+                    $num, 'table', $t,
+                    tbl       => $table,
+                    status    => $br eq '[' ? 'bracket' : $br eq '(' ? 'option' : '',
+                    range_end => defined $to ? "T$table-$to" : undef
+                );
+            } elsif ($cur) {
+                $cur->{text} .= ' ' . $l;
+            }
+            next;
+        }
+
+        next unless $mode eq 'schedule';
+
+        # A new entry: "641.5 Caption", ".59 Caption" (under the last
+        # three-digit number), "1 Caption" (a PDF that lost the point) and
+        # ranges "641.593–.599"; brackets, parentheses, "*" and ">" marks.
+        my ( $mark, $from, $to, $t, $rel );
+        if ( $l =~ /^(?:> ?)?\*? ?([\[(]?) ?($ABS)(?: ?[–—-] ?($ABS|$DEC))? ?[\])]? (.+)$/ ) {
+            ( $mark, $from, $to, $t ) = ( $1, $2, $3, $4 );
+        } elsif ( $l =~ /^(?:> ?)?\*? ?([\[(]?) ?($DEC)(?: ?[–—-] ?($DEC|$ABS))? ?[\])]? (.+)$/ ) {
+            ( $mark, $from, $to, $t, $rel ) = ( $1, $2, $3, $4, 1 );
+        } elsif ( $l =~ /^(\d{1,2}) ($UP\p{Ll}.*)$/ ) {
+            ( $mark, $from, $to, $t, $rel ) = ( '', ".$1", undef, $2, 1 );
+            # "69 Museologia" after 068: the next section, its first digit lost.
+            if ( length $1 == 2 && defined $base && defined $class && "$class$1" == $base + 1 ) {
+                ( $from, $rel ) = ( "$class$1", 0 );
+            }
+        }
+        if ( defined $from && $t =~ /^(?:\*|[\[(]?$UP|\d{4}\b)/ ) {
+            for ( grep { defined } $from, $to ) { s/ //g }
+            # Numbers from the point on belong to the last three-digit number
+            # before the summary (the summaries do not change it).
+            my $num = $rel ? ( defined $base ? substr( $base, 0, 3 ) . $from : undef ) : $from;
+            # The summary ends where the numbers start again from the top.
+            $summary = 0 if $summary && defined $num && $num le $sum_last;
+            # A three-digit number may come out of order (a centred entry printed
+            # before its members). The running head of a page ("791 Artes
+            # recreativas 791") only says which section goes on.
+            $t =~ s/ \Q$from\E\.?$// if !$rel;
+            if ( defined $num && ( !defined $class || substr( $num, 0, 1 ) eq $class ) && ( $summary || $num ge $last || !$rel ) ) {
+                my $end;
+                if ( defined $to ) {
+                    $end = $to =~ /^\./ ? substr( $num, 0, 3 ) . $to : $to;
+                }
+                my $key = defined $end && $end ne $num ? "$num-$end" : $num;
+                $cur = $add->(
+                    $key, 'schedule', $t,
+                    status    => $mark eq '[' ? 'bracket' : $mark eq '(' ? 'option' : '',
+                    range_end => $end
+                );
+                if ($summary) {
+                    $sum_last = $num;
+                } elsif ( $num lt $last && substr( $num, 0, 3 ) eq substr( $last, 0, 3 ) ) {
+                    # Back to the number of the section being read: the
+                    # heading repeated on a new page; the order goes on.
+                } else {
+                    $last = $num;
+                    $base = substr( $num, 0, 3 ) unless $rel;
+                }
+                next;
+            }
+        }
+        $cur->{text} .= ' ' . $l if $cur;
+    }
+
+    return { entries => \%e, terms => \@terms, meta => \%meta };
+}
+
+# The text of a file: UTF-8, or Windows-1252 when it is not valid UTF-8.
+sub read_text {
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or die "cannot read $path: $!\n";
+    my $raw = do { local $/; <$fh> };
+    close $fh;
+    $raw =~ s/^\xEF\xBB\xBF//;
+    my $text = eval { decode( 'UTF-8', $raw, Encode::FB_CROAK ) };
+    $text = decode( 'cp1252', $raw ) unless defined $text;
+    return $text;
+}
+
+# ----------------------------------------------------------------------
+# The index
+# ----------------------------------------------------------------------
+
+sub connect_db {
+    my ( $path, $write ) = @_;
+    my %o = ( RaiseError => 1, PrintError => 0, AutoCommit => 1, sqlite_unicode => 1 );
+    $o{sqlite_open_flags} = DBD::SQLite::OPEN_READONLY() if !$write && eval { require DBD::SQLite; 1 };
+    return DBI->connect( "dbi:SQLite:dbname=$path", '', '', \%o );
+}
+
+# build(TEXT_FILE, DB_FILE, NAME) -> { entries, schedule, tables, terms, edition }
+# The index is written next to DB_FILE and renamed over it at the end.
+sub build {
+    my ( $in, $out, $name ) = @_;
+    my $p = parse( [ split /\r\n|\r|\n|\f/, read_text($in) ] );
+    my $e = $p->{entries};
+
+    my $tmp = "$out.new";
+    unlink $tmp;
+    my $dbh = connect_db( $tmp, 1 );
+    $dbh->do($_) for (
+        'CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)',
+        'CREATE TABLE entries (num TEXT PRIMARY KEY, kind TEXT, tbl INTEGER, heading TEXT, notes TEXT, status TEXT, range_end TEXT, parent TEXT, sortkey TEXT, hnorm TEXT, norm TEXT)',
+        'CREATE TABLE terms (id INTEGER PRIMARY KEY, num TEXT, term TEXT, norm TEXT)',
+    );
+    $dbh->begin_work;
+    my $ins = $dbh->prepare('INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+    my %n = ( entries => 0, schedule => 0, tables => 0, terms => 0 );
+    for my $num ( sort keys %$e ) {
+        my $x = $e->{$num};
+        my ( $h, $notes ) = split_text( $x->{text} );
+        next if $h eq '';
+        my ($start) = $num =~ /^(T\d-\d+|\d{3}(?:\.\d+)?)/;
+        my $parent = '';
+        for my $b ( broader($start) ) {
+            if ( $e->{$b} ) { $parent = $b; last }
+        }
+        $ins->execute( $num, $x->{kind}, $x->{tbl}, $h, $notes, $x->{status} // '', $x->{range_end}, $parent, $start . ( $num eq $start ? '' : '~' ), norm($h), norm("$h $notes") );
+        $n{entries}++;
+        $n{ $x->{kind} eq 'table' ? 'tables' : 'schedule' }++;
+    }
+    my $tins = $dbh->prepare('INSERT INTO terms (num, term, norm) VALUES (?,?,?)');
+    my %seen;
+    for my $t ( @{ $p->{terms} } ) {
+        my ( $num, $term ) = @$t;
+        next unless $num =~ /^\d{3}(?:\.\d+)?$/;
+        $term =~ s/\s+/ /g;
+        $term =~ s/^\s+|\s+$//g;
+        next if $term eq '' || $seen{"$num\t$term"}++;
+        $tins->execute( $num, $term, norm($term) );
+        $n{terms}++;
+    }
+    my %meta = ( %{ $p->{meta} }, schema => $SCHEMA, name => $name // '', built => POSIX::strftime( '%Y-%m-%d %H:%M', localtime ), edition => $p->{meta}{edition} // '', %n );
+    $dbh->do( 'INSERT INTO meta VALUES (?,?)', undef, $_, $meta{$_} ) for sort keys %meta;
+    $dbh->do('CREATE INDEX entries_parent ON entries (parent)');
+    $dbh->do('CREATE INDEX terms_num ON terms (num)');
+    $dbh->commit;
+    $dbh->disconnect;
+    rename $tmp, $out or die "cannot write $out: $!\n";
+    return \%meta;
+}
+
+# For the panel (run with koha_exec): KohaEasy::CDD::build_cli(TXT, DB, NAME)
+sub build_cli {
+    binmode STDOUT, ':encoding(UTF-8)';
+    my $m = build(@_);
+    print "$_=$m->{$_}\n" for qw( entries schedule tables terms edition );
+    return 1;
+}
+
+sub meta {
+    my ($dbh) = @_;
+    return { map { $_->[0] => $_->[1] } @{ $dbh->selectall_arrayref('SELECT k, v FROM meta') } };
+}
+
+my $COLS = 'num, kind, tbl, heading, notes, status, range_end, parent, sortkey';
+
+sub entry {
+    my ( $dbh, $num ) = @_;
+    return $dbh->selectrow_hashref( "SELECT $COLS FROM entries WHERE num = ?", undef, $num );
+}
+
+sub children {
+    my ( $dbh, $num ) = @_;
+    return $dbh->selectall_arrayref( "SELECT $COLS FROM entries WHERE parent = ? ORDER BY sortkey", { Slice => {} }, $num );
+}
+
+# The ten main classes (or the top entries of a table: "T1").
+sub roots {
+    my ( $dbh, $table ) = @_;
+    return $dbh->selectall_arrayref( "SELECT $COLS FROM entries WHERE tbl = ? AND parent = '' ORDER BY sortkey", { Slice => {} }, $table ) if $table;
+    return $dbh->selectall_arrayref( "SELECT $COLS FROM entries WHERE kind <> 'table' AND parent = '' ORDER BY sortkey", { Slice => {} } );
+}
+
+# The entries above a number, from the main class down.
+sub ancestors {
+    my ( $dbh, $num ) = @_;
+    my ($start) = $num =~ /^(T\d-\d+|\d{3}(?:\.\d+)?)/ or return [];
+    my @up;
+    my %seen;
+    my $x = entry( $dbh, $num );
+    my @c = $x ? () : broader($start);
+    my $p = $x ? $x->{parent} : undef;
+    while (1) {
+        my $y;
+        if ( defined $p ) {
+            last if $p eq '' || $seen{$p}++;
+            $y = entry( $dbh, $p );
+        } else {
+            while ( @c && !$y ) { $y = entry( $dbh, shift @c ) }
+        }
+        last unless $y;
+        unshift @up, $y;
+        $p = $y->{parent};
+    }
+    return \@up;
+}
+
+# Ranges that hold a number ("641.593–641.599" holds 641.5972, "T1—093-099"
+# holds T1—0981).
+sub ranges_with {
+    my ( $dbh, $num ) = @_;
+    my ( $t, $n ) = $num =~ /^(T\d-)?(\d[\d.]*)$/ or return [];
+    my $like = defined $t ? "$t%" : substr( $n, 0, 3 ) . '%';
+    my $dig = sub { ( my $x = shift ) =~ s/^T\d-//; return digits($x) };
+    my $r = $dbh->selectall_arrayref( "SELECT $COLS FROM entries WHERE range_end IS NOT NULL AND num LIKE ? ORDER BY sortkey", { Slice => {} }, $like );
+    return [ grep {
+        my ( $a, $b ) = ( $dig->( $_->{sortkey} =~ s/~$//r ), $dig->( $_->{range_end} ) );
+        my $w = length $b;
+        my $d = substr( $dig->($num), 0, $w );
+        length($d) == $w && $d ge substr( $a . '0' x $w, 0, $w ) && $d le $b;
+    } @$r ];
+}
+
+sub terms_of {
+    my ( $dbh, $num ) = @_;
+    return $dbh->selectcol_arrayref( 'SELECT term FROM terms WHERE num = ? ORDER BY term', undef, $num );
+}
+
+# Subjects of the alphabetical list under a number (869 -> 869.3 POESIA...).
+sub terms_below {
+    my ( $dbh, $num, $limit ) = @_;
+    return $dbh->selectall_arrayref( 'SELECT num, term FROM terms WHERE num LIKE ? AND num <> ? ORDER BY num, term LIMIT ?', { Slice => {} }, "$num%", $num, $limit || 60 );
+}
+
+# How a number not printed in the schedules was probably built: the
+# longest number of the schedules (or of the list of subjects) it starts
+# with, then Table 1 (standard subdivisions: terminal zeros of a class or
+# division dropped first), Table 2 (areas, after —09 or added directly),
+# Table 3 (literary forms, 810-899) or Table 4 (languages, 420-499). Only a
+# hint: the notes of the schedules decide.
+sub analyse {
+    my ( $dbh, $num ) = @_;
+    return [] unless $num =~ /^\d{3}(?:\.\d+)?$/;
+    my $d = digits($num);
+    my @try;
+    for my $len ( reverse 3 .. length($d) - 1 ) {
+        my $rest = substr( $d, $len );
+        # 510 + 05 = 510.5: the zeros of 510 were dropped before adding.
+        if ( $len == 3 && $rest !~ /^0/ && ( my $short = substr( $d, 0, 3 ) ) =~ s/0+$// ) {
+            $rest = substr( $d, length $short ) if substr( $d, length $short, 1 ) eq '0';
+        }
+        push @try, [ from_digits( substr( $d, 0, $len ) ), $rest ];
+    }
+    # 603 = 600 + 03, 520.3 = 520 + 03 (a class or a division plus Table 1).
+    for my $k ( 2, 1 ) {
+        push @try, [ from_digits( substr( $d, 0, $k ) ), substr( $d, $k ) ] if substr( $d, $k, 1 ) eq '0';
+    }
+    for my $t (@try) {
+        my ( $bn, $rest ) = @$t;
+        next if $bn eq $num || $rest eq '';
+        my $b = entry( $dbh, $bn );
+        if ( !$b ) {
+            # A number of the list of subjects can be the base too.
+            my $terms = terms_of( $dbh, $bn );
+            $b = { num => $bn, heading => $terms->[0], kind => 'index' } if @$terms;
+        }
+        next if !$b || $b->{kind} eq 'table';
+        my @steps = ( { num => $b->{num}, heading => $b->{heading}, add => '' } );
+        my $from = sub {
+            my ( $tbl, $r ) = @_;
+            for my $l ( reverse 1 .. length $r ) {
+                my $x = entry( $dbh, "T$tbl-" . substr( $r, 0, $l ) ) or next;
+                push @steps, { num => $x->{num}, heading => $x->{heading}, add => substr( $r, 0, $l ) };
+                return substr( $r, $l );
+            }
+            return $r;
+        };
+        my $i = substr( $d, 0, 3 );
+        if ( $rest =~ /^09([1-9]\d*)$/ ) {
+            my $x = entry( $dbh, 'T1-09' );
+            push @steps, { num => 'T1-09', heading => $x ? $x->{heading} : '', add => '09' };
+            $rest = $from->( 2, $1 );
+        } elsif ( $rest =~ /^0/ ) {
+            $rest = $from->( 1, $rest );
+        } elsif ( $i ge '810' && $i le '899' ) {
+            $rest = $from->( 3, $rest );    # literature: forms of Table 3
+        } elsif ( $i ge '420' && $i le '499' ) {
+            $rest = $from->( 4, $rest );    # languages: Table 4
+        } else {
+            $rest = $from->( 2, $rest );    # areas added directly
+        }
+        push @steps, { num => '', heading => '', add => $rest } if $rest ne '';
+        return \@steps;
+    }
+    return [];
+}
+
+# ----------------------------------------------------------------------
+# Search
+# ----------------------------------------------------------------------
+
+sub _like { my $t = shift; $t =~ s/([%_\\])/\\$1/g; return "%$t%" }
+
+sub _word { my ( $hay, $t ) = @_; return " $hay " =~ /\Q $t\E/ ? 1 : 0 }
+
+# The sentence of the notes that holds a word of the search.
+sub snippet {
+    my ( $notes, @tok ) = @_;
+    return '' unless defined $notes && $notes ne '';
+    for my $s ( split /(?<=[.;])\s+/, $notes ) {
+        my $n = norm($s);
+        next unless grep { index( $n, $_ ) >= 0 } @tok;
+        return length($s) > 240 ? substr( $s, 0, 237 ) . '…' : $s;
+    }
+    return '';
+}
+
+# search(DBH, QUERY, LIMIT) -> [ { num, heading, kind, status, terms => [...], snippet, score } ]
+# All the words must be found in one entry or one subject of the list; when
+# nothing has them all, the entries with the most of them come first.
+sub search {
+    my ( $dbh, $q, $limit ) = @_;
+    $limit ||= 40;
+    my @tok = tokens($q);
+    return [] unless @tok;
+    my $full = norm($q);
+    for my $mode ( 'AND', 'OR' ) {
+        my $where = join " $mode ", map {"norm LIKE ? ESCAPE '\\'"} @tok;
+        my @args = map { _like($_) } @tok;
+        my %r;
+        my $ent = $dbh->selectall_arrayref( "SELECT $COLS, hnorm, norm FROM entries WHERE $where LIMIT 4000", { Slice => {} }, @args );
+        for my $x (@$ent) {
+            my ( $s, $hits ) = ( 0, 0 );
+            for my $t (@tok) {
+                if ( index( $x->{hnorm}, $t ) >= 0 ) { $s += 10 + 4 * _word( $x->{hnorm}, $t ); $hits++ }
+                elsif ( index( $x->{norm}, $t ) >= 0 ) { $s += 2 + _word( $x->{norm}, $t ); $hits++ }
+            }
+            $s += 25 if $x->{hnorm} eq $full;
+            $s += $x->{kind} eq 'table' ? -3 : 3;
+            $s -= 8 if $x->{status} eq 'bracket';
+            $s -= length( $x->{num} ) * 0.2;
+            my $y = $r{ $x->{num} } //= { %$x, score => 0, hits => 0, terms => [] };
+            $y->{score} = $s if $s > $y->{score};
+            $y->{hits}  = $hits if $hits > $y->{hits};
+            $y->{snippet} = index( $x->{hnorm}, $tok[0] ) >= 0 && @tok == 1 ? '' : snippet( $x->{notes}, @tok );
+        }
+        my $ter = $dbh->selectall_arrayref( "SELECT num, term, norm FROM terms WHERE $where LIMIT 4000", { Slice => {} }, @args );
+        for my $x (@$ter) {
+            my ( $s, $hits ) = ( 0, 0 );
+            for my $t (@tok) {
+                next unless index( $x->{norm}, $t ) >= 0;
+                $s += 9 + 3 * _word( $x->{norm}, $t );
+                $hits++;
+            }
+            $s += 25 if $x->{norm} eq $full;
+            my $y = $r{ $x->{num} } //= { num => $x->{num}, kind => 'index', status => '', heading => '', score => -1, hits => 0, terms => [] };
+            push @{ $y->{terms} }, $x->{term} if @{ $y->{terms} } < 4;
+            $y->{tscore} = $s if $s > ( $y->{tscore} // 0 );
+            $y->{hits} = $hits if $hits > $y->{hits};
+        }
+        next if !%r && $mode eq 'AND';
+        for my $y ( values %r ) {
+            $y->{score} = 0 if $y->{score} < 0;
+            $y->{score} += ( $y->{tscore} // 0 ) + 2 * ( @{ $y->{terms} } > 1 ? @{ $y->{terms} } - 1 : 0 );
+            $y->{score} += 30 * $y->{hits};
+        }
+        my @r = sort { $b->{score} <=> $a->{score} || $a->{num} cmp $b->{num} } values %r;
+        splice @r, $limit if @r > $limit;
+        # Captions of the numbers found only in the list of subjects.
+        for my $y ( grep { $_->{heading} eq '' } @r ) {
+            my $x = entry( $dbh, $y->{num} );
+            if ($x) {
+                $y->{$_} = $x->{$_} for qw( heading kind status parent );
+                $y->{snippet} = '';
+            } else {
+                $y->{heading} = $y->{terms}[0] // '';
+                $y->{kind}    = 'index';
+            }
+        }
+        return \@r;
+    }
+    return [];
+}
+
+1;
+CDDPM
+}
+
+# English texts of the page (translated with the panel).
+cdd_text() {
+    case "$1" in
+        title)          t "CDD lookup" ;;
+        search_ph)      t "Class number (e.g. 869.3) or words of the subject (e.g. Brazilian poetry)" ;;
+        search)         t "Search" ;;
+        main_classes)   t "Main classes" ;;
+        table)          t "Table" ;;
+        no_index)       t "The CDD index has not been built yet. In the panel: Library tools > CDD lookup > Build the index from your CDD file." ;;
+        index_info)     t "Index built from {file} on {date}: {sched} entries of the schedules, {tables} of the tables, {terms} subjects of the alphabetical list." ;;
+        edition)        t "Edition" ;;
+        results)        t "Results" ;;
+        no_results)     t "Nothing found. Try another word, fewer words or the class number." ;;
+        in_library)     t "In your library" ;;
+        titles)         t "titles" ;;
+        items)          t "items" ;;
+        with_sub)       t "in subdivisions" ;;
+        incl_sub)       t "including subdivisions" ;;
+        apply)          t "Use in the record" ;;
+        copy)           t "Copy" ;;
+        copied)         t "Copied" ;;
+        narrower)       t "Subdivisions" ;;
+        subjects)       t "Subjects of the list with this number" ;;
+        subjects_below) t "Subjects of the list under this number" ;;
+        built)          t "Not printed in the schedules: probably a built number." ;;
+        analysis)       t "How it was probably built" ;;
+        analysis_hint)  t "Only a hint: the notes of the schedules decide." ;;
+        rest)           t "not explained" ;;
+        st_bracket)     t "Not used" ;;
+        st_option)      t "Optional number" ;;
+        st_index)       t "Only in the list of subjects" ;;
+        within)         t "Within" ;;
+        lib_titles)     t "Titles of your library in this class and its subdivisions:" ;;
+        words)          t "How your library classified titles with these words" ;;
+        suggest)        t "Suggestions for the record being catalogued" ;;
+        from)           t "From" ;;
+        build)          t "Build a number" ;;
+        build_hint)     t "Add the notation of a table to this number, e.g. 03 (dictionaries), 09 (history) or 0981 (Brazil: 09 and the area 81 of Table 2)." ;;
+        lookup)         t "Look up" ;;
+        gone)           t "The cataloguing form was closed or changed: the number was copied instead." ;;
+        cataloguing)    t "Cataloguing" ;;
+    esac
+}
+
+# The page: Perl code around the strings of the panel language.
+cdd_page_script() {
+    cat <<'CDDPL1'
+#!/usr/bin/perl
+
+# cdd_lookup.pl (koha-easy-installer)
+# The CDD (Dewey Decimal Classification) while cataloguing: search by
+# number or by words of the subject, the hierarchy above and below each
+# number, the numbers of the list of subjects, how a number not printed in
+# the schedules was probably built, and how many titles of the library
+# already use each class (the class number of the item call numbers).
+# Opened from the button next to the class fields of the cataloguing form
+# (082, 083, 090, 092, item call number), the number chosen goes into that
+# field ("Use in the record"); otherwise it is copied. Installed and removed
+# by the panel (Library tools > CDD lookup).
+#
+# Read only: nothing in Koha is changed by this page. The index is built by
+# the panel from the library's own copy of the CDD (KohaEasy::CDD); the
+# DDC is copyrighted by OCLC and is not distributed with the panel.
+#
+# Under Koha's persistent Plack the Perl process lives between requests:
+# no named sub captures file-scope lexical variables (package variables).
+
+use Modern::Perl;
+use CGI qw ( -utf8 );
+use C4::Auth qw( checkauth );
+use C4::Context;
+use Encode qw( decode encode );
+use JSON::PP;
+use MIME::Base64 qw( decode_base64 );
+use KohaEasy::CDD;
+
+sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
+CDDPL1
+    local k
+    printf "our \$INDEX = '%s';\nour %%CTX;\nour %%CACHE;\nour %%T = (\n" "$CDD_DB"
+    for k in $CDD_KEYS; do
+        printf '    %s => _d(q{%s}),\n' "$k" "$(cdd_text "$k" | base64 -w0)"
+    done
+    printf ');\n'
+    cat <<'CDDPL2'
+
+run();
+
+sub h {
+    my $s = shift // '';
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    $s =~ s/'/&#39;/g;
+    return $s;
+}
+
+sub u { my $s = encode( 'UTF-8', shift // '' ); $s =~ s/([^A-Za-z0-9_.~-])/sprintf( '%%%02X', ord $1 )/ge; return $s }
+
+# Link to the page, keeping the field of the cataloguing form it serves.
+sub link_to {
+    my %p = @_;
+    $p{target} = $CTX{target} if $CTX{target};
+    return 'cdd_lookup.pl?' . join( '&amp;', map { u($_) . '=' . u( $p{$_} ) } sort grep { defined $p{$_} && $p{$_} ne '' } keys %p );
+}
+
+sub num_link {
+    my ( $num, $label ) = @_;
+    return '<a class="num" href="' . link_to( n => $num ) . '">' . h( $label // KohaEasy::CDD::display_number($num) ) . '</a>';
+}
+
+sub run {
+    my $cgi = CGI->new;
+    # Any member of the staff who can see the catalogue (read only).
+    my ( $user, $cookie ) = checkauth( $cgi, 0, { catalogue => 1 }, 'intranet' );
+    print $cgi->header( -cookie => $cookie, -charset => 'utf-8' );
+
+    %CTX = ( target => '', edition => '' );
+    my $target = $cgi->param('target') // '';
+    $CTX{target} = $target if $target =~ /^[A-Za-z0-9_-]{1,80}$/;
+    my ( $q, $n, $t, $hint ) = map { my $v = $cgi->param($_) // ''; $v =~ s/^\s+|\s+$//g; substr( $v, 0, 400 ) } qw( q n t hint );
+
+    my $dbh = -r $INDEX ? eval { KohaEasy::CDD::connect_db($INDEX) } : undef;
+    my $meta = $dbh ? eval { KohaEasy::CDD::meta($dbh) } : undef;
+    if ( !$meta ) {
+        render_page( '<div class="msg warn">' . h( $T{no_index} ) . '</div>', '' );
+        return;
+    }
+    $CTX{edition} = $meta->{edition} // '';
+
+    my $body;
+    my $num = KohaEasy::CDD::clean_number( $n ne '' ? $n : $q );
+    if ( $t =~ /^[1-6]$/ ) {
+        $body = table_view( $dbh, $meta, $t );
+    } elsif ( defined $num && ( $n ne '' || $q ne '' ) ) {
+        $body = number_view( $dbh, $meta, $num );
+        $q = KohaEasy::CDD::display_number($num) if $n eq '';
+    } elsif ( $q ne '' ) {
+        $body = search_view( $dbh, $q );
+    } else {
+        $body = home_view( $dbh, $meta, $hint );
+    }
+    render_page( $body, $q, $meta );
+    $dbh->disconnect;
+    return;
+}
+
+# ----------------------------------------------------------------------
+# The collection: class numbers of the call numbers of the items (the
+# first number with three digits, "R 869.3 A848d" -> 869.3), counted once
+# for the whole collection and kept a minute (Plack keeps the process).
+# ----------------------------------------------------------------------
+
+sub classes {
+    return $CACHE{classes} if $CACHE{classes} && time - $CACHE{at} < 60;
+    my $rows = eval {
+        C4::Context->dbh->selectall_arrayref( q{/* kei-cdd:classes */
+            SELECT c, COUNT(DISTINCT biblionumber), COUNT(*)
+            FROM (SELECT REGEXP_SUBSTR(itemcallnumber, '[0-9]{3}([.][0-9]+)?') AS c, biblionumber FROM items WHERE itemcallnumber REGEXP '[0-9]{3}') x
+            GROUP BY c} );
+    } || [];
+    $CACHE{classes} = { map { $_->[0] => [ $_->[1], $_->[2] ] } grep { defined $_->[0] && $_->[0] ne '' } @$rows };
+    $CACHE{at} = time;
+    return $CACHE{classes};
+}
+
+# The start of the class numbers under NUM (800 -> "8", 810 -> "81").
+sub class_prefix {
+    my $num = shift;
+    return $num if $num =~ /\./;
+    ( my $p = $num ) =~ s/0+$//;
+    return $p eq '' ? substr( $num, 0, 1 ) : $p;
+}
+
+# ( titles, items ) with exactly NUM and ( titles, items ) with NUM and the
+# numbers under it; a range counts the numbers inside it.
+sub usage {
+    my $num = shift;
+    my $c   = classes();
+    my @r   = ( 0, 0, 0, 0 );
+    return @r if $num =~ /^T/;
+    if ( $num =~ /^(\d{3}(?:\.\d+)?)-(\d{3}(?:\.\d+)?)$/ ) {
+        my ( $a, $b ) = ( KohaEasy::CDD::digits($1), KohaEasy::CDD::digits($2) );
+        my $w = length $b;
+        $a = substr( $a . '0' x $w, 0, $w );
+        for my $k ( keys %$c ) {
+            my $d = substr( KohaEasy::CDD::digits($k), 0, $w );
+            next unless $d ge $a && $d le $b;
+            $r[2] += $c->{$k}[0];
+            $r[3] += $c->{$k}[1];
+        }
+        return @r;
+    }
+    @r[ 0, 1 ] = @{ $c->{$num} // [ 0, 0 ] };
+    my $p = class_prefix($num);
+    for my $k ( keys %$c ) {
+        next unless index( $k, $p ) == 0;
+        $r[2] += $c->{$k}[0];
+        $r[3] += $c->{$k}[1];
+    }
+    return @r;
+}
+
+sub usage_cell {
+    my $num = shift;
+    my ( $t, $i, $tb, $ib ) = usage($num);
+    return '<span class="none">&ndash;</span>' unless $tb;
+    my $s = $t ? '<b>' . $t . '</b> ' . h( $T{titles} ) : '';
+    $s .= ( $s ne '' ? ' ' : '' ) . '<span class="sub">+' . ( $tb - $t ) . ' ' . h( $T{with_sub} ) . '</span>' if $tb > $t;
+    return $s;
+}
+
+# Titles of the library in NUM and under it: [ biblionumber, title, author, call number ].
+sub titles_in {
+    my $num = shift;
+    return [] if $num =~ /^T/;
+    my ($start) = $num =~ /^(\d{3}(?:\.\d+)?)/;
+    my $rows = eval {
+        C4::Context->dbh->selectall_arrayref( q{/* kei-cdd:titles */
+            SELECT b.biblionumber, b.title, b.author, MIN(i.itemcallnumber) AS cn
+            FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber
+            WHERE REGEXP_SUBSTR(i.itemcallnumber, '[0-9]{3}([.][0-9]+)?') LIKE ?
+            GROUP BY b.biblionumber, b.title, b.author ORDER BY cn, b.title LIMIT 15}, undef, class_prefix($start) . '%' );
+    };
+    return $rows || [];
+}
+
+# How the library classified titles (or authors) with the words of a search.
+sub classified_as {
+    my @tok = grep { length >= 3 } @_;
+    return [] unless @tok;
+    splice @tok, 5 if @tok > 5;
+    my $where = join ' AND ', map {'(b.title LIKE ? OR b.author LIKE ?)'} @tok;
+    my $rows = eval {
+        C4::Context->dbh->selectall_arrayref( qq{/* kei-cdd:words */
+            SELECT REGEXP_SUBSTR(i.itemcallnumber, '[0-9]{3}([.][0-9]+)?') AS c, COUNT(DISTINCT b.biblionumber) AS n
+            FROM biblio b JOIN items i ON i.biblionumber = b.biblionumber
+            WHERE i.itemcallnumber REGEXP '[0-9]{3}' AND $where
+            GROUP BY c ORDER BY n DESC, c LIMIT 8}, undef, map { ( "%$_%", "%$_%" ) } @tok );
+    };
+    return $rows || [];
+}
+
+# ----------------------------------------------------------------------
+# Views
+# ----------------------------------------------------------------------
+
+# Buttons of a number: use it in the field of the record, copy it.
+sub actions {
+    my ( $num, $status ) = @_;
+    return '' if $num =~ /-/ || $status eq 'bracket';
+    my $d = h( KohaEasy::CDD::display_number($num) );
+    my $s = '';
+    $s .= '<button type="button" class="apply" data-num="' . $d . '">' . h( $T{apply} ) . '</button>' if $CTX{target} && $num !~ /^T/;
+    $s .= '<button type="button" class="copy" data-num="' . $d . '">' . h( $T{copy} ) . '</button>';
+    return '<span class="actions">' . $s . '</span>';
+}
+
+sub badge {
+    my $x = shift;
+    return '<span class="badge no">' . h( $T{st_bracket} ) . '</span>' if ( $x->{status} // '' ) eq 'bracket';
+    return '<span class="badge opt">' . h( $T{st_option} ) . '</span>' if ( $x->{status} // '' ) eq 'option';
+    return '<span class="badge idx">' . h( $T{st_index} ) . '</span>' if ( $x->{kind} // '' ) eq 'index';
+    return '';
+}
+
+# Numbers in the notes become links ("classe em 641.5", "T1—09", and "—072"
+# in the notes of a table: a number of the same table).
+sub notes_html {
+    my ( $notes, $tbl ) = @_;
+    my $s = h($notes);
+    $s =~ s{(T[1-6])\s?\x{2014}\s?(\d+)|(?<![\w\x{2014}])\x{2014}\s?(\d+)|(?<![\d.,])(\d{3}(?:[.,]\d+)?)(?![\d])}{
+        defined $1 ? num_link( "$1-$2", "$1\x{2014}$2" )
+        : defined $3 ? ( $tbl ? "\x{2014}" . num_link( "T$tbl-$3", $3 ) : "\x{2014}$3" )
+        : do { ( my $n = $4 ) =~ tr/,/./; '<a class="num" href="' . link_to( n => $n ) . '">' . $4 . '</a>' }
+    }ge;
+    return $s;
+}
+
+sub result_rows {
+    my ($rows) = @_;
+    my $html = '';
+    for my $x (@$rows) {
+        my @other = grep { KohaEasy::CDD::norm($_) ne KohaEasy::CDD::norm( $x->{heading} ) } @{ $x->{terms} // [] };
+        $html .= '<tr><td class="n">' . num_link( $x->{num} ) . '</td><td>'
+            . '<div class="head">' . h( $x->{heading} ) . ' ' . badge($x) . '</div>'
+            . ( @other ? '<div class="terms">' . join( ' &middot; ', map { h($_) } @other ) . '</div>' : '' )
+            . ( ( $x->{snippet} // '' ) ne '' ? '<div class="snip">' . h( $x->{snippet} ) . '</div>' : '' )
+            . '</td><td class="use">' . usage_cell( $x->{num} ) . '</td><td class="act">' . actions( $x->{num}, $x->{status} // '' ) . '</td></tr>';
+    }
+    return $html;
+}
+
+sub results_table {
+    my ($rows) = @_;
+    return '<table class="list"><thead><tr><th>CDD</th><th></th><th>' . h( $T{in_library} ) . '</th><th></th></tr></thead><tbody>' . result_rows($rows) . '</tbody></table>';
+}
+
+sub search_view {
+    my ( $dbh, $q ) = @_;
+    my $r = KohaEasy::CDD::search( $dbh, $q, 40 );
+    my $html = '<h2>' . h( $T{results} ) . '</h2>';
+    $html .= @$r ? results_table($r) : '<p class="msg warn">' . h( $T{no_results} ) . '</p>';
+    my $w = classified_as( KohaEasy::CDD::tokens($q) );
+    if (@$w) {
+        $html .= '<h3>' . h( $T{words} ) . '</h3><ul class="words">'
+            . join( '', map { '<li>' . num_link( $_->[0] ) . ' <span class="sub">' . $_->[1] . ' ' . h( $T{titles} ) . '</span></li>' } @$w ) . '</ul>';
+    }
+    return $html;
+}
+
+sub classes_grid {
+    my ($rows) = @_;
+    return '<div class="grid">' . join(
+        '',
+        map {
+            my ( undef, undef, $tb ) = usage( $_->{num} );
+            '<a class="cell" href="' . link_to( n => $_->{num} ) . '"><span class="n">' . h( KohaEasy::CDD::display_number( $_->{num} ) ) . '</span> '
+                . h( $_->{heading} ) . ( $tb ? ' <span class="sub">' . $tb . ' ' . h( $T{titles} ) . '</span>' : '' ) . '</a>'
+        } @$rows
+    ) . '</div>';
+}
+
+sub home_view {
+    my ( $dbh, $meta, $hint ) = @_;
+    my $html = '';
+    # Opened from the cataloguing form: the title and the subjects of the
+    # record are searched at once.
+    my @parts = grep { /\S/ } split /\s*;\s*/, $hint;
+    if (@parts) {
+        my ( %seen, @rows );
+        for my $p ( @parts[ 0 .. ( $#parts < 3 ? $#parts : 3 ) ] ) {
+            for my $x ( @{ KohaEasy::CDD::search( $dbh, $p, 5 ) } ) {
+                push @rows, $x unless $seen{ $x->{num} }++;
+            }
+        }
+        $html .= '<h2>' . h( $T{suggest} ) . '</h2><p class="hint">' . h( $T{from} ) . ': ' . join( ' &middot; ', map { h($_) } @parts ) . '</p>'
+            . ( @rows ? results_table( \@rows ) : '<p class="msg warn">' . h( $T{no_results} ) . '</p>' );
+    }
+    $html .= '<h2>' . h( $T{main_classes} ) . '</h2>' . classes_grid( KohaEasy::CDD::roots($dbh) );
+    return $html;
+}
+
+sub table_name {
+    my ( $meta, $t ) = @_;
+    return $T{table} . " $t" . ( $meta->{"t$t"} ? " \x{2014} " . $meta->{"t$t"} : '' );
+}
+
+sub table_view {
+    my ( $dbh, $meta, $t ) = @_;
+    my $rows = KohaEasy::CDD::roots( $dbh, $t );
+    return '<h2>' . h( table_name( $meta, $t ) ) . '</h2>' . ( @$rows ? results_table($rows) : '<p class="msg warn">' . h( $T{no_results} ) . '</p>' );
+}
+
+sub number_view {
+    my ( $dbh, $meta, $num ) = @_;
+    my $x    = KohaEasy::CDD::entry( $dbh, $num );
+    my $up   = KohaEasy::CDD::ancestors( $dbh, $num );
+    my $html = '<nav class="crumbs"><a href="' . link_to() . '">' . h( $T{main_classes} ) . '</a>';
+    $html .= ' &rsaquo; <a href="' . link_to( t => $1 ) . '">' . h( $T{table} . " $1" ) . '</a>' if $num =~ /^T(\d)/;
+    $html .= ' &rsaquo; ' . num_link( $_->{num} ) . ' <span class="sub">' . h( $_->{heading} ) . '</span>' for @$up;
+    $html .= '</nav>';
+
+    my $terms = $num =~ /^T/ ? [] : KohaEasy::CDD::terms_of( $dbh, $num );
+    my $heading = $x ? $x->{heading} : $terms->[0] // '';
+    my $shown = { %{ $x // { kind => @$terms ? 'index' : '' } } };
+    $html .= '<div class="entry"><div class="big">' . h( KohaEasy::CDD::display_number($num) ) . '</div><div><div class="title">' . h($heading) . ' ' . badge($shown) . '</div>'
+        . actions( $num, $x ? $x->{status} : '' ) . '</div></div>';
+    $html .= '<p class="notes">' . notes_html( $x->{notes}, $x->{tbl} ) . '</p>' if $x && $x->{notes} ne '';
+    my @other = grep { KohaEasy::CDD::norm($_) ne KohaEasy::CDD::norm($heading) } @$terms;
+    $html .= '<h3>' . h( $T{subjects} ) . '</h3><p>' . join( ' &middot; ', map { h($_) } @other ) . '</p>' if @other;
+
+    for my $r ( @{ KohaEasy::CDD::ranges_with( $dbh, $num ) } ) {
+        next if $r->{num} eq $num;
+        $html .= '<p>' . h( $T{within} ) . ' ' . num_link( $r->{num} ) . ': ' . h( $r->{heading} ) . '</p>';
+    }
+
+    # A number made with the tables (not printed in the schedules).
+    if ( ( !$x || $x->{kind} eq 'main' ) && $num =~ /^\d{3}\.\d/ ) {
+        my $steps = KohaEasy::CDD::analyse( $dbh, $num );
+        if (@$steps) {
+            $html .= '<div class="msg info"><b>' . h( $T{built} ) . '</b><br>' . h( $T{analysis} ) . ': '
+                . join( ' + ', map { $_->{num} ne '' ? num_link( $_->{num} ) . ( $_->{add} ne '' ? ' (' . h( $_->{add} ) . ')' : '' ) . ' ' . h( $_->{heading} ) : h( $_->{add} ) . ' <i>(' . h( $T{rest} ) . ')</i>' } @$steps )
+                . '<br><span class="hint">' . h( $T{analysis_hint} ) . '</span></div>';
+        }
+    }
+
+    my $kids = $num =~ /^T/ || $num =~ /^\d/ ? KohaEasy::CDD::children( $dbh, $num ) : [];
+    $html .= '<h3>' . h( $T{narrower} ) . '</h3>' . results_table($kids) if @$kids;
+
+    if ( $num !~ /^T/ ) {
+        my $below = KohaEasy::CDD::terms_below( $dbh, $num, 60 );
+        if (@$below) {
+            $html .= '<h3>' . h( $T{subjects_below} ) . '</h3><table class="list"><tbody>'
+                . join( '', map { '<tr><td class="n">' . num_link( $_->{num} ) . '</td><td>' . h( $_->{term} ) . '</td><td class="use">' . usage_cell( $_->{num} ) . '</td><td class="act">' . actions( $_->{num}, '' ) . '</td></tr>' } @$below )
+                . '</tbody></table>';
+        }
+        $html .= build_box($num) if $num =~ /^\d{3}(?:\.\d+)?$/ && ( !$x || $x->{status} ne 'bracket' );
+
+        my ( $t, $i, $tb, $ib ) = usage($num);
+        $html .= '<h3>' . h( $T{in_library} ) . '</h3><p><b>' . $t . '</b> ' . h( $T{titles} ) . ', ' . $i . ' ' . h( $T{items} )
+            . ( $tb > $t ? ' <span class="sub">(' . $tb . ' ' . h( $T{titles} ) . ', ' . $ib . ' ' . h( $T{items} ) . ' ' . h( $T{incl_sub} ) . ')</span>' : '' ) . '</p>';
+        my $list = titles_in($num);
+        if (@$list) {
+            $html .= '<p class="hint">' . h( $T{lib_titles} ) . '</p><table class="list"><tbody>'
+                . join( '', map { '<tr><td class="n">' . h( $_->[3] ) . '</td><td><a href="/cgi-bin/koha/catalogue/detail.pl?biblionumber=' . int( $_->[0] ) . '" target="_blank">' . h( $_->[1] ) . '</a> <span class="sub">' . h( $_->[2] ) . '</span></td></tr>' } @$list )
+                . '</tbody></table>';
+        }
+    }
+    return $html;
+}
+
+# Adds the notation of a table to the number (worked out in the page).
+sub build_box {
+    my $num = shift;
+    my $d = h($num);
+    return '<h3>' . h( $T{build} ) . '</h3><div class="build" data-base="' . $d . '"><span class="big2">' . $d . '</span> + <input type="text" id="kei-add" size="10" maxlength="20" inputmode="numeric" placeholder="09"> = <span class="big2" id="kei-built">' . $d . '</span> '
+        . '<a id="kei-look" class="btn" href="' . link_to( n => $num ) . '">' . h( $T{lookup} ) . '</a> '
+        . actions( $num, '' ) . '<p class="hint">' . h( $T{build_hint} ) . '</p></div>';
+}
+
+sub render_page {
+    my ( $body, $q, $meta ) = @_;
+    my $tabs = '';
+    if ($meta) {
+        $tabs = join ' ', map { '<a href="' . link_to( t => $_ ) . '" title="' . h( table_name( $meta, $_ ) ) . '">' . h( $T{table} . " $_" ) . '</a>' }
+            grep { $meta->{"t$_"} } 1 .. 6;
+    }
+    my $info = $meta ? $T{index_info} : '';
+    if ($meta) {
+        my %v = ( file => $meta->{name}, date => $meta->{built}, sched => $meta->{schedule}, tables => $meta->{tables}, terms => $meta->{terms} );
+        $info =~ s/\{(\w+)\}/$v{$1} \/\/ ''/ge;
+        $info = h($info) . ( $meta->{edition} ? ' ' . h( $T{edition} ) . ' ' . h( $meta->{edition} ) . '.' : '' );
+    }
+    my $js = JSON::PP->new->ascii->encode( { target => $CTX{target}, edition => $CTX{edition}, copied => $T{copied}, gone => $T{gone} } );
+    my $home  = $CTX{target} ? '' : '<a class="back" href="/cgi-bin/koha/cataloguing/cataloging-home.pl">' . h( $T{cataloguing} ) . '</a>';
+    my $html = <<"HTML";
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>@{[ h( $T{title} ) ]}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; color: #222; background: #fff; }
+    header { background: #408540; color: #fff; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+    header h1 { font-size: 1.2em; margin: 0; }
+    header h1 a, header .tabs a, header a.back { color: #fff; text-decoration: none; }
+    header .tabs a { padding: 2px 6px; border: 1px solid rgba(255,255,255,.5); border-radius: 3px; font-size: .85em; }
+    header a.back { margin-left: auto; font-size: .9em; }
+    form.search { display: flex; gap: 6px; padding: 12px 16px; background: #f3f7f3; border-bottom: 1px solid #dde7dd; }
+    form.search input { flex: 1; padding: 8px; font-size: 1em; border: 1px solid #aaa; border-radius: 3px; min-width: 0; }
+    main { padding: 4px 16px 24px; max-width: 1100px; }
+    h2 { font-size: 1.15em; margin: 18px 0 8px; } h3 { font-size: 1em; margin: 18px 0 6px; color: #333; }
+    a { color: #006100; } a.num { font-weight: bold; white-space: nowrap; }
+    table.list { border-collapse: collapse; width: 100%; }
+    table.list th { text-align: left; font-size: .8em; color: #666; border-bottom: 2px solid #ddd; padding: 4px 6px; }
+    table.list td { border-bottom: 1px solid #eee; padding: 6px; vertical-align: top; }
+    td.n { width: 1%; white-space: nowrap; } td.use { width: 1%; white-space: nowrap; font-size: .9em; } td.act { width: 1%; white-space: nowrap; }
+    .terms { font-size: .85em; color: #555; margin-top: 2px; } .snip { font-size: .85em; color: #666; margin-top: 2px; }
+    .sub, .hint { color: #777; font-size: .85em; } .none { color: #bbb; }
+    .badge { font-size: .72em; padding: 1px 6px; border-radius: 8px; white-space: nowrap; vertical-align: middle; }
+    .badge.no { background: #f2dede; color: #a94442; } .badge.opt { background: #fcf8e3; color: #8a6d3b; } .badge.idx { background: #e8eef7; color: #31587a; }
+    button, a.btn { padding: 3px 8px; margin-left: 4px; border: 1px solid #408540; background: #fff; color: #306030; border-radius: 3px; cursor: pointer; font-size: .85em; text-decoration: none; display: inline-block; }
+    button.apply { background: #408540; color: #fff; }
+    .crumbs { margin: 12px 0 6px; font-size: .9em; line-height: 1.6; }
+    .entry { display: flex; gap: 14px; align-items: center; margin: 10px 0; }
+    .entry .big { font-size: 1.8em; font-weight: bold; color: #306030; white-space: nowrap; }
+    .entry .title { font-size: 1.15em; font-weight: bold; margin-bottom: 4px; }
+    .notes { line-height: 1.45; background: #fafafa; border-left: 3px solid #cfe0cf; padding: 8px 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+    .grid .cell { border: 1px solid #dde7dd; border-radius: 4px; padding: 8px; text-decoration: none; color: #222; }
+    .grid .cell:hover { background: #f3f7f3; } .grid .n { font-weight: bold; color: #306030; }
+    ul.words { columns: 2; padding-left: 18px; }
+    .build input { padding: 5px; font-size: 1em; } .big2 { font-weight: bold; font-size: 1.1em; }
+    .msg { margin-top: 12px; padding: 10px; border-radius: 4px; } .warn { background: #fcf8e3; color: #8a6d3b; } .info { background: #eef5ee; line-height: 1.6; }
+    footer { padding: 10px 16px; color: #888; font-size: .8em; border-top: 1px solid #eee; }
+    \@media (max-width: 640px) { td.use { display: none; } .entry { flex-direction: column; align-items: flex-start; } ul.words { columns: 1; } }
+  </style>
+</head>
+<body>
+<header><h1><a href="@{[ link_to() ]}">@{[ h( $T{title} ) ]}</a></h1><span class="tabs">$tabs</span>$home</header>
+<form class="search" method="get" action="cdd_lookup.pl">
+  <input type="search" name="q" value="@{[ h($q) ]}" placeholder="@{[ h( $T{search_ph} ) ]}" autofocus>
+  <input type="hidden" name="target" value="@{[ h( $CTX{target} ) ]}">
+  <button type="submit">@{[ h( $T{search} ) ]}</button>
+</form>
+<main>
+$body
+</main>
+<footer>$info</footer>
+<script>
+(function () {
+    var K = $js;
+    function copy(num, btn) {
+        var done = function () { if (btn) { btn.textContent = K.copied; } };
+        if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(num).then(done, function () { fallback(num); done(); }); }
+        else { fallback(num); done(); }
+    }
+    function fallback(num) {
+        var t = document.createElement("textarea"); t.value = num; document.body.appendChild(t); t.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(t);
+    }
+    // The number goes into the field the page was opened from: a class
+    // field (082, 083) takes the whole number; a call number (090, 952 \$o)
+    // keeps what follows the class (the author notation).
+    function apply(num, btn) {
+        var w = window.opener, el = null;
+        try { el = w && !w.closed ? w.document.getElementById(K.target) : null; } catch (e) { el = null; }
+        if (!el) { copy(num, btn); alert(K.gone); return; }
+        var v = el.value.replace(/^\\s+|\\s+\$/g, ""), m = v.match(/^\\S*\\d{3}(?:[.,]\\d+)?(\\s.*)?\$/);
+        el.value = (!/^tag_08[23]_/.test(K.target) && m && m[1]) ? num + m[1] : num;
+        var box = el.closest ? el.closest(".tag") : null;
+        if (/^tag_08[23]_/.test(K.target) && box && K.edition) {
+            var ed = box.querySelector("input[id^='" + K.target.slice(0, 7) + "_subfield_2']");
+            if (ed && !ed.value) { ed.value = K.edition; }
+        }
+        try { el.dispatchEvent(new w.Event("change", { bubbles: true })); } catch (e) {}
+        el.focus();
+        window.close();
+    }
+    document.addEventListener("click", function (e) {
+        var b = e.target.closest ? e.target.closest("button[data-num]") : null;
+        if (!b) return;
+        e.preventDefault();
+        if (b.className.indexOf("apply") >= 0) apply(b.getAttribute("data-num"), b); else copy(b.getAttribute("data-num"), b);
+    });
+    // Build a number: the notation of the table goes after the number;
+    // the final zeros of a class or division (800, 810) are dropped first
+    // (510 + 05 = 510.5), and the point goes after the third digit.
+    var box = document.querySelector(".build");
+    if (box) {
+        var base = box.getAttribute("data-base"), input = document.getElementById("kei-add"), out = document.getElementById("kei-built"),
+            look = document.getElementById("kei-look"), acts = box.querySelectorAll("button[data-num]");
+        input.addEventListener("input", function () {
+            var add = input.value.replace(/[^0-9]/g, ""), d = base.replace(".", "");
+            if (add && base.indexOf(".") < 0) { d = d.replace(/0+\$/, ""); }
+            d = d + add;
+            while (d.length < 3) d += "0";
+            var n = d.length > 3 ? d.slice(0, 3) + "." + d.slice(3) : d;
+            out.textContent = n;
+            look.href = look.href.replace(/([?&]n=)[^&]*/, "\$1" + encodeURIComponent(n));
+            for (var i = 0; i < acts.length; i++) { acts[i].setAttribute("data-num", n); }
+        });
+    }
+})();
+</script>
+</body>
+</html>
+HTML
+    print encode( 'UTF-8', $html );
+    return;
+}
+CDDPL2
+}
+
+# The buttons in the staff interface (a marked block in IntranetUserJS): CDD
+# next to the class fields of the cataloguing form (082 and 083 $a, the call
+# numbers 090 and 092 $a, the item call number 952 $o) and CDD lookup in the
+# tools of the cataloguing home page. The click is caught on the document,
+# so the fields Koha repeats (cloned with the button) work too.
+cdd_js_block() {
+    local label title v
+    label=$(t "CDD lookup")
+    title=$(t "Search the CDD and use the number in this field")
+    for v in label title; do
+        declare -n _s=$v
+        _s=${_s//\\/\\\\}; _s=${_s//\"/\\\"}; _s=${_s//</\\u003c}
+        unset -n _s
+    done
+    cat <<CDDJS
+${CDD_JS_BEGIN}
+\$(document).ready(function () {
+    var url = "/cgi-bin/koha/cataloguing/cdd_lookup.pl";
+    if (/\/cgi-bin\/koha\/cataloguing\/cataloging-home\.pl\$/.test(location.pathname)) {
+        var tools = \$("a[href*='tools/inventory.pl'], a[href*='marc_modification_templates.pl'], a[href*='labels/label-home.pl']").closest("ul").first();
+        if (!tools.length) tools = \$("a[href*='/cgi-bin/koha/tools/']").closest("ul").last();
+        if (tools.length && !tools.find("a[href*='cdd_lookup.pl']").length) {
+            var cls = tools.find("a").first().attr("class") || "circ-button";
+            var a = \$("<a></a>").attr({ "class": cls, href: url }).append(\$("<i></i>").attr("class", "fa fa-sitemap")).append(document.createTextNode(" ${label}"));
+            tools.append(\$("<li></li>").append(a));
+        }
+        return;
+    }
+    if (!/\/cgi-bin\/koha\/cataloguing\/(addbiblio|additem)\.pl\$/.test(location.pathname)) return;
+    var fields = "input[id^='tag_082_subfield_a'], input[id^='tag_083_subfield_a'], input[id^='tag_090_subfield_a'], input[id^='tag_092_subfield_a'], input[id^='tag_952_subfield_o']";
+    function add() {
+        \$(fields).each(function () {
+            if (\$(this).next(".kei-cdd").length) return;
+            \$(this).after(\$("<a href=\"#\" class=\"kei-cdd buttonDot\" style=\"margin-left:4px\"></a>").attr("title", "${title}").text("CDD"));
+        });
+    }
+    add();
+    new MutationObserver(add).observe(document.body, { childList: true, subtree: true });
+    \$(document).on("click", "a.kei-cdd", function (e) {
+        e.preventDefault();
+        var input = \$(this).prev("input")[0];
+        if (!input) return;
+        var n = (input.value.match(/\d{3}(?:[.,]\d+)?/) || [""])[0], hint = [];
+        if (!n) {
+            // The subjects of the record first, then its title.
+            \$("input[id^='tag_650_subfield_a']").each(function () { if (this.value) hint.push(this.value); });
+            var title = \$("input[id^='tag_245_subfield_a']").first().val();
+            if (title) hint.push(title);
+        }
+        var w = window.open(url + "?target=" + encodeURIComponent(input.id) + (n ? "&q=" + encodeURIComponent(n) : "&hint=" + encodeURIComponent(hint.join(" ; ").slice(0, 400))), "kei_cdd", "width=1040,height=780,scrollbars=yes,resizable=yes");
+        if (w) w.focus();
+    });
+});
+${CDD_JS_END}
+CDDJS
+}
+
+cdd_js_sql() {   # cdd_js_sql add|remove FILE: SQL that rewrites IntranetUserJS
+    local cur new
+    cur=$(mr_js_current)
+    cur=$(printf '%s\n' "$cur" | awk -v b="$CDD_JS_BEGIN" -v e="$CDD_JS_END" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }')
+    new="$cur"
+    if [ "$1" = "add" ]; then new="${cur:+${cur}$'\n'}$(cdd_js_block)"; fi
+    printf "START TRANSACTION;\nUPDATE systempreferences SET value = %s WHERE variable = 'IntranetUserJS';\nCOMMIT;\n" "$(sql_quote "$new")" > "$2"
+}
+
+cdd_installed() { [ -f "$CDD_FILE" ]; }
+cdd_js_on() { mr_js_current | grep -qxF "$CDD_JS_BEGIN"; }
+cdd_js_latest() { [ "$(mr_js_current | awk -v b="$CDD_JS_BEGIN" -v e="$CDD_JS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }')" = "$(cdd_js_block)" ]; }
+# cdd_info KEY: a fact about the index (written when it is built).
+cdd_info() { [ -s "$CDD_DB" ] && sed -n "s/^$1=//p" "$CDD_INFO" 2>/dev/null | head -n 1; }
+
+# cdd_require_sqlite LOG: DBD::SQLite (Debian package libdbd-sqlite3-perl)
+# reads the index; checked with Koha's own Perl, as the instance user.
+cdd_require_sqlite() {
+    koha_exec "$1" sqlite-check /usr/bin/perl -MDBD::SQLite -e 1 && return 0
+    display_explanation "Installing the tools to read the CDD (libdbd-sqlite3-perl)..."
+    apt_install libdbd-sqlite3-perl >/dev/null 2>&1
+    koha_exec "$1" sqlite-check /usr/bin/perl -MDBD::SQLite -e 1 && return 0
+    local pkg="libdbd-sqlite3-perl"
+    msg_error "" "$(t 'The package ${pkg} could not be installed. Nothing was changed.\n\nLog: ${APT_LOG}')" 10 72
+    return 1
+}
+
+function_cdd() {
+    require_database || return 0
+    local opt status index
+    while true; do
+        if cdd_installed; then status="$(t "Installed"): /cgi-bin/koha/cataloguing/cdd_lookup.pl"; else status="$(t "Not installed.")"; fi
+        if [ -s "$CDD_DB" ]; then
+            local n ed name built
+            n=$(cdd_info schedule); ed=$(cdd_info edition); name=$(cdd_info name); built=$(cdd_info built)
+            index="$(t 'Index: ${n} entries of the schedules (edition ${ed}), built from ${name} on ${built}.')"
+        else
+            index="$(t "Index: not built yet.")"
+        fi
+        opt=$(ui_menu "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" "$(t "A page of the staff interface to search the CDD while cataloguing: by number or subject, with the hierarchy and how many titles of the library use each class, and a CDD button next to the class fields that puts the number in the record. The CDD is not distributed with the panel: the index is built from the library's own copy (the PDF or its text) and stays on this server.")"$'\n\n'"$index"$'\n'"$status" \
+            "1" "$(t "Build the index from your CDD file (PDF or text)")" \
+            "2" "$(t "Install or update the page")" \
+            "3" "$(t "Remove the page (the index is kept)")") || return 0
+        case "$opt" in
+            1) lt_cdd_build ;;
+            2) lt_cdd_install ;;
+            3) lt_cdd_remove ;;
+        esac
+        clear
+    done
+}
+
+lt_cdd_build() {
+    local file
+    file=$(select_file "/root" "pdf txt" "$(t "Pick your copy of the CDD (.pdf, or .txt with the text of the PDF):")" "$(t "CDD file")") || return 0
+    tools_locked _lt_cdd_build "$file" || return 0
+    if ! cdd_installed && prompt_yes_no "$(t "CDD lookup")" "$(t "Install the CDD lookup page in the staff interface now?")" 9 70; then
+        lt_cdd_install
+    fi
+}
+
+_lt_cdd_build() {
+    local file="$1" log txt stats name n tables terms ed pkg
+    log=$(tools_log cdd)
+    cdd_require_sqlite "$log" || return 1
+    txt="$TOOLS_WORK/cdd.txt"
+    if [ "$(head -c 5 "$file" 2>/dev/null)" = "%PDF-" ]; then
+        if ! command -v pdftotext >/dev/null 2>&1; then
+            display_explanation "Installing the tools to read the CDD (poppler-utils)..."
+            apt_install poppler-utils >/dev/null 2>&1
+        fi
+        if ! command -v pdftotext >/dev/null 2>&1; then
+            pkg="poppler-utils"
+            msg_error "" "$(t 'The package ${pkg} could not be installed. Nothing was changed.\n\nLog: ${APT_LOG}')" 10 72
+            return 1
+        fi
+        display_explanation "Reading the text of the PDF..."
+        printf '$ pdftotext -enc UTF-8 %s\n' "${file##*/}" >> "$log"
+        if ! pdftotext -enc UTF-8 "$file" "$txt" >> "$log" 2>&1 || [ ! -s "$txt" ]; then
+            msg_error "" "$(t 'The text of the PDF could not be read (a scanned PDF has no text: use the text of an OCR). Nothing was changed.\n\nLog: ${log}')" 11 76
+            return 1
+        fi
+    else
+        cp -f -- "$file" "$txt" || return 1
+    fi
+    chown "${INSTANCE}-koha:" "$txt" 2>/dev/null || true
+    mkdir -p "$TOOLS_WORK/KohaEasy"
+    cdd_pm > "$TOOLS_WORK/KohaEasy/CDD.pm"
+    printf 'use KohaEasy::CDD;\nKohaEasy::CDD::build_cli(@ARGV);\n' > "$TOOLS_WORK/cdd_build.pl"
+    display_explanation "Reading the CDD and building the index..."
+    stats="$TOOLS_WORK/cdd.stats"
+    # The name is only shown on the page; the quoting of koha_exec refuses ' and newlines.
+    name=${file##*/}; name=${name//\'/}; name=${name//$'\n'/ }
+    if ! koha_exec "$log" cdd-build /usr/bin/perl -I "$TOOLS_WORK" "$TOOLS_WORK/cdd_build.pl" "$txt" "$TOOLS_WORK/cdd.sqlite" "$name"; then
+        msg_error "" "$(t 'The index could not be built. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 1
+    fi
+    tools_output "$log" > "$stats"
+    n=$(kv_get "$stats" schedule); tables=$(kv_get "$stats" tables); terms=$(kv_get "$stats" terms); ed=$(kv_get "$stats" edition)
+    # Fewer entries than the ten classes and their divisions: not the schedules.
+    if [ "${n:-0}" -lt 100 ]; then
+        n=${n:-0}
+        msg_error "" "$(t 'Only ${n} entries of the schedules were found: this file does not look like the CDD. The previous index was kept.\n\nLog: ${log}')" 11 76
+        return 1
+    fi
+    mkdir -p "$CDD_DIR" && chown "root:${INSTANCE}-koha" "$CDD_DIR" 2>/dev/null
+    chmod 750 "$CDD_DIR"
+    install -m 640 "$TOOLS_WORK/cdd.sqlite" "$CDD_DB.new" && chown "root:${INSTANCE}-koha" "$CDD_DB.new" 2>/dev/null
+    mv -f "$CDD_DB.new" "$CDD_DB" || { msg_error "" "$(t "The index could not be saved. Nothing was changed.")" 8 64; return 1; }
+    { cat "$stats"; printf 'name=%s\nbuilt=%s\n' "${file##*/}" "$(date '+%F %H:%M')"; } > "$CDD_INFO"
+    chmod 640 "$CDD_INFO"
+    log "cdd: index built from ${file##*/} ($n schedule entries, $tables table entries, $terms subjects)"
+    ed=${ed:-?}
+    msg_ok "$(t '✔ CDD index built: ${n} entries of the schedules, ${tables} of the tables and ${terms} subjects of the alphabetical list (edition ${ed}).\n\nIt stays on this server only: ${CDD_DB}')" 12 76
+}
+
+lt_cdd_install() {
+    if [ ! -d "${KOHA_INTRA_CGI}/cataloguing" ]; then
+        msg_error "" "$(t "The staff interface folder of Koha was not found. Nothing was changed.")" 9 72
+        return 1
+    fi
+    local link="no"
+    prompt_yes_no "$(t "CDD lookup")" "$(t "Also add the shortcuts in the staff interface: a CDD button next to the class number fields of the cataloguing form (082, 090, item call number) and CDD lookup in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 13 76 && link="yes"
+    tools_locked _lt_cdd_install "$link"
+}
+
+_lt_cdd_install() {
+    local link="$1" log new sql updating=0 url note=""
+    log=$(tools_log cdd)
+    cdd_require_sqlite "$log" || return 1
+    new="$TOOLS_WORK/cdd_lookup.pl"
+    mkdir -p "$TOOLS_WORK/KohaEasy"
+    cdd_page_script > "$new"
+    cdd_pm > "$TOOLS_WORK/KohaEasy/CDD.pm"
+    chmod 644 "$new" "$TOOLS_WORK/KohaEasy/CDD.pm"
+    chmod 755 "$TOOLS_WORK/KohaEasy"
+    display_explanation "Checking the page with the Perl modules of Koha..."
+    if ! koha_exec "$log" perl-check /usr/bin/perl -I "$TOOLS_WORK" -c "$new"; then
+        ui_textbox "$(t "CDD lookup")" "$log"
+        msg_error "" "$(t 'The page does not compile with this version of Koha. Nothing was changed.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    cdd_installed && updating=1
+    if [ "$link" = "yes" ] && ! cdd_js_latest; then
+        tools_safety_backup CDD || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cdd_js_sql add "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    { mkdir -p "${CDD_PM%/*}" \
+        && install -o root -g root -m 644 "$TOOLS_WORK/KohaEasy/CDD.pm" "${CDD_PM}.new" && mv -f "${CDD_PM}.new" "$CDD_PM" \
+        && install -o root -g root -m 755 "$new" "${CDD_FILE}.new" && mv -f "${CDD_FILE}.new" "$CDD_FILE"; } || {
+        msg_error "" "$(t "The page could not be installed. Nothing was changed.")" 8 64; return 1; }
+    printf 'installed=%s\nlink=%s\n' "$(date +%F)" "$link" > "$CDD_STATE"
+    # Plack keeps compiled pages in memory: an updated page needs a restart.
+    [ "$updating" = "1" ] && plack_restart
+    url="/cgi-bin/koha/cataloguing/cdd_lookup.pl"
+    [ -s "$CDD_DB" ] || note="$(t "The page asks for the index until it is built (option 1).")"
+    log "cdd: page installed (link=$link)"
+    msg_ok "$(t '✔ Page installed. In the staff interface: ${url}')"${note:+$'\n\n'"$note"} 11 76
+}
+
+lt_cdd_remove() {
+    cdd_installed || cdd_js_on || { msg_info "$(t "CDD lookup")" "$(t "Not installed.")" 8 60; return 0; }
+    prompt_yes_no "$(t "CDD lookup")" "$(t 'Remove the page and its buttons? The index (${CDD_DB}) is kept.')" 10 74 defaultno || return 0
+    tools_locked _lt_cdd_remove
+}
+
+_lt_cdd_remove() {
+    local log sql
+    log=$(tools_log cdd)
+    if cdd_js_on; then
+        tools_safety_backup CDD || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cdd_js_sql remove "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    rm -f "$CDD_FILE" "$CDD_STATE" "$CDD_PM"
+    plack_restart
+    log "cdd: page removed"
+    msg_ok "$(t "✔ The page was removed.")"
 }
 
 # Loaded with "source installer" (tests/): functions only, no menu.
