@@ -78,6 +78,49 @@ public class KohaSessionWindow : Form {
     static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
     [DllImport("user32.dll")]
     static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
+    [DllImport("kernel32.dll")]
+    static extern bool SetProcessShutdownParameters(uint level, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcess(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit,
+        uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll")]
+    static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll")]
+    static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr h);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+        public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+        public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+        public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int pid; public int tid; }
+    // Asked before the other programs of the session when Windows ends it
+    // (the highest level an application may use), so Koha is stopped while
+    // WSL and its wsl.exe processes are still there.
+    public static bool ShutDownFirst() { return SetProcessShutdownParameters(0x3FF, 0); }
+    // Runs a program with no console at all (DETACHED_PROCESS), so Windows
+    // does not close it with the console programs when the session ends.
+    // Returns its exit code, -1 when it is still running after timeoutMs,
+    // -2 when it could not be started.
+    public static int RunDetached(string commandLine, int timeoutMs) {
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        PROCESS_INFORMATION pi;
+        const uint DETACHED_PROCESS = 0x8, CREATE_NEW_PROCESS_GROUP = 0x200;
+        if (!CreateProcess(null, new System.Text.StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, IntPtr.Zero, null, ref si, out pi)) { return -2; }
+        try {
+            if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) { return -1; }
+            uint code;
+            if (!GetExitCodeProcess(pi.hProcess, out code)) { return -2; }
+            return (int)code;
+        } finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    }
     const int WM_ENDSESSION = 0x16;
     bool blocking;
     public event EventHandler SessionEnding;
@@ -104,6 +147,7 @@ public class KohaSessionWindow : Form {
 '@
 }
 $session = New-Object KohaSessionWindow
+if (-not [KohaSessionWindow]::ShutDownFirst()) { Write-KohaLog 'tray: the shutdown order could not be set' }
 $blockReason = T 'Koha is saving the catalog before Windows shuts down...'
 
 $tray = New-Object System.Windows.Forms.NotifyIcon
@@ -199,6 +243,9 @@ $pool.ApartmentState = 'STA'
 $pool.Open()
 $langDir = Join-Path $here 'lang'
 $job = $null
+# The tray starts at sign-in: for its first seconds a Koha that is not up
+# yet reads as starting (Get-KohaBootGraceUntil covers a cold boot).
+$graceUntil = [int64](Get-UnixTime) + [int64]$cfg.BootGraceS
 $nextStatus = [DateTime]::MinValue
 $nextDisk = [DateTime]::MinValue
 
@@ -209,13 +256,15 @@ function Start-Check {
     $ps = [powershell]::Create()
     $ps.Runspace = $pool
     [void]$ps.AddScript({
-            param($LangDir, $WithDisk)
+            param($LangDir, $WithDisk, $GraceUntil)
             Import-KeiLanguage -LangDir $LangDir
-            $status = Get-KohaStatus
+            $status = Get-KohaStatus -GraceUntil $GraceUntil
+            # The stop the end of a Windows session runs, kept current in Debian.
+            if ($status.State -eq 'running') { Update-KohaStopScript | Out-Null }
             $disk = $null
             if ($WithDisk) { $disk = Get-KohaDiskHealth -Linux $status.Linux }
             return [pscustomobject]@{ Status = $status; Disk = $disk }
-        }).AddArgument($langDir).AddArgument($WithDisk)
+        }).AddArgument($langDir).AddArgument($WithDisk).AddArgument($graceUntil)
     return @{ PS = $ps; Handle = $ps.BeginInvoke() }
 }
 
@@ -250,6 +299,8 @@ $timer.add_Tick({
                     $r = $res[0]
                     $state = Get-KohaState
                     Update-Menu $r.Status
+                    # While Koha comes up, look again soon rather than in a minute.
+                    if ($r.Status.State -eq 'starting') { Request-Check 10 }
                     $n = Get-KohaNotifications -Previous ([string]$state.lastState) -Status $r.Status -Disk $r.Disk -State $state
                     foreach ($x in $n.Notifications) { Show-KohaNotification -Title $x.Title -Text $x.Text -Level $x.Level | Out-Null }
                     if ($null -eq $r.Disk) { $n.Changes.Remove('lastDiskLevel') }
@@ -295,7 +346,7 @@ $firstRun.Start()
 # Windows carries on. Bounded by the stop's own time limit.
 $session.add_SessionEnding({
         $timer.Stop()
-        if (-not $session.Blocking) { return }
+        if (-not $session.Blocking) { Write-KohaLog 'tray: Windows is ending the session; Koha is not running, nothing to stop'; return }
         $rs = [runspacefactory]::CreateRunspace($iss)
         $rs.Open()
         $ps = [powershell]::Create()
@@ -307,6 +358,7 @@ $session.add_SessionEnding({
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 100
         }
+        if (-not $h.IsCompleted) { Write-KohaLog 'tray: the clean stop did not finish before its time limit' }
         $session.Unblock()
     })
 

@@ -963,6 +963,16 @@ function Start-KohaTray { Start-KohaHidden 'Tray' }
 
 # KohaEasy.exe for this PC, with what it means for the librarian.
 function Install-KohaLauncherStep {
+    # Every run of the installer tries each hidden launch again, best first:
+    # the tray check below falls back again where one still fails, so a PC
+    # does not stay on a launch that shows a console after one bad start.
+    $st = Get-KohaState
+    if ($st.launcher -eq 'refused' -or $st.hiddenLaunch -ne 'conhost') {
+        Write-KohaLog ('hidden launch reset for a new check (launcher {0}, hiddenLaunch {1})' -f $st.launcher, $st.hiddenLaunch) 'install'
+        $reset = @{ hiddenLaunch = 'conhost' }
+        if ($st.launcher -eq 'refused') { $reset.launcher = ''; $reset.launcherHash = '' }
+        Set-KohaState $reset | Out-Null
+    }
     $r = Install-KohaLauncher
     if ($r -eq 'built') { Write-KohaStep (T 'KohaEasy.exe is ready: Koha starts in the background with no windows.') 'ok' }
     if ($r -eq 'failed') { Write-KohaStep (T 'KohaEasy.exe could not be used on this PC; Koha starts through a hidden console instead.') 'warn' }
@@ -996,9 +1006,18 @@ function Invoke-KohaSafeStep {
 # the one Windows reports, so a desktop moved by OneDrive gets it too.
 function Install-KohaShortcuts {
     Set-KohaTrayAtSignIn -Enabled $true
-    New-KohaShortcuts | Out-Null
+    $desktop = Get-KohaDesktopPath
+    New-KohaShortcuts -Desktop $desktop | Out-Null
     Set-KohaDistroIcon | Out-Null
-    Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f [Environment]::GetFolderPath('Desktop')) 'ok'
+    # Said only after checking the Koha icon really is on the desktop.
+    $lnk = ''
+    if ($desktop) { $lnk = [System.IO.Path]::Combine($desktop, 'Koha.lnk') }
+    if ($lnk -and (Test-Path -LiteralPath $lnk)) {
+        Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f $desktop) 'ok'
+    } else {
+        Write-KohaLog ('desktop shortcut missing: desktop {0}' -f $desktop) 'install'
+        Write-KohaStep ((T 'The Koha icon could not be put on the desktop ({0}). Use Koha in the Start menu instead. If an antivirus removed it, see its protection history.') -f $desktop) 'warn'
+    }
 }
 
 # Starts the tray and checks it is there. When KohaEasy.exe does not bring
@@ -1009,8 +1028,8 @@ function Start-KohaTrayChecked {
     param([int]$WaitSeconds = 8)
     Restart-KohaTray
     Start-Sleep -Seconds $WaitSeconds
-    if (-not (Test-KohaTrayRunning) -and (Get-KohaState).launcher -eq 'ok') {
-        Write-KohaLog 'the tray did not start through KohaEasy.exe; using conhost --headless' 'install'
+    if ((Get-KohaState).launcher -eq 'ok' -and -not (Test-KohaTrayRunning)) {
+        Write-KohaLog 'the tray did not start through KohaEasy.exe; using the next hidden launch' 'install'
         Set-KohaState @{ launcher = 'refused' } | Out-Null
         Set-KohaTrayAtSignIn -Enabled $true
         New-KohaShortcuts | Out-Null
@@ -1018,7 +1037,16 @@ function Start-KohaTrayChecked {
         Start-KohaTray
         Start-Sleep -Seconds $WaitSeconds
     }
-    if (-not (Test-KohaTrayRunning) -and (Get-KohaState).hiddenLaunch -ne 'powershell') {
+    if (@('nowscript', 'powershell') -notcontains (Get-KohaState).hiddenLaunch -and (Get-KohaWscriptPath) -and -not (Test-KohaTrayRunning)) {
+        Write-KohaLog 'the tray did not start through wscript KohaEasy.Hidden.js; using conhost --headless' 'install'
+        Set-KohaState @{ hiddenLaunch = 'nowscript' } | Out-Null
+        Set-KohaTrayAtSignIn -Enabled $true
+        New-KohaShortcuts | Out-Null
+        try { Register-KohaTasks } catch { Write-KohaLog ('tasks not registered again: ' + $_.Exception.Message) 'install' }
+        Start-KohaTray
+        Start-Sleep -Seconds $WaitSeconds
+    }
+    if ((Get-KohaState).hiddenLaunch -ne 'powershell' -and -not (Test-KohaTrayRunning)) {
         Write-KohaLog 'the tray did not start through conhost --headless; using powershell -WindowStyle Hidden' 'install'
         Set-KohaState @{ hiddenLaunch = 'powershell' } | Out-Null
         Set-KohaTrayAtSignIn -Enabled $true
@@ -1027,6 +1055,8 @@ function Start-KohaTrayChecked {
         Start-KohaTray
         Start-Sleep -Seconds $WaitSeconds
     }
+    $l = Get-KohaHiddenLaunch -Arguments 'Tray'
+    Write-KohaLog ('hidden launch in use: {0} {1} (launcher {2}, hiddenLaunch {3})' -f $l.Target, $l.Arguments, (Get-KohaState).launcher, (Get-KohaState).hiddenLaunch) 'install'
     if (Test-KohaTrayRunning) {
         Write-KohaStep (T 'The Koha icon is in the notification area, next to the clock.') 'ok'
     } else {

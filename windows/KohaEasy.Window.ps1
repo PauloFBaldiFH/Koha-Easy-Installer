@@ -9,12 +9,13 @@
 #   * the components: Debian (WSL), MariaDB, Apache, RabbitMQ, Memcached,
 #     koha-common and the staff page's HTTP answer
 #   * the actions: the management panel (terminal menus), Restart Koha and
-#     the terminal area; More actions holds Start, Stop, Restart Debian and
-#     Koha, Rebuild search index, the library network test, diagnostics and
-#     the Debian terminal
-#   * the terminal area, folded by default: what every action does, line by
-#     line, and a command line for one command at a time, inside this
-#     window (no console window)
+#     Open the Debian terminal; More actions holds Stop, Restart Debian and
+#     Koha, Rebuild search index, the library network test and diagnostics
+# The Debian terminal opens in a window of its own (Windows Terminal, or
+# the classic console), a real terminal where sudo, passwords and full-
+# screen programs work; an embedded one would need a terminal emulator
+# inside this window (ConPTY and a VT renderer), far more than a status
+# window should carry. Closing it or typing exit ends everything it ran.
 # No console window ever appears: the desktop icon, the tray and the Start
 # menu open it through KohaEasy.exe (a Windows program that starts
 # PowerShell with CreateNoWindow; conhost --headless where Windows refuses
@@ -66,8 +67,6 @@ $theme = @{
     AccentHover = New-Rgb 59 130 246
     Button      = New-Rgb 48 48 55
     ButtonHover = New-Rgb 63 63 72
-    Term        = New-Rgb 12 12 14
-    TermText    = New-Rgb 212 212 216
 }
 $dotColor = @{ running = $theme.Green; starting = $theme.Amber; failed = $theme.Red; stopped = $theme.Grey; unknown = $theme.Grey }
 $banner = @{
@@ -82,7 +81,6 @@ $fontSmall = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $fontCaption = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
 $fontBanner = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
 $fontDot = New-Object System.Drawing.Font('Segoe UI', 16)
-$fontMono = New-Object System.Drawing.Font('Consolas', 9.5)
 
 # ----------------------------------------------------------------------
 # Building blocks
@@ -307,12 +305,12 @@ $script:rows = @{}
 # The actions: three on the surface, the rest under More actions.
 $cardActions = New-Card
 [void]$cardActions.Controls.Add((New-Caption (T 'Actions')))
-$main = New-Flow
+$main = New-Flow $true
 $btnPanel = New-FlatButton ([string][char]0x2699 + '  ' + (T 'Management panel')) 'secondary' { Start-KohaHidden 'Panel' }
 $btnServices = New-FlatButton ([string][char]0x27F3 + '  ' + (T 'Restart Koha')) 'secondary' { Invoke-Action 'services' }
-$btnConsole = New-FlatButton '' 'secondary' { Set-TerminalOpen (-not $cardTerm.Visible) }
+$btnTerminal = New-FlatButton ('>_  ' + (T 'Open the Debian terminal')) 'secondary' { Start-KohaHidden 'Terminal' }
 $btnMore = New-FlatButton '' 'ghost' { Set-MoreOpen (-not $more.Visible) }
-foreach ($b in $btnPanel, $btnServices, $btnConsole, $btnMore) { [void]$main.Controls.Add($b) }
+foreach ($b in $btnPanel, $btnServices, $btnTerminal, $btnMore) { [void]$main.Controls.Add($b) }
 [void]$cardActions.Controls.Add($main)
 
 $more = New-Flow $true
@@ -325,8 +323,7 @@ $btnReindex = New-FlatButton (T 'Rebuild search index') 'secondary' {
 $btnLan = New-FlatButton (T 'Test the library network') 'secondary' { Invoke-Action 'lan' }
 $btnReport = New-FlatButton (T 'Export diagnostics (.txt)') 'secondary' { Invoke-Action 'report' }
 $btnZip = New-FlatButton (T 'Export diagnostics (.zip)') 'secondary' { Start-KohaHidden 'ExportDiagnostics' }
-$btnTerminal = New-FlatButton (T 'Debian terminal (advanced)') 'secondary' { Start-KohaHidden 'Terminal' }
-foreach ($b in $btnStop, $btnDebian, $btnReindex, $btnLan, $btnReport, $btnZip, $btnTerminal) { [void]$more.Controls.Add($b) }
+foreach ($b in $btnStop, $btnDebian, $btnReindex, $btnLan, $btnReport, $btnZip) { [void]$more.Controls.Add($b) }
 $more.Visible = $false
 [void]$cardActions.Controls.Add($more)
 
@@ -335,62 +332,8 @@ $lblBusy.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
 [void]$cardActions.Controls.Add($lblBusy)
 [void]$root.Controls.Add($cardActions)
 
-# The terminal area: what the actions do, and one command at a time as the
-# Debian user. Folded until Terminal opens it.
-$cardTerm = New-Card
-$cardTerm.Tag.Fill = $theme.Term
-$cardTerm.BackColor = $theme.Term
-$termHead = New-Flow
-[void]$termHead.Controls.Add((New-Caption (T 'Terminal')))
-[void]$cardTerm.Controls.Add($termHead)
-$term = New-Object System.Windows.Forms.RichTextBox
-$term.ReadOnly = $true
-$term.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-$term.BackColor = $theme.Term
-$term.ForeColor = $theme.TermText
-$term.Font = $fontMono
-$term.Size = New-Object System.Drawing.Size(($W - 32), 190)
-$term.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
-$term.DetectUrls = $false
-$term.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
-[void]$cardTerm.Controls.Add($term)
-$prompt = New-Flow
-$lblPrompt = New-Text '~$' $fontMono $theme.Green
-$lblPrompt.Margin = New-Object System.Windows.Forms.Padding(0, 3, 6, 0)
-$txtCmd = New-Object System.Windows.Forms.TextBox
-$txtCmd.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-$txtCmd.BackColor = $theme.Term
-$txtCmd.ForeColor = $theme.TermText
-$txtCmd.Font = $fontMono
-$txtCmd.Width = $W - 32 - 40
-$txtCmd.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
-$txtCmd.add_KeyDown({
-        param($s, $e)
-        if ($e.KeyCode -eq 'Enter') {
-            $e.SuppressKeyPress = $true
-            $c = $txtCmd.Text.Trim()
-            if ($c) { $txtCmd.Text = ''; Invoke-Action 'command' $c }
-        }
-    })
-[void]$prompt.Controls.Add($lblPrompt)
-[void]$prompt.Controls.Add($txtCmd)
-[void]$cardTerm.Controls.Add($prompt)
-$lblTermHint = New-Text (T 'One command at a time, as the Debian user. For programs that ask questions, use the Debian terminal (More actions).') $fontSmall $theme.Grey ($W - 32)
-$lblTermHint.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
-[void]$cardTerm.Controls.Add($lblTermHint)
-$cardTerm.Visible = $false
-[void]$root.Controls.Add($cardTerm)
-
 $form.Controls.Add($root)
 
-function Set-TerminalOpen {
-    param([bool]$Open)
-    $cardTerm.Visible = $Open
-    $arrow = [string][char]0x25BE
-    if ($Open) { $arrow = [string][char]0x25B4 }
-    $btnConsole.Text = '>_  ' + (T 'Terminal') + '  ' + $arrow
-    if ($Open) { $term.SelectionStart = $term.TextLength; $term.ScrollToCaret(); [void]$txtCmd.Focus() }
-}
 function Set-MoreOpen {
     param([bool]$Open)
     $more.Visible = $Open
@@ -398,33 +341,7 @@ function Set-MoreOpen {
     if ($Open) { $arrow = [string][char]0x25B4 }
     $btnMore.Text = (T 'More actions') + '  ' + $arrow
 }
-Set-TerminalOpen $false
 Set-MoreOpen $false
-
-# ----------------------------------------------------------------------
-# The terminal area's lines
-# ----------------------------------------------------------------------
-$script:queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-function Write-Term {
-    param([string]$Line, $Color = $null)
-    if ($null -eq $Color) {
-        $Color = $theme.TermText
-        if ($Line -match '\[OK\]') { $Color = $theme.Green }
-        elseif ($Line -match '\[FAILED\]|failed|error') { $Color = $theme.Red }
-    }
-    if ($term.TextLength -gt 200000) { $term.Select(0, 100000); $term.SelectedText = '' }
-    $term.SelectionStart = $term.TextLength
-    $term.SelectionLength = 0
-    $term.SelectionColor = $Color
-    $term.AppendText($Line + "`n")
-    $term.SelectionColor = $term.ForeColor
-    $term.ScrollToCaret()
-}
-function Read-TermQueue {
-    $line = $null
-    $n = 0
-    while ($n -lt 200 -and $script:queue.TryDequeue([ref]$line)) { Write-Term $line; $n++ }
-}
 
 # ----------------------------------------------------------------------
 # Background work
@@ -443,31 +360,17 @@ $script:health = $null
 $script:spin = 0
 
 $worker = {
-    param($LangDir, $Action, $Queue, $Command)
+    param($LangDir, $Action)
     Import-KeiLanguage -LangDir $LangDir
-    # The terminal area shows what an action does, not the periodic checks.
-    if ($Action -eq 'refresh') { Set-KohaOutputSink $null } else { Set-KohaOutputSink $Queue }
     $result = $null
-    try {
-        switch ($Action) {
-            'start'    { $result = Start-Koha -Trigger user -Wait }
-            'stop'     { $result = Stop-Koha }
-            'services' { $result = Restart-KohaServices }
-            'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
-            'report'   { $result = Export-KohaDiagnosticsText }
-            'reindex'  { $result = Invoke-KohaSearchReindex }
-            'lan'      { $result = Test-KohaLanAccess }
-            'command'  {
-                $result = Invoke-KohaUserCommand -Command $Command
-                if ($null -ne $result) {
-                    foreach ($l in ([string]$result.Output -split "`n")) { $Queue.Enqueue($l.TrimEnd()) }
-                }
-                # A command changes nothing the banner shows: no new check.
-                return [pscustomobject]@{ Action = $Action; Result = $result; Status = $null; Health = $null; Lan = $null }
-            }
-        }
-    } finally {
-        Set-KohaOutputSink $null
+    switch ($Action) {
+        'start'    { $result = Start-Koha -Trigger user -Wait }
+        'stop'     { $result = Stop-Koha }
+        'services' { $result = Restart-KohaServices }
+        'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
+        'report'   { $result = Export-KohaDiagnosticsText }
+        'reindex'  { $result = Invoke-KohaSearchReindex }
+        'lan'      { $result = Test-KohaLanAccess }
     }
     $lan = $null
     if ([bool](Get-KohaState)['lanAccess']) { $lan = Get-KohaLanUrls }
@@ -483,7 +386,6 @@ $busyText = @{
     report   = (T 'Collecting diagnostics... This can take a minute.')
     reindex  = (T 'Rebuilding the search index... On large catalogs this takes several minutes.')
     lan      = (T 'Testing the library network...')
-    command  = (T 'Running the command...')
 }
 
 function Set-Buttons {
@@ -498,24 +400,21 @@ function Set-Buttons {
     $btnReindex.Enabled = (-not $Busy) -and $on
     $btnLan.Enabled = (-not $Busy) -and $on
     $btnTerminal.Enabled = (-not $Busy) -and $on
-    $txtCmd.Enabled = (-not $Busy) -and $on
     $btnReport.Enabled = -not $Busy
     $btnPanel.Enabled = $installed
 }
 
 function Invoke-Action {
-    param([string]$Action, [string]$Command = '')
+    param([string]$Action)
     if ($null -ne $script:job) { return }
     if ($Action -ne 'refresh') {
         $lblBusy.ForeColor = $theme.Amber
         $lblBusy.Text = $busyText[$Action]
-        if ($Action -eq 'command') { Write-Term ('~$ ' + $Command) $theme.Green }
-        else { Write-Term ('# ' + $busyText[$Action]) $theme.Muted }
     }
     Set-Buttons $true
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
-    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action).AddArgument($script:queue).AddArgument($Command)
+    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action)
     $script:job = @{ PS = $ps; Handle = $ps.BeginInvoke(); Action = $Action }
 }
 
@@ -634,16 +533,7 @@ function Show-Result {
             $text = ((T 'Diagnostics saved on the desktop: {0}') -f $Result) + "`n" + (T 'Send this file to whoever supports your library. Passwords are not included.')
             try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $Result) } catch { }
         }
-        'command' {
-            if ($null -eq $Result) { $text = T 'Debian is stopped. Start Koha first.'; $color = $bad }
-            elseif ([int]$Result.ExitCode -eq 124) { $text = T 'The command took too long and was stopped. For programs that ask questions, use the Debian terminal (More actions).'; $color = $bad }
-            else {
-                $text = ''
-                if ([int]$Result.ExitCode -ne 0) { Write-Term ((T 'exit code {0}') -f $Result.ExitCode) $theme.Red }
-            }
-        }
     }
-    if ($Action -ne 'command' -and $text) { Write-Term ('# ' + ($text -split "`n")[0]) $color }
     $lblBusy.ForeColor = $color
     $lblBusy.Text = $text
 }
@@ -652,7 +542,6 @@ $spinner = @([char]0x25D0, [char]0x25D3, [char]0x25D1, [char]0x25D2)
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 250
 $timer.add_Tick({
-        Read-TermQueue
         if ($null -ne $script:job) {
             if (-not $script:job.Handle.IsCompleted) {
                 if ($script:job.Action -ne 'refresh') {
@@ -667,8 +556,7 @@ $timer.add_Tick({
                 $r = $null
                 if ($res.Count -gt 0) { $r = $res[-1] }
                 if ($null -ne $r) {
-                    if ($null -ne $r.Status) { Update-View $r.Status $r.Health $r.Lan }
-                    Read-TermQueue
+                    Update-View $r.Status $r.Health $r.Lan
                     if ($action -ne 'refresh') { Show-Result $action $r.Result }
                 } elseif ($script:job.PS.Streams.Error.Count -gt 0) {
                     throw $script:job.PS.Streams.Error[0].Exception
@@ -677,7 +565,6 @@ $timer.add_Tick({
                 Write-KohaLog ('Koha window: {0} failed: {1}' -f $action, $_.Exception.Message)
                 $lblBusy.ForeColor = $theme.Red
                 $lblBusy.Text = $_.Exception.Message
-                Write-Term $_.Exception.Message $theme.Red
             } finally {
                 $script:job.PS.Dispose()
                 $script:job = $null
@@ -703,7 +590,7 @@ $form.add_FormClosing({
         param($s, $e)
         # A Start, Stop or Restart in progress finishes first, out of sight:
         # cutting it short could leave Debian's services half restarted.
-        if ($null -ne $script:job -and $script:job.Action -ne 'refresh' -and $script:job.Action -ne 'command') {
+        if ($null -ne $script:job -and $script:job.Action -ne 'refresh') {
             $e.Cancel = $true
             $script:closeWhenDone = $true
             $form.Hide()
