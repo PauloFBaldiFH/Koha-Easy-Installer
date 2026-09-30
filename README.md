@@ -152,7 +152,7 @@ Real-Windows behaviour (the installer, notifications, the tray, Task Scheduler, 
 | 7 | Diagnostics & maintenance | Status, health check, logs, optimization |
 | 8 | Security center | Fail2ban, firewall, password rotation |
 | 9 | Koha settings & parameters | Sizing, e-mail, super librarian, SIP2/Z39.50, clock |
-| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration, WhatsApp / Telegram messaging, cataloguing aids, replace a MARC record |
+| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration, WhatsApp / Telegram messaging, cataloguing aids, replace a MARC record, CDD lookup |
 | 11 | General tools | htop/nethogs, terminal browser, file manager |
 | 12 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
 | 13 | Koha languages | Koha language packs and panel language |
@@ -252,6 +252,16 @@ Two more tabs of the same page catalogue a book from photos of its cover, title 
 - The librarian corrects the draft next to the photos, and a **mandatory preview** follows. Only then is the record added with Koha's `AddBiblio`, in one transaction under a database lock, after the ISBN is checked against the catalogue again (a record with the same ISBN needs an explicit tick), with a copy of the record and of the model's answer saved in `kei-marc-replace/vision/`. A form sent twice adds nothing. With a biblionumber, the draft goes to the replacement above instead (with its lock and saved version).
 
 The two modules are installed with the page in `/usr/local/lib/site_perl/KohaEasy/Cataloguing/` and removed with it (the settings stay with the saved versions).
+
+### CDD lookup in the cataloguing (staff interface)
+
+**Library tools > CDD lookup** puts the whole CDD (Dewey) in Koha's cataloguing, at `/cgi-bin/koha/cataloguing/cdd_lookup.pl`.
+
+- **The CDD is not distributed with the panel**: the DDC is copyrighted by OCLC. **Build the index** asks for the library's own copy (the PDF, or a `.txt` with its text; a PDF is read with `pdftotext`) and builds a SQLite index on the server (`/var/lib/koha/<instance>/kei-cdd/cdd.sqlite`, readable only by root and the instance). The schedules, Tables 1 to 6 and the alphabetical list of subjects are read, with bracketed (not used) and optional numbers marked. A file with fewer than 100 schedule entries is refused and the previous index is kept. A scanned PDF has no text: use the text of an OCR.
+- **The page** searches by number (`869.3`, `869,3`, `T1—09`) or by words of the subject (accents and plurals ignored). Each number shows its place in the hierarchy, the notes (with the numbers in them as links), the subdivisions, the subjects of the list, and, for a number not printed in the schedules, **how it was probably built** (base number plus Table 1, Table 2 through —09, Table 3 in 810–899, Table 4 in 420–499), marked as a hint. **Build a number** adds a table notation to the number as you type.
+- **In your library**: next to each result, how many titles and items of the catalogue use that class (with and without its subdivisions, from the call numbers of the items), the titles themselves, and how the library classified titles with the searched words.
+- **Install the page** optionally adds a **CDD** button next to 082, 083, 090, 092 `$a` and the item call number (952 `$o`) in the cataloguing forms, and **CDD lookup** in the tools of the cataloguing home page (a marked block in `IntranetUserJS`, verified `PRE-CDD` backup first). The button opens the lookup with the number already in the field or with the subjects and title of the record as suggestions; **Use in the record** puts the number in the field (082 and 083 get the number and `$2` the edition when empty; 090, 092 and 952 keep the author notation after it). **Copy** copies it.
+- **Remove the page** removes the page, the buttons and the module `KohaEasy/CDD.pm`; the index is kept.
 
 ## Automated tasks
 
