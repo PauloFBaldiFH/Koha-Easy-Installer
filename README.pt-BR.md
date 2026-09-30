@@ -284,6 +284,8 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 
 A instalação mostra sete etapas numeradas, uma linha por tarefa com uma pequena barra de progresso do Pac-Man, e uma tela final com os endereços do catálogo e da interface da equipe. A saída dos comandos nunca aparece na tela: ela fica em `/var/log/koha-easy-install/apt.log`. Se uma tarefa falhar, o painel mostra a etapa que falhou, o que verificar e as últimas linhas desse log, que é o arquivo a enviar ao suporte de TI.
 
+As outras tarefas longas do painel têm o mesmo visual: troca do motor de busca, reparo do índice de busca, configuração do Cloudflare Tunnel, atualização do sistema, validação, reparo dos serviços, manutenção profunda e atualização de idiomas. A saída delas fica em `/var/log/koha-easy-install/` (por exemplo `search-engine.log`, `zebra-rebuild.log`, `cloudflare.log` e `apt.log`).
+
 ## Desinstalação
 
 O `uninstall.sh` **apaga definitivamente** o Koha, seus bancos de dados, os backups locais e as configurações, e pede confirmação antes:

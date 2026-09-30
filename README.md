@@ -284,6 +284,8 @@ E-mail notices are left to Koha's own schedule (`koha-common`): overdue and adva
 
 The installation shows seven numbered steps, one line per task with a small Pac-Man progress bar, and a final screen with the addresses of the catalog and the staff interface. The commands' own output never reaches the screen: it is kept in `/var/log/koha-easy-install/apt.log`. If a task fails, the panel shows the failed step, what to check and the last lines of that log, which is the file to send to IT support.
 
+The panel's other long tasks look the same: switching the search engine, repairing the search index, setting up the Cloudflare Tunnel, updating the system, validation, service repair, deep maintenance and language updates. Their output goes to `/var/log/koha-easy-install/` (for example `search-engine.log`, `zebra-rebuild.log`, `cloudflare.log` and `apt.log`).
+
 ## Uninstall
 
 `uninstall.sh` **permanently deletes** Koha, its databases, local backups and settings, and asks for confirmation first:
