@@ -518,10 +518,17 @@ XML
     local js; js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
     assert '[[ "$js" == "/* the library'"'"'s own code */"$'"'"'\n'"'"'"\$(document).ready(function () { var re = /a\\b/; });"* ]]' "the library code is kept as it was: $js"
     assert 'grep -q "tools/marc_replace.pl?biblionumber=" <<< "$js" && grep -q "Replace the record (MARC file)" <<< "$js"'
+    assert 'grep -qF "cataloguing\/cataloging-home\.pl" <<< "$js" && grep -q "\"/cgi-bin/koha/tools/marc_replace.pl\", \"fa-exchange\", \"Replace a MARC record\"" <<< "$js" && grep -q "marc_replace.pl?op=vision\", \"fa-camera\", \"AI cataloguing\"" <<< "$js"' "shortcuts in the tools of the cataloguing home page"
     answer yes
     panel lt_mr_install
     js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
-    assert '[ "$(grep -c "marc_replace begin" <<< "$js")" = "1" ] && grep -q "^koha-plack --restart library" "$KEI_S/calls.log"' "updated once, Plack restarted"
+    assert '[ "$(grep -c "marc_replace begin" <<< "$js")" = "1" ] && grep -q "^koha-plack --restart library" "$KEI_S/calls.log" && [ "$(pre_backups MARC-REPLACE)" = "1" ]' "the same block is not written again"
+    # A block of an older version (without the shortcuts) is replaced by the new one.
+    mysql -e "UPDATE systempreferences SET value = REPLACE(value, 'cataloging-home', 'old-home') WHERE variable = 'IntranetUserJS';" "$DB"
+    answer yes
+    panel lt_mr_install
+    js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")
+    assert '[ "$(grep -c "marc_replace begin" <<< "$js")" = "1" ] && grep -q "cataloging-home" <<< "$js" && ! grep -q "old-home" <<< "$js"' "old block updated: $js"
     answer yes
     panel lt_mr_remove
     assert '[ ! -e "$page" ] && [ -d /var/lib/koha/library/kei-marc-replace ] && [ ! -e "$PM/KohaEasy/Cataloguing" ]'
@@ -697,6 +704,41 @@ vision_preview() {
     assert 'grep -q "Only staff allowed to change the system preferences" <<< "$output" && ! grep -q "name=\"provider\"" <<< "$output"'
     vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=openai token=sk-evil
     assert 'grep -q "You are not allowed to change these settings" <<< "$output" && grep -qx "provider=ollama" "$VD/vision.conf"'
+}
+
+@test "V08 prompts: default MARC 21 instructions with an example record, customisable and restorable; the note for one book is sent once and never kept" {
+    vision_setup
+    vcgi GET op=vision-settings
+    assert 'grep -q "all the rules of MARC 21" <<< "$output" && grep -q "245 10 |a Dom Casmurro / |c Machado de Assis." <<< "$output" && grep -q "name=\"instructions_default\"" <<< "$output"' "default instructions shown: $output"
+    vcgi GET op=vision
+    assert 'grep -q "<textarea id=\"note\" name=\"note\"[^>]*></textarea>" <<< "$output"' "empty note field"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg" "note=Livro de <b>1897</b>, o ilustrador é o autor"
+    local req; req=$(grep chat/completions "$KEI_S/http.log" | tail -n1)
+    assert 'grep -q "all the rules of MARC 21" <<< "$req" && grep -q "Language of cataloguing: Portuguese" <<< "$req" && grep -q "650 _4 |a Romance brasileiro." <<< "$req"' "default instructions, language and example record: $req"
+    assert 'grep -q "for this book only (they take precedence over the general ones above):\\\\nLivro de <b>1897</b>, o ilustrador é o autor" <<< "$req" && grep -q "ANSWER FORMAT. The images show one printed book" <<< "$req"' "note of the book, then the fixed format: $req"
+    assert '! grep -q "1897" <<< "$output" && ! grep -rq "1897" "$VD"' "the note does not follow the draft and is not kept"
+    local text; text=$(draft_text)
+    vcgi POST op=cud-vision-preview csrf_token=tok-SESSID1 "marctext=$text" "extraction=$(field extraction)"
+    vcgi POST op=cud-vision-add csrf_token=tok-SESSID1 "record=$(field record)" "nonce=$(field nonce)" "extraction=$(field extraction)"
+    assert 'grep -q "Record added" <<< "$output" && ! grep -rq "1897" "$VD"' "$output"
+    vcgi GET op=vision
+    assert 'grep -q "<textarea id=\"note\" name=\"note\"[^>]*></textarea>" <<< "$output"' "the next book starts with an empty note"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1
+    assert 'grep -q "Choose at least one photo" <<< "$output" && grep -q "<textarea id=\"note\" name=\"note\"[^>]*></textarea>" <<< "$output"'
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "note=keep me <i>"
+    assert 'grep -q ">keep me &lt;i&gt;</textarea>" <<< "$output"' "kept (escaped) when the photos are missing"
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=compatible url=http://127.0.0.1:18080/v1 model=vision-test lang=spa \
+        $'instructions=Catalogue for a school library in {language}.\nUse CDD 22 and <short> subjects.'
+    assert 'grep -q "Settings saved" <<< "$output" && [ "$(stat -c %a "$VD/vision-prompt.txt")" = "640" ] && grep -q "school library in {language}" "$VD/vision-prompt.txt"' "$output"
+    assert 'grep -q "&lt;short&gt; subjects.</textarea>" <<< "$output" && ! grep -q "<short>" <<< "$output"' "saved text shown back, escaped"
+    vcgi POST op=cud-vision csrf_token=tok-SESSID1 "img_title=@$W/titlepage.jpg"
+    req=$(grep chat/completions "$KEI_S/http.log" | tail -n1)
+    assert 'grep -q "Catalogue for a school library in Spanish." <<< "$req" && ! grep -q "all the rules of MARC 21" <<< "$req" && ! grep -q "for this book only" <<< "$req" && grep -q "ANSWER FORMAT" <<< "$req"' "custom instructions, no note, fixed format kept: $req"
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=compatible url=http://127.0.0.1:18080/v1 model=vision-test "instructions=anything" instructions_default=1
+    assert '[ ! -e "$VD/vision-prompt.txt" ] && grep -q "all the rules of MARC 21" <<< "$output"' "default restored"
+    touch "$KS/noconfig"
+    vcgi POST op=cud-vision-settings csrf_token=tok-SESSID1 provider=compatible "instructions=evil"
+    assert '[ ! -e "$VD/vision-prompt.txt" ]' "only with the permission"
 }
 
 @test "V07 the author notation of the page is the notation of the panel (same table, same rules)" {
