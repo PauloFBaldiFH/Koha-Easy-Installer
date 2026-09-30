@@ -6456,7 +6456,7 @@ broker_wait_approval() {
 
 # Asks for a new address. Leaves the request in BROKER_ENROLL.
 broker_new_request() {
-    local inst email name body
+    local inst email name body st
     inst=$(ui_input "$(t "Free address")" "$(t "Name of the library or institution:")") || return 1
     inst=$(printf '%s' "$inst" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [ ${#inst} -ge 3 ] || { msg_error "" "$(t "Type the name of the library (at least 3 characters).")" 8 66; return 1; }
@@ -6479,13 +6479,14 @@ broker_new_request() {
     user=$(json_field "$BROKER_BODY" user_code)
     url=$(json_field "$BROKER_BODY" verification_uri)
     slug=$(json_field "$BROKER_BODY" suggested_slug)
+    st=$(json_field "$BROKER_BODY" status)
     broker_cleanup
     if [ -z "$device" ] || ! is_auth_url "$url"; then
         msg_error "" "$(t "The address service gave an unexpected answer. Try again later.")" 8 70
         return 1
     fi
     kv_write "$BROKER_ENROLL" 600 DEVICE_CODE "$device" USER_CODE "$user" VERIFY_URL "$url" SLUG "$slug" \
-        BROKER_URL "$(broker_url)" CREATED "$(date +%s)" || return 1
+        STATUS "${st:-pending}" BROKER_URL "$(broker_url)" CREATED "$(date +%s)" || return 1
     log "broker: request $user sent for '$slug'"
 }
 
@@ -6652,7 +6653,7 @@ function_cloudflare_free_address() {
     fi
     local tool
     require_koha || return 0
-    for tool in openssl perl curl; do
+    for tool in openssl curl; do
         command -v "$tool" >/dev/null 2>&1 || { msg_error "" "$(t "Missing tool:") $tool" 8 60; return 0; }
     done
 
@@ -6660,8 +6661,13 @@ function_cloudflare_free_address() {
         if [ -f /etc/cloudflared/config.yml ]; then
             prompt_yes_no "$(t "Free address")" "$(t "This server already publishes Koha with your own domain. A free address replaces it (your domain's tunnel is switched off).\n\nContinue?")" 11 74 defaultno || return 0
         fi
-        msg_info "$(t "Free address")" "$(t "GET A FREE ADDRESS FOR YOUR CATALOG\n\nNo domain or Cloudflare account is needed. You send a short request\n(library name, contact e-mail and the name you want); the address service\nreviews it and this server then connects on its own.\n\nThe public catalog (OPAC) goes online. The staff interface stays on the\nlocal network until you turn on remote staff access, which adds a password\nchecked before anyone reaches Koha.")" 17 78
+        msg_info "$(t "Free address")" "$(t "GET A FREE ADDRESS FOR YOUR CATALOG\n\nNo domain or Cloudflare account is needed. Type the library name, a contact\ne-mail and the name you want: the address is created right away and this\nserver connects on its own. If the name is taken, a close variant is used.\n\nThe public catalog (OPAC) goes online. The staff interface stays on the\nlocal network until you turn on remote staff access, which adds a password\nchecked before anyone reaches Koha.")" 17 78
         broker_new_request || return 0
+        # Approved on the spot (the usual case): no link to open, no wait.
+        if [ "$(kv_get "$BROKER_ENROLL" STATUS)" = "approved" ]; then
+            broker_complete_request
+            return 0
+        fi
     fi
 
     broker_wait_request

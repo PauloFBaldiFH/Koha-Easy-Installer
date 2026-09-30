@@ -37,7 +37,7 @@ const mf = new Miniflare({
     BROKER_HOST: "127.0.0.1",
     NAME_PREFIX: "t-",
     STAFF_SUFFIX: "-admin",
-    AUTO_APPROVE: "false",
+    AUTO_APPROVE: process.env.KEI_BROKER_AUTO_APPROVE ?? "true",
     PBKDF2_ITERATIONS: "1000",
     MAX_LIBRARIES_PER_DAY: "20",
   },

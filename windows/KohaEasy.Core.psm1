@@ -65,8 +65,16 @@ function Get-KohaPath {
     }
 }
 
+# The Koha window's terminal area: while it is set (a ConcurrentQueue of
+# strings), every log line is also queued there for the window to show.
+$script:OutputSink = $null
+function Set-KohaOutputSink { param($Queue) $script:OutputSink = $Queue }
+
 function Write-KohaLog {
     param([string]$Message, [string]$Name = 'koha')
+    if ($null -ne $script:OutputSink) {
+        try { $script:OutputSink.Enqueue(('{0}  {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message)) } catch { }
+    }
     try {
         $dir = Get-KohaPath Logs
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -1755,6 +1763,65 @@ function Get-KohaServiceStateText {
     }
 }
 
+# Pure: the Koha window's banner from the rows of Get-KohaServiceHealth and
+# the state of Get-KohaStatus. Level is ok (every row running), starting,
+# fault (the rows in Broken are down while Koha should run), stopped (the
+# librarian stopped Koha: nothing is highlighted) or unknown.
+function Get-KohaHealthSummary {
+    param($Health, [string]$State)
+    $rows = @()
+    if ($null -ne $Health) { $rows = @($Health.Services) }
+    $broken = @($rows | Where-Object { $_.State -ne 'running' -and $_.State -ne 'starting' })
+    $level = 'unknown'
+    $text = T 'Checking...'
+    if ($State -eq 'not_installed') {
+        $level = 'stopped'; $broken = @(); $text = Get-KohaStateText $State
+    } elseif ($State -eq 'stopped_by_user') {
+        $level = 'stopped'; $broken = @(); $text = Get-KohaStateText $State
+    } elseif ($rows.Count -eq 0) {
+        $broken = @()
+    } elseif ($broken.Count -eq 0 -and @($rows | Where-Object { $_.State -eq 'starting' }).Count -eq 0) {
+        $level = 'ok'; $text = T 'All services are running'
+    } elseif ($State -eq 'starting' -or $broken.Count -eq 0) {
+        # Koha is still coming up: the rows that are not up yet are not faults.
+        $level = 'starting'; $broken = @(); $text = Get-KohaStateText 'starting'
+    } else {
+        $level = 'fault'
+        if (-not [bool]$Health.DebianRunning) {
+            # Everything inside Debian is down with it: name only Debian.
+            $broken = @($rows | Where-Object { $_.Unit -eq 'wsl' })
+        }
+        if ($broken.Count -eq 1) {
+            if ($broken[0].Unit -eq 'http') { $text = T 'Attention: the staff interface does not answer' }
+            else { $text = (T 'Attention: {0} is offline') -f $broken[0].Name }
+        } else {
+            $text = (T 'Attention: {0} components are offline ({1})') -f $broken.Count, ((@($broken | ForEach-Object { Get-KohaServiceName $_ })) -join ', ')
+        }
+    }
+    return [pscustomobject]@{ Level = $level; Text = $text; Broken = @($broken | ForEach-Object { $_.Unit }) }
+}
+
+# The row's name as the Koha window shows it.
+function Get-KohaServiceName {
+    param($Row)
+    if ($Row.Unit -eq 'http') { return (T 'HTTP response') }
+    return [string]$Row.Name
+}
+
+# The Koha window's command line: one command, not interactive, as the Debian
+# user (WSL's default user) in a login shell, from the home folder. Its
+# stdin is empty, and Linux's timeout ends it after $TimeoutSeconds.
+# Returns ExitCode (124 on timeout) and Output. Never starts Debian.
+function Invoke-KohaUserCommand {
+    param([Parameter(Mandatory = $true)][string]$Command, [int]$TimeoutSeconds = 120)
+    if (-not (Test-KohaDistroRunning)) { return $null }
+    # The command crosses on stdin, like every script here (see
+    # Invoke-KohaLinuxScript); "exit $?" ends it before Windows' CR LF.
+    $body = ($Command -replace "`r", '') + "`nexit `$?`n"
+    $wslArgs = @('-d', $script:Cfg.Distro, '--cd', '~', '--', 'timeout', '-k', '5', [string]$TimeoutSeconds, 'bash', '-l')
+    return (Invoke-KohaWsl -Arguments $wslArgs -InputText $body)
+}
+
 # Read-only, like the tray: a stopped Debian is reported, never started.
 function Get-KohaServiceHealth {
     $lines = @(Get-KohaQuickCheck)
@@ -1782,7 +1849,7 @@ systemctl reset-failed >/dev/null 2>&1
 rc=0
 for s in mariadb memcached rabbitmq-server koha-common apache2; do
   systemctl cat "$s.service" >/dev/null 2>&1 || continue
-  systemctl restart "$s.service" || { echo "failed: $s"; rc=1; }
+  if systemctl restart "$s.service"; then echo "[OK] $s"; else echo "[FAILED] $s"; rc=1; fi
 done
 exit $rc
 '@
@@ -1792,7 +1859,7 @@ function Restart-KohaServices {
     if (-not (Test-KohaDistroRunning)) { return 'not_running' }
     Write-KohaLog 'restarting Koha services'
     $r = Invoke-KohaLinuxScript -Script $script:RestartServicesScript
-    if ($r.ExitCode -ne 0) { Write-KohaLog ('restart services: ' + $r.Output) }
+    foreach ($l in ([string]$r.Output -split "`n")) { if ($l.Trim()) { Write-KohaLog ('restart services: ' + $l.TrimEnd()) } }
     if ($NoWait) {
         if ($r.ExitCode -eq 0) { return 'restarted' }
         return 'failed'

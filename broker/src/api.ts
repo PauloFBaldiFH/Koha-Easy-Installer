@@ -2,9 +2,9 @@
 //
 // Enrollment follows the device-authorization pattern (RFC 8628): the panel
 // asks for a code, shows the verification link as QR / browser / link, and
-// polls. In this baseline an admin approves requests (AUTO_APPROVE=false);
-// the automatic gates from the blueprint (Turnstile, email OTP, CNPJ and
-// institutional-domain checks on the join page) plug in at approval time.
+// polls. With AUTO_APPROVE=true (the default) every request is approved on
+// the spot under the first free valid name: no review, no word filter. With
+// AUTO_APPROVE=false an admin approves each request (admin.ts).
 //
 // After enrollment every call is signed with the install's Ed25519 key.
 
@@ -13,7 +13,7 @@ import type { Env, JobRow, LibraryRow } from "./env";
 import { now } from "./env";
 import { pbkdf2, randomBytes, randomToken, sha256Hex, toBase64 } from "./crypto";
 import { HttpError, json, parseJson, str } from "./http";
-import { hostnamesFor, maxSlugLength, slugify, validateSlug } from "./names";
+import { hostnamesFor, maxSlugLength, slugCandidates, slugify, validateSlug } from "./names";
 import { parseCidr } from "./netaddr";
 import { checkSignedRequest, isValidPublicKey } from "./signature";
 
@@ -56,14 +56,25 @@ export async function deviceStart(request: Request, env: Env, body: ArrayBuffer)
   const requested = str(b.requested_name, "requested_name", { max: 100, optional: true });
 
   const opts = { prefix: env.NAME_PREFIX, staffSuffix: env.STAFF_SUFFIX };
-  const slug = slugify(requested || institution).slice(0, maxSlugLength(opts.prefix, opts.staffSuffix)).replace(/-+$/, "");
+  const max = maxSlugLength(opts.prefix, opts.staffSuffix);
+  let slug = slugify(requested || institution).slice(0, max).replace(/-+$/, "");
 
   const deviceCode = randomToken(32);
   const code = userCode();
   const t = now();
   let status: "pending" | "approved" = "pending";
-  if (env.AUTO_APPROVE === "true" && validateSlug(slug, opts).ok && (await slugAvailable(env, slug))) {
-    status = "approved";
+  if (env.AUTO_APPROVE !== "false") {
+    // Instant approval: the first free valid name. Only the technical
+    // reserved names (www, join, broker, ...) are never handed out.
+    const auto = { ...opts, allowBlocked: true };
+    const candidates = [...slugCandidates(requested, institution, max), `biblioteca-${userCode().replace("-", "").toLowerCase()}`];
+    for (const c of candidates) {
+      if (validateSlug(c, auto).ok && (await slugAvailable(env, c))) {
+        slug = c;
+        status = "approved";
+        break;
+      }
+    }
   }
   await env.DB.prepare(
     `INSERT INTO enrollments (device_code_hash, user_code, status, institution_name, contact_email, cnpj,
@@ -94,6 +105,8 @@ export async function deviceStart(request: Request, env: Env, body: ArrayBuffer)
     suggested_slug: slug,
     expires_in: ENROLLMENT_TTL_SECONDS,
     interval: POLL_INTERVAL_SECONDS,
+    status,
+    ...(status === "approved" ? { hostnames: hostnamesFor(slug, env) } : {}),
   });
 }
 
@@ -124,15 +137,18 @@ export async function enroll(request: Request, env: Env, body: ArrayBuffer): Pro
   const publicKey = str(b.public_key, "public_key", { max: 64 });
   if (!isValidPublicKey(publicKey)) throw new HttpError(400, "public_key must be a base64 raw Ed25519 key (32 bytes)");
 
-  // Global circuit breaker: a burst of new libraries stops provisioning
-  // until someone looks at it.
+  // Optional global circuit breaker: MAX_LIBRARIES_PER_DAY above 0 pauses
+  // enrollment after that many new libraries in 24 hours. 0 turns it off.
   const t = now();
-  const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM libraries WHERE created_at > ?")
-    .bind(t - 86400)
-    .first<{ n: number }>();
-  if ((recent?.n ?? 0) >= Number(env.MAX_LIBRARIES_PER_DAY || "20")) {
-    await audit(env, "system", "circuit_breaker.open", null, { recent: recent?.n });
-    throw new HttpError(503, "new registrations are paused, try again later");
+  const cap = Number(env.MAX_LIBRARIES_PER_DAY || "0");
+  if (cap > 0) {
+    const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM libraries WHERE created_at > ?")
+      .bind(t - 86400)
+      .first<{ n: number }>();
+    if ((recent?.n ?? 0) >= cap) {
+      await audit(env, "system", "circuit_breaker.open", null, { recent: recent?.n });
+      throw new HttpError(503, "new registrations are paused, try again later");
+    }
   }
 
   const hash = await sha256Hex(deviceCode);
@@ -169,8 +185,7 @@ export async function enroll(request: Request, env: Env, body: ArrayBuffer): Pro
   return json({ library_id: libraryId, job_id: jobId, hostnames: hostnamesFor(enrollment.approved_slug, env) }, 202);
 }
 
-// Human-facing page behind the QR code. For now it only shows the status of
-// the request; the verification form (Turnstile, email code, CNPJ) goes here.
+// Human-facing page behind the QR code: shows the status of the request.
 export async function joinPage(request: Request, env: Env): Promise<Response> {
   await limit(env.RL_API, clientIp(request));
   const code = new URL(request.url).searchParams.get("c") ?? "";
