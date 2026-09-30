@@ -9350,6 +9350,635 @@ _lt_br_migrate_sheet_run() {
 }
 
 # ----------------------------------------------------------------------
+# Biblioteca Fácil database: its DBISAM 4 tables (T01_USUA ... T15_RESE)
+# read straight from the program's backup (.bkp) or from its data folder
+# (T09_ACER.dat and the other .dat files); the format is described in
+# docs/biblioteca-facil-format.md. Three steps, each with its own preview,
+# confirmation and verified PRE-* backup: the collection (MARC 21 through the
+# staged MARC import), the patrons (import_patrons.pl), then the loans and
+# holds (one SQL transaction, linked by card number and barcode).
+# ----------------------------------------------------------------------
+bf_write_dbreader() {
+    cat > "$1" <<'BFDB'
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long;
+use Encode qw( decode encode );
+use Compress::Zlib ();
+use Digest::MD5 qw( md5 );
+use File::Basename qw( dirname basename );
+use POSIX qw( strftime floor );
+
+# koha-easy-installer: reads the database of Biblioteca Fácil (DBISAM 4
+# tables, T01_USUA ... T15_RESE) straight from the program's backup (.bkp:
+# zlib-compressed copies of the table files) or from its data folder
+# (T09_ACER.dat and the other .dat files), and builds:
+#   --marc     MARC 21 records (one per title) with one 952 item per copy
+#   --patrons  a CSV for import_patrons.pl
+#   --circ     an SQL transaction with the loans (issues, old_issues) and the
+#              holds still valid (reserves), linked by card number and barcode
+#   --circ-check  the same linking, counted and rolled back (preview)
+# --dry-run prints the report (tables, counts, integrity) and a sample.
+# Exit codes: 4 = not a Biblioteca Fácil backup, 5 = no collection table.
+my %o = ( sample => 2, lang => 'por', country => 'bl ', today => strftime( '%Y-%m-%d', localtime ) );
+GetOptions( \%o, 'in=s', 'marc=s', 'patrons=s', 'circ=s', 'circ-check=s', 'branch=s', 'itype=s', 'itypes=s',
+    'cpf-attr', 'dry-run', 'sample=i', 'today=s' ) or exit 2;
+$o{branch} //= ''; $o{itype} //= '';
+
+binmode STDOUT, ':encoding(UTF-8)';
+sub fail { my ( $code, $msg ) = @_; print "$msg\n"; exit $code }
+sub norm { my $s = lc( shift // '' ); $s =~ tr/áàâãäéèêëíìîïóòôõöúùûüçñ/aaaaaeeeeiiiiooooouuuucn/; $s =~ s/[^a-z0-9]+/ /g; $s =~ s/^ | $//g; return $s }
+sub clean { my $s = shift // ''; $s =~ s/[\x00-\x1f]+/ /g; $s =~ s/\s+/ /g; $s =~ s/^ | $//g; return $s }
+
+# ---------------------------------------------------------------- files
+# Returns ( { 'T09_ACER' => bytes, ... }, description, backup date ).
+sub read_backup {
+    my $path = shift;
+    open( my $fh, '<:raw', $path ) or fail( 1, "Cannot read $path" );
+    local $/; my $d = <$fh>; close $fh;
+    fail( 4, 'Not a Biblioteca Fácil backup: the file is too small.' ) if length($d) < 64;
+    my ( $when, $dl ) = unpack( 'd< C', substr( $d, 24, 9 ) );
+    my $desc = decode( 'cp1252', substr( $d, 33, $dl ) );
+    my $pos  = 33 + $dl;
+    my $n    = unpack( 'V', substr( $d, $pos, 4 ) ); $pos += 4;
+    fail( 4, 'Not a Biblioteca Fácil backup: no table list.' ) if $n < 1 || $n > 200;
+    for ( 1 .. $n ) { $pos += 1 + ord( substr( $d, $pos, 1 ) ) }
+    my %t;
+    while ( $pos < length $d ) {
+        my $nl = ord( substr( $d, $pos, 1 ) );
+        my $name = substr( $d, $pos + 1, $nl );
+        fail( 4, "Not a Biblioteca Fácil backup: unexpected data at byte $pos." ) unless $nl && $name =~ /^[\w\$.-]+$/;
+        $pos += 1 + $nl;
+        # First zlib stream of the entry (its length is the 4 bytes before it).
+        my $z;
+        for my $p ( $pos + 29 .. $pos + 64 ) {
+            last if $p + 2 > length $d;
+            my ( $a, $b ) = unpack( 'C C', substr( $d, $p, 2 ) );
+            if ( $a == 0x78 && ( ( $a << 8 ) | $b ) % 31 == 0 ) { $z = $p; last }
+        }
+        fail( 4, "Damaged backup: no data found for $name." ) unless defined $z;
+        my ( $lo, $hi ) = unpack( 'V V', substr( $d, $z - 29, 8 ) );
+        my $size = $hi ? -1 : $lo;
+        fail( 4, "Damaged backup: invalid size for $name." ) if $size < 0 || $size > 1 << 30;
+        my ( $out, $p ) = ( '', $z - 4 );
+        while ( length($out) < $size ) {
+            my $cl = unpack( 'V', substr( $d, $p, 4 ) );
+            fail( 4, "Damaged backup: $name is cut short." ) if !$cl || $p + 4 + $cl > length $d;
+            my $chunk = Compress::Zlib::uncompress( substr( $d, $p + 4, $cl ) );
+            fail( 4, "Damaged backup: $name cannot be decompressed." ) unless defined $chunk && length $chunk;
+            $out .= $chunk; $p += 4 + $cl;
+        }
+        fail( 4, "Damaged backup: $name has " . length($out) . " bytes instead of $size." ) if length($out) != $size;
+        $t{ uc $1 } = $out if $name =~ /^(T\d\d_\w+)\.dat$/i;
+        $pos = $p;
+    }
+    my $date = '';
+    if ( $when && $when > 0 && $when < 2958466 ) {
+        my $days = floor($when); my $secs = int( ( $when - $days ) * 86400 + 0.5 );
+        $date = sprintf( '%s %02d:%02d', ymd( $days + 693594 ), int( $secs / 3600 ), int( $secs % 3600 / 60 ) );
+    }
+    return ( \%t, clean($desc), $date );
+}
+
+sub read_folder {
+    my $dir = shift;
+    opendir( my $dh, $dir ) or fail( 1, "Cannot read the folder $dir" );
+    my %t;
+    for my $f ( readdir $dh ) {
+        next unless $f =~ /^(T\d\d_\w+)\.dat$/i;
+        open( my $fh, '<:raw', "$dir/$f" ) or next;
+        local $/; $t{ uc $1 } = <$fh>; close $fh;
+    }
+    closedir $dh;
+    return ( \%t, '', '' );
+}
+
+# DBISAM dates: days where 1 = 0001-01-01 (proleptic Gregorian).
+sub ymd {
+    my $j = shift() + 1721425;    # Julian day number
+    my $a = $j + 32044; my $b = int( ( 4 * $a + 3 ) / 146097 ); my $c = $a - int( 146097 * $b / 4 );
+    my $d = int( ( 4 * $c + 3 ) / 1461 ); my $e = $c - int( 1461 * $d / 4 ); my $m = int( ( 5 * $e + 2 ) / 153 );
+    return sprintf( '%04d-%02d-%02d', 100 * $b + $d - 4800 + int( $m / 10 ), $m + 3 - 12 * int( $m / 10 ), $e - int( ( 153 * $m + 2 ) / 5 ) + 1 );
+}
+
+# ---------------------------------------------------------------- tables
+my ( %stat, @warn );
+sub parse_table {
+    my ( $name, $d ) = @_;
+    my %t = ( name => $name, rows => [], deleted => 0, bad => 0 );
+    if ( length($d) < 512 + 768 ) { push @warn, "$name: file too small, ignored"; return }
+    my ( $rs, $nf ) = unpack( 'v v', substr( $d, 45, 4 ) );
+    my $start = 512 + $nf * 768;
+    if ( $rs < 26 || $nf < 1 || $nf > 1000 || $start > length $d ) { push @warn, "$name: unknown table layout (encrypted or not DBISAM 4), ignored"; return }
+    $t{active_hdr} = unpack( 'V', substr( $d, 41, 4 ) );
+    $t{desc} = clean( decode( 'cp1252', substr( $d, 73, ord( substr( $d, 72, 1 ) ) ) ) );
+    my @f;
+    for my $i ( 0 .. $nf - 1 ) {
+        my $o = 512 + $i * 768;
+        my ( $num, $nl ) = unpack( 'v C', substr( $d, $o, 3 ) );
+        my $fname = substr( $d, $o + 3, $nl );
+        my ( $type, $len, $off ) = ( ord( substr( $d, $o + 164, 1 ) ), unpack( 'v', substr( $d, $o + 169, 2 ) ), unpack( 'v', substr( $d, $o + 172, 2 ) ) );
+        if ( $num != $i + 1 || $off + 1 + $len > $rs ) { push @warn, "$name: unknown field layout, ignored"; return }
+        ( my $key = uc $fname ) =~ s/^T\d\d_//;
+        push @f, { name => $key, type => $type, len => $len, off => $off };
+    }
+    $t{fields} = { map { $_->{name} => 1 } @f };
+    my $n = int( ( length($d) - $start ) / $rs );
+    push @warn, "$name: the file ends in the middle of a record (cut short?)" if ( length($d) - $start ) % $rs;
+    my %unknown;
+    for my $r ( 0 .. $n - 1 ) {
+        my $rec = substr( $d, $start + $r * $rs, $rs );
+        if ( ord($rec) ) { $t{deleted}++; next }
+        if ( md5( substr( $rec, 25 ) ) ne substr( $rec, 9, 16 ) ) { $t{bad}++; next }
+        my %v;
+        for my $f (@f) {
+            next unless ord( substr( $rec, $f->{off}, 1 ) );    # NULL
+            my $raw = substr( $rec, $f->{off} + 1, $f->{len} );
+            my $t = $f->{type};
+            my $v;
+            if    ( $t == 1 ) { $raw =~ s/\x00.*//s; $v = clean( decode( 'cp1252', $raw ) ); $v = undef if $v eq '' }
+            elsif ( $t == 2 ) { my $x = unpack( 'l<', $raw ); $v = ( $x > 657072 && $x < 767011 ) ? ymd($x) : undef; $stat{bad_dates}++ if $x && !defined $v }
+            elsif ( $t == 4 ) { $v = unpack( 's<', $raw ) ? 1 : 0 }
+            elsif ( $t == 5 ) { $v = unpack( 's<', $raw ) }
+            elsif ( $t == 6 ) { $v = unpack( 'l<', $raw ) }
+            elsif ( $t == 7 ) { $v = unpack( 'd<', $raw ) }
+            elsif ( $t == 12 ) { $v = unpack( 'v', $raw ) }
+            else { $unknown{ $f->{name} } = 1; next }
+            $v{ $f->{name} } = $v;
+        }
+        push @{ $t{rows} }, \%v;
+    }
+    push @warn, "$name: fields of an unknown type skipped: " . join( ', ', sort keys %unknown ) if %unknown;
+    push @warn, "$name: $t{bad} record(s) failed the checksum and were skipped" if $t{bad};
+    push @warn, sprintf( '%s: the header counts %d record(s), %d were read', $name, $t{active_hdr}, scalar @{ $t{rows} } )
+        if $t{active_hdr} != @{ $t{rows} } + $t{bad};
+    return \%t;
+}
+
+my $in = $o{in} // fail( 2, '--in is required' );
+my ( $files, $desc, $when ) = $in =~ /\.dat$/i ? read_folder( dirname($in) ) : read_backup($in);
+my %T;
+for my $name ( sort keys %$files ) {
+    my ($short) = $name =~ /^(T\d\d)_/;
+    my $t = parse_table( $name, $files->{$name} ) or next;
+    $T{$short} = $t;
+}
+fail( 5, 'No collection table (T09_ACER) was found: this is not a Biblioteca Fácil database.' ) unless $T{T09} && $T{T09}{fields}{TITULO};
+
+sub rows { my $t = $T{ shift() }; return $t ? @{ $t->{rows} } : () }
+# Rows the program itself removed (EXCLUSAO date) stay out.
+sub live { my $k = shift; my @r = rows($k); my @live = grep { !defined $_->{EXCLUSAO} } @r; $stat{"removed_$k"} = @r - @live; return @live }
+
+# ---------------------------------------------------------------- lookups
+my %author  = map { $_->{NUMAUTOR}     => $_->{AUTOR} }         grep { defined $_->{NUMAUTOR} && defined $_->{AUTOR} } live('T05');
+my %pub     = map { $_->{NUMEDITORA}   => $_ }                  grep { defined $_->{NUMEDITORA} } live('T06');
+my %genre   = map { $_->{NUMCLASSIFIC} => $_->{CLASSIFICACAO} } grep { defined $_->{NUMCLASSIFIC} && defined $_->{CLASSIFICACAO} } live('T07');
+my %type    = map { $_->{NUMTIPOITEM}  => $_ }                  grep { defined $_->{NUMTIPOITEM} } live('T08');
+my %lang_of = map { $_->{NUMIDIOMA}    => $_->{IDIOMA} }        grep { defined $_->{NUMIDIOMA} && defined $_->{IDIOMA} } live('T14');
+my %langs = ( portugues => 'por', portuguesa => 'por', portuguese => 'por', ingles => 'eng', inglesa => 'eng', english => 'eng',
+    espanhol => 'spa', espanhola => 'spa', spanish => 'spa', castelhano => 'spa', frances => 'fre', francesa => 'fre', french => 'fre',
+    italiano => 'ita', italiana => 'ita', alemao => 'ger', alema => 'ger', german => 'ger', latim => 'lat', japones => 'jpn',
+    chines => 'chi', russo => 'rus', guarani => 'grn', tupi => 'tup', braile => 'por', braille => 'por' );
+my %itype;
+if ( $o{itypes} && open( my $t, '<:encoding(UTF-8)', $o{itypes} ) ) {
+    while (<$t>) { chomp; my ( $code, $d ) = split /\t/; next unless $code; $itype{ norm($code) } = $code; $itype{ norm($d) } = $code if defined $d }
+    close $t;
+}
+my ( %acervo, %authors_of, %toc_of );
+for my $r ( live('T09') ) { $acervo{ $r->{NUMACERVO} } = $r if defined $r->{NUMACERVO} }
+for my $r ( sort { ( $a->{SEQUENCIA} // 0 ) <=> ( $b->{SEQUENCIA} // 0 ) } rows('T10') ) {
+    my ( $c, $au ) = ( $r->{NUMACERVO} // 0, $r->{NUMAUTOR} // 0 );
+    if ( !$acervo{$c} || !defined $author{$au} ) { $stat{orphan_author_links}++; next }
+    push @{ $authors_of{$c} }, $au unless grep { $_ == $au } @{ $authors_of{$c} || [] };
+}
+for my $r ( sort { ( $a->{SEQUENCIAL} // 0 ) <=> ( $b->{SEQUENCIAL} // 0 ) } rows('T12') ) {
+    next unless defined $r->{INDICE} && $acervo{ $r->{NUMACERVO} // 0 };
+    push @{ $toc_of{ $r->{NUMACERVO} } }, $r->{INDICE} . ( $r->{PAGINA} ? " (p. $r->{PAGINA})" : '' );
+}
+
+# ---------------------------------------------------------------- catalogue
+my %is_article = map { $_ => 1 } qw( o a os as um uma uns umas the an el la los las lo le les un une il gli der die das ein eine );
+sub nonfiling { my $t = shift; my ($w) = $t =~ /^(\S+)\s/; return ( $w && $is_article{ lc $w } ) ? length($w) + 1 : ( $t =~ /^l'/i ? 2 : 0 ) }
+my ( %rec, @order, %group_of, %barcode_of, %seen_barcode, %type_map );
+for my $id ( sort { $a <=> $b } keys %acervo ) {
+    my $r = $acervo{$id};
+    if ( !defined $r->{TITULO} ) { $stat{no_title}++; next }
+    my ($year) = ( $r->{ANOEDICAO2} // '' ) =~ /\b(1[5-9]\d\d|20\d\d)\b/;
+    $year //= $r->{ANOEDICAO} if ( $r->{ANOEDICAO} // 0 ) >= 1500 && $r->{ANOEDICAO} <= 2100;
+    ( my $isbn = uc( $r->{ISBN} // '' ) ) =~ s/[^0-9X]//g;
+    $isbn = '' unless $isbn =~ /^(\d{9}[\dX]|\d{13})$/;
+    my @au = @{ $authors_of{$id} || [] };
+    my $key = join '|', norm( $r->{TITULO} ), norm( $r->{SUBTITULO} ), norm( $r->{EDICAO} ), $year // '', $r->{NUMEDITORA} // '', $isbn, join( ',', @au );
+    unless ( $rec{$key} ) { push @order, $key; $rec{$key} = { %$r, year => $year, isbn => $isbn, authors => \@au, toc => $toc_of{$id}, items => [] } }
+    $group_of{$id} = $key;
+    my $tombo = ( $r->{TOMBO} // 0 ) > 0 ? "$r->{TOMBO}" : '';
+    if ( $tombo eq '' || $seen_barcode{$tombo}++ ) { $stat{bf_barcodes}++; $tombo = "BF$id" } else { $stat{tombo_barcodes}++ }
+    $barcode_of{$id} = $tombo;
+    my $t = $type{ $r->{NUMTIPOITEM} // 0 };
+    my $code = ( $t && $t->{TIPOITEM} ) ? ( $itype{ norm( $t->{TIPOITEM} ) } || $o{itype} ) : $o{itype};
+    $type_map{ $t && $t->{TIPOITEM} ? $t->{TIPOITEM} : '-' } = $code;
+    $stat{withdrawn}++ if $r->{BAIXA};
+    $stat{notforloan}++ if $r->{NAOEMPRESTAR};
+    $stat{photos}++ if $r->{FOTO};
+    push @{ $rec{$key}{items} }, { %$r, id => $id, barcode => $tombo, itype => $code };
+}
+
+my @records;
+if ( $o{marc} || $o{'dry-run'} ) {
+    require MARC::Record; require MARC::Field;
+    my $today = strftime( '%y%m%d', localtime );
+    for my $key (@order) {
+        my $r = $rec{$key};
+        my $m = MARC::Record->new();
+        $m->leader('00000nam a22000007a 4500');
+        my $lang = $langs{ norm( $lang_of{ $r->{NUMIDIOMA} // 0 } ) } || $o{lang};
+        $m->append_fields( MARC::Field->new( '008', $today . ( $r->{year} ? "s$r->{year}" : 'nuuuu' ) . '    ' . $o{country} . ( '|' x 17 ) . $lang . ' d' ) );
+        my ( @f, %c );
+        $c{$_} = $r->{$_} // '' for qw( TITULO SUBTITULO EDICAO CDD CDU CUTTER PAGINAS OBS1 OBS2 );
+        my $p = $pub{ $r->{NUMEDITORA} // 0 } || {};
+        push @f, MARC::Field->new( '020', ' ', ' ', a => $r->{isbn} ) if $r->{isbn} ne '';
+        push @f, MARC::Field->new( '041', '0', ' ', a => $lang ) if $lang_of{ $r->{NUMIDIOMA} // 0 };
+        push @f, MARC::Field->new( '080', ' ', ' ', a => $c{CDU} ) if $c{CDU} ne '';
+        push @f, MARC::Field->new( '082', '0', '4', a => $c{CDD} ) if $c{CDD} ne '';
+        my $class = $c{CDD} ne '' ? $c{CDD} : $c{CDU};
+        push @f, MARC::Field->new( '090', ' ', ' ', a => $class, ( $c{CUTTER} ne '' ? ( b => $c{CUTTER} ) : () ) ) if $class ne '';
+        my @au = map { $author{$_} } @{ $r->{authors} };
+        my $main = shift @au;
+        push @f, MARC::Field->new( '100', ( $main =~ /,/ ? '1' : '0' ), ' ', a => $main ) if defined $main;
+        my @t = ( a => $c{TITULO} . ( $c{SUBTITULO} ne '' ? ' :' : '' ) );
+        push @t, ( b => $c{SUBTITULO} ) if $c{SUBTITULO} ne '';
+        push @f, MARC::Field->new( '245', ( defined $main ? '1' : '0' ), nonfiling( $c{TITULO} ), @t );
+        push @f, MARC::Field->new( '250', ' ', ' ', a => ( $c{EDICAO} =~ /^\d+$/ ? "$c{EDICAO}. ed." : $c{EDICAO} ) ) if $c{EDICAO} ne '';
+        my ( $place, $publisher, $year ) = ( $p->{LOCALIZACAO} // '', $p->{EDITORA} // '', $r->{year} // '' );
+        my @imp;
+        push @imp, ( a => $place . ( $publisher ne '' ? ' :' : ( $year ne '' ? ',' : '' ) ) ) if $place ne '';
+        push @imp, ( b => $publisher . ( $year ne '' ? ',' : '' ) ) if $publisher ne '';
+        push @imp, ( c => $year ) if $year ne '';
+        push @f, MARC::Field->new( '260', ' ', ' ', @imp ) if @imp;
+        push @f, MARC::Field->new( '300', ' ', ' ', a => "$c{PAGINAS} p." ) if $c{PAGINAS} =~ /^[1-9]\d*$/;
+        push @f, MARC::Field->new( '500', ' ', ' ', a => $_ ) for grep { $_ ne '' } $c{OBS1}, $c{OBS2};
+        push @f, MARC::Field->new( '505', '0', ' ', a => join( ' -- ', @{ $r->{toc} } ) ) if $r->{toc};
+        my %kw;
+        push @f, MARC::Field->new( '650', ' ', '4', a => $_ ) for grep { defined && !$kw{ norm($_) }++ } map { $r->{"PALAVRAS$_"} } 1 .. 5;
+        push @f, MARC::Field->new( '655', ' ', '4', a => $genre{ $r->{NUMCLASSIFIC} } ) if defined $genre{ $r->{NUMCLASSIFIC} // 0 };
+        push @f, MARC::Field->new( '700', ( /,/ ? '1' : '0' ), ' ', a => $_ ) for @au;
+        push @f, MARC::Field->new( '942', ' ', ' ', c => $r->{items}[0]{itype} );
+        for my $it ( @{ $r->{items} } ) {
+            my $cn = join( ' ', grep { defined && $_ ne '' } $it->{CDD} // $it->{CDU}, $it->{CUTTER} );
+            my @s = ( a => $o{branch}, b => $o{branch}, y => $it->{itype} );
+            push @s, ( o => $cn ) if $cn ne '';
+            push @s, ( p => $it->{barcode} );
+            push @s, ( t => $it->{EXEMPLAR} ) if defined $it->{EXEMPLAR};
+            push @s, ( h => $it->{VOLUME} ) if defined $it->{VOLUME};
+            push @s, ( c => $it->{LOCAL} ) if defined $it->{LOCAL};
+            push @s, ( d => $it->{AQUISICAO} ) if defined $it->{AQUISICAO};
+            push @s, ( 0 => 1 ) if $it->{BAIXA};
+            push @s, ( 7 => 1 ) if $it->{NAOEMPRESTAR};
+            push @s, ( x => "Biblioteca Fácil: acervo $it->{id}" );
+            push @f, MARC::Field->new( '952', ' ', ' ', @s );
+        }
+        $m->append_fields( sort { $a->tag cmp $b->tag } @f );
+        push @records, $m;
+    }
+}
+
+# ---------------------------------------------------------------- patrons
+sub cpf_ok {
+    my $c = shift;
+    return 0 unless $c =~ /^\d{11}$/ && $c !~ /^(\d)\1{10}$/;
+    my @d = split //, $c;
+    for my $n ( 9, 10 ) {
+        my $s = 0; $s += $d[$_] * ( $n + 1 - $_ ) for 0 .. $n - 1;
+        my $v = ( $s * 10 ) % 11; $v = 0 if $v == 10;
+        return 0 unless $v == $d[$n];
+    }
+    return 1;
+}
+my @pcols = qw( cardnumber surname firstname sex dateofbirth address address2 city state zipcode email phone mobile
+    altcontactsurname altcontactphone dateenrolled sort1 sort2 borrowernotes debarred debarredcomment );
+push @pcols, 'patron_attributes' if $o{'cpf-attr'};
+my ( @patrons, %card_ok, %seen_cpf );
+for my $r ( sort { ( $a->{NUMLEITOR} // 0 ) <=> ( $b->{NUMLEITOR} // 0 ) } live('T04') ) {
+    my $name = $r->{LEITOR} // '';
+    if ( !defined $r->{NUMLEITOR} || $name eq '' ) { $stat{patron_no_name}++; next }
+    my %p = ( cardnumber => $r->{NUMLEITOR} );
+    my ( $first, $rest ) = split / /, $name, 2;
+    @p{qw( firstname surname )} = defined $rest ? ( $first, $rest ) : ( '', $first );
+    my $sex = uc substr( $r->{SEXO2} // '', 0, 1 );
+    $p{sex} = $sex =~ /^[MF]$/ ? $sex : '';
+    $p{dateofbirth}  = $r->{DATANASC} // '';
+    $p{dateenrolled} = $r->{DATACADASTRO} // '';
+    $p{address}  = $r->{ENDERECO} // ''; $p{address2} = $r->{BAIRRO} // ''; $p{city} = $r->{CIDADE} // '';
+    $p{state}    = uc( $r->{ESTADO} // '' ); $p{zipcode} = $r->{CEP} // '';
+    $p{email}    = ( $r->{INTERNET} // '' ) =~ /^[^@\s]+@[^@\s]+\.[^@\s]+$/ ? $r->{INTERNET} : '';
+    $p{phone}    = $r->{TELEFONE1} // ''; $p{mobile} = $r->{TELEFONE2} // '';
+    $p{altcontactsurname} = $r->{NOMECONTATO} // ''; $p{altcontactphone} = $r->{FONECONTATO} // '';
+    $p{sort1} = $r->{TURMA} // ''; $p{sort2} = $r->{TURNO2} // ( $r->{TURNO} // '' );
+    my @notes;
+    push @notes, "Matrícula: $r->{MATRICULA}"      if defined $r->{MATRICULA};
+    push @notes, "RG: $r->{IDENTIDADE}"            if defined $r->{IDENTIDADE};
+    push @notes, "Pai: $r->{NOMEPAI}"              if defined $r->{NOMEPAI};
+    push @notes, "Mãe: $r->{NOMEMAE}"              if defined $r->{NOMEMAE};
+    push @notes, "Referência: $r->{PONTOREFER}"    if defined $r->{PONTOREFER};
+    push @notes, "Escolaridade: $r->{ESCOLARIDADE}" if defined $r->{ESCOLARIDADE};
+    push @notes, "Naturalidade: $r->{NATURALIDADE}" if defined $r->{NATURALIDADE};
+    push @notes, "E-mail: $r->{INTERNET}"          if defined $r->{INTERNET} && $p{email} eq '';
+    push @notes, grep { defined } $r->{OBS1}, $r->{OBS2};
+    push @notes, "Leitor $r->{NUMLEITOR} do Biblioteca Fácil";
+    $p{borrowernotes} = join ' | ', @notes;
+    ( $p{debarred}, $p{debarredcomment} ) = $r->{DESATIVADO} ? ( '9999-12-31', 'Desativado no Biblioteca Fácil' ) : ( '', '' );
+    $stat{deactivated}++ if $r->{DESATIVADO};
+    ( my $cpf = $r->{CPF} // '' ) =~ s/\D//g;
+    $p{patron_attributes} = '';
+    if ( $cpf ne '' ) {
+        if    ( !cpf_ok($cpf) )     { $stat{bad_cpf}++ }
+        elsif ( $seen_cpf{$cpf}++ ) { $stat{dup_cpf}++ }
+        else                        { $p{patron_attributes} = "CPF:$cpf"; $stat{cpf_kept}++ }
+    }
+    $card_ok{ $r->{NUMLEITOR} } = 1;
+    push @patrons, \%p;
+}
+
+# ---------------------------------------------------------------- circulation
+my %loan_head = map { $_->{NUMEMPRESTIMO} => $_ } grep { defined $_->{NUMEMPRESTIMO} } rows('T13');
+my ( @loans, %open_of );
+for my $r ( sort { ( $a->{NUMMOVIMENTO} // 0 ) <=> ( $b->{NUMMOVIMENTO} // 0 ) } rows('T11') ) {
+    my $h = $loan_head{ $r->{NUMEMPRESTIMO} // 0 };
+    if ( defined $r->{EXCLUSAO} || !$h || defined $h->{EXCLUSAO} ) { $stat{loan_cancelled}++; next }
+    my ( $card, $c ) = ( $h->{NUMLEITOR} // 0, $r->{NUMACERVO} // 0 );
+    if ( !$card_ok{$card} || !$group_of{$c} ) { $stat{loan_orphan}++; next }
+    my $issued = $h->{DATA} // $r->{PREVISAO};
+    if ( !$issued ) { $stat{loan_orphan}++; next }
+    my %l = ( card => $card, acervo => $c, barcode => $barcode_of{$c}, issued => $issued, due => $r->{PREVISAO} // $issued, returned => $r->{DEVOLUCAO} );
+    if ( !defined $l{returned} ) {
+        # Only one open loan per copy: an older one counts as returned on the date of the newer.
+        if ( my $prev = $open_of{$c} ) { $prev->{returned} = $issued; $stat{loan_double}++ }
+        $open_of{$c} = \%l;
+    }
+    push @loans, \%l;
+}
+my $open = grep { !defined $_->{returned} } @loans;
+my $returned = @loans - $open;
+$stat{marked_on_loan} = grep { $_->{EMPRESTADO} } values %acervo;
+
+my ( @holds, %hold_seen, %rank );
+for my $r ( sort { ( $a->{DATA} // '' ) cmp( $b->{DATA} // '' ) || ( $a->{NUMRESERVA} // 0 ) <=> ( $b->{NUMRESERVA} // 0 ) } rows('T15') ) {
+    my ( $card, $c ) = ( $r->{NUMLEITOR} // 0, $r->{NUMACERVO} // 0 );
+    my $until = $r->{VALIDADE2} // $r->{VALIDADE1};
+    if ( defined $r->{EXCLUSAO} || $r->{UTILIZOU} || ( $until && $until lt $o{today} ) ) { $stat{hold_old}++; next }
+    if ( !$card_ok{$card} || !$group_of{$c} ) { $stat{hold_orphan}++; next }
+    next if $hold_seen{"$card|$group_of{$c}"}++;
+    push @holds, { card => $card, acervo => $c, barcode => $barcode_of{$c}, reserved => $r->{DATA} // $o{today}, expires => $until, rank => ++$rank{ $group_of{$c} } };
+}
+$stat{hold_old} += $T{T15}{deleted} if $T{T15};
+
+sub sqlq { my $s = shift; return 'NULL' unless defined $s && $s ne ''; $s =~ s/\\/\\\\/g; $s =~ s/'/\\'/g; return "'$s'" }
+sub circ_sql {
+    my $check = shift;
+    my $b = sqlq( $o{branch} );
+    my @s = ( '-- koha-easy-installer: Biblioteca Fácil loans and holds', 'SET NAMES utf8mb4;', 'START TRANSACTION;',
+        'CREATE TEMPORARY TABLE kei_bf_loan (n int NOT NULL PRIMARY KEY, card varchar(32) NOT NULL, acervo int NOT NULL, barcode varchar(80) NOT NULL, issued datetime NOT NULL, due datetime NOT NULL, returned datetime NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+        'CREATE TEMPORARY TABLE kei_bf_hold (n int NOT NULL PRIMARY KEY, card varchar(32) NOT NULL, acervo int NOT NULL, barcode varchar(80) NOT NULL, reserved date NOT NULL, expires date NULL, rnk int NOT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;' );
+    my $n = 0;
+    for my $l (@loans) {
+        push @s, sprintf( 'INSERT INTO kei_bf_loan VALUES (%d, %s, %d, %s, %s, %s, %s);', ++$n, sqlq( $l->{card} ), $l->{acervo}, sqlq( $l->{barcode} ),
+            sqlq("$l->{issued} 12:00:00"), sqlq("$l->{due} 23:59:00"), defined $l->{returned} ? sqlq("$l->{returned} 12:00:00") : 'NULL' );
+    }
+    $n = 0;
+    for my $h (@holds) {
+        push @s, sprintf( 'INSERT INTO kei_bf_hold VALUES (%d, %s, %d, %s, %s, %s, %d);', ++$n, sqlq( $h->{card} ), $h->{acervo}, sqlq( $h->{barcode} ), sqlq( $h->{reserved} ), sqlq( $h->{expires} ), $h->{rank} );
+    }
+    # A loan or hold is linked only to the patron with that card number and to
+    # the item with that barcode that came from the same Biblioteca Fácil copy.
+    push @s, "CREATE TEMPORARY TABLE kei_bf_loan_ok AS SELECT l.n, l.issued, l.due, l.returned, b.borrowernumber, i.itemnumber FROM kei_bf_loan l JOIN borrowers b ON b.cardnumber = l.card JOIN items i ON i.barcode = l.barcode AND i.itemnotes_nonpublic = CONCAT('Biblioteca Fácil: acervo ', l.acervo);",
+        "CREATE TEMPORARY TABLE kei_bf_hold_ok AS SELECT h.n, h.reserved, h.expires, h.rnk, b.borrowernumber, i.biblionumber FROM kei_bf_hold h JOIN borrowers b ON b.cardnumber = h.card JOIN items i ON i.barcode = h.barcode AND i.itemnotes_nonpublic = CONCAT('Biblioteca Fácil: acervo ', h.acervo);",
+        "SELECT COUNT(*) INTO \@kei_loans FROM kei_bf_loan_ok;",
+        "SELECT COUNT(*) INTO \@kei_holds FROM kei_bf_hold_ok;",
+        # What is already in Koha (a second run, or the item already on loan) is left out.
+        'DELETE o FROM kei_bf_loan_ok o WHERE o.returned IS NOT NULL AND EXISTS (SELECT 1 FROM old_issues x WHERE x.itemnumber = o.itemnumber AND x.borrowernumber = o.borrowernumber AND x.issuedate = o.issued);',
+        'DELETE o FROM kei_bf_loan_ok o WHERE o.returned IS NULL AND EXISTS (SELECT 1 FROM issues x WHERE x.itemnumber = o.itemnumber);',
+        'DELETE h FROM kei_bf_hold_ok h WHERE EXISTS (SELECT 1 FROM reserves x WHERE x.borrowernumber = h.borrowernumber AND x.biblionumber = h.biblionumber);',
+        "SELECT CONCAT('Loans linked: ', \@kei_loans, ' of ', (SELECT COUNT(*) FROM kei_bf_loan)) AS kei;",
+        "SELECT CONCAT('Loans already in Koha (skipped): ', \@kei_loans - COUNT(*)) AS kei FROM kei_bf_loan_ok;",
+        "SELECT CONCAT('Loans to add: ', COUNT(*)) AS kei FROM kei_bf_loan_ok;",
+        "SELECT CONCAT('Open loans to add: ', COUNT(*)) AS kei FROM kei_bf_loan_ok WHERE returned IS NULL;",
+        "SELECT CONCAT('Holds linked: ', \@kei_holds, ' of ', (SELECT COUNT(*) FROM kei_bf_hold)) AS kei;",
+        "SELECT CONCAT('Holds already in Koha (skipped): ', \@kei_holds - COUNT(*)) AS kei FROM kei_bf_hold_ok;",
+        "SELECT CONCAT('Holds to add: ', COUNT(*)) AS kei FROM kei_bf_hold_ok;";
+    if ($check) { push @s, 'ROLLBACK;'; return join( "\n", @s ) . "\n" }
+    push @s,
+        # New issue ids start above every id in use, so a later check-in never
+        # moves a loan onto an existing old_issues row.
+        "SELECT GREATEST((SELECT COALESCE(MAX(issue_id), 0) FROM issues), (SELECT COALESCE(MAX(issue_id), 0) FROM old_issues), COALESCE((SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues'), 1) - 1) INTO \@kei_id;",
+        "INSERT INTO old_issues (issue_id, borrowernumber, itemnumber, date_due, branchcode, returndate, issuedate) SELECT (\@kei_id := \@kei_id + 1), borrowernumber, itemnumber, due, $b, returned, issued FROM kei_bf_loan_ok WHERE returned IS NOT NULL ORDER BY n;",
+        "SET \@kei_old = ROW_COUNT();",
+        "INSERT INTO issues (issue_id, borrowernumber, itemnumber, date_due, branchcode, issuedate) SELECT (\@kei_id := \@kei_id + 1), o.borrowernumber, o.itemnumber, o.due, $b, o.issued FROM kei_bf_loan_ok o WHERE o.returned IS NULL AND NOT EXISTS (SELECT 1 FROM issues x WHERE x.itemnumber = o.itemnumber) ORDER BY o.n;",
+        "SET \@kei_open = ROW_COUNT();",
+        "UPDATE items i JOIN issues c ON c.itemnumber = i.itemnumber SET i.onloan = DATE(c.date_due) WHERE c.issue_id > \@kei_id - \@kei_open;",
+        "UPDATE items i JOIN (SELECT itemnumber, COUNT(*) AS c FROM kei_bf_loan_ok GROUP BY itemnumber) s ON s.itemnumber = i.itemnumber SET i.issues = COALESCE(i.issues, 0) + s.c;",
+        "INSERT INTO reserves (borrowernumber, reservedate, biblionumber, branchcode, priority, expirationdate) SELECT h.borrowernumber, h.reserved, h.biblionumber, $b, h.rnk + COALESCE((SELECT MAX(r.priority) FROM reserves r WHERE r.biblionumber = h.biblionumber), 0), h.expires FROM kei_bf_hold_ok h WHERE NOT EXISTS (SELECT 1 FROM reserves x WHERE x.borrowernumber = h.borrowernumber AND x.biblionumber = h.biblionumber) ORDER BY h.n;",
+        "SET \@kei_holds = ROW_COUNT();",
+        'COMMIT;',
+        "SET \@kei_sql = CONCAT('ALTER TABLE issues AUTO_INCREMENT = ', \@kei_id + 1);",
+        'PREPARE kei_stmt FROM @kei_sql; EXECUTE kei_stmt; DEALLOCATE PREPARE kei_stmt;',
+        "SELECT CONCAT('Returned loans added: ', \@kei_old) AS kei;",
+        "SELECT CONCAT('Open loans added: ', \@kei_open) AS kei;",
+        "SELECT CONCAT('Holds added: ', \@kei_holds) AS kei;";
+    return join( "\n", @s ) . "\n";
+}
+
+# ---------------------------------------------------------------- output
+sub csvq { my $s = shift // ''; $s =~ s/"/""/g; return qq{"$s"} }
+if ( $o{marc} ) {
+    open( my $out, '>:raw', $o{marc} ) or fail( 1, "cannot write $o{marc}" );
+    print {$out} encode( 'UTF-8', $_->as_usmarc ) for @records;
+    close($out) or fail( 1, "cannot write $o{marc}" );
+}
+if ( $o{patrons} ) {
+    open( my $out, '>:encoding(UTF-8)', $o{patrons} ) or fail( 1, "cannot write $o{patrons}" );
+    print {$out} join( ',', @pcols ), "\n";
+    for my $p (@patrons) { print {$out} join( ',', map { csvq( $p->{$_} ) } @pcols ), "\n" }
+    close($out) or fail( 1, "cannot write $o{patrons}" );
+}
+for my $k ( 'circ', 'circ-check' ) {
+    next unless $o{$k};
+    open( my $out, '>:encoding(UTF-8)', $o{$k} ) or fail( 1, "cannot write $o{$k}" );
+    print {$out} circ_sql( $k eq 'circ-check' );
+    close($out) or fail( 1, "cannot write $o{$k}" );
+}
+
+my $items = 0; $items += @{ $rec{$_}{items} } for @order;
+my %label = ( T01 => 'program operators', T02 => 'operator permissions', T03 => 'settings', T04 => 'patrons', T05 => 'authors', T06 => 'publishers',
+    T07 => 'literary classification', T08 => 'item types', T09 => 'collection (one row per copy)', T10 => 'authors of each copy', T11 => 'loan lines',
+    T12 => 'contents (index) lines', T13 => 'loans', T14 => 'languages', T15 => 'holds' );
+print "Backup: $desc", ( $when ? " ($when)" : '' ), "\n" if $desc;
+print "Tables read: ", scalar( keys %T ), " of 15\n";
+for my $k ( sort keys %label ) {
+    my $t = $T{$k};
+    printf "  %-4s %-30s %s\n", $k, $label{$k},
+        $t ? sprintf( '%d row(s)%s%s', scalar @{ $t->{rows} }, ( $t->{deleted} ? ", $t->{deleted} deleted" : '' ), ( $stat{"removed_$k"} ? sprintf( ', %d removed in the program', $stat{"removed_$k"} ) : '' ) ) : 'missing';
+}
+print "Warnings:\n", map( {"  $_\n"} @warn ) if @warn;
+print "\n";
+printf "Copies without title (skipped): %d\n", $stat{no_title} // 0;
+print "Records: ", scalar(@order), "\n";
+print "Items created: $items\n";
+printf "Barcodes from the tombo: %d\n", $stat{tombo_barcodes} // 0;
+printf "Barcodes BF<number> (tombo missing or repeated): %d\n", $stat{bf_barcodes} // 0;
+printf "Withdrawn (baixa): %d    Not for loan: %d\n", $stat{withdrawn} // 0, $stat{notforloan} // 0;
+printf "Author links to missing authors or copies: %d\n", $stat{orphan_author_links} // 0;
+print "Item types: ", join( ', ', map {"$_ -> $type_map{$_}"} sort keys %type_map ), "\n" if %type_map;
+print "\n";
+print "Patrons ready: ", scalar(@patrons), "\n";
+printf "Patrons without name (skipped): %d\n", $stat{patron_no_name} // 0;
+printf "Invalid CPF (not kept): %d    Repeated CPF (kept on the first only): %d\n", $stat{bad_cpf} // 0, $stat{dup_cpf} // 0;
+printf "Deactivated (restricted in Koha): %d\n", $stat{deactivated} // 0;
+print "\n";
+print "Open loans: $open\n";
+print "Returned loans: $returned\n";
+printf "Loan lines skipped (cancelled, or patron or copy missing): %d\n", ( $stat{loan_cancelled} // 0 ) + ( $stat{loan_orphan} // 0 );
+printf "Copies with two open loans (the older one closed): %d\n", $stat{loan_double} // 0 if $stat{loan_double};
+printf "Copies marked as on loan in the program: %d\n", $stat{marked_on_loan} // 0;
+print "Holds still valid: ", scalar(@holds), "\n";
+printf "Holds used, expired or removed (skipped): %d\n", $stat{hold_old} // 0;
+printf "Holds whose patron or copy is missing (skipped): %d\n", $stat{hold_orphan} // 0 if $stat{hold_orphan};
+print "\n";
+printf "Not migrated: program operators and their passwords (%d), photos (%d)\n", scalar( rows('T01') ), $stat{photos} // 0;
+my ($conf) = rows('T03');
+my @rules;
+push @rules, "loan period $conf->{DIAS} days" if $conf && $conf->{DIAS};
+push @rules, "up to $conf->{LIMITEITENSEMPR} items per patron" if $conf && $conf->{LIMITEITENSEMPR};
+push @rules, map {"$_->{TIPOITEM} $_->{QTDDIAS} days"} grep { $_->{TIPOITEM} && $_->{QTDDIAS} } map { $type{$_} } sort { $a <=> $b } keys %type;
+print "Circulation rules in the old program (set them in Koha > Circulation and fines rules): ", join( '; ', @rules ), "\n" if @rules;
+if ( $o{'dry-run'} ) {
+    my $n = 0;
+    for my $m (@records) {
+        last if $n++ >= $o{sample};
+        print "\n--- Sample ---\n" if $n == 1;
+        print $m->as_formatted, "\n";
+    }
+}
+exit 0;
+BFDB
+}
+
+lt_br_migrate_bfdb() {
+    require_database || return 0
+    local file branch itype cat mode
+    file=$(select_file "/root" "bkp dat" "$(t "Pick the Biblioteca Fácil backup (.bkp) or the T09_ACER.dat file of its data folder:")" "$(t "Backup file")") || return 0
+    if [ ! -r "$file" ] || [ ! -s "$file" ]; then
+        msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    branch=$(tools_pick "$(t "Legacy migration")" "$(t "Library of the items:")" "SELECT branchcode, branchname FROM ${DB_NAME}.branches ORDER BY branchname;") || return 0
+    itype=$(tools_pick "$(t "Legacy migration")" "$(t "Item type for the rows without one:")" "SELECT itemtype, description FROM ${DB_NAME}.itemtypes ORDER BY description;") || return 0
+    cat=$(tools_pick "$(t "Legacy migration")" "$(t "Patron category for the Biblioteca Fácil readers:")" "SELECT categorycode, description FROM ${DB_NAME}.categories ORDER BY description;") || return 0
+    mode=$(ui_menu "$(t "Records already in the catalog")" "$(t "When an incoming record matches one in the catalog (ISBN and title):")" \
+        "keep"    "$(t "Keep the catalog record, add only new items")" \
+        "replace" "$(t "Replace the catalog record with the incoming one")" \
+        "new"     "$(t "Do not compare: every record becomes a new title")") || return 0
+    tools_locked _lt_br_bfdb_run "$file" "$branch" "$itype" "$cat" "$mode"
+}
+
+_lt_br_bfdb_run() {
+    local file="$1" branch="$2" itype="$3" cat="$4" mode="$5" log src script types rc=0 over="no" match="cardnumber"
+    local recs items pats open returned holds
+    local mrc="$TOOLS_WORK/bf-koha.mrc" pcsv="$TOOLS_WORK/bf-patrons.csv" circ="$TOOLS_WORK/bf-circulation.sql" check="$TOOLS_WORK/bf-circulation-check.sql"
+    local args=()
+    log=$(tools_log bf-database)
+    script="$TOOLS_WORK/bfdb2koha.pl"; types="$TOOLS_WORK/itemtypes.tsv"
+    # The copies handed to Koha hold patron data: only root and the instance user read them.
+    if [[ "${file,,}" == *.dat ]]; then
+        mkdir -p "$TOOLS_WORK/bf-data"
+        find "$(dirname "$file")" -maxdepth 1 -type f -iname 'T[0-9][0-9]_*.dat' -exec cp -f -- {} "$TOOLS_WORK/bf-data/" \; 2>>"$log"
+        chown -R "${INSTANCE}-koha:" "$TOOLS_WORK/bf-data" 2>/dev/null || true
+        chmod -R go-rwx "$TOOLS_WORK/bf-data"
+        src="$TOOLS_WORK/bf-data/${file##*/}"
+    elif ! src=$(tools_copy "$file" bf-backup.bkp); then
+        msg_error "" "$(t "The file could not be copied to the work folder.\nNothing was changed.")" 10 70
+        return 1
+    fi
+    run_sql "SELECT itemtype, description FROM ${DB_NAME}.itemtypes;" > "$types"
+    bf_write_dbreader "$script"
+    chown "${INSTANCE}-koha:" "$types" 2>/dev/null || true
+    chmod 600 "$types"
+    args=(--in "$src" --branch "$branch" --itype "$itype" --itypes "$types")
+    [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.borrower_attribute_types WHERE code = 'CPF';")" = "1" ] && args+=(--cpf-attr)
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    koha_exec "$log" bfdb2koha /usr/bin/perl "$script" "${args[@]}" --dry-run || rc=$?
+    case "$rc" in
+        0) ;;
+        4|5)
+            ui_textbox "$(t "Legacy migration")" "$log"
+            msg_error "" "$(t 'This is not a Biblioteca Fácil backup or data folder that the panel can read.\nNothing was changed.\n\nLog: ${log}')" 11 76
+            return 1 ;;
+        *)
+            ui_textbox "$(t "Legacy migration")" "$log"
+            msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+            return 1 ;;
+    esac
+    recs=$(tools_num "$log" "Records:"); items=$(tools_num "$log" "Items created:"); pats=$(tools_num "$log" "Patrons ready:")
+    open=$(tools_num "$log" "Open loans:"); returned=$(tools_num "$log" "Returned loans:"); holds=$(tools_num "$log" "Holds still valid:")
+    tools_output "$log" > "$TOOLS_WORK/bf-preview.txt"
+    ui_textbox "$(t "Preview (dry run)")" "$TOOLS_WORK/bf-preview.txt"
+    if [ $((recs + pats)) -eq 0 ]; then
+        msg_info "$(t "Legacy migration")" "$(t 'The backup has no copies and no patrons.\nNothing was changed.\n\nLog: ${log}')" 11 72
+        return 0
+    fi
+    prompt_yes_no "$(t "Legacy migration")" "$(t 'Records: ${recs}\nItems: ${items}\nPatrons: ${pats}\nLoans: ${open} open, ${returned} returned\nHolds: ${holds}\n\nMigrate in three steps (collection, patrons, then loans and holds)? Each step shows its own preview and makes a verified backup before it writes.')" 17 76 defaultno || return 0
+    if ! koha_exec "$log" bfdb2koha /usr/bin/perl "$script" "${args[@]}" --marc "$mrc" --patrons "$pcsv" --circ "$circ" --circ-check "$check"; then
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    chmod 600 "$mrc" "$pcsv" "$circ" "$check" 2>/dev/null || true
+    log "tools: Biblioteca Fácil database read ($recs records, $items items, $pats patrons, $open open and $returned returned loans, $holds holds)"
+    # Each step stops the migration if it fails; declining a step skips it,
+    # and the loans and holds then link only what is already in Koha.
+    if [ "${recs:-0}" -gt 0 ]; then
+        _lt_marc_import_run "$mrc" "ISO2709" "UTF-8" "$mode" || return 1
+    fi
+    if [ "${pats:-0}" -gt 0 ]; then
+        prompt_yes_no "$(t "Import patrons")" "$(t 'Update the patrons that are already registered (same ${match})?\n\nNo = keep them as they are and import only the new ones.')" 11 72 defaultno && over="yes"
+        _lt_patron_import_run "$pcsv" "$match" "$branch" "$cat" "$over" || return 1
+    fi
+    if [ $((open + returned + holds)) -gt 0 ]; then
+        _lt_br_bfdb_circ "$circ" "$check"
+    fi
+}
+
+# Loans and holds of the Biblioteca Fácil database: counted in a rolled back
+# transaction first, then added in one transaction after a PRE-CIRCULATION backup.
+_lt_br_bfdb_circ() {
+    local circ="$1" check="$2" log linked open holds old new held
+    log=$(tools_log bf-circulation)
+    display_explanation "Preview (dry run): nothing is changed yet..."
+    if ! koha_sql_run "$log" "$check"; then
+        ui_textbox "$(t "Legacy migration")" "$log"
+        msg_error "" "$(t 'Koha could not complete the request. Nothing was changed.\n\nLog: ${log}')" 10 74
+        return 1
+    fi
+    linked=$(tools_num "$log" "Loans to add:"); open=$(tools_num "$log" "Open loans to add:"); holds=$(tools_num "$log" "Holds to add:")
+    tools_output "$log" | grep -E '^(Loans|Open loans|Holds) ' > "$TOOLS_WORK/bf-circulation.txt"
+    ui_textbox "$(t "Preview (dry run)")" "$TOOLS_WORK/bf-circulation.txt"
+    if [ $((linked + holds)) -eq 0 ]; then
+        msg_info "$(t "Legacy migration")" "$(t 'No loan or hold to add: they are already in Koha, or the collection and the patrons must be imported first.\nNothing was changed.\n\nLog: ${log}')" 12 76
+        return 0
+    fi
+    prompt_yes_no "$(t "Legacy migration")" "$(t 'Loans: ${linked} (${open} still open)\nHolds: ${holds}\n\nAdd them to Koha now? A verified backup is made first.')" 12 72 defaultno || return 0
+    tools_safety_backup CIRCULATION || return 1
+    display_explanation "Applying the changes..."
+    if ! koha_sql_run "$log" "$circ"; then
+        ui_textbox "$(t "Legacy migration")" "$log"
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    old=$(tools_num "$log" "Returned loans added:"); new=$(tools_num "$log" "Open loans added:"); held=$(tools_num "$log" "Holds added:")
+    log "tools: Biblioteca Fácil loans and holds added (returned=$old open=$new holds=$held)"
+    msg_ok "$(t '✔ Loans and holds added.\n\nReturned loans: ${old}\nOpen loans: ${new}\nHolds: ${held}\n\nSafety backup: ${TOOLS_PRE}\nLog: ${log}')" 15 76
+}
+
+# ----------------------------------------------------------------------
 # Legacy patron spreadsheets -> import_patrons.pl CSV (with CPF checks).
 # Columns are recognised by their usual Portuguese or English names.
 # ----------------------------------------------------------------------
@@ -10653,7 +11282,8 @@ function_brazil_tools() {
             "6" "$(t "◷  Brazilian holidays in the calendar")" \
             "7" "$(t "⇩  Migrate a collection spreadsheet (Biblioteca Fácil)")" \
             "8" "$(t "▤  Government census reports (MEC/INEP/IBGE)")" \
-            "9" "$(t "▤  ABNT references and bibliographies (NBR 6023)")" 3>&1 1>&2 2>&3) || return 0
+            "9" "$(t "▤  ABNT references and bibliographies (NBR 6023)")" \
+            "10" "$(t "⇩  Migrate the Biblioteca Fácil database (backup .bkp)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_br_migrate_marc ;;
             2) lt_br_patrons ;;
@@ -10664,6 +11294,7 @@ function_brazil_tools() {
             7) lt_br_migrate_sheet ;;
             8) lt_br_census ;;
             9) lt_br_abnt ;;
+            10) lt_br_migrate_bfdb ;;
         esac
         clear
     done
