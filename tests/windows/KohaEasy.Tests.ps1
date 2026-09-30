@@ -1201,11 +1201,51 @@ Describe 'The Koha icon as the one way in' {
         $sm = Join-Path $TestDrive 'Programs3/Koha'
         $dt = Join-Path $TestDrive 'Desk3'
         New-Item -ItemType Directory -Path $dt -Force | Out-Null
-        $made = @(New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico'))
-        $made.Count | Should -Be 11
+        $made = @(New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') -PublicDesktop '')
+        # The desktop one is the Start menu one, copied as a plain file.
+        $made.Count | Should -Be 12
         Test-Path -LiteralPath (Join-Path $sm 'Koha.lnk') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $dt 'Koha.lnk') | Should -BeTrue
+        Get-KohaIconPlace | Should -Be 'desktop'
         @(Get-KohaShortcutErrors).Count | Should -Be 1
         @(Get-KohaShortcutErrors)[0] | Should -BeLike '*Koha.lnk: Unable to save shortcut'
+    }
+
+    It 'puts the Koha icon on the desktop of all users only when neither the desktop nor the Start menu took it' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { if ($Path -like '*Pub4*') { [System.IO.File]::WriteAllText($Path, ''); return }; throw 'Access is denied' }
+        Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { $true }
+        $pub = Join-Path $TestDrive 'Pub4'
+        $dt = Join-Path $TestDrive 'Desk4'
+        New-Item -ItemType Directory -Path $pub, $dt -Force | Out-Null
+        New-KohaShortcuts -StartMenu (Join-Path $TestDrive 'Programs4/Koha') -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') -PublicDesktop $pub | Out-Null
+        Get-KohaIconPlace | Should -Be 'public'
+        Test-Path -LiteralPath (Join-Path $pub 'Koha.lnk') | Should -BeTrue
+        # Once the own desktop takes it again, the second icon goes.
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { [System.IO.File]::WriteAllText($Path, '') }
+        New-KohaShortcuts -StartMenu (Join-Path $TestDrive 'Programs4/Koha') -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') -PublicDesktop $pub | Out-Null
+        Get-KohaIconPlace | Should -Be 'desktop'
+        Test-Path -LiteralPath (Join-Path $pub 'Koha.lnk') | Should -BeFalse
+    }
+
+    It 'writes a shortcut the second way when WScript.Shell cannot, and gives both reasons when neither can' {
+        Mock -ModuleName KohaEasy.Core Import-KohaNative { $false }
+        { Save-KohaLnkShortcut -Path (Join-Path $TestDrive 'x.lnk') -Target 'a' -Arguments '' -Icon 'i' } | Should -Throw '*WScript.Shell*'
+    }
+
+    It 'logs why a window, the tray or the Koha icon ended, and reads the tray''s reason back' {
+        $ps = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw
+        $ps.IndexOf('trap {') | Should -BeLessThan $ps.IndexOf('Import-Module')
+        $ps | Should -Match "'\{0\} failed: \{1\} \| stack: \{2\}'"
+        Write-KohaLog 'Tray failed: Add-Type: compile error | stack: at <ScriptBlock>'
+        Get-KohaLastFailure 'Tray' | Should -Be 'Add-Type: compile error'
+        Get-KohaLastFailure 'Window' | Should -Be ''
+    }
+
+    It 'downloads the panel dependencies with one status line, APT''s output only in its log' {
+        $sh = Get-Content -LiteralPath (Join-Path $repo 'installer') -Raw
+        $sh | Should -Match 'Downloading the panel dependencies\.\.\.'
+        $sh | Should -Match 'apt_install "\$\{MISSING_DEPS\[@\]\}" >/dev/null 2>&1'
+        $sh | Should -Match 'KEI_VERBOSE'
     }
 
     It 'opens the Koha window from the Koha icon, and brings an open one to the front' {

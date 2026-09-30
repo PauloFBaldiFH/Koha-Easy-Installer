@@ -2251,15 +2251,30 @@ function Save-KohaUrlShortcut {
     [System.IO.File]::WriteAllText($Path, $text, [System.Text.Encoding]::ASCII)
 }
 
+# Two independent ways: WScript.Shell, then the shell's own IShellLink in
+# KohaEasy.exe (KohaEasy.Native). Throws with both reasons when neither
+# could write it.
 function Save-KohaLnkShortcut {
     param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon)
-    $shell = New-Object -ComObject WScript.Shell
-    $lnk = $shell.CreateShortcut($Path)
-    $lnk.TargetPath = $Target
-    $lnk.Arguments = $Arguments
-    $lnk.WorkingDirectory = Get-KohaPath Root
-    $lnk.IconLocation = $Icon + ',0'
-    $lnk.Save()
+    try {
+        $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop
+        $lnk = $shell.CreateShortcut($Path)
+        $lnk.TargetPath = $Target
+        $lnk.Arguments = $Arguments
+        $lnk.WorkingDirectory = Get-KohaPath Root
+        $lnk.IconLocation = $Icon + ',0'
+        $lnk.Save()
+        return
+    } catch {
+        $first = 'WScript.Shell: ' + $_.Exception.Message
+    }
+    if (-not (Import-KohaNative)) { throw $first }
+    try {
+        [KohaEasy.Native]::CreateShortcut($Path, $Target, $Arguments, (Get-KohaPath Root), $Icon)
+        Write-KohaLog ('shortcut written through IShellLink after ' + $first)
+    } catch {
+        throw ('{0}; IShellLink: {1}' -f $first, $_.Exception.Message)
+    }
 }
 
 # The signed-in user's own desktop, the one Explorer shows: Windows' answer
@@ -2309,6 +2324,10 @@ function Add-KohaShortcutError {
 }
 # What went wrong in the last New-KohaShortcuts, one line per file.
 function Get-KohaShortcutErrors { return @($script:ShortcutErrors) }
+# Where the last New-KohaShortcuts left the Koha icon: desktop, public (the
+# desktop of all users), startmenu, or '' (nowhere).
+$script:KohaIconPlace = ''
+function Get-KohaIconPlace { return $script:KohaIconPlace }
 
 # Creates (or refreshes) every shortcut with the Koha icon. The icon is copied
 # next to KohaEasy.ps1 first, so shortcuts keep it if the ZIP folder is deleted.
@@ -2316,7 +2335,8 @@ function New-KohaShortcuts {
     param(
         [string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'),
         [string]$Desktop = (Get-KohaDesktopPath),
-        [string]$IconSource = [System.IO.Path]::Combine($PSScriptRoot, 'koha.ico')
+        [string]$IconSource = [System.IO.Path]::Combine($PSScriptRoot, 'koha.ico'),
+        [string]$PublicDesktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
     )
     # Every problem is kept (Get-KohaShortcutErrors) and none stops the
     # other shortcuts: the Koha icon comes first, and one shortcut Windows
@@ -2325,11 +2345,11 @@ function New-KohaShortcuts {
     $icon = Get-KohaIconPath
     try {
         if ((Test-Path -LiteralPath $IconSource) -and ($IconSource -ne $icon)) {
-            New-Item -ItemType Directory -Path (Split-Path -Parent $icon) -Force | Out-Null
-            Copy-Item -LiteralPath $IconSource -Destination $icon -Force
+            New-Item -ItemType Directory -Path (Split-Path -Parent $icon) -Force -ErrorAction Stop | Out-Null
+            Copy-Item -LiteralPath $IconSource -Destination $icon -Force -ErrorAction Stop
         }
     } catch { Add-KohaShortcutError $icon $_.Exception.Message }
-    try { New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null } catch { Add-KohaShortcutError $StartMenu $_.Exception.Message }
+    try { New-Item -ItemType Directory -Path $StartMenu -Force -ErrorAction Stop | Out-Null } catch { Add-KohaShortcutError $StartMenu $_.Exception.Message }
     if ($Desktop) {
         # Older versions also put the two web shortcuts on the desktop; the
         # one Koha icon (the Koha window) replaces them.
@@ -2363,10 +2383,40 @@ function New-KohaShortcuts {
             else { Add-KohaShortcutError $file 'the file was not there right after it was written' }
         }
     }
+    # The Koha icon where the librarian looks for it, whatever refused the
+    # first try: the Start menu one copied onto the desktop as a plain file,
+    # then the desktop of all users (it needs administrator rights on most
+    # PCs, so it is only a last try).
+    $menuLnk = [System.IO.Path]::Combine($StartMenu, 'Koha.lnk')
+    $deskLnk = ''
+    if ($Desktop) { $deskLnk = [System.IO.Path]::Combine($Desktop, 'Koha.lnk') }
+    $script:KohaIconPlace = ''
+    if ($deskLnk -and -not (Test-Path -LiteralPath $deskLnk) -and (Test-Path -LiteralPath $menuLnk)) {
+        try {
+            [System.IO.File]::Copy($menuLnk, $deskLnk, $true)
+            if (Test-Path -LiteralPath $deskLnk) { [void]$made.Add($deskLnk); Write-KohaLog ('Koha icon copied from the Start menu to ' + $deskLnk) }
+        } catch { Add-KohaShortcutError $deskLnk ('copy from the Start menu: ' + $_.Exception.Message) }
+    }
+    if ($deskLnk -and (Test-Path -LiteralPath $deskLnk)) {
+        $script:KohaIconPlace = 'desktop'
+        # A second Koha icon from an earlier last try would show twice.
+        if ($PublicDesktop) {
+            $pub = [System.IO.Path]::Combine($PublicDesktop, 'Koha.lnk')
+            if (Test-Path -LiteralPath $pub) { Remove-Item -LiteralPath $pub -Force -ErrorAction SilentlyContinue }
+        }
+    } elseif ($PublicDesktop -and (Test-Path -LiteralPath $PublicDesktop)) {
+        $pub = [System.IO.Path]::Combine($PublicDesktop, 'Koha.lnk')
+        try {
+            if (Test-Path -LiteralPath $menuLnk) { [System.IO.File]::Copy($menuLnk, $pub, $true) }
+            else { $k = @(Get-KohaShortcutList)[0]; Save-KohaLnkShortcut -Path $pub -Target $k.Target -Arguments $k.Arguments -Icon $k.Icon }
+            if (Test-Path -LiteralPath $pub) { [void]$made.Add($pub); $script:KohaIconPlace = 'public' }
+        } catch { Add-KohaShortcutError $pub $_.Exception.Message }
+    }
+    if (-not $script:KohaIconPlace -and (Test-Path -LiteralPath $menuLnk)) { $script:KohaIconPlace = 'startmenu' }
     # Only with the Start menu shortcut does Windows know Koha's name and
     # icon for its notifications and the taskbar.
     Set-KohaState @{ appIdShortcut = $identity } | Out-Null
-    Write-KohaLog ('shortcuts created: {0}, Koha identity on the taskbar: {1}' -f $made.Count, $identity)
+    Write-KohaLog ('shortcuts created: {0}, Koha icon: {1}, Koha identity on the taskbar: {2}' -f $made.Count, $script:KohaIconPlace, $identity)
     return @($made)
 }
 
@@ -2424,6 +2474,19 @@ function Set-KohaDistroIcon {
 # ----------------------------------------------------------------------
 # Tray at sign-in (HKCU Run: no administrator rights)
 # ----------------------------------------------------------------------
+# The last "<Command> failed:" line KohaEasy.ps1 wrote today (its trap), so
+# a tray that ended at once can say why. '' when there is none.
+function Get-KohaLastFailure {
+    param([string]$Command)
+    try {
+        $file = Join-Path (Get-KohaPath Logs) ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+        if (-not (Test-Path -LiteralPath $file)) { return '' }
+        $hit = Select-String -LiteralPath $file -Pattern ('\| {0} failed: ' -f [regex]::Escape($Command)) | Select-Object -Last 1
+        if ($hit) { return (($hit.Line -split ' failed: ', 2)[1] -split ' \| stack: ')[0] }
+    } catch { }
+    return ''
+}
+
 function Test-KohaTrayAtSignIn {
     try {
         $v = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'KohaEasyTray' -ErrorAction Stop).KohaEasyTray
@@ -2465,7 +2528,7 @@ function Set-KohaTrayAtSignIn {
     if ($Enabled) {
         $l = Get-KohaHiddenLaunch -Arguments 'Tray'
         $cmd = '"{0}" {1}' -f $l.Target, $l.Arguments
-        New-ItemProperty -Path $key -Name 'KohaEasyTray' -Value $cmd -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $key -Name 'KohaEasyTray' -Value $cmd -PropertyType String -Force -ErrorAction Stop | Out-Null
     } else {
         Remove-ItemProperty -Path $key -Name 'KohaEasyTray' -ErrorAction SilentlyContinue
     }
@@ -2474,6 +2537,11 @@ function Set-KohaTrayAtSignIn {
 # The tray is the PowerShell running "KohaEasy.ps1 Tray" (whatever started it:
 # KohaEasy.exe, conhost or PowerShell itself).
 function Test-KohaTrayRunning {
+    # The tray holds this mutex while it runs (KohaEasy.Tray.ps1).
+    $m = $null
+    try {
+        if ([System.Threading.Mutex]::TryOpenExisting('Local\KohaEasyTray', [ref]$m)) { $m.Dispose(); return $true }
+    } catch { }
     try {
         return (@(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop |
                 Where-Object { ([string]$_.CommandLine) -match 'KohaEasy\.ps1"?\s+Tray' }).Count -gt 0)
