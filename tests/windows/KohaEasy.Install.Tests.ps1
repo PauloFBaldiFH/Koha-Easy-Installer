@@ -955,6 +955,110 @@ Describe 'Koha window' {
     }
 }
 
+Describe 'The Koha window banner and terminal area' {
+    BeforeAll {
+        function New-Health {
+            param([bool]$Debian = $true, [hashtable]$States = @{})
+            $rows = foreach ($u in 'wsl', 'mariadb', 'apache2', 'rabbitmq-server', 'memcached', 'koha-common', 'http') {
+                $st = 'running'
+                if ($States.ContainsKey($u)) { $st = $States[$u] }
+                $name = @{ wsl = 'Debian (WSL)'; mariadb = 'MariaDB'; apache2 = 'Apache'; 'rabbitmq-server' = 'RabbitMQ'; memcached = 'Memcached'; 'koha-common' = 'Koha (koha-common)'; http = 'staff' }[$u]
+                [pscustomobject]@{ Unit = $u; Name = $name; State = $st; Detail = '200' }
+            }
+            return [pscustomobject]@{ DebianRunning = $Debian; Services = @($rows) }
+        }
+    }
+
+    It 'is green only when every component runs' {
+        $s = Get-KohaHealthSummary -Health (New-Health) -State 'running'
+        $s.Level | Should -Be 'ok'
+        $s.Text | Should -Be 'All services are running'
+        @($s.Broken).Count | Should -Be 0
+    }
+
+    It 'names the one component that is down, and highlights only that one' {
+        $s = Get-KohaHealthSummary -Health (New-Health -States @{ mariadb = 'failed' }) -State 'running'
+        $s.Level | Should -Be 'fault'
+        $s.Text | Should -Be 'Attention: MariaDB is offline'
+        @($s.Broken) | Should -Be @('mariadb')
+    }
+
+    It 'counts and lists several components that are down' {
+        $s = Get-KohaHealthSummary -Health (New-Health -States @{ apache2 = 'stopped'; http = 'failed' }) -State 'not_responding'
+        $s.Level | Should -Be 'fault'
+        $s.Text | Should -Be 'Attention: 2 components are offline (Apache, HTTP response)'
+        @($s.Broken) | Should -Be @('apache2', 'http')
+    }
+
+    It 'says the staff interface does not answer when only the web answer fails' {
+        $s = Get-KohaHealthSummary -Health (New-Health -States @{ http = 'failed' }) -State 'not_responding'
+        $s.Text | Should -Be 'Attention: the staff interface does not answer'
+    }
+
+    It 'names only Debian when Debian is down while Koha should run' {
+        $all = @{ wsl = 'stopped'; mariadb = 'stopped'; apache2 = 'stopped'; 'rabbitmq-server' = 'stopped'; memcached = 'stopped'; 'koha-common' = 'stopped'; http = 'stopped' }
+        $s = Get-KohaHealthSummary -Health (New-Health -Debian $false -States $all) -State 'stopped'
+        $s.Level | Should -Be 'fault'
+        $s.Text | Should -Be 'Attention: Debian (WSL) is offline'
+        @($s.Broken) | Should -Be @('wsl')
+    }
+
+    It 'highlights nothing when the librarian stopped Koha, or while it starts' {
+        $all = @{ wsl = 'stopped'; mariadb = 'stopped'; apache2 = 'stopped'; 'rabbitmq-server' = 'stopped'; memcached = 'stopped'; 'koha-common' = 'stopped'; http = 'stopped' }
+        $s = Get-KohaHealthSummary -Health (New-Health -Debian $false -States $all) -State 'stopped_by_user'
+        $s.Level | Should -Be 'stopped'
+        @($s.Broken).Count | Should -Be 0
+        $s = Get-KohaHealthSummary -Health (New-Health -States @{ memcached = 'starting' }) -State 'running'
+        $s.Level | Should -Be 'starting'
+        $s = Get-KohaHealthSummary -Health (New-Health -States @{ apache2 = 'stopped'; http = 'failed' }) -State 'starting'
+        $s.Level | Should -Be 'starting'
+        @($s.Broken).Count | Should -Be 0
+        (Get-KohaHealthSummary -Health $null -State 'running').Level | Should -Be 'unknown'
+    }
+
+    It 'runs one command as the Debian user, from home, with a time limit and the command on stdin' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { throw 'must not run' }
+        Invoke-KohaUserCommand -Command 'df -h' | Should -BeNullOrEmpty
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { $script:wargs = $Arguments; $script:win = $InputText; [pscustomobject]@{ ExitCode = 0; Output = 'ok' } }
+        (Invoke-KohaUserCommand -Command "df -h`r").Output | Should -Be 'ok'
+        ($script:wargs -join ' ') | Should -Be '-d koha --cd ~ -- timeout -k 5 120 bash -l'
+        $script:wargs | Should -Not -Contain '-u'
+        $script:win | Should -Be "df -h`nexit `$?`n"
+    }
+
+    It 'sends the log lines of an action to the terminal area while it is set' {
+        $q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+        Set-KohaOutputSink $q
+        try { Write-KohaLog 'restart services: [OK] mariadb' } finally { Set-KohaOutputSink $null }
+        Write-KohaLog 'not shown'
+        $q.Count | Should -Be 1
+        $line = $null
+        [void]$q.TryDequeue([ref]$line)
+        $line | Should -Match '^\d\d:\d\d:\d\d  restart services: \[OK\] mariadb$'
+    }
+
+    It 'shows each restarted service in the terminal area' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [pscustomobject]@{ ExitCode = 0; Output = "[OK] mariadb`n[OK] apache2`n" } }
+        Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $true }
+        Mock -ModuleName KohaEasy.Core Write-KohaLog { }
+        Restart-KohaServices | Should -Be 'ready'
+        Should -Invoke -ModuleName KohaEasy.Core Write-KohaLog -ParameterFilter { $Message -eq 'restart services: [OK] mariadb' } -Times 1 -Exactly
+        Should -Invoke -ModuleName KohaEasy.Core Write-KohaLog -ParameterFilter { $Message -eq 'restart services: [OK] apache2' } -Times 1 -Exactly
+    }
+
+    It 'the window keeps three actions on its surface, Staff before the catalog, and no Refresh button' {
+        $w = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Window.ps1') -Raw
+        $w.IndexOf("T 'Staff interface'") | Should -BeLessThan $w.IndexOf("T 'Public catalog (OPAC)'")
+        $w | Should -Match 'foreach \(\$b in \$btnPanel, \$btnServices, \$btnConsole, \$btnMore\)'
+        $w | Should -Not -Match "T 'Refresh'"
+        $w | Should -Match "'command'\s+\{"
+        $w | Should -Match 'SetDarkTitleBar'
+    }
+}
+
 Describe 'Linux errors are answers, not PowerShell errors' {
     BeforeAll {
         $script:bin = Join-Path $TestDrive 'fakebin'
