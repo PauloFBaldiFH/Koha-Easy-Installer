@@ -1,8 +1,8 @@
 #!/usr/bin/env bats
-# Library tools 11-13 and the Biblioteca Fácil preset: WhatsApp / Telegram
+# Library tools 11-12 and the Biblioteca Fácil preset: WhatsApp / Telegram
 # messaging (the SMS::Send driver of the panel, run by the real SMS::Send
-# against tests/mocks/http-mock), cataloguing aids (author tables and CDD,
-# real MariaDB), collection spreadsheets (real MARC::Record and
+# against tests/mocks/http-mock), the author and CDD tables of the AI
+# cataloguing, collection spreadsheets (real MARC::Record and
 # yaz-marcdump) and marc_replace.pl (run as a CGI with the Koha doubles of
 # tests/mocks/perl5).
 
@@ -199,7 +199,7 @@ JSON
     assert '[ ! -e "$CONF" ] && [ ! -e "$PM/SMS/Send/KohaEasy/Gateway.pm" ] && [ ! -e "$PM/KohaEasy/Messaging.pm" ] && [ ! -e /etc/cron.d/koha_messaging ] && [ ! -d /var/lib/koha/library/kei-messaging ]'
 }
 
-# --- Cataloguing aids -----------------------------------------------------------
+# --- Author notation and CDD tables (AI cataloguing) ---------------------------
 
 # Synthetic rows in the layout of the PHA book (left letter, number, right
 # letter), made around the examples of its explanation chapter.
@@ -284,66 +284,27 @@ EOF
     assert '[ "$status" -ne 0 ]' "a name must start with a letter"
 }
 
-@test "C03 notation of a catalogue record: 100, 245 ind2 and 082 read from MARCXML; numbers used by other authors in the class" {
-    mkdir -p /etc/koha-easy-install/tables
-    pha_rows > "$W/pha.txt"
-    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
-    inputs 201
-    panel lt_cat_record
-    local r="$KEI_S/textbox.last"
-    assert 'grep -q "PHA table.*: L589c" "$r" && grep -q "Heading: Lentino, Noêmia$" "$r"' "$(cat "$r")"
-    assert 'grep -qx "      025.4" "$r" && grep -qx "      L589c" "$r"' "call number with the class of 082"
-    assert 'grep -q "025.4 L589o .*Lent, Carlos" "$r"' "another author already uses L589 in 025.4"
-    assert '! grep -q "L5891a" "$r" && ! grep -q "869.3 L589x" "$r" && ! grep -q "LENTINO" "$r"' "longer numbers, other classes and the record itself are not collisions"
-    assert 'grep -q "L588  (free)" "$r" && grep -q "L59  (free)" "$r"' "neighbouring numbers: $(cat "$r")"
-    inputs 999999
-    panel lt_cat_record
-    assert 'dialogs | grep -q "Record not found"'
-}
-
-@test "C04 CDD: main classes built in, the library's schedule by number or word, and how the catalogue uses it" {
-    inputs "869.3"
-    panel lt_cat_cdd
-    assert 'grep -q "800 .*Literature" "$KEI_S/textbox.last" && grep -q "869.3 .*1$" "$KEI_S/textbox.last"' "$(cat "$KEI_S/textbox.last")"
+@test "C03 CDD schedule: loaded for the AI cataloguing and removed again" {
     printf '800\tLiteratura (teste)\n860;Literaturas ibéricas (teste)\n869 Literatura em português (teste)\n869.3\tFicção (teste)\nxyz\n' > "$W/cdd.txt"
     export KEI_SELECT_FILE="$W/cdd.txt"
     inputs cdd
     answer yes
     panel lt_cat_load
-    assert '[ "$(wc -l < /etc/koha-easy-install/tables/cdd.tsv)" = "4" ]' "$(cat "$KEI_S/textbox.last")"
-    inputs "869.3"
-    panel lt_cat_cdd
-    local r="$KEI_S/textbox.last"
-    assert 'grep -q "^  800 .*Literature" "$r" && grep -q "^  860 .*Literaturas ibéricas" "$r" && grep -q "^  869 .*Literatura em português" "$r" && grep -q "^  869.3 .*Ficção" "$r"' "$(cat "$r")"
-    inputs "FICCAO"
-    panel lt_cat_cdd
-    assert 'grep -q "869.3 .*Ficção (teste)" "$KEI_S/textbox.last"' "search without accents or case: $(cat "$KEI_S/textbox.last")"
-    inputs "title 1 "
-    panel lt_cat_cdd
-    assert 'grep -q "^  000\.[0-9]* " "$KEI_S/textbox.last"' "classes used by titles with the word: $(cat "$KEI_S/textbox.last")"
+    assert '[ "$(wc -l < /etc/koha-easy-install/tables/cdd.tsv)" = "4" ] && grep -qP "^869\.3\tFicção \(teste\)$" /etc/koha-easy-install/tables/cdd.tsv' "$(cat "$KEI_S/textbox.last")"
     inputs cdd
     answer yes
     panel lt_cat_remove
     assert '[ ! -e /etc/koha-easy-install/tables/cdd.tsv ]'
 }
 
-@test "C05 the cataloguing aids never write to the catalogue" {
-    local before after
-    before=$(mysqldump --skip-dump-date "$DB" | md5sum)
-    mkdir -p /etc/koha-easy-install/tables
-    pha_rows > "$W/pha.txt"
-    panel cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv
-    inputs "Lentino, Noêmia" "Classificação" "025.4"
-    panel lt_cat_notation
-    inputs 201
-    panel lt_cat_record
-    inputs "poesia"
-    panel lt_cat_cdd
-    after=$(mysqldump --skip-dump-date "$DB" | md5sum)
-    assert '[ "$before" = "$after" ] && [ "$(pre_backups)" = "0" ]'
-    inputs "Lentino" "x" "025.4; DROP TABLE items"
-    panel lt_cat_notation
-    assert 'dialogs | grep -q "Invalid class number"'
+@test "C04 the old cataloguing aids menu is gone; the tables are loaded from Replace a MARC record" {
+    local f
+    for f in function_cataloguing lt_cat_notation lt_cat_record lt_cat_cdd cat_cdd_lookup cat_notation_report; do
+        assert '! grep -qE "(^|[^_a-z])${f}([^_a-z]|$)" "$KEI_REPO/installer"' "$f was removed"
+    done
+    assert '! grep -q "Cataloguing aids" "$KEI_REPO/installer"'
+    assert 'sed -n "/^function_marc_replace() {/,/^}/p" "$KEI_REPO/installer" | grep -q "4) lt_cat_load ;;" && sed -n "/^function_marc_replace() {/,/^}/p" "$KEI_REPO/installer" | grep -q "5) lt_cat_remove ;;"'
+    assert 'sed -n "/^function_library_tools() {/,/^}/p" "$KEI_REPO/installer" | grep -q "12) function_marc_replace ;;"'
 }
 
 # --- Collection spreadsheets (Biblioteca Fácil) -----------------------------------
@@ -548,7 +509,7 @@ XML
 
 VD=/var/lib/koha/library/kei-marc-replace
 # The page and its two modules (in $W/lib, as the site Perl folder), the PHA
-# table of the cataloguing aids and a vision model on the HTTP double.
+# table and a vision model on the HTTP double.
 vision_setup() {
     mr_setup
     mkdir -p "$W/lib/KohaEasy/Cataloguing" /etc/koha-easy-install/tables
