@@ -493,6 +493,66 @@ bf_circ_schema() {
     assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
 }
 
+# --- ISIS catalogue (PostgreSQL export) --------------------------------------------
+
+# Synthetic export (tests/lib/isis_dump.py): pg_dump of the acervo and ocorrencias
+# tables with noise around it and the tombo quirks of the real exports.
+isis_dump() { python3 "$KEI_REPO/tests/lib/isis_dump.py" "$@"; }
+
+@test "F06 ISIS: the PostgreSQL export becomes MARC 21 with one item per tombo, the noise left out and the tombos cleaned" {
+    isis_dump "$W/Backup_ISIS.backup"
+    export KEI_SELECT_FILE="$W/Backup_ISIS.backup"
+    inputs CPL LIVRO new
+    answer yes yes
+    panel lt_br_migrate_isis
+    assert '[ "$status" -eq 0 ]' "$output"
+    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
+    assert 'grep -q "Noise left out: 25 byte(s) before the dump, 19 byte(s) after it" "$p" && grep -q "encoding UTF8" "$p"' "$(cat "$p")"
+    assert 'grep -q "acervo *9 row(s)  collection" "$p" && grep -q "registro *-> 952 \$p \$h (one item per tombo)" "$p"'
+    assert 'grep -q "^Records: 8$" "$p" && grep -q "^Items created: 26$" "$p" && grep -q "^Barcodes ISIS<MFN>-<n> (tombo already used): 1$" "$p"'
+    assert 'grep -q "Not imported (no title, but a tombo in the row): MFN 8" "$p" && grep -q "title with a caret .*: MFN 2" "$p" && grep -q "Patrons, loans and holds: not in this backup" "$p"'
+    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "8" ] && [ "$(marc_dump "$f" | grep -c "^952")" = "26" ]' "$(marc_dump "$f" | head -40)"
+    assert 'marc_dump "$f" | grep -qx "245 12 \$a O CORTIÇO" && marc_dump "$f" | grep -qx "250    \$a 2ª ed" && marc_dump "$f" | grep -qx "260    \$a Sao Paulo : \$b Atica, \$c 1990"' "<O> article, ª repaired, place split"
+    assert 'marc_dump "$f" | grep -qx "650  4 \$a ROMANCE BRASILEIRO" && marc_dump "$f" | grep -qx "650  4 \$a ROMANCE" && marc_dump "$f" | grep -qx "100 1  \$a CANSI, BERNARDO \$c FREI"'
+    assert 'marc_dump "$f" | grep -qx "245 10 \$a INTRODUÇÃO A TEOLOGIA" && marc_dump "$f" | grep -qx "245 00 \$a MANUAL DE IDENTIFICAÇÃO" && ! marc_dump "$f" | grep -q "Informação não encontrada"'
+    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 823 A95 \$p 2135 \$h v. II \$d 2022-09-13 \$x ISIS MFN 2; registro: -2134 I^f2135 II^f2136 III"' "$(marc_dump "$f" | grep ^952)"
+    local b
+    b=$(marc_dump "$f" | grep "^952" | sed -n "s/.*\\\$p \([^ ]*\).*/\1/p" | tr "\n" " ")
+    assert '[ "$b" = "1001 2134 2135 2136 3377 3404 3462 18705 12452 669 670 671 672 148 2717 12730 516 ISIS6-1 1655 1656 1657 ISIS7 4475 4779 4495 9010 " ]' "barcodes: $b"
+    assert 'marc_dump "$f" | grep -q "\$p 12730 \$0 1 \$1 1 \$x .*Ocorrência 2021-01-29: O LIVRO FOI EXTRAVIADO" && marc_dump "$f" | grep -q "\$p 2717 .*tombo marcado com \\\$ no ISIS"' "withdrawn, lost, \$ kept in the note"
+    assert 'marc_dump "$f" | grep -q "\$p ISIS6-1 .*tombo 1001 repetido (já usado no MFN 1)" && marc_dump "$f" | grep -q "\$p 4779 \$h v. 5 " && marc_dump "$f" | grep -q "\$p 4495 \$h v. 6 "' "repeated tombo, volume glued to the next tombo"
+    assert '! marc_dump "$f" | grep -q "\$p 863\|\$p 54495\|\$p 42 "' "a call number typed in the tombo field is not a barcode"
+    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
+    assert '[ -z "$(ls -A /tmp/koha_tools.* 2>/dev/null)" ]' "the work copies are gone"
+}
+
+@test "F07 ISIS: gzip, INSERT statements and Latin-1 give the same records; a cut, damaged or custom-format file, or a declined preview, changes nothing" {
+    "$KEI_SH" "$PANEL" isis_write_reader "$W/isis2koha.pl"
+    isis_dump "$W/plain.backup"
+    isis_dump "$W/other.backup.gz" --inserts --gzip --latin1
+    perl "$W/isis2koha.pl" --in "$W/plain.backup" --branch CPL --itype LIVRO --marc "$W/a.mrc" > "$W/a.txt"
+    perl "$W/isis2koha.pl" --in "$W/other.backup.gz" --branch CPL --itype LIVRO --marc "$W/b.mrc" > "$W/b.txt"
+    assert 'grep -q "^File: gzip + PostgreSQL plain SQL dump" "$W/b.txt" && grep -q "encoding LATIN1" "$W/b.txt" && grep -q "^Items created: 26$" "$W/b.txt"' "$(cat "$W/b.txt")"
+    assert 'cmp -s "$W/a.mrc" "$W/b.mrc"' "same records: $(diff <(marc_dump "$W/a.mrc") <(marc_dump "$W/b.mrc"))"
+    isis_dump "$W/cut.backup" --cut
+    perl "$W/isis2koha.pl" --in "$W/cut.backup" --dry-run > "$W/c.txt"
+    assert 'grep -q "The dump ends inside the data of table acervo" "$W/c.txt" && grep -q "^Records: 7$" "$W/c.txt"' "$(cat "$W/c.txt")"
+    printf 'PGDMP\001\016\000' > "$W/custom.backup"
+    run perl "$W/isis2koha.pl" --in "$W/custom.backup" --dry-run
+    assert '[ "$status" -eq 4 ] && echo "$output" | grep -q "custom-format dump"' "$output"
+    head -c 4000 /dev/urandom > "$W/estragado.backup"
+    export KEI_SELECT_FILE="$W/estragado.backup"
+    inputs CPL LIVRO new
+    panel lt_br_migrate_isis
+    assert 'dialogs | grep -q "not an ISIS backup"' "$(dialogs | tail -3)"
+    export KEI_SELECT_FILE="$W/plain.backup"
+    inputs CPL LIVRO keep
+    answer no
+    panel lt_br_migrate_isis
+    assert 'grep -q "isis2koha.pl.*--dry-run" "$KEI_S/calls.log" && ! grep -q "isis2koha.pl.*--marc" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
+    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
+}
+
 # --- marc_replace.pl ---------------------------------------------------------------
 
 KS=/run/kei-mock/koha
