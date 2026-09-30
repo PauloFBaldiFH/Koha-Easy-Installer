@@ -1263,6 +1263,43 @@ Describe 'The Koha icon as the one way in' {
     }
 }
 
+Describe 'Koha icon and logo in the Koha window and the tray' {
+    It 'logs why koha.ico could not be loaded and returns nothing when KohaEasy.exe has no icon either' {
+        $missing = Join-Path $TestDrive 'no-such.ico'
+        Get-KohaIcon -Path $missing -Exe '' -Tries 1 | Should -BeNullOrEmpty
+        $log = Get-Content -LiteralPath (Join-Path (Get-KohaPath Logs) ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Raw
+        $log | Should -Match ([regex]::Escape('koha.ico could not be loaded from ' + $missing + ': the file is missing'))
+    }
+
+    It 'tries a busy koha.ico again, then falls back to the icon inside KohaEasy.exe' {
+        $core = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Core.psm1') -Raw
+        $core | Should -Match 'for \(\$i = 1; \$i -le \$Tries; \$i\+\+\)'
+        $core | Should -Match 'System.IO.File\]::ReadAllBytes\(\$Path\)'
+        $core | Should -Match 'System.Drawing.Icon\]::ExtractAssociatedIcon\(\$Exe\)'
+        $core | Should -Match '\$icon = Get-KohaIcon\s+if \(\$icon\) \{ \$form.Icon = \$icon \}'
+    }
+
+    It 'gives the Koha window koha.ico through Get-KohaIcon and the green Koha logo in its header' {
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match "Get-KohaIcon -Path \(Join-Path \`$here 'koha.ico'\) -Exe \(Join-Path \`$here 'KohaEasy.exe'\)"
+        $w | Should -Not -Match 'New-Object System.Drawing.Icon\('
+        $w | Should -Match "Join-Path \`$here 'koha-logo.png'"
+        $w | Should -Match "T 'The Koha name and logo belong to the Koha community.'"
+        $w.IndexOf('$root.Controls.Add($header)') | Should -BeLessThan $w.IndexOf('$root.Controls.Add($cardBanner)')
+        $png = [System.IO.File]::ReadAllBytes((Join-Path $repo 'windows/koha-logo.png'))
+        [System.BitConverter]::ToString($png, 0, 8) | Should -Be '89-50-4E-47-0D-0A-1A-0A'
+        $png.Length | Should -BeLessThan 50000
+    }
+
+    It 'draws the tray icon at the notification area size, the status dot ringed beside the leaf' {
+        $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
+        $t | Should -Match "Get-KohaIcon -Size 48 -Path \(Join-Path \`$here 'koha.ico'\)"
+        $t | Should -Match 'SystemInformation\]::SmallIconSize.Width'
+        $t | Should -Match '\$g.DrawEllipse\(\$ring'
+        $t | Should -Not -Match 'Test-Path -LiteralPath \$kohaIco'
+    }
+}
+
 Describe 'Cold boot' {
     It 'reads a Koha that should run as starting in the first seconds after Windows starts' {
         $st = @{ desired = 'running'; startedAt = 0; autostart = 'logon' }

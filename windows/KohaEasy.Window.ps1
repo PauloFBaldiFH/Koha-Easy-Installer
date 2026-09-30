@@ -2,6 +2,7 @@
 # A native Windows window, so it keeps working when Koha does not: it reads
 # Debian's services through wsl.exe and never needs Koha's web server.
 # Dark, in cards, from top to bottom:
+#   * a header with the green Koha logo
 #   * a banner: green only when every component runs; when one fails it
 #     turns red and names it (only that row is highlighted), with the time
 #     of the check and the latest backup, and Start Koha while it is off
@@ -222,8 +223,10 @@ $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.AutoSize = $true
 $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
 $form.KeyPreview = $true
-$kohaIco = Join-Path $here 'koha.ico'
-if (Test-Path -LiteralPath $kohaIco) { try { $form.Icon = New-Object System.Drawing.Icon($kohaIco) } catch { } }
+# koha.ico on the title bar and the taskbar button (Get-KohaIcon: tried
+# again while the file is busy, then KohaEasy.exe's own icon, logged).
+$kohaIco = Get-KohaIcon -Path (Join-Path $here 'koha.ico') -Exe (Join-Path $here 'KohaEasy.exe')
+if ($kohaIco) { $form.Icon = $kohaIco }
 # A dark title bar to match (KohaEasy.exe; Windows 10 1809 and later).
 $form.add_HandleCreated({
         if (Import-KohaNative) { try { [void][KohaEasy.Native]::SetDarkTitleBar($form.Handle) } catch { } }
@@ -235,6 +238,36 @@ $root.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
 $root.ColumnCount = 1
 $root.Padding = New-Object System.Windows.Forms.Padding(16, 16, 16, 6)
 $root.BackColor = $theme.Bg
+
+# Header: the Koha logo (green, as the Koha community publishes it; the
+# name and logo are theirs, said on its tooltip) and the product name. The
+# PNG is read into memory, so the file is never held open. Without it the
+# window simply starts with the banner.
+$logoFile = Join-Path $here 'koha-logo.png'
+if (Test-Path -LiteralPath $logoFile) {
+    try {
+        $logo = New-Object System.Windows.Forms.PictureBox
+        $logo.Image = [System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($logoFile))))
+        $logo.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+        $logo.Size = New-Object System.Drawing.Size(140, 40)
+        $logo.Margin = New-Object System.Windows.Forms.Padding(0)
+        $logoTip = New-Object System.Windows.Forms.ToolTip
+        $logoTip.SetToolTip($logo, (T 'The Koha name and logo belong to the Koha community.'))
+        $header = New-Object System.Windows.Forms.TableLayoutPanel
+        $header.AutoSize = $true
+        $header.ColumnCount = 2
+        $header.MinimumSize = New-Object System.Drawing.Size($W, 0)
+        $header.MaximumSize = New-Object System.Drawing.Size($W, 0)
+        $header.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+        [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        $product = New-Text 'Koha Easy Installer' $fontSmall $theme.Muted
+        $product.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
+        [void]$header.Controls.Add($logo, 0, 0)
+        [void]$header.Controls.Add($product, 1, 0)
+        [void]$root.Controls.Add($header)
+    } catch { Write-KohaLog ('Koha logo not shown: ' + $_.Exception.Message) }
+}
 
 # Banner: a dot, the state in words, when it was checked and the latest
 # backup; Start Koha while Koha is off.

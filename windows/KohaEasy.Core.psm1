@@ -990,8 +990,8 @@ function Show-KohaChoice {
     $form.TopMost = $true
     $form.AutoSize = $true
     $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $icon = Get-KohaIconPath
-    if (Test-Path -LiteralPath $icon) { try { $form.Icon = New-Object System.Drawing.Icon($icon) } catch { } }
+    $icon = Get-KohaIcon
+    if ($icon) { $form.Icon = $icon }
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.AutoSize = $true
     $layout.Padding = New-Object System.Windows.Forms.Padding(12)
@@ -2213,6 +2213,48 @@ function Export-KohaDiagnostics {
 # Shortcuts (Start menu folder "Koha" and desktop), all with koha.ico
 # ----------------------------------------------------------------------
 function Get-KohaIconPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'koha.ico') }
+
+# koha.ico as an icon for a window or the tray ($Size 0: the file's own
+# sizes). Read into memory, and tried again while a program still holds
+# the file (an antivirus scan at sign-in); then KohaEasy.exe's own icon,
+# the same koha.ico built in; then $null, and the window keeps Windows'
+# default icon. Every failure is logged with Windows' reason.
+function Get-KohaIcon {
+    param(
+        [int]$Size = 0,
+        [string]$Path = (Get-KohaIconPath),
+        [string]$Exe = ([System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.exe')),
+        [int]$Tries = 3,
+        [int]$WaitMs = 700
+    )
+    try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch { }
+    $why = 'the file is missing'
+    if (Test-Path -LiteralPath $Path) {
+        for ($i = 1; $i -le $Tries; $i++) {
+            try {
+                $ms = New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($Path))
+                if ($Size -gt 0) { return (New-Object System.Drawing.Icon($ms, $Size, $Size)) }
+                return (New-Object System.Drawing.Icon($ms))
+            } catch {
+                $why = $_.Exception.Message
+                if ($i -lt $Tries) { Start-Sleep -Milliseconds $WaitMs }
+            }
+        }
+    }
+    $msg = 'koha.ico could not be loaded from {0}: {1}' -f $Path, $why
+    if ($Exe -and (Test-Path -LiteralPath $Exe)) {
+        try {
+            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($Exe)
+            if ($ico) {
+                Write-KohaLog ($msg + '; using the icon inside KohaEasy.exe')
+                if ($Size -gt 0) { return (New-Object System.Drawing.Icon($ico, $Size, $Size)) }
+                return $ico
+            }
+        } catch { $msg += '; KohaEasy.exe: ' + $_.Exception.Message }
+    }
+    Write-KohaLog $msg
+    return $null
+}
 
 # What to create (pure, tested). Kind "url" is an Internet shortcut (.url),
 # "lnk" a program shortcut. Commands run KohaEasy.ps1 in Windows PowerShell 5.1.
