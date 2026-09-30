@@ -1001,22 +1001,33 @@ function Invoke-KohaSafeStep {
     }
 }
 
-# The Koha icon on the desktop (the Koha window), the Start menu folder, the
-# tray at sign-in and the Koha icon on Debian's own entries. The desktop is
-# the one Windows reports, so a desktop moved by OneDrive gets it too.
+# The Koha icon on the desktop and in the Start menu (folder Koha), the
+# other shortcuts, the tray at sign-in and the Koha icon on Debian's own
+# entries. The desktop is the one Windows reports, so a desktop moved by
+# OneDrive gets it too. Each part runs on its own: a sign-in entry Windows
+# refuses no longer takes the shortcuts with it. What is said is checked on
+# disk, with Windows' own reason when a shortcut is missing.
 function Install-KohaShortcuts {
-    Set-KohaTrayAtSignIn -Enabled $true
+    param([string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'))
     $desktop = Get-KohaDesktopPath
-    New-KohaShortcuts -Desktop $desktop | Out-Null
-    Set-KohaDistroIcon | Out-Null
-    # Said only after checking the Koha icon really is on the desktop.
-    $lnk = ''
-    if ($desktop) { $lnk = [System.IO.Path]::Combine($desktop, 'Koha.lnk') }
-    if ($lnk -and (Test-Path -LiteralPath $lnk)) {
+    New-KohaShortcuts -StartMenu $StartMenu -Desktop $desktop | Out-Null
+    $errors = @(Get-KohaShortcutErrors)
+    try { Set-KohaTrayAtSignIn -Enabled $true } catch { Write-KohaLog ('tray at sign-in not set: ' + $_.Exception.Message) 'install' }
+    try { Set-KohaDistroIcon | Out-Null } catch { Write-KohaLog ('Debian entries keep their icon: ' + $_.Exception.Message) 'install' }
+    $onDesktop = $false
+    if ($desktop) { $onDesktop = Test-Path -LiteralPath ([System.IO.Path]::Combine($desktop, 'Koha.lnk')) }
+    $menu = [System.IO.Path]::Combine($StartMenu, 'Koha.lnk')
+    $inMenu = Test-Path -LiteralPath $menu
+    $reason = ($errors | Select-Object -First 1)
+    if (-not $desktop) { $reason = 'Windows reported no desktop folder for this account' }
+    if (-not $reason) { $reason = '?' }
+    Write-KohaLog ('Koha icon: desktop {0} ({1}), Start menu {2}' -f $onDesktop, $desktop, $inMenu) 'install'
+    if ($onDesktop) {
         Write-KohaStep ((T 'Shortcuts created in the Start menu (folder Koha) and on the desktop ({0}).') -f $desktop) 'ok'
+    } elseif ($inMenu) {
+        Write-KohaStep ((T 'The Koha icon could not be put on the desktop ({0}). Open Koha from the Start menu (folder Koha). Reason: {1}') -f $desktop, $reason) 'warn'
     } else {
-        Write-KohaLog ('desktop shortcut missing: desktop {0}' -f $desktop) 'install'
-        Write-KohaStep ((T 'The Koha icon could not be put on the desktop ({0}). Use Koha in the Start menu instead. If an antivirus removed it, see its protection history.') -f $desktop) 'warn'
+        Write-KohaStep ((T 'The Koha shortcuts could not be created. Reason: {0}. The log is in C:\KohaEasy\logs.') -f $reason) 'error'
     }
 }
 

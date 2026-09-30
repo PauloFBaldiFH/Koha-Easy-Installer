@@ -35,7 +35,7 @@ $title = T 'Koha - Status and services'
 $mutex = New-Object System.Threading.Mutex($false, 'Local\KohaEasyWindow')
 if (-not $mutex.WaitOne(0)) {
     # Already open: bring that window to the front instead of a second one.
-    try { [void](New-Object -ComObject WScript.Shell).AppActivate($title) } catch { }
+    Show-KohaOpenWindow $title | Out-Null
     return
 }
 # Before any window exists: Windows reads it when the first one opens.

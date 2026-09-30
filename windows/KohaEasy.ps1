@@ -5,7 +5,8 @@
     KohaEasy.ps1 Start [-Trigger user|logon]   Koha - Start shortcut, tray, sign-in task
     KohaEasy.ps1 Stop [-Force]                 Koha - Stop shortcut, tray
     KohaEasy.ps1 Restart [-Force]              Koha - Restart shortcut, tray
-    KohaEasy.ps1 Window                        the Koha window: banner, quick access, components, actions, terminal area (desktop icon, Koha - Status, tray)
+    KohaEasy.ps1 Launch                        the Koha icon (desktop, Start menu): starts the tray and Koha when they are not running, puts back a deleted sign-in entry or task, then the Koha window (or brings it to the front)
+    KohaEasy.ps1 Window                        the Koha window: banner, quick access, components, actions (Koha - Status, tray)
     KohaEasy.ps1 Status                        the same summary in a message box
     KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
     KohaEasy.ps1 Panel                         the Koha window and the tray: starts Koha, opens the control panel
@@ -31,7 +32,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
+    [ValidateSet('Launch', 'Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -86,6 +87,11 @@ function Invoke-Start {
 }
 
 switch ($Command) {
+    'Launch' {
+        if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
+        Invoke-KohaLaunch | Out-Null
+        & (Join-Path $PSScriptRoot 'KohaEasy.Window.ps1')
+    }
     'Window' {
         if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
         & (Join-Path $PSScriptRoot 'KohaEasy.Window.ps1')

@@ -773,7 +773,7 @@ function Get-KohaWscriptPath {
 # tray and what the shortcuts and the tray menu run. The scheduled tasks'
 # Run and UpdatePortProxy, and the commands the installer waits on, are
 # left alone.
-$script:HiddenCommands = @('Window', 'Tray', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'ExportReport', 'ExportDiagnostics', 'CheckDisk')
+$script:HiddenCommands = @('Launch', 'Window', 'Tray', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'ExportReport', 'ExportDiagnostics', 'CheckDisk')
 
 # Pure: whether KohaEasy.ps1 should start itself again the hidden way and
 # end, which closes the console it was given. That console comes from a
@@ -941,6 +941,17 @@ function Set-KohaProcessAppId {
     try { return [bool][KohaEasy.Native]::SetProcessAppId($script:Cfg.AppId) } catch { return $false }
 }
 
+# An open Koha window, restored and brought to the front (the Koha icon
+# clicked again): KohaEasy.Native when KohaEasy.exe is in use, else the
+# Windows shell.
+function Show-KohaOpenWindow {
+    param([string]$Title)
+    if (Import-KohaNative) {
+        try { if ([KohaEasy.Native]::FocusWindow($Title)) { return $true } } catch { }
+    }
+    try { return [bool](New-Object -ComObject WScript.Shell).AppActivate($Title) } catch { return $false }
+}
+
 function Set-KohaShortcutAppId {
     param([string]$Path)
     if (-not (Import-KohaNative)) { return $false }
@@ -1063,8 +1074,31 @@ function Test-KohaKeepAliveOutdated {
     return -not ([string]$a.Execute -eq $want.Target -and [string]$a.Arguments -eq $want.Arguments)
 }
 
+function Test-KohaTaskPresent {
+    param([string]$Name)
+    try { return ($null -ne (Get-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $Name -ErrorAction Stop)) } catch { return $false }
+}
+
+# Koha starts through its keep-alive task, and the sign-in task starts it
+# at sign-in: a task that was deleted by hand (Task Scheduler) is made again,
+# with this version's hidden launch, before Koha is started.
+function Repair-KohaTasks {
+    if ((Test-KohaTaskPresent $script:Cfg.KeepTask) -and (Test-KohaTaskPresent $script:Cfg.SignInTask)) { return 'present' }
+    $mode = [string](Get-KohaState).autostart
+    if (@('logon', 'manual') -notcontains $mode) { $mode = 'logon' }
+    Write-KohaLog ('Koha tasks missing; registering them again (autostart {0})' -f $mode)
+    Register-KohaTasks -Autostart $mode
+    return 'registered'
+}
+
 function Set-KohaSignInTask {
     param([bool]$Enabled)
+    if (-not (Test-KohaTaskPresent $script:Cfg.SignInTask)) {
+        $mode = 'manual'
+        if ($Enabled) { $mode = 'logon' }
+        Register-KohaTasks -Autostart $mode
+        return
+    }
     if ($Enabled) {
         Enable-ScheduledTask -TaskPath $script:Cfg.TaskPath -TaskName $script:Cfg.SignInTask | Out-Null
     } else {
@@ -1124,6 +1158,7 @@ function Start-Koha {
         return 'skipped'
     }
     Set-KohaState @{ desired = 'running'; startedAt = (Get-UnixTime) } | Out-Null
+    try { Repair-KohaTasks | Out-Null } catch { Write-KohaLog ('Koha tasks not registered again: ' + $_.Exception.Message) }
     Start-KohaKeepAlive
     Write-KohaLog "start requested ($Trigger)"
     if (-not $Wait) { return 'started' }
@@ -2185,11 +2220,13 @@ function Get-KohaShortcutList {
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     $lnk = { param($name, $a) $l = Get-KohaHiddenLaunch -Arguments $a; @{ Name = $name; Kind = 'lnk'; Target = $l.Target; Arguments = $l.Arguments } }
     $list = @(
-        # The one desktop icon: the Koha window (status, services, actions).
-        # It works even when Koha itself does not answer. Also in the Start
-        # menu, where it carries Koha's identity (AppId): the taskbar pins
-        # the Koha window as Koha, and notifications show Koha's name.
-        (& $lnk 'Koha' 'Window') + @{ Desktop = $true; StartMenu = $true; AppId = $true }
+        # The one desktop icon: starts what is not running (the tray, Koha)
+        # and opens the Koha window, or brings the open one to the front
+        # (Invoke-KohaLaunch). The window works even when Koha itself does
+        # not answer. Also in the Start menu, where it carries Koha's
+        # identity (AppId): the taskbar pins the Koha window as Koha, and
+        # notifications show Koha's name.
+        (& $lnk 'Koha' 'Launch') + @{ Desktop = $true; StartMenu = $true; AppId = $true }
         @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
         @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
         (& $lnk (T 'Koha - Control panel') 'Panel')
@@ -2226,17 +2263,19 @@ function Save-KohaLnkShortcut {
 }
 
 # The signed-in user's own desktop, the one Explorer shows: Windows' answer
-# (it follows OneDrive's desktop backup), else the folder Explorer's
+# (it follows OneDrive's desktop backup), else the Windows shell's (the
+# WScript.Shell that writes the shortcuts), else the folder Explorer's
 # registry value names, else OneDrive's and the profile's Desktop folders.
 # Only a folder that exists, and never the Public desktop or another
 # account's. '' when there is none.
 function Get-KohaDesktopPath {
     param(
         [string]$Known = [Environment]::GetFolderPath('Desktop'),
+        [string]$Shell = (Get-KohaShellDesktop),
         [string]$Registry = (Get-KohaRegistryDesktop),
         [string]$UserProfile = $env:USERPROFILE
     )
-    $candidates = @($Known, $Registry)
+    $candidates = @($Known, $Shell, $Registry)
     if ($UserProfile) {
         $candidates += @(Get-ChildItem -LiteralPath $UserProfile -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
                 ForEach-Object { [System.IO.Path]::Combine($_.FullName, 'Desktop') })
@@ -2251,12 +2290,25 @@ function Get-KohaDesktopPath {
     return ''
 }
 
+function Get-KohaShellDesktop {
+    try { return [string](New-Object -ComObject WScript.Shell).SpecialFolders.Item('Desktop') } catch { return '' }
+}
+
 function Get-KohaRegistryDesktop {
     try {
         $v = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -Name Desktop -ErrorAction Stop).Desktop
         return [Environment]::ExpandEnvironmentVariables([string]$v)
     } catch { return '' }
 }
+
+$script:ShortcutErrors = New-Object System.Collections.ArrayList
+function Add-KohaShortcutError {
+    param([string]$Path, [string]$Message)
+    [void]$script:ShortcutErrors.Add(('{0}: {1}' -f $Path, $Message))
+    Write-KohaLog ('shortcut not created: {0}: {1}' -f $Path, $Message)
+}
+# What went wrong in the last New-KohaShortcuts, one line per file.
+function Get-KohaShortcutErrors { return @($script:ShortcutErrors) }
 
 # Creates (or refreshes) every shortcut with the Koha icon. The icon is copied
 # next to KohaEasy.ps1 first, so shortcuts keep it if the ZIP folder is deleted.
@@ -2266,12 +2318,18 @@ function New-KohaShortcuts {
         [string]$Desktop = (Get-KohaDesktopPath),
         [string]$IconSource = [System.IO.Path]::Combine($PSScriptRoot, 'koha.ico')
     )
+    # Every problem is kept (Get-KohaShortcutErrors) and none stops the
+    # other shortcuts: the Koha icon comes first, and one shortcut Windows
+    # refuses must not leave the librarian with none.
+    $script:ShortcutErrors = New-Object System.Collections.ArrayList
     $icon = Get-KohaIconPath
-    if ((Test-Path -LiteralPath $IconSource) -and ($IconSource -ne $icon)) {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $icon) -Force | Out-Null
-        Copy-Item -LiteralPath $IconSource -Destination $icon -Force
-    }
-    New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null
+    try {
+        if ((Test-Path -LiteralPath $IconSource) -and ($IconSource -ne $icon)) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $icon) -Force | Out-Null
+            Copy-Item -LiteralPath $IconSource -Destination $icon -Force
+        }
+    } catch { Add-KohaShortcutError $icon $_.Exception.Message }
+    try { New-Item -ItemType Directory -Path $StartMenu -Force | Out-Null } catch { Add-KohaShortcutError $StartMenu $_.Exception.Message }
     if ($Desktop) {
         # Older versions also put the two web shortcuts on the desktop; the
         # one Koha icon (the Koha window) replaces them.
@@ -2288,16 +2346,21 @@ function New-KohaShortcuts {
         if ($s.ContainsKey('Desktop') -and $s.Desktop -and $Desktop) { $dirs += $Desktop }
         foreach ($d in $dirs) {
             $file = [System.IO.Path]::Combine($d, (ConvertTo-KohaFileName $s.Name) + '.' + $s.Kind)
-            if ($s.Kind -eq 'url') {
-                Save-KohaUrlShortcut -Path $file -Url $s.Target -Icon $s.Icon
-            } else {
-                Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
-                if ($s.ContainsKey('AppId') -and $s.AppId -and (Set-KohaShortcutAppId -Path $file) -and $d -eq $StartMenu) { $identity = $true }
+            try {
+                if ($s.Kind -eq 'url') {
+                    Save-KohaUrlShortcut -Path $file -Url $s.Target -Icon $s.Icon
+                } else {
+                    Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
+                }
+            } catch {
+                Add-KohaShortcutError $file $_.Exception.Message
+                continue
             }
-            # Counted only once Windows shows it there (an antivirus can
-            # remove a shortcut as soon as it is written).
+            # Koha's identity is extra: without it the shortcut still works.
+            if ($s.Kind -eq 'lnk' -and $s.ContainsKey('AppId') -and $s.AppId -and (Set-KohaShortcutAppId -Path $file) -and $d -eq $StartMenu) { $identity = $true }
+            # Counted only once Windows shows it there.
             if (Test-Path -LiteralPath $file) { [void]$made.Add($file) }
-            else { Write-KohaLog ('shortcut missing right after it was written: ' + $file) }
+            else { Add-KohaShortcutError $file 'the file was not there right after it was written' }
         }
     }
     # Only with the Start menu shortcut does Windows know Koha's name and
@@ -2361,6 +2424,41 @@ function Set-KohaDistroIcon {
 # ----------------------------------------------------------------------
 # Tray at sign-in (HKCU Run: no administrator rights)
 # ----------------------------------------------------------------------
+function Test-KohaTrayAtSignIn {
+    try {
+        $v = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'KohaEasyTray' -ErrorAction Stop).KohaEasyTray
+        return [bool]$v
+    } catch { return $false }
+}
+
+# The Koha icon (desktop and Start menu), before the Koha window opens:
+# whatever is missing is started or put back, nothing is started twice.
+#   - the Koha icon next to the clock at sign-in (the Run entry), and the
+#     Koha tasks, when someone deleted them;
+#   - the tray, when it is not running;
+#   - Koha, when Debian is not running (the window shows it starting).
+# Returns what it did: signin, tasks, tray, start.
+function Invoke-KohaLaunch {
+    $did = New-Object System.Collections.ArrayList
+    try {
+        if (-not (Test-KohaTrayAtSignIn)) { Set-KohaTrayAtSignIn -Enabled $true; [void]$did.Add('signin') }
+    } catch { Write-KohaLog ('Koha icon: sign-in entry not written: ' + $_.Exception.Message) }
+    try {
+        if ((Repair-KohaTasks) -eq 'registered') { [void]$did.Add('tasks') }
+    } catch { Write-KohaLog ('Koha icon: tasks not registered again: ' + $_.Exception.Message) }
+    if (-not (Test-KohaTrayRunning)) {
+        Set-KohaState @{ trayClosed = $false } | Out-Null
+        Start-KohaHidden 'Tray'
+        [void]$did.Add('tray')
+    }
+    if (-not (Test-KohaDistroRunning)) {
+        Start-Koha -Trigger user | Out-Null
+        [void]$did.Add('start')
+    }
+    Write-KohaLog ('Koha icon: {0}' -f ((@($did) + @('window')) -join ', '))
+    return @($did)
+}
+
 function Set-KohaTrayAtSignIn {
     param([bool]$Enabled = $true)
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
