@@ -657,11 +657,20 @@ Describe 'Bootstrapper' {
         $text | Should -Not -Match '(?m)^\s*&\s*\$ps\b'
     }
 
-    It 'is the only way to install: no .cmd, and both READMEs show the same one-liner' {
-        @(Get-ChildItem -LiteralPath $repo -Recurse -Filter '*.cmd' -File).Count | Should -Be 0
+    It 'Install-Koha.cmd runs the same one-liner as both READMEs, in ASCII with CRLF' {
         $url = 'https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1'
-        Get-Content -Raw (Join-Path $repo 'README.md') | Should -Match ([regex]::Escape("irm $url | iex"))
-        Get-Content -Raw (Join-Path $repo 'README.pt-BR.md') | Should -Match ([regex]::Escape("irm $url | iex"))
+        $line = "irm $url | iex"
+        Get-Content -Raw (Join-Path $repo 'README.md') | Should -Match ([regex]::Escape($line))
+        Get-Content -Raw (Join-Path $repo 'README.pt-BR.md') | Should -Match ([regex]::Escape($line))
+        @(Get-ChildItem -LiteralPath $repo -Recurse -Filter '*.cmd' -File | ForEach-Object Name) | Should -Be @('Install-Koha.cmd')
+        $cmd = Join-Path $repo 'windows/Install-Koha.cmd'
+        $bytes = [System.IO.File]::ReadAllBytes($cmd)
+        @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+        ($text -replace "`r`n", '') | Should -Not -Match "`n"
+        $text | Should -Match ([regex]::Escape("-ExecutionPolicy Bypass -Command `"[Net.ServicePointManager]::SecurityProtocol='Tls12'; $line`""))
+        Get-Content -Raw (Join-Path $repo 'README.md') | Should -Match 'blob/main/windows/Install-Koha\.cmd'
+        Get-Content -Raw (Join-Path $repo 'README.pt-BR.md') | Should -Match 'blob/main/windows/Install-Koha\.cmd'
     }
 }
 
