@@ -117,3 +117,22 @@ widths() {
     printf '%s\n' "$motd" > "$BATS_TEST_TMPDIR/motd"
     assert '[ "$(widths "$BATS_TEST_TMPDIR/motd" "^  |" | wc -l)" = "1" ]' "$motd"
 }
+
+@test "U11 a dialog inside a tui_run task is drawn on the terminal and its answer reaches the task" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/bin/sh\necho "FAKE-DIALOG"\necho "the-answer" >&2\n' > "$BATS_TEST_TMPDIR/bin/whiptail"
+    chmod +x "$BATS_TEST_TMPDIR/bin/whiptail"
+    # The installer's own whiptail wrapper instead of the battery's recorder.
+    cat >> "$KEI_EXTRA" <<X
+unset -f whiptail
+PATH="$BATS_TEST_TMPDIR/bin:\$PATH"
+eval "\$(sed -n '/^whiptail() {/,/^}/p' "$KEI_REPO/installer")"
+ask() { echo task-noise; r=\$(whiptail --inputbox "Q" 8 40 3>&1 1>&2 2>&3); echo "got=\$r" > "$BATS_TEST_TMPDIR/answer"; }
+X
+    run script -qc "TERM=xterm NO_COLOR=1 $KEI_SH $PANEL tui_run Asking ask" /dev/null
+    assert 'echo "$output" | grep -q FAKE-DIALOG' "the dialog must reach the terminal: $output"
+    assert '! grep -q FAKE-DIALOG "$LOG"' "the dialog must not go to the log: $(cat "$LOG")"
+    assert 'grep -q task-noise "$LOG"' "$(cat "$LOG")"
+    assert '[ "$(cat "$BATS_TEST_TMPDIR/answer")" = "got=the-answer" ]' "$(cat "$BATS_TEST_TMPDIR/answer" 2>&1)"
+    assert 'echo "$output" | grep -q "Done!"' "$output"
+}

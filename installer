@@ -559,6 +559,14 @@ kei_plain_args() {
 whiptail() {
     ui_layout "$@"
     [ "${KEI_PLAIN_GLYPHS:-0}" = "1" ] && kei_plain_args
+    # Inside a tui_run task stdout is the log: the dialog goes to the terminal.
+    if [ "${TUI_IN_RUN:-0}" = "1" ] && { : </dev/tty; } 2>/dev/null; then
+        tui_stop_anim
+        NEWT_COLORS="$UI_THEME" command whiptail --backtitle "Koha Easy Installer & Manager v${PANEL_VERSION# }" \
+            --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
+            --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "${UI_ARGS[@]}" </dev/tty >/dev/tty
+        return
+    fi
     NEWT_COLORS="$UI_THEME" command whiptail --backtitle "Koha Easy Installer & Manager v${PANEL_VERSION# }" \
         --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
         --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "${UI_ARGS[@]}"
@@ -1084,6 +1092,7 @@ prompt_yes_no() {
     local rc
     # "defaultno" (5th argument): the No button has the focus.
     [ "${5:-}" = "defaultno" ] && defno=(--defaultno)
+    [ "${TUI_IN_RUN:-0}" = "1" ] && tui_stop_anim
 
     if command -v whiptail >/dev/null 2>&1; then
         whiptail --title "$title" "${defno[@]}" --yesno "$message" "$h" "$w" </dev/tty >/dev/tty 2>/dev/tty
@@ -1133,6 +1142,8 @@ pause_terminal_continue() { read -r -p "   $(t "Press [ENTER] to continue...")";
 #   tui_celebrate IP                    final screen with the real addresses
 # cmd runs in the panel's own shell (the variables it sets are kept); the
 # animation is a small background process that follows the panel's life.
+# A dialog opened by cmd (a question, an error) stops the animation and is
+# drawn on the terminal, not in the log.
 # Plain terminals (the Linux console, the classic Windows console) get
 # ASCII symbols; without a terminal (pipes, tests) nothing is animated.
 # ======================================================================
@@ -1226,6 +1237,18 @@ tui_header() {
     printf '   %s\n' "$sub"
 }
 
+# tui_title ICON "Title": the heading of a panel screen that runs tasks.
+tui_title() {
+    local rule
+    tui_rep "$TUI_LINE" 60; rule=$REPLY
+    tui_icon "$1"
+    printf '\n   %s%s%s%s\n' "$REPLY" "$TUI_CYN$TUI_BLD" "$2" "$TUI_RST"
+    printf '   %s%s%s\n' "$TUI_DIM" "$rule" "$TUI_RST"
+    tui_icon "☕"
+    printf '   %s%s%s%s\n\n' "$TUI_DIM" "$REPLY" "$(t "This might take a few minutes. Please keep this window open.")" "$TUI_RST"
+    log "screen: $2"
+}
+
 # tui_step N TOTAL ICON "Title" [long]
 tui_step() {
     local note
@@ -1265,7 +1288,7 @@ tui_task_line() {
 
 # tui_run "Label" cmd [args...]  (Mode A: unknown duration)
 tui_run() {
-    local label="$1" rc
+    local label="$1" rc TUI_IN_RUN=1
     shift
     tui_fit "$label" "$(tui_label_width)"; label=$REPLY
     mkdir -p "$(dirname "$TUI_LOG")" 2>/dev/null
@@ -4130,14 +4153,14 @@ EOF
 install_task_cleanup() {
     apt-get clean -y
     DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
-    journalctl --vacuum-time=7d
+    journalctl --vacuum-time="${1:-7}d"
     return 0
 }
 
 # The final check never stops the installation: its result is shown on the
 # last screen and in the validation report.
 install_task_check() {
-    validate_complete_system "$(t "installation complete")"
+    validate_complete_system "${1:-$(t "installation complete")}"
     return 0
 }
 
@@ -4831,6 +4854,13 @@ function_test_backup() {
 # ======================================================================
 # 6. KOHA LANGUAGES
 # ======================================================================
+# koha-translate --install, then --update (its templates), for one language.
+lang_task_install() {
+    ${3:-} "$1" --install "$2"
+    ${3:-} "$1" --update "$2" || true
+    return 0
+}
+
 function_install_languages() {
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -4878,8 +4908,7 @@ function_install_languages() {
     # PREPARE SYSTEM LOCALE
     # ==================================================================
     clear
-
-    display_explanation "Preparing OS for language: \$choice"
+    tui_title "🌍" "$(t "Koha & Panel Languages")"
 
     local loc_prefix
     loc_prefix=$(echo "$choice" | cut -d'-' -f1,2 | sed 's/-/_/')
@@ -4910,7 +4939,7 @@ function_install_languages() {
             "s/^#[[:space:]]*(${loc_prefix}[^[:space:]]*\.UTF-8[[:space:]]+UTF-8)/\1/i" \
             /etc/locale.gen 2>/dev/null || true
 
-        $sudo_cmd locale-gen >/dev/null 2>&1 || true
+        tui_run "$(t "Setting up language and UTF-8")" $sudo_cmd locale-gen || true
     fi
 
     # ==================================================================
@@ -4928,13 +4957,13 @@ function_install_languages() {
         return 0
     fi
 
+    : > /tmp/koha_lang.log
     if $sudo_cmd "$koha_trans_cmd" --list 2>/dev/null | grep -Fq "$choice"; then
-        display_explanation "Language already installed. Updating templates..."
-        $sudo_cmd "$koha_trans_cmd" --update "$choice" > /tmp/koha_lang.log 2>&1
+        TUI_LOG=/tmp/koha_lang.log tui_run "$(t "Updating the Koha language pack")" \
+            $sudo_cmd "$koha_trans_cmd" --update "$choice"
     else
-        display_explanation "Compiling and installing language in Koha (may take a while): \$choice"
-        $sudo_cmd "$koha_trans_cmd" --install "$choice" > /tmp/koha_lang.log 2>&1
-        $sudo_cmd "$koha_trans_cmd" --update "$choice" >> /tmp/koha_lang.log 2>&1 || true
+        TUI_LOG=/tmp/koha_lang.log tui_run "$(t "Installing the Koha language pack")" \
+            lang_task_install "$koha_trans_cmd" "$choice" "$sudo_cmd"
     fi
 
     # ==================================================================
@@ -5011,24 +5040,97 @@ function_install_languages() {
 # ======================================================================
 # 7. TOGGLE SEARCH ENGINE
 # ======================================================================
+# Tasks of the search engine switch (run under tui_run, output to the log).
+# The <elasticsearch> block of koha-conf.xml stays when leaving it (Debian
+# ships it even for Zebra); only the damage left there by older panel
+# versions is repaired.
+se_task_es_off() {
+    manage_koha_indexers stop
+    systemctl disable --now elasticsearch || true
+    repair_koha_conf_xml
+    return 0
+}
+
+se_task_zebra_off() {
+    rm -f "$CRON_ZEBRA"
+    systemctl restart cron || true
+    zebra_stop
+    return 0
+}
+
+se_task_es_install() {
+    wait_for_apt_locks
+    ensure_elastic_repo || apt_update_indices
+    apt_install elasticsearch koha-elasticsearch
+}
+
+# Exit 1: memory settings not written; 2: elasticsearch.yml missing;
+# 3: the analysis-icu plugin could not be installed.
+se_task_es_configure() {
+    local yml=/etc/elasticsearch/elasticsearch.yml
+    adjust_elasticsearch_heap || return 1
+    [ -f "$yml" ] || return 2
+    cp -f "$yml" "${yml}.bak-$(date +%Y%m%d-%H%M%S)" || true
+    grep -q '^discovery.type: single-node' "$yml" || echo 'discovery.type: single-node' >> "$yml"
+    grep -q '^network.host: 127.0.0.1' "$yml" || echo 'network.host: 127.0.0.1' >> "$yml"
+    if ! /usr/share/elasticsearch/bin/elasticsearch-plugin list 2>/dev/null | grep -q '^analysis-icu$'; then
+        /usr/share/elasticsearch/bin/elasticsearch-plugin install --batch analysis-icu || return 3
+    fi
+    return 0
+}
+
+# Exit 1: the service did not start; 2: nothing answers on 9200 after a minute.
+se_task_es_start() {
+    systemctl daemon-reload
+    systemctl enable elasticsearch || true
+    systemctl restart elasticsearch || return 1
+    local _
+    for _ in $(seq 1 60); do
+        curl -sS --max-time 2 http://127.0.0.1:9200 && return 0
+        sleep 1
+    done
+    return 2
+}
+
+# Koha switched to Elasticsearch: cache flushed, broker ready, old indices
+# dropped, Koha restarted.
+se_task_koha_on_es() {
+    systemctl restart memcached || true
+    prepare_koha_broker || true
+    curl -sS -X DELETE --max-time 10 "http://127.0.0.1:9200/${DB_NAME}_biblios" || true
+    curl -sS -X DELETE --max-time 10 "http://127.0.0.1:9200/${DB_NAME}_authorities" || true
+    systemctl restart koha-common || true
+    return 0
+}
+
+# Zebra unlocked (stale locks and pid file removed, owner fixed) and started.
+zebra_unlock_start() {
+    zebra_stop
+    force_stop_koha_zebra
+    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
+    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
+    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
+        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
+        "/var/lock/koha/${INSTANCE}" 2>/dev/null || true
+    zebra_start
+    return 0
+}
+
 function_toggle_search_engine() {
     require_koha_tables || return 0
+    local TUI_LOG="${LOG_DIR}/search-engine.log"
     local engine; engine=$(get_search_engine)
     if [ "$engine" = "Elasticsearch" ]; then
         prompt_yes_no "$(t "Search Engine")" \
 "$(t "Current engine: ELASTICSEARCH.\n\nSwitch back to ZEBRA? It uses about 1.5 GB less RAM,\nbut loses dynamic facets and advanced search.")" 12 74 || return 0
         clear
+        tui_title "🔎" "$(t "Switching the search engine to Zebra")"
         if ! backup_lock_acquire; then
             msg_error "" "$(t "Another backup/restore is running. Engine switch cancelled.")" 9 72
             return 1
         fi
         maintenance_begin
-        display_explanation "Stopping the Elasticsearch indexer..."
-        manage_koha_indexers stop
-        systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-        # The <elasticsearch> block stays (Debian ships it even for Zebra);
-        # only the damage left there by older panel versions is repaired.
-        repair_koha_conf_xml
+        tui_run "$(t "Stopping Elasticsearch")" se_task_es_off
         if ! mysql -e "UPDATE ${DB_NAME}.systempreferences SET value='Zebra' WHERE variable='SearchEngine';" >/dev/null 2>&1; then
             manage_koha_indexers start >/dev/null 2>&1 || true
             systemctl enable --now elasticsearch >/dev/null 2>&1 || true
@@ -5036,17 +5138,8 @@ function_toggle_search_engine() {
             msg_error "" "$(t "Could not set SearchEngine to Zebra. Elasticsearch configuration was restored.")" 10 74
             return 1
         fi
-        display_explanation "Flushing the preferences cache (Memcached)..."
-        systemctl restart memcached >/dev/null 2>&1 || true
-        display_explanation "Unlocking and restarting Zebra..."
-        zebra_stop
-        force_stop_koha_zebra
-        rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
-        rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
-        chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
-            "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
-            "/var/lock/koha/${INSTANCE}" 2>/dev/null || true
-        zebra_start >/dev/null 2>&1
+        tui_run "$(t "Clearing the preferences cache")" systemctl restart memcached
+        tui_run "$(t "Unlocking and starting Zebra")" zebra_unlock_start
         if ! is_koha_zebra_running; then
             ensure_search_indexing >/dev/null 2>&1
             maintenance_end; backup_lock_release
@@ -5054,9 +5147,10 @@ function_toggle_search_engine() {
             return 1
         fi
         write_cron_zebra
-        systemctl restart koha-common >/dev/null 2>&1 || true
-        display_explanation "Reindexing the catalog into Zebra..."
-        if ! koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log"; then
+        tui_run "$(t "Restarting Koha services")" systemctl restart koha-common
+        : > "${LOG_DIR}/zebra-rebuild.log"
+        if ! TUI_LOG="${LOG_DIR}/zebra-rebuild.log" tui_run "$(t "Reindexing the catalog")" \
+                koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE"; then
             ensure_search_indexing >/dev/null 2>&1
             maintenance_end; backup_lock_release
             msg_error "" "$(t "Zebra rebuild failed. The system will remain on Zebra; use the repair option.")" 11 76
@@ -5068,8 +5162,8 @@ function_toggle_search_engine() {
         fi
         ensure_search_indexing >/dev/null 2>&1
         maintenance_end; backup_lock_release
-        plack_restart
-        validate_complete_system "$(t "switch to Zebra")"
+        tui_run "$(t "Starting Koha (Plack)")" plack_restart
+        tui_run "$(t "Checking that everything works")" install_task_check "$(t "switch to Zebra")"
         msg_ok "$(t "System now running on ZEBRA.\nIncremental indexing runs every 2 minutes.")" 10 70
 
         if prompt_yes_no "$(t "View Report")" \
@@ -5094,21 +5188,17 @@ function_toggle_search_engine() {
     fi
 
     clear
+    tui_title "🔎" "$(t "Switching the search engine to Elasticsearch")"
     if ! backup_lock_acquire; then
         msg_error "" "$(t "Another backup/restore is running. Engine switch cancelled.")" 9 72
         return 1
     fi
     maintenance_begin
 
-    display_explanation "Disabling Zebra and its queue..."
-    rm -f "$CRON_ZEBRA"; systemctl restart cron >/dev/null 2>&1 || true
-    zebra_stop
+    tui_run "$(t "Stopping Zebra")" se_task_zebra_off
 
     if ! dpkg -s koha-elasticsearch >/dev/null 2>&1 || ! dpkg -s elasticsearch >/dev/null 2>&1; then
-        display_explanation "Installing Elasticsearch 7..."
-        wait_for_apt_locks >/dev/null 2>&1
-        ensure_elastic_repo || apt_update_indices
-        if ! apt_install elasticsearch koha-elasticsearch; then
+        if ! TUI_LOG="$APT_LOG" tui_run "$(t "Installing Elasticsearch 7")" se_task_es_install; then
             restore_apt_timers
             write_cron_zebra
             zebra_start >/dev/null 2>&1 || true
@@ -5118,60 +5208,37 @@ function_toggle_search_engine() {
         fi
     fi
 
-    display_explanation "Tuning Elasticsearch memory and configuration..."
-    if ! adjust_elasticsearch_heap; then
+    local es_rc=0
+    tui_run "$(t "Configuring Elasticsearch")" se_task_es_configure || es_rc=$?
+    if [ "$es_rc" -ne 0 ]; then
+        [ "$es_rc" -eq 3 ] && systemctl disable --now elasticsearch >/dev/null 2>&1
         write_cron_zebra
         zebra_start >/dev/null 2>&1 || true
         maintenance_end; backup_lock_release
-        msg_error "" "$(t "Could not write Elasticsearch memory configuration. Zebra was restored.")" 11 78
+        case "$es_rc" in
+            2) msg_error "" "$(t "Elasticsearch configuration file is missing.")" 9 70 ;;
+            3) msg_error "" "$(t "Could not install the Elasticsearch analysis-icu plugin. Zebra was restored.")" 11 78 ;;
+            *) msg_error "" "$(t "Could not write Elasticsearch memory configuration. Zebra was restored.")" 11 78 ;;
+        esac
         return 1
     fi
-    if [ ! -f /etc/elasticsearch/elasticsearch.yml ]; then
+
+    es_rc=0
+    tui_run "$(t "Starting Elasticsearch")" se_task_es_start || es_rc=$?
+    if [ "$es_rc" -ne 0 ]; then
+        systemctl disable --now elasticsearch >/dev/null 2>&1 || true
+        write_cron_zebra
+        zebra_start >/dev/null 2>&1 || true
         maintenance_end; backup_lock_release
-        msg_error "" "$(t "Elasticsearch configuration file is missing.")" 9 70
-        write_cron_zebra; zebra_start >/dev/null 2>&1 || true
-        return 1
-    fi
-    cp -f /etc/elasticsearch/elasticsearch.yml "/etc/elasticsearch/elasticsearch.yml.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-    grep -q '^discovery.type: single-node' /etc/elasticsearch/elasticsearch.yml 2>/dev/null || echo 'discovery.type: single-node' >> /etc/elasticsearch/elasticsearch.yml
-    grep -q '^network.host: 127.0.0.1'     /etc/elasticsearch/elasticsearch.yml 2>/dev/null || echo 'network.host: 127.0.0.1'     >> /etc/elasticsearch/elasticsearch.yml
-    if ! /usr/share/elasticsearch/bin/elasticsearch-plugin list 2>/dev/null | grep -q '^analysis-icu$'; then
-        if ! /usr/share/elasticsearch/bin/elasticsearch-plugin install --batch analysis-icu >/dev/null 2>&1; then
-            systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-            write_cron_zebra
-            zebra_start >/dev/null 2>&1 || true
-            maintenance_end; backup_lock_release
-            msg_error "" "$(t "Could not install the Elasticsearch analysis-icu plugin. Zebra was restored.")" 11 78
-            return 1
+        if [ "$es_rc" -eq 2 ]; then
+            msg_error "" "$(t "Elasticsearch did not start on port 9200. Zebra was kept.")" 12 76
+        else
+            msg_error "" "$(t "Elasticsearch failed to start. Zebra was restored.")" 12 76
         fi
-    fi
-
-    display_explanation "Starting Elasticsearch (up to 1 minute)..."
-    systemctl daemon-reload
-    systemctl enable elasticsearch >/dev/null 2>&1 || true
-    if ! systemctl restart elasticsearch; then
-        systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-        write_cron_zebra; zebra_start >/dev/null 2>&1 || true
-        maintenance_end; backup_lock_release
-        msg_error "" "$(t "Elasticsearch failed to start. Zebra was restored.")" 12 76
-        return 1
-    fi
-    local es_ok="no"
-    for _ in $(seq 1 60); do
-        curl -sS --max-time 2 http://127.0.0.1:9200 >/dev/null 2>&1 && { es_ok="yes"; break; }
-        sleep 1
-    done
-    if [ "$es_ok" = "no" ]; then
-        systemctl disable --now elasticsearch >/dev/null 2>&1 || true
-        write_cron_zebra
-        zebra_start >/dev/null 2>&1 || true
-        maintenance_end; backup_lock_release
-        msg_error "" "$(t "Elasticsearch did not start on port 9200. Zebra was kept.")" 12 76
         return 1
     fi
 
-    display_explanation "Declaring Elasticsearch in koha-conf.xml..."
-    if ! set_xml_elasticsearch inserir; then
+    if ! tui_run "$(t "Declaring Elasticsearch in Koha")" set_xml_elasticsearch inserir; then
         systemctl disable --now elasticsearch >/dev/null 2>&1 || true
         write_cron_zebra
         zebra_start >/dev/null 2>&1 || true
@@ -5187,23 +5254,15 @@ function_toggle_search_engine() {
         msg_error "" "$(t "Could not set SearchEngine to Elasticsearch. Zebra was restored.")" 10 76
         return 1
     fi
-    display_explanation "Flushing the preferences cache (Memcached)..."
-    systemctl restart memcached >/dev/null 2>&1 || true
-    prepare_koha_broker || true
-    curl -sS -X DELETE --max-time 10 "http://127.0.0.1:9200/${DB_NAME}_biblios" >/dev/null 2>&1 || true
-    curl -sS -X DELETE --max-time 10 "http://127.0.0.1:9200/${DB_NAME}_authorities" >/dev/null 2>&1 || true
-    display_explanation "Restarting Koha with Elasticsearch enabled..."
-    systemctl restart koha-common >/dev/null 2>&1 || true
-    display_explanation "Starting the continuous indexer..."
+    tui_run "$(t "Restarting Koha services")" se_task_koha_on_es
     local indexer_ok="yes"
-    if ! manage_koha_indexers start; then indexer_ok="no"; fi
+    tui_run "$(t "Starting the indexer")" manage_koha_indexers start || indexer_ok="no"
     local cut_time; cut_time=$(date '+%Y-%m-%d %H:%M:%S')
     local rebuild_ok="yes"
-    display_explanation "Reindexing the catalog into Elasticsearch..."
-    if [ "$indexer_ok" = "yes" ] && ! rebuild_koha_elasticsearch "$cut_time"; then rebuild_ok="no"; fi
+    if [ "$indexer_ok" = "yes" ] && ! tui_run "$(t "Reindexing the catalog")" rebuild_koha_elasticsearch "$cut_time"; then rebuild_ok="no"; fi
     maintenance_end; backup_lock_release
-    plack_restart
-    validate_complete_system "$(t "Elasticsearch activation")"
+    tui_run "$(t "Starting Koha (Plack)")" plack_restart
+    tui_run "$(t "Checking that everything works")" install_task_check "$(t "Elasticsearch activation")"
     if [ "$indexer_ok" = "yes" ] && [ "$rebuild_ok" = "yes" ] && is_koha_indexer_running; then
         msg_ok "$(t "System now running on ELASTICSEARCH.\n\nThe indexer has automatic recovery and the watchdog checks the queue every 5 minutes.")" 12 78
 
@@ -5251,25 +5310,23 @@ require_koha_tables() {
 
 # Unlocks Zebra and rebuilds both of its indices from scratch: the core of
 # "Repair / rebuild indexing", also run by the Koha window on Windows
-# (--rebuild-search-index). The rebuild's output goes to zebra-rebuild.log,
-# and to the screen too with "show". Returns 1 if anything failed.
+# (--rebuild-search-index). The rebuild's output goes to zebra-rebuild.log;
+# with "show" the screen gets one Pac-Man line per task. Returns 1 if
+# anything failed.
 zebra_full_rebuild() {
     local show="${1:-}" ok=0
     maintenance_begin
     repair_koha_conf_xml
-    [ -n "$show" ] && display_explanation "Unlocking Zebra..."
-    zebra_stop
-    force_stop_koha_zebra
-    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
-    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
-    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
-        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
-        "/var/lock/koha/${INSTANCE}" 2>/dev/null
-    zebra_start >/dev/null 2>&1
+    if [ -n "$show" ]; then
+        TUI_LOG="${LOG_DIR}/zebra-rebuild.log" tui_run "$(t "Unlocking and starting Zebra")" zebra_unlock_start
+    else
+        zebra_unlock_start >/dev/null 2>&1
+    fi
     write_cron_zebra
     if [ -n "$show" ]; then
-        display_explanation "Rebuilding the indices..."
-        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || ok=1
+        : > "${LOG_DIR}/zebra-rebuild.log"
+        TUI_LOG="${LOG_DIR}/zebra-rebuild.log" tui_run "$(t "Reindexing the catalog")" \
+            koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" || ok=1
     else
         koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" > "${LOG_DIR}/zebra-rebuild.log" 2>&1 || ok=1
     fi
@@ -5297,6 +5354,15 @@ kei_rebuild_search_index() {
     return "$rc"
 }
 
+se_task_es_repair() {
+    systemctl restart elasticsearch
+    prepare_koha_broker
+    systemctl restart memcached koha-common
+    manage_koha_indexers start
+    plack_restart
+    return 0
+}
+
 function_repair_indexing() {
     require_koha_tables || return 0
     local engine; engine=$(get_search_engine)
@@ -5315,21 +5381,17 @@ $(t "Pending jobs")         : ${pend:-?}
 $(t "Index / database")     : ${docs:-?} / ${bibs:-?}
 $(t "Growing queue + smaller index = indexer is down.")" 18 76
         prompt_yes_no "$(t "Repair")" "$(t "Reinstall the indexer service, flush the cache and restart everything?")" 10 74 || return 0
+        local TUI_LOG="${LOG_DIR}/search-engine.log"
         clear
-        display_explanation "Repairing the indexing services..."
-        systemctl restart elasticsearch >/dev/null 2>&1
-        prepare_koha_broker
-        systemctl restart memcached koha-common >/dev/null 2>&1
-        manage_koha_indexers start
-        plack_restart
+        tui_title "🔎" "$(t "Repairing the search index")"
+        tui_run "$(t "Repairing the indexing services")" se_task_es_repair
         local rebuild_ok="yes"
         if prompt_yes_no "$(t "Reindex")" "$(t "Rebuild the whole index from scratch?\nOn large catalogs this can take several minutes.")" 10 74; then
-            clear
             local cut_time; cut_time=$(date '+%Y-%m-%d %H:%M:%S')
-            rebuild_koha_elasticsearch "$cut_time" || rebuild_ok="no"
+            tui_run "$(t "Reindexing the catalog")" rebuild_koha_elasticsearch "$cut_time" || rebuild_ok="no"
         fi
 
-        validate_complete_system "$(t "Elasticsearch indexing repair")"
+        tui_run "$(t "Checking that everything works")" install_task_check "$(t "Elasticsearch indexing repair")"
 
         if is_koha_indexer_running && [ "$rebuild_ok" = "yes" ]; then
             msg_ok "$(t "Indexer is running and catalog synchronized.\nAdd a test record and search for it after ~10 seconds.")" 11 76
@@ -5351,12 +5413,12 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
 
     prompt_yes_no "$(t "Repair Zebra")" "$(t "Unlock Zebra and rebuild the indices from scratch?")" 10 70 || return 0
     clear
+    tui_title "🔎" "$(t "Repairing the search index")"
     local zebra_ok="yes"
     zebra_full_rebuild show || zebra_ok="no"
-    display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
-    ensure_koha_services >/dev/null 2>&1
+    tui_run "$(t "Restarting Koha services")" ensure_koha_services
 
-    validate_complete_system "$(t "Zebra indexing repair")"
+    tui_run "$(t "Checking that everything works")" install_task_check "$(t "Zebra indexing repair")"
 
     if [ "$zebra_ok" = "yes" ]; then
         msg_ok "$(t "Zebra unlocked and catalog reindexed successfully.")" 9 68
@@ -6082,26 +6144,46 @@ cloudflare_route_dns() {
 # Installs cloudflared from Cloudflare's signed APT repository (once).
 cloudflared_install() {
     command -v cloudflared >/dev/null 2>&1 && return 0
-    display_explanation "Installing cloudflared..."
-    if ! wait_for_apt_locks; then return 1; fi
+    local rc=0
+    TUI_LOG="$APT_LOG" tui_run "$(t "Installing cloudflared")" cloudflared_install_task || rc=$?
+    restore_apt_timers
+    case "$rc" in
+        0) return 0 ;;
+        2) msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66 ;;
+        3) msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72 ;;
+    esac
+    return 1
+}
+
+# Exit 2: the repository key could not be downloaded; 3: the repository
+# could not be read; 1: APT locked or the package failed.
+cloudflared_install_task() {
+    wait_for_apt_locks || return 1
     mkdir -p /etc/apt/keyrings && chmod 0755 /etc/apt/keyrings
-    if ! curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg; then
-        restore_apt_timers
-        msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
-        return 1
-    fi
+    curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg || return 2
     apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
     if ! apt_update_indices; then
         rm -f /etc/apt/sources.list.d/cloudflared.list
-        restore_apt_timers
-        msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72
-        return 1
+        return 3
     fi
-    if ! apt_install cloudflared; then
-        restore_apt_timers
-        return 1
-    fi
-    restore_apt_timers
+    apt_install cloudflared
+}
+
+# Tunnel NAME created again (a tunnel of that name without its credentials
+# on this server, OLD_ID, is deleted first).
+cloudflare_create_tunnel() {
+    [ -n "${2:-}" ] && { cloudflared tunnel delete -f "$1" || true; }
+    cloudflared tunnel create "$1"
+}
+
+# The tunnel's config.yml installed as the cloudflared service and started.
+cloudflare_service_install() {
+    cloudflared service uninstall || true
+    cp /etc/cloudflared/config.yml /etc/cloudflared/config.yml.bak || true
+    cloudflared --config /etc/cloudflared/config.yml service install
+    systemctl enable --now cloudflared
+    sleep 3
+    return 0
 }
 
 function_cloudflare_setup() {
@@ -6112,7 +6194,9 @@ function_cloudflare_setup() {
         msg_error "" "$(t "This server uses a free address. Leave it first (Free address menu), then set up your own domain.")" 10 74
         return 0
     fi
+    local TUI_LOG="${LOG_DIR}/cloudflare.log"
     clear
+    tui_title "🌐" "$(t "Cloudflare Tunnel")"
     cloudflared_install || return 1
 
     if [ ! -f "$REAL_HOME/.cloudflared/cert.pem" ] && [ ! -f "/root/.cloudflared/cert.pem" ]; then
@@ -6130,20 +6214,14 @@ function_cloudflare_setup() {
     fi
 
     local tunnel_name="koha-library"
-    display_explanation "Checking Cloudflare tunnel..."
-    
+
     local tunnel_id_check
     tunnel_id_check=$(cloudflared tunnel list 2>/dev/null | awk -v n="$tunnel_name" '$0 ~ n {print $1; exit}')
 
     if [ -n "$tunnel_id_check" ] && { [ -f "$REAL_HOME/.cloudflared/${tunnel_id_check}.json" ] || [ -f "/root/.cloudflared/${tunnel_id_check}.json" ]; }; then
         log "Tunnel '$tunnel_name' already exists with credentials; reusing..."
     else
-        display_explanation "Creating tunnel '\$tunnel_name'..."
-        if [ -n "$tunnel_id_check" ]; then
-            cloudflared tunnel delete -f "$tunnel_name" >/dev/null 2>&1 || true
-        fi
-
-        if ! cloudflared tunnel create "$tunnel_name"; then
+        if ! tui_run "$(t "Creating the tunnel")" cloudflare_create_tunnel "$tunnel_name" "$tunnel_id_check"; then
             msg_error "" "$(t "Failed to create tunnel.")" 10 74
             return 1
         fi
@@ -6194,16 +6272,9 @@ ingress:
   - service: http_status:404
 EOF
 
-    display_explanation "Registering subdomains in DNS..."
-    cloudflare_route_dns "$tunnel_name" "${opac_sub}.${dominio}"
-    cloudflare_route_dns "$tunnel_name" "${staff_sub}.${dominio}"
-
-    display_explanation "Installing tunnel as a service..."
-    cloudflared service uninstall >/dev/null 2>&1 || true
-    cp /etc/cloudflared/config.yml /etc/cloudflared/config.yml.bak 2>/dev/null || true
-    cloudflared --config /etc/cloudflared/config.yml service install
-    systemctl enable --now cloudflared >/dev/null 2>&1
-    sleep 3
+    tui_run "$(t "Registering the catalog address")" cloudflare_route_dns "$tunnel_name" "${opac_sub}.${dominio}"
+    tui_run "$(t "Registering the staff address")" cloudflare_route_dns "$tunnel_name" "${staff_sub}.${dominio}"
+    tui_run "$(t "Starting the tunnel service")" cloudflare_service_install
 
     if systemctl is-active --quiet cloudflared; then
         set_koha_public_urls "https://${opac_sub}.${dominio}" "https://${staff_sub}.${dominio}"
@@ -7275,10 +7346,26 @@ function_configure_clock() {
 # ======================================================================
 # 19. UPDATE SYSTEM AND SCHEMAS
 # ======================================================================
+# Koha's services after an update. Exit 1: a core service did not restart;
+# 2: Plack; 3: the Elasticsearch indexer; 4: Zebra.
+update_task_services() {
+    systemctl restart memcached apache2 koha-common || return 1
+    if ! ensure_koha_services && ! plack_running; then return 2; fi
+    if [ "$(get_search_engine)" = "Elasticsearch" ]; then
+        manage_koha_indexers start || return 3
+    else
+        zebra_stop
+        zebra_start || return 4
+        ensure_search_indexing
+    fi
+    return 0
+}
+
 function_update_system() {
     prompt_yes_no "$(t "Update")" \
 "$(t "System and Koha packages will be updated and database\nmigrations applied.\n\nRecommended: make a backup first.\n\nContinue?")" 13 74 || return 0
     clear
+    tui_title "📦" "$(t "Updating the system")"
     # koha-common's own postinst migrates the database during "apt-get
     # upgrade": the verified safety copy must exist before the packages move.
     local cur_tables pre_update
@@ -7287,10 +7374,9 @@ function_update_system() {
             msg_error "" "$(t "Another backup or restore is already running.\nNothing was changed.")" 10 72
             return 1
         fi
-        display_explanation "Generating the backup..."
         pre_update="${DIR_SQL}/PRE-UPDATE_$(date +%Y-%m-%d_%Hh%M%S).sql.gz"
         CLEANUP_FILE="$pre_update"
-        if ! create_safety_backup "$pre_update"; then
+        if ! tui_run "$(t "Saving a safety backup")" create_safety_backup "$pre_update"; then
             CLEANUP_FILE=""
             backup_lock_release
             msg_error "$(t "Safety backup failed")" "$(t 'The safety backup of the current database could not be created or validated (check the free space and ${DIR_SQL}).\n\nNothing was changed.')" 12 76
@@ -7298,55 +7384,37 @@ function_update_system() {
         fi
         CLEANUP_FILE=""
         backup_lock_release
-        echo "$(t "Safety backup:") $pre_update"
+        echo "   $(t "Safety backup:") $pre_update"
         log "pre-update safety backup: $pre_update"
     fi
-    if ! wait_for_apt_locks; then return 1; fi
-    apt_update_indices
-    if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade "${APT_OPTS[@]}"; then
+    if ! tui_run "$(t "Updating the packages")" install_task_upgrade; then
         restore_apt_timers
         msg_error "" "$(t "Package upgrade failed. Koha migrations will not run.")" 10 76
         return 1
     fi
     if is_koha_installed; then
-        display_explanation "Applying database migrations..."
-        if ! /usr/sbin/koha-upgrade-schema "$INSTANCE"; then
+        if ! tui_run "$(t "Applying database migrations")" /usr/sbin/koha-upgrade-schema "$INSTANCE"; then
             restore_apt_timers
             msg_error "" "$(t "Database migration failed. Services will not be restarted automatically to avoid hiding the error.")" 11 78
             return 1
         fi
-        if ! systemctl restart memcached apache2 koha-common >/dev/null 2>&1; then
+        local svc_rc=0
+        tui_run "$(t "Restarting Koha services")" update_task_services || svc_rc=$?
+        if [ "$svc_rc" -ne 0 ]; then
             restore_apt_timers
-            msg_error "" "$(t "One of the core services did not restart after the update.")" 9 72
+            case "$svc_rc" in
+                1) msg_error "" "$(t "One of the core services did not restart after the update.")" 9 72 ;;
+                2) msg_error "" "$(t "Plack did not restart after the update.")" 9 70 ;;
+                3) msg_error "" "$(t "The Elasticsearch indexer could not be started after the update.")" 10 76 ;;
+                *) msg_error "" "$(t "Zebra could not be started after the update.")" 9 72 ;;
+            esac
             return 1
-        fi
-        if ! ensure_koha_services >/dev/null 2>&1 && ! plack_running; then
-            restore_apt_timers
-            msg_error "" "$(t "Plack did not restart after the update.")" 9 70
-            return 1
-        fi
-        if [ "$(get_search_engine)" = "Elasticsearch" ]; then
-            if ! manage_koha_indexers start; then
-                restore_apt_timers
-                msg_error "" "$(t "The Elasticsearch indexer could not be started after the update.")" 10 76
-                return 1
-            fi
-        else
-            zebra_stop
-            if ! zebra_start; then
-                restore_apt_timers
-                msg_error "" "$(t "Zebra could not be started after the update.")" 9 72
-                return 1
-            fi
-            ensure_search_indexing >/dev/null 2>&1
         fi
     fi
-    display_explanation "Cleaning orphan packages..."
-    apt-get clean -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >/dev/null 2>&1 || true
-    journalctl --vacuum-time=14d >/dev/null 2>&1 || true
+    tui_run "$(t "Cleaning temporary files")" install_task_cleanup 14
     restore_apt_timers
-    if validate_complete_system "$(t "system update")"; then
+    tui_run "$(t "Checking that everything works")" install_task_check "$(t "system update")"
+    if [ "$V_FAIL" -eq 0 ]; then
         msg_ok "$(t "Update finished with no critical errors.")" 9 70
     else
         msg_info "$(t "Update with warnings")" "$(t "The update ran but validation found \$V_FAIL failure(s) and \$V_WARN warning(s).\n\nLog: \$VALIDATION_LOG")" 11 76
@@ -7361,7 +7429,9 @@ function_update_system() {
 # ======================================================================
 function_validate_system() {
     clear
-    if validate_complete_system "$(t "manual validation")"; then
+    tui_title "🩺" "$(t "Full system validation")"
+    tui_run "$(t "Checking that everything works")" install_task_check "$(t "manual validation")"
+    if [ "$V_FAIL" -eq 0 ]; then
         msg_ok "$(t "No critical failures.\n\nOK: \$V_OK   Warnings: \$V_WARN")" 10 70
     else
         msg_info "$(t "Issues found")" "$(t "Failures: \$V_FAIL   Warnings: \$V_WARN   OK: \$V_OK")" 10 70
@@ -7372,15 +7442,20 @@ function_validate_system() {
 # ======================================================================
 # 20.0. RESTART / REPAIR KOHA SERVICES
 # ======================================================================
+repair_task_services() {
+    systemctl start mariadb
+    start_koha_workers
+    is_koha_zebra_running || zebra_start
+    ensure_search_indexing
+    ensure_koha_services
+    return 0
+}
+
 function_repair_services() {
     require_koha || return 0
     clear
-    display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
-    systemctl start mariadb >/dev/null 2>&1
-    start_koha_workers
-    is_koha_zebra_running || zebra_start >/dev/null 2>&1
-    ensure_search_indexing >/dev/null 2>&1
-    ensure_koha_services >/dev/null 2>&1
+    tui_title "🔧" "$(t "Restarting Koha services")"
+    tui_run "$(t "Restarting Koha services")" repair_task_services
     local mc_state plack_state details="" cache cache_line
     memcached_alive && mc_state="$(t "active")" || mc_state="$(t "inactive")"
     plack_running && plack_state="$(t "running")" || plack_state="$(t "stopped")"
@@ -7402,6 +7477,19 @@ function_repair_services() {
 # ======================================================================
 # 20.1. DEEP MAINTENANCE & OPTIMIZATION
 # ======================================================================
+maint_task_logs() {
+    journalctl --vacuum-time=7d || true
+    find "$LOG_DIR" -name "*.log" -mtime +14 -delete 2>/dev/null || true
+    return 0
+}
+
+maint_task_restart() {
+    systemctl restart memcached || true
+    plack_restart || true
+    systemctl restart apache2 || true
+    return 0
+}
+
 function_deep_maintenance() {
     require_database || return 0
     
@@ -7409,22 +7497,16 @@ function_deep_maintenance() {
 "$(t "This routine will:\n\n• Repair and optimize MariaDB tables\n• Clean system journal logs (> 7 days)\n• Vacuum temporary and backup old files\n\nContinue?")" 14 76 || return 0
 
     clear
-    display_explanation "Optimizing MariaDB tables and database..."
-    
-    if mysqlcheck --auto-repair --optimize --default-character-set=utf8mb4 "$DB_NAME" >/tmp/koha_db_optimize.log 2>&1; then
+    tui_title "🧹" "$(t "Deep maintenance")"
+    : > /tmp/koha_db_optimize.log
+    if TUI_LOG=/tmp/koha_db_optimize.log tui_run "$(t "Optimizing the database")" \
+            mysqlcheck --auto-repair --optimize --default-character-set=utf8mb4 "$DB_NAME"; then
         log "database optimized successfully"
     else
         log "database optimization reported warnings or errors"
     fi
-
-    display_explanation "Cleaning system and journal logs..."
-    journalctl --vacuum-time=7d >/dev/null 2>&1 || true
-    find "$LOG_DIR" -name "*.log" -mtime +14 -delete 2>/dev/null || true
-
-    display_explanation "Restarting core services to free memory..."
-    systemctl restart memcached >/dev/null 2>&1 || true
-    plack_restart || true
-    systemctl restart apache2 >/dev/null 2>&1 || true
+    tui_run "$(t "Cleaning system logs")" maint_task_logs
+    tui_run "$(t "Restarting Koha services")" maint_task_restart
 
     msg_ok "$(t "Maintenance completed successfully!\n\n• MariaDB tables optimized\n• System logs vacuumed\n• Services restarted and memory flushed")" 12 74
     log "deep maintenance completed"

@@ -220,3 +220,15 @@ EOF
     assert '[ "$(xmllint --xpath "string(/yazgfs/server/config)" $conf)" = "/etc/koha/sites/library/zebra-biblios-dom.cfg" ]'
     assert 'cmp -s "$conf" "$KEI_REPO/tests/mocks/koha-conf.xml"' "repair must give back the original file"
 }
+
+@test "I19 the search engine switch shows one line per task; the commands' output goes to search-engine.log" {
+    es_server
+    rm -f /var/log/koha-easy-install/search-engine.log
+    panel function_toggle_search_engine
+    assert '[ "$(live_engine)" = "Zebra" ]'
+    assert 'echo "$output" | grep -q "Switching the search engine to Zebra"' "$output"
+    assert 'echo "$output" | grep -q "Stopping Elasticsearch.*Done!"' "$output"
+    assert 'echo "$output" | grep -q "Reindexing the catalog.*Done!"' "$output"
+    assert '[ -s /var/log/koha-easy-install/search-engine.log ]'
+    assert 'grep -q "=====.*se_task_es_off" /var/log/koha-easy-install/search-engine.log' "$(cat /var/log/koha-easy-install/search-engine.log)"
+}
