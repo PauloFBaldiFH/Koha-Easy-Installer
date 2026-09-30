@@ -486,7 +486,7 @@ Describe 'Shortcuts' {
         $desk = @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop })
         $desk.Count | Should -Be 1
         $desk[0].Name | Should -Be 'Koha'
-        $desk[0].Arguments | Should -BeLike '* Window -Hidden'
+        $desk[0].Arguments | Should -BeLike '* Launch -Hidden'
         ($list | Where-Object { $_.Name -like '*Control panel*' }).Arguments | Should -BeLike '* Panel -Hidden'
         ($list | Where-Object { $_.Name -like '*Status' -and $_.Kind -eq 'lnk' }).Arguments | Should -BeLike '* Window -Hidden'
         ($list | Where-Object { $_.Name -like '*Export diagnostics' }).Arguments | Should -BeLike '* ExportReport -Hidden'
@@ -1134,6 +1134,92 @@ Describe 'Desktop shortcut' {
         $made = @(New-KohaShortcuts -StartMenu (Join-Path $TestDrive 'Programs2/Koha') -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico'))
         @($made | Where-Object { $_ -like '*.lnk' }).Count | Should -Be 0
         @($made | Where-Object { $_ -like '*.url' }).Count | Should -Be 2
+    }
+}
+
+Describe 'The Koha icon as the one way in' {
+    BeforeEach {
+        $script:did = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Set-KohaTrayAtSignIn { [void]$script:did.Add('signin') }
+        Mock -ModuleName KohaEasy.Core Register-KohaTasks { [void]$script:did.Add('register ' + $Autostart) }
+        Mock -ModuleName KohaEasy.Core Start-KohaHidden { [void]$script:did.Add('hidden ' + $Arguments) }
+        Mock -ModuleName KohaEasy.Core Start-KohaKeepAlive { [void]$script:did.Add('keep-alive') }
+        Mock -ModuleName KohaEasy.Core Update-KohaHandshake { }
+    }
+
+    It 'starts the tray and Koha, and puts back what was deleted, when nothing runs' {
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayAtSignIn { $false }
+        Mock -ModuleName KohaEasy.Core Test-KohaTaskPresent { $false }
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayRunning { $false }
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
+        Set-KohaState @{ autostart = 'logon'; trayClosed = $true } | Out-Null
+        $r = Invoke-KohaLaunch
+        $r | Should -Be @('signin', 'tasks', 'tray', 'start')
+        $script:did | Should -Contain 'hidden Tray'
+        $script:did | Should -Contain 'register logon'
+        $script:did | Should -Contain 'keep-alive'
+        (Get-KohaState).trayClosed | Should -BeFalse
+        (Get-KohaState).desired | Should -Be 'running'
+    }
+
+    It 'starts nothing twice when Koha and the tray already run' {
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayAtSignIn { $true }
+        Mock -ModuleName KohaEasy.Core Test-KohaTaskPresent { $true }
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayRunning { $true }
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        @(Invoke-KohaLaunch).Count | Should -Be 0
+        $script:did.Count | Should -Be 0
+    }
+
+    It 'still opens the window when the sign-in entry or the tasks cannot be written' {
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayAtSignIn { $false }
+        Mock -ModuleName KohaEasy.Core Set-KohaTrayAtSignIn { throw 'denied' }
+        Mock -ModuleName KohaEasy.Core Test-KohaTaskPresent { $false }
+        Mock -ModuleName KohaEasy.Core Register-KohaTasks { throw 'denied' }
+        Mock -ModuleName KohaEasy.Core Test-KohaTrayRunning { $true }
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        @(Invoke-KohaLaunch).Count | Should -Be 0
+    }
+
+    It 'registers the Koha tasks again before a start when they were deleted' {
+        Mock -ModuleName KohaEasy.Core Test-KohaTaskPresent { $Name -ne 'Keep Koha running' }
+        Set-KohaState @{ autostart = 'manual' } | Out-Null
+        Start-Koha -Trigger user | Should -Be 'started'
+        $script:did | Should -Be @('register manual', 'keep-alive')
+        Set-KohaState @{ autostart = 'logon' } | Out-Null
+    }
+
+    It 'makes the sign-in task again when the sign-in toggle finds it deleted' {
+        Mock -ModuleName KohaEasy.Core Test-KohaTaskPresent { $false }
+        Set-KohaSignInTask -Enabled $true
+        $script:did | Should -Be @('register logon')
+    }
+
+    It 'keeps making the other shortcuts when Windows refuses one, and says why' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { if ($Path -like '*Desk3*Koha.lnk') { throw 'Unable to save shortcut' }; [System.IO.File]::WriteAllText($Path, '') }
+        Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { $true }
+        $sm = Join-Path $TestDrive 'Programs3/Koha'
+        $dt = Join-Path $TestDrive 'Desk3'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        $made = @(New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico'))
+        $made.Count | Should -Be 11
+        Test-Path -LiteralPath (Join-Path $sm 'Koha.lnk') | Should -BeTrue
+        @(Get-KohaShortcutErrors).Count | Should -Be 1
+        @(Get-KohaShortcutErrors)[0] | Should -BeLike '*Koha.lnk: Unable to save shortcut'
+    }
+
+    It 'opens the Koha window from the Koha icon, and brings an open one to the front' {
+        $ps = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw
+        $at = $ps.IndexOf("    'Launch' {")
+        $at | Should -BeGreaterThan 0
+        $ps.IndexOf('Invoke-KohaLaunch', $at) | Should -BeLessThan $ps.IndexOf("    'Window' {")
+        $ps.IndexOf('KohaEasy.Window.ps1', $at) | Should -BeLessThan $ps.IndexOf("    'Window' {")
+        Test-KohaRelaunchHidden -Command 'Launch' -Hidden $false -Target 'C:\KohaEasy\bin\KohaEasy.exe' | Should -BeTrue
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match 'Show-KohaOpenWindow \$title'
+        $cs = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Launcher.cs') -Raw
+        $cs | Should -Match 'public static bool FocusWindow'
+        $cs.IndexOf('Native.AllowForeground()') | Should -BeLessThan $cs.IndexOf('Process.Start(psi)')
     }
 }
 

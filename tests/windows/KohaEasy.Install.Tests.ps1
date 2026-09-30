@@ -196,7 +196,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good -NonInteractive | Should -Be 0
-        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan check')
+        $script:calls | Should -Be @('distro', 'systemd', 'copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'start', 'lan check')
         (Get-KohaState).phase | Should -Be 'done'
         (Get-KohaState).autostart | Should -Be 'logon'
     }
@@ -269,7 +269,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Start-Process { }
         Set-KohaState @{ linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'lan', 'start', 'lan check')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'lan', 'start', 'lan check')
         (Get-KohaState).lanAccess | Should -BeTrue
         (Get-KohaState).lanSetup | Should -Be 2
     }
@@ -278,11 +278,11 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Test-KohaWslReady { $true }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria' } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan', 'lan check')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'start', 'lan', 'lan check')
         (Get-KohaState).lanAccess | Should -BeTrue
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'lan check')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'start', 'lan check')
     }
 
     It 'updates the library network rules an older version set up, once' {
@@ -322,7 +322,7 @@ Describe 'Install flow' {
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true; lanSetup = 2 } | Out-Null
         Mock -ModuleName KohaEasy.Install Test-KohaKeepAliveOutdated { $true }
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'stop koha', 'tray', 'start', 'lan check')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'stop koha', 'tray', 'start', 'lan check')
         Mock -ModuleName KohaEasy.Install Update-KohaWslConfig { $true }
         $script:calls.Clear()
         Install-Koha -Facts $good | Should -Be 0
@@ -361,7 +361,7 @@ Describe 'Install flow' {
         Mock -ModuleName KohaEasy.Install Read-Host { 'y' }
         Set-KohaState @{ phase = 'done'; linuxUser = 'maria'; lanAccess = $true } | Out-Null
         Install-Koha -Facts $good | Should -Be 0
-        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'tray at sign-in', 'shortcuts', 'icons', 'tray', 'start', 'diagnostics', 'panel', 'start', 'lan')
+        $script:calls | Should -Be @('copy panel', 'launcher', 'tasks logon', 'shortcuts', 'tray at sign-in', 'icons', 'tray', 'start', 'diagnostics', 'panel', 'start', 'lan')
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*koha-common package: iF*' }
     }
 
@@ -479,17 +479,23 @@ Describe 'Install messages' {
         Set-KohaState @{ launcher = ''; launcherHash = '' } | Out-Null
     }
 
-    It 'says the desktop shortcut was made only when it is there' {
+    It 'says where the Koha icon really is, with Windows'' reason when it is missing' {
         $dt = Join-Path $TestDrive 'DeskInstall'
-        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        $sm = Join-Path $TestDrive 'MenuInstall/Koha'
+        New-Item -ItemType Directory -Path $dt, $sm -Force | Out-Null
         Mock -ModuleName KohaEasy.Install Get-KohaDesktopPath { $dt }
-        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { }
+        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { throw 'Requested registry access is not allowed.' }
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { }
+        Mock -ModuleName KohaEasy.Install Get-KohaShortcutErrors { @('X\Koha.lnk: Unable to save shortcut') }
         Mock -ModuleName KohaEasy.Install New-KohaShortcuts { }
-        Install-KohaShortcuts
-        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*could not be put on the desktop*' }
-        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $dt 'Koha.lnk') -Value '' }
-        Install-KohaShortcuts
+        Install-KohaShortcuts -StartMenu $sm
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*shortcuts could not be created*Unable to save shortcut*' }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $StartMenu 'Koha.lnk') -Value '' }
+        Install-KohaShortcuts -StartMenu $sm
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*could not be put on the desktop*Start menu*Unable to save shortcut*' }
+        # The sign-in entry failing does not stop the shortcuts.
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $Desktop 'Koha.lnk') -Value '' }
+        Install-KohaShortcuts -StartMenu $sm
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like ('*Shortcuts created*' + $dt + '*') }
     }
 

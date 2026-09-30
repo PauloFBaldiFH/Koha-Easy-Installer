@@ -52,6 +52,11 @@ namespace KohaEasy
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             psi.WorkingDirectory = dir;
+            // Started from a click (the Koha icon), this program may bring a
+            // window to the front; PowerShell, started by it, gets the same
+            // right, so an open Koha window comes forward instead of only
+            // flashing on the taskbar.
+            Native.AllowForeground();
             try
             {
                 using (Process p = Process.Start(psi))
@@ -128,6 +133,37 @@ namespace KohaEasy
 
         [DllImport("ole32.dll")]
         static extern int PropVariantClear(ref PropVariant pvar);
+
+        [DllImport("user32.dll")]
+        static extern bool AllowSetForegroundWindow(int processId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr FindWindow(string className, string windowName);
+
+        [DllImport("user32.dll")]
+        static extern bool IsIconic(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hwnd, int cmd);
+
+        [DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hwnd);
+
+        public static void AllowForeground()
+        {
+            try { AllowSetForegroundWindow(-1); } catch { } // ASFW_ANY
+        }
+
+        // The window titled title restored (when minimized) and in front.
+        // False when there is no such window.
+        public static bool FocusWindow(string title)
+        {
+            IntPtr hwnd = FindWindow(null, title);
+            if (hwnd == IntPtr.Zero) { return false; }
+            if (IsIconic(hwnd)) { ShowWindow(hwnd, 9); } // SW_RESTORE
+            SetForegroundWindow(hwnd);
+            return true;
+        }
 
         [DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
