@@ -8340,8 +8340,7 @@ function_library_tools() {
             "9" "$(t "▤  View tool logs")" \
             "10" "$(t "◆  Brazil: localization & migration")" \
             "11" "$(t "✉  Messaging: WhatsApp and Telegram")" \
-            "12" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
-            "13" "$(t "⇄  Replace a MARC record (staff tool)")" 3>&1 1>&2 2>&3) || return 0
+            "12" "$(t "⇄  Replace a MARC record (staff tool)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_marc_import ;;
             2) lt_marc_undo ;;
@@ -8354,8 +8353,7 @@ function_library_tools() {
             9) lt_view_logs ;;
             10) function_brazil_tools ;;
             11) function_messaging ;;
-            12) function_cataloguing ;;
-            13) function_marc_replace ;;
+            12) function_marc_replace ;;
         esac
         clear
     done
@@ -11099,18 +11097,21 @@ lt_msg_remove() {
 }
 
 # ======================================================================
-# 32. CATALOGUING AIDS: AUTHOR NOTATION (PHA, CUTTER-SANBORN) AND CDD
+# 32. AUTHOR NOTATION AND CDD TABLES OF THE AI CATALOGUING
 # ----------------------------------------------------------------------
-# Read-only helpers for the cataloguers. The author tables (Tabela PHA of
-# Heloísa de Almeida Prado, Cutter-Sanborn) and the Dewey schedules are
-# copyrighted and are not distributed with the panel: each library loads
-# its own copy as a text file (one entry and its number per line; the PHA
-# rows as printed, entry - number - entry, are read as they are). The notation
-# follows the rules of the PHA explanation: the entry that comes right
-# before the name in alphabetical order, the initial of the surname, the
-# number and the initial of the title (the initial article never counts;
-# a title starting with "l" gets a capital L), prefixes read as one word
-# (La Fonte, O'Donnel) and M' / Mc read as Mac.
+# The author tables (Tabela PHA of Heloísa de Almeida Prado, Cutter-Sanborn)
+# and the Dewey schedule the AI cataloguing of marc_replace.pl reads
+# (KohaEasy::Cataloguing::Rules). They are copyrighted and are not
+# distributed with the panel: each library loads its own copy as a text
+# file (one entry and its number per line; the PHA rows as printed, entry -
+# number - entry, are read as they are) under Library tools > Replace a
+# MARC record. The notation follows the rules of the PHA explanation: the
+# entry that comes right before the name in alphabetical order, the initial
+# of the surname, the number and the initial of the title (the initial
+# article never counts; a title starting with "l" gets a capital L),
+# prefixes read as one word (La Fonte, O'Donnel) and M' / Mc read as Mac.
+# cat_notation is the reference the Perl port in Rules.pm is checked
+# against (tests C02 and V07): change both together.
 # ======================================================================
 CAT_DIR="${CONF_DIR}/tables"
 
@@ -11291,175 +11292,6 @@ END {
 }' "$table"
 }
 
-# Call numbers of the catalogue that already use the letter and number
-# BASE (e.g. A848, not A8481) in CLASS: "callnumber<TAB>author<TAB>title".
-cat_used() {
-    local class="$1" base="$2" skip="${3:-0}" re
-    [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]] && [[ "$base" =~ ^[A-Z][0-9]+$ ]] && [[ "$skip" =~ ^[0-9]+$ ]] || return 0
-    if [ -n "$class" ]; then re="^${class//./\\.}[[:space:]]+${base}([^0-9]|\$)"; else re="(^|[[:space:]])${base}([^0-9]|\$)"; fi
-    run_sql "SELECT DISTINCT i.itemcallnumber, COALESCE(b.author, ''), COALESCE(b.title, '') FROM ${DB_NAME}.items i JOIN ${DB_NAME}.biblio b ON b.biblionumber = i.biblionumber WHERE i.itemcallnumber REGEXP $(sql_quote "$re") AND i.biblionumber <> ${skip} ORDER BY i.itemcallnumber LIMIT 20;"
-}
-
-# Report of one notation: the entry used, the call number and the uses of
-# the same number in the class (a different author needs another number).
-cat_notation_report() {
-    local kind="$1" name="$2" title="$3" ind2="$4" mode="$5" class="$6" skip="${7:-0}" out="$8"
-    local res rc=0 nota ent num prev nxt base used
-    res=$(cat_notation "$kind" "$name" "$title" "$ind2" "$mode") || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        printf '%s\n' "$(t "No notation: the name must start with a letter (write it as Surname, Forename).")" > "$out"
-        return 1
-    fi
-    IFS=$'\037' read -r nota ent num prev nxt <<< "${res//$'\t'/$'\037'}"
-    base="${nota:0:1}${num}"
-    {
-        printf '%s: %s\n' "$(cat_table_name "$kind")" "$nota"
-        printf '\n  %s: %s\n  %s: %s (%s)\n' "$(t "Heading")" "$name" "$(t "Table entry used")" "$ent" "$num"
-        [ -n "$title" ] && printf '  %s: %s\n' "$(t "Title")" "$title"
-        [ -n "$class" ] && printf '\n  %s:\n      %s\n      %s\n' "$(t "Call number")" "$class" "$nota"
-        used=$(cat_used "$class" "$base" "$skip")
-        if [ -n "$used" ]; then
-            printf '\n%s\n' "$(t "Already used in the catalogue (in the same class, two different authors cannot have the same number):")"
-            printf '%s\n' "$used" | awk -F'\t' '{ printf "  %-22s %-28s %s\n", $1, substr($2, 1, 28), substr($3, 1, 40) }'
-            printf '\n%s\n' "$(t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):")"
-            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free")"
-            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free")"
-        elif [ -n "$class" ]; then
-            printf '\n%s\n' "$(t "Not used yet in this class in the catalogue.")"
-        fi
-    } > "$out"
-}
-
-cat_pick_kind() {   # author table to use (only the loaded ones)
-    local items=() k
-    for k in pha cutter; do [ -s "$(cat_table_path "$k")" ] && items+=("$k" "$(cat_table_name "$k")"); done
-    if [ ${#items[@]} -eq 0 ]; then
-        msg_info "$(t "Author notation")" "$(t "Load the PHA or Cutter-Sanborn table of your library first (Load a table).")" 9 70
-        return 1
-    fi
-    [ ${#items[@]} -eq 2 ] && { printf '%s' "${items[0]}"; return 0; }
-    ui_menu "$(t "Author notation")" "$(t "Table:")" "${items[@]}"
-}
-
-lt_cat_notation() {
-    local kind name title class out
-    kind=$(cat_pick_kind) || return 0
-    name=$(ui_input "$(t "Author notation")" "$(t "Author as in the heading: Surname, Forename (e.g. Assis, Machado de). For an institution, its name.")" "") || return 0
-    [ -n "${name// /}" ] || return 0
-    title=$(ui_input "$(t "Author notation")" "$(t "Title of the work (for the initial after the number):")" "") || return 0
-    class=$(ui_input "$(t "Author notation")" "$(t "Class number (CDD), to check the numbers already used (optional):")" "") || return 0
-    class="${class// /}"
-    if ! [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]]; then
-        msg_error "" "$(t "Invalid class number.")" 8 60
-        return 1
-    fi
-    tools_workdir || return 1
-    out="$TOOLS_WORK/notation.txt"
-    cat_notation_report "$kind" "$name" "$title" "" person "${class// /}" 0 "$out"
-    ui_textbox "$(t "Author notation")" "$out"
-}
-
-# From a catalogue record: 100 (person), 110/111 (institution, first word)
-# or the title (anonymous work); class from 082.
-lt_cat_record() {
-    local kind bn row a100 a110 a111 t245 ind2 c082 name mode out
-    kind=$(cat_pick_kind) || return 0
-    bn=$(ui_input "$(t "Author notation")" "$(t "Record number (biblionumber):")" "") || return 0
-    if ! [[ "$bn" =~ ^[0-9]{1,10}$ ]]; then
-        msg_error "" "$(t "Invalid record number.")" 8 60
-        return 1
-    fi
-    row=$(run_sql "SELECT CONCAT_WS(CHAR(31), ExtractValue(metadata, '//datafield[@tag=\"100\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"110\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"111\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"245\"]/subfield[@code=\"a\"]'), ExtractValue(metadata, '//datafield[@tag=\"245\"]/@ind2'), ExtractValue(metadata, '//datafield[@tag=\"082\"]/subfield[@code=\"a\"]'), '') FROM ${DB_NAME}.biblio_metadata WHERE biblionumber = ${bn} AND format = 'marcxml' LIMIT 1;")
-    if [ -z "$row" ]; then
-        msg_error "" "$(t "Record not found.")" 8 60
-        return 1
-    fi
-    # Unit separator, not tab: empty fields must keep their place.
-    IFS=$'\037' read -r a100 a110 a111 t245 ind2 c082 _ <<< "$row"
-    t245="${t245%[ /:;=]}"; t245="${t245%[ /:;=]}"
-    if [ -n "$a100" ]; then name="${a100%[,.]}"; mode=person
-    elif [ -n "${a110}${a111}" ]; then name="${a110:-$a111}"; mode=corporate
-    else name="$t245"; mode=title
-    fi
-    tools_workdir || return 1
-    out="$TOOLS_WORK/notation.txt"
-    cat_notation_report "$kind" "$name" "$t245" "$ind2" "$mode" "${c082%% *}" "$bn" "$out"
-    ui_textbox "$(t "Author notation")" "$out"
-}
-
-# Main classes of the DDC (first summary); the rest comes from the
-# schedule loaded by the library.
-cat_ddc_classes() {
-    printf '000\t%s\n' "$(t "Computer science, information and general works")"
-    printf '100\t%s\n' "$(t "Philosophy and psychology")"
-    printf '200\t%s\n' "$(t "Religion")"
-    printf '300\t%s\n' "$(t "Social sciences")"
-    printf '400\t%s\n' "$(t "Language")"
-    printf '500\t%s\n' "$(t "Science")"
-    printf '600\t%s\n' "$(t "Technology")"
-    printf '700\t%s\n' "$(t "Arts and recreation")"
-    printf '800\t%s\n' "$(t "Literature")"
-    printf '900\t%s\n' "$(t "History and geography")"
-}
-
-# cat_cdd_lookup QUERY OUT: by number (the chain of classes above it and
-# the entries below it) or by word (captions containing it), plus how the
-# catalogue already uses the number or the word.
-cat_cdd_lookup() {
-    local q="$1" out="$2" table like
-    table=$(cat_table_path cdd)
-    {
-        if [[ "$q" =~ ^[0-9]{1,3}(\.[0-9]*)?$ ]]; then
-            q="${q%.}"
-            printf '%s %s\n\n' "$(t "CDD number")" "$q"
-            { cat_ddc_classes; [ -s "$table" ] && cat "$table"; } | LC_ALL=C awk -F'\t' -v q="$q" '
-                function sig(n) { if (n ~ /\./) return n; sub(/0+$/, "", n); return n == "" ? "0" : n }
-                !($1 in seen) { seen[$1] = 1; p = sig($1)
-                    if (index(q, p) == 1) up[$1] = $2
-                    else if (index($1, q) == 1 && length($1) <= length(q) + 2 && $1 != q) down[$1] = $2 }
-                END {
-                    n = 0; for (k in up) keys[++n] = k
-                    for (i = 2; i <= n; i++) { x = keys[i]; for (j = i - 1; j >= 1 && keys[j] > x; j--) keys[j + 1] = keys[j]; keys[j + 1] = x }
-                    for (i = 1; i <= n; i++) printf "  %-10s %s\n", keys[i], up[keys[i]]
-                    m = 0; for (k in down) d[++m] = k
-                    for (i = 2; i <= m; i++) { x = d[i]; for (j = i - 1; j >= 1 && d[j] > x; j--) d[j + 1] = d[j]; d[j + 1] = x }
-                    if (m) print ""
-                    for (i = 1; i <= m && i <= 60; i++) printf "      %-10s %s\n", d[i], down[d[i]]
-                }'
-            like=$(sql_quote "${q}%")
-            printf '\n%s\n' "$(t "In the catalogue (items by class number):")"
-            run_sql "SELECT SUBSTRING_INDEX(TRIM(itemcallnumber), ' ', 1) AS c, COUNT(*) FROM ${DB_NAME}.items WHERE itemcallnumber LIKE ${like} GROUP BY c ORDER BY c LIMIT 40;" \
-                | awk -F'\t' '{ printf "  %-12s %s\n", $1, $2 } END { if (NR == 0) print "  -" }'
-        else
-            printf '%s: %s\n\n' "$(t "Subject")" "$q"
-            { cat_ddc_classes; [ -s "$table" ] && cat "$table"; } | awk -F'\t' -v q="$q" "$(cat_awk_lib)"'
-                BEGIN { w = tolower(unaccent(q)) }
-                { c = tolower(unaccent($2)); if (index(c, w)) { printf "  %-10s %s\n", $1, $2; n++ } if (n >= 60) exit }
-                END { if (!n) print "  -" }'
-            [ -s "$table" ] || printf '\n%s\n' "$(t "Only the main classes are built in: load the CDD schedule of your library to search all of it.")"
-            like=$(sql_quote "%$(printf '%s' "$q" | sed 's/[%_\\]/\\&/g')%")
-            printf '\n%s\n' "$(t "How the catalogue classified titles with this word:")"
-            run_sql "SELECT SUBSTRING_INDEX(TRIM(i.itemcallnumber), ' ', 1) AS c, COUNT(*) AS n FROM ${DB_NAME}.items i JOIN ${DB_NAME}.biblio b ON b.biblionumber = i.biblionumber WHERE b.title LIKE ${like} AND i.itemcallnumber REGEXP '^[0-9]{3}' GROUP BY c ORDER BY n DESC, c LIMIT 15;" \
-                | awk -F'\t' '{ printf "  %-12s %s\n", $1, $2 } END { if (NR == 0) print "  -" }'
-        fi
-    } > "$out"
-}
-
-lt_cat_cdd() {
-    local q out
-    q=$(ui_input "$(t "CDD")" "$(t "Class number (e.g. 869.3) or a word of the subject (e.g. poetry):")" "") || return 0
-    q="${q#"${q%%[![:space:]]*}"}"; q="${q%"${q##*[![:space:]]}"}"
-    [ -n "$q" ] || return 0
-    if [ "${#q}" -gt 60 ]; then
-        msg_error "" "$(t "The text is too long.")" 8 60
-        return 1
-    fi
-    tools_workdir || return 1
-    out="$TOOLS_WORK/cdd.txt"
-    cat_cdd_lookup "$q" "$out"
-    ui_textbox "$(t "CDD")" "$out"
-}
-
 lt_cat_load() {
     local kind file utf8 new report problems entries
     kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
@@ -11507,28 +11339,6 @@ lt_cat_remove() {
     rm -f "$(cat_table_path "$kind")"
     log "cataloguing: $kind table removed"
     msg_ok "$(t "✔ Table removed.")"
-}
-
-function_cataloguing() {
-    require_database || return 0
-    local opt status
-    while true; do
-        status="$(t "Loaded tables"): PHA $(cat_table_count pha), Cutter-Sanborn $(cat_table_count cutter), CDD $(cat_table_count cdd)"
-        opt=$(ui_menu "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" "$(t "Read-only helpers: nothing in the catalogue is changed.")"$'\n'"$status" \
-            "1" "$(t "Author notation (PHA or Cutter-Sanborn)")" \
-            "2" "$(t "Author notation of a catalogue record")" \
-            "3" "$(t "CDD: look up a number or a subject")" \
-            "4" "$(t "Load a table (PHA, Cutter-Sanborn, CDD)")" \
-            "5" "$(t "Remove a table")") || return 0
-        case "$opt" in
-            1) lt_cat_notation ;;
-            2) lt_cat_record ;;
-            3) lt_cat_cdd ;;
-            4) lt_cat_load ;;
-            5) lt_cat_remove ;;
-        esac
-        clear
-    done
 }
 
 # ======================================================================
@@ -13060,7 +12870,7 @@ package KohaEasy::Cataloguing::Rules;
 # library's own PHA or Cutter-Sanborn table and a CDD number.
 #
 # The author notation is a line-by-line port of the awk code of the panel
-# (cat_awk_lib and cat_notation in the installer, "Cataloguing aids"): the
+# (cat_awk_lib and cat_notation in the installer, section 32): the
 # same table file (CONF_DIR/tables/<kind>.tsv, "letter<TAB>key<TAB>number
 # <TAB>entry" sorted by letter and key) gives the same notation in the
 # terminal and in marc_replace.pl. Change both together.
@@ -13557,7 +13367,7 @@ mr_text() {
         v_w_ddc)          t "No CDD number: classify the book (fields 082 and 090)." ;;
         v_w_ddc_model)    t "The CDD number is a suggestion of the model (the book has no CIP number): check it in the schedules." ;;
         v_w_notation)     t "No author notation: the table has no entry for this letter." ;;
-        v_w_no_table)     t "No PHA or Cutter-Sanborn table is loaded, so there is no author notation (load one in the panel: Cataloguing aids)." ;;
+        v_w_no_table)     t "No PHA or Cutter-Sanborn table is loaded, so there is no author notation (load one in the panel: Library tools, Replace a MARC record, Load a table)." ;;
         v_w_isbn)         t "ISBN with a wrong check digit, kept in 020 z for checking:" ;;
         f_title)          t "title" ;;
         f_authors)        t "author" ;;
@@ -13684,14 +13494,19 @@ function_marc_replace() {
     local opt status
     while true; do
         if mr_installed; then status="$(t "Installed"): /cgi-bin/koha/tools/marc_replace.pl"; else status="$(t "Not installed.")"; fi
+        status+=$'\n'"$(t "Loaded tables"): PHA $(cat_table_count pha), Cutter-Sanborn $(cat_table_count cutter), CDD $(cat_table_count cdd)"
         opt=$(ui_menu "$(t "⇄  Replace a MARC record (staff tool)")" "$(t "A page of the staff interface that replaces a record by its biblionumber with a .mrc or .xml file or pasted text, showing a preview first. The items are never changed and the previous version is saved.")"$'\n\n'"$status" \
             "1" "$(t "Install or update the page")" \
             "2" "$(t "Remove the page")" \
-            "3" "$(t "Versions saved by the page")") || return 0
+            "3" "$(t "Versions saved by the page")" \
+            "4" "$(t "Load a table (PHA, Cutter-Sanborn, CDD)")" \
+            "5" "$(t "Remove a table")") || return 0
         case "$opt" in
             1) lt_mr_install ;;
             2) lt_mr_remove ;;
             3) lt_mr_versions ;;
+            4) lt_cat_load ;;
+            5) lt_cat_remove ;;
         esac
         clear
     done
