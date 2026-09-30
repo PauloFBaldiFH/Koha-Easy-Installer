@@ -9647,7 +9647,9 @@ _lt_br_labels_remove() {
 # followed by the reference of the record by ABNT NBR 6023 (essential
 # elements; the complete formatter is Library tools > Brazil > ABNT).
 # Koha picks the file per language ({langcode} in the system preference).
-ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
+# The card starts collapsed (a <details> element, no script): the
+# cataloguer opens it with SHOW_LABEL.
+ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL SHOW_LABEL
     printf '<?xml version="1.0" encoding="UTF-8"?>\n'
     printf '<!-- Koha Easy Installer: Koha'"'"'s default detail view plus the Brazilian catalogue card (ficha catalografica, AACR2). Generated file. -->\n'
     printf '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:marc="http://www.loc.gov/MARC21/slim" exclude-result-prefixes="marc">\n'
@@ -9655,6 +9657,7 @@ ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
     printf '  <xsl:variable name="kei-title">%s</xsl:variable>\n' "$(xml_escape "$2")"
     printf '  <xsl:variable name="kei-print">%s</xsl:variable>\n' "$(xml_escape "$3")"
     printf '  <xsl:variable name="kei-abnt-label">%s</xsl:variable>\n' "$(xml_escape "$4")"
+    printf '  <xsl:variable name="kei-show">%s</xsl:variable>\n' "$(xml_escape "${5:-$2}")"
     cat <<'FICHA'
   <xsl:template match="marc:record">
     <xsl:apply-imports/>
@@ -9692,9 +9695,14 @@ ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
       </xsl:choose>
     </xsl:variable>
     <xsl:variable name="has-entry" select="boolean(marc:datafield[@tag='100' or @tag='110' or @tag='111'])"/>
-    <div class="kei-ficha-box" id="kei-ficha">
+    <details class="kei-ficha-box" id="kei-ficha">
+      <summary class="kei-ficha-show"><xsl:value-of select="$kei-show"/></summary>
       <style type="text/css">
 .kei-ficha-box { margin: 1.5em 0; }
+.kei-ficha-show { cursor: pointer; display: inline-block; padding: 0.3em 0.8em; border: 1px solid #bbb; border-radius: 4px; background: #f7f7f7; font-weight: bold; }
+.kei-ficha-box[open] .kei-ficha-show { margin-bottom: 0.6em; }
+.kei-ficha-show::before { content: "\25B8  "; }
+.kei-ficha-box[open] .kei-ficha-show::before { content: "\25BE  "; }
 .kei-ficha { display: flex; gap: 0.3cm; box-sizing: border-box; width: 12.5cm; min-height: 7.5cm; padding: 0.4cm 0.5cm; border: 1px solid #333; background: #fff; color: #000; font-family: "Times New Roman", Times, serif; font-size: 10pt; line-height: 1.35; }
 .kei-ficha-num { flex: 0 0 1.7cm; white-space: nowrap; }
 .kei-ficha-body { flex: 1 1 auto; }
@@ -9707,7 +9715,7 @@ ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
   body.kei-print * { visibility: hidden; }
   body.kei-print #kei-ficha, body.kei-print #kei-ficha * { visibility: visible; }
   body.kei-print #kei-ficha { position: absolute; left: 0; top: 0; }
-  .kei-ficha-print { display: none; }
+  .kei-ficha-print, .kei-ficha-show { display: none; }
 }
       </style>
       <h3 class="kei-ficha-title"><xsl:value-of select="$kei-title"/></h3>
@@ -9761,7 +9769,7 @@ ficha_xsl() {   # ficha_xsl DEFAULT_XSL TITLE PRINT_LABEL ABNT_LABEL
         </div>
       </div>
       <button type="button" class="btn btn-default btn-sm kei-ficha-print" onclick="document.body.classList.add('kei-print'); window.print(); document.body.classList.remove('kei-print');"><xsl:value-of select="$kei-print"/></button>
-    </div>
+    </details>
   </xsl:template>
   <!-- Reference by ABNT NBR 6023:2018 (essential elements) under the card. -->
   <xsl:variable name="kei-lc" select="'abcdefghijklmnopqrstuvwxyzàáâãäåçèéêëìíîïñòóôõöùúûüý'"/>
@@ -9866,8 +9874,9 @@ FICHA
 # each one importing the default view of its own language (English when a
 # side lacks that language). Prints the number of languages.
 ficha_write() {
-    local langs=() l d opac staff title print_label abnt_label
+    local langs=() l d opac staff title print_label abnt_label show_label
     title="$(t "Cataloguing card")"; print_label="$(t "Print the card")"; abnt_label="$(t "Reference (ABNT NBR 6023)")"
+    show_label="$(t "Show the AACR2 catalogue card")"
     for d in "$KOHA_OPAC_TMPL"/*/xslt/MARC21slim2OPACDetail.xsl "$KOHA_INTRA_TMPL"/*/xslt/MARC21slim2intranetDetail.xsl; do
         [ -f "$d" ] || continue
         l="${d%/xslt/*}"; l="${l##*/}"
@@ -9878,8 +9887,8 @@ ficha_write() {
         opac="$KOHA_OPAC_TMPL/$l/xslt/MARC21slim2OPACDetail.xsl"; [ -f "$opac" ] || opac="$KOHA_OPAC_TMPL/en/xslt/MARC21slim2OPACDetail.xsl"
         staff="$KOHA_INTRA_TMPL/$l/xslt/MARC21slim2intranetDetail.xsl"; [ -f "$staff" ] || staff="$KOHA_INTRA_TMPL/en/xslt/MARC21slim2intranetDetail.xsl"
         mkdir -p "$FICHA_DIR/$l" || return 1
-        ficha_xsl "$opac" "$title" "$print_label" "$abnt_label" > "$FICHA_DIR/$l/opac-detail.xsl" || return 1
-        ficha_xsl "$staff" "$title" "$print_label" "$abnt_label" > "$FICHA_DIR/$l/staff-detail.xsl" || return 1
+        ficha_xsl "$opac" "$title" "$print_label" "$abnt_label" "$show_label" > "$FICHA_DIR/$l/opac-detail.xsl" || return 1
+        ficha_xsl "$staff" "$title" "$print_label" "$abnt_label" "$show_label" > "$FICHA_DIR/$l/staff-detail.xsl" || return 1
     done
     chown -R "root:${INSTANCE}-koha" "$FICHA_DIR" 2>/dev/null || true
     chmod -R u=rwX,g=rX,o= "$FICHA_DIR"
@@ -11968,6 +11977,7 @@ MR_VISION_KEYS="tab_replace tab_vision tab_settings v_title v_intro v_img_cover 
     v_edit v_another e_URL e_TOKEN_PLAIN e_NO_TOKEN e_NO_IMAGES e_UNREACHABLE e_HTTP e_EMPTY e_NO_JSON \
     s_title s_intro s_perm s_provider p_openai p_anthropic p_ollama p_compatible s_url s_model s_token \
     s_token_saved s_token_clear s_timeout s_max_px s_lang s_org s_country s_table t_auto t_none s_ddc_ed \
+    s_instructions s_instructions_hint s_instructions_default v_note v_note_hint v_note_example \
     s_save s_test s_saved s_err_save s_err_perm s_test_ok s_test_fail ddc0 ddc1 ddc2 ddc3 ddc4 ddc5 ddc6 \
     ddc7 ddc8 ddc9 table_pha table_cutter"
 
@@ -12034,7 +12044,7 @@ use POSIX qw( strftime );
 sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
 MRPL1
     local k
-    printf "our \$BACKUP_DIR = '%s';\nour \$TABLE_DIR = '%s';\nour \$VISION_CONF = \"\$BACKUP_DIR/vision.conf\";\nour \$USER = '';\nour %%T = (\n" "$MR_DIR" "$CAT_DIR"
+    printf "our \$BACKUP_DIR = '%s';\nour \$TABLE_DIR = '%s';\nour \$VISION_CONF = \"\$BACKUP_DIR/vision.conf\";\nour \$VISION_PROMPT = \"\$BACKUP_DIR/vision-prompt.txt\";\nour \$USER = '';\nour %%T = (\n" "$MR_DIR" "$CAT_DIR"
     for k in title intro paste paste_hint file bn itype keep preview replace cancel err_csrf err_bn err_nobib \
              err_input err_parse err_many err_lines err_title err_changed err_backup err_mod current new items_kept \
              items_dropped charset confirm ok view prev_dl undo_hint warnings not_found $MR_VISION_KEYS; do
@@ -12531,7 +12541,12 @@ sub render_vision_form {
         $body .= qq{<label for="img_$role">} . h( $T{"v_img_$role"} ) . '</label>'
             . qq{<input type="file" id="img_$role" name="img_$role" accept="image/jpeg,image/png,image/webp">};
     }
+    # Instructions for this book only: sent with the photos, never saved, so
+    # the next book starts with an empty field.
     $body .= '<p class="hint">' . h( $T{v_img_hint} ) . '</p>'
+        . '<label for="note">' . h( $T{v_note} ) . '</label>'
+        . '<textarea id="note" name="note" rows="3" maxlength="2000" placeholder="' . h( $T{v_note_example} ) . '">' . h( scalar $cgi->param('note') // '' ) . '</textarea>'
+        . '<p class="hint">' . h( $T{v_note_hint} ) . '</p>'
         . '<label for="biblionumber">' . h( $T{v_bn} ) . '</label>'
         . '<input type="text" id="biblionumber" name="biblionumber" value="' . h($bn) . '" placeholder="12345" inputmode="numeric">'
         . '<label for="itemtype">' . h( $T{itype} ) . ' (942$c)</label>'
@@ -12587,7 +12602,9 @@ sub do_vision {
         return;
     }
 
-    my $res = KohaEasy::Cataloguing::Vision::extract( $conf, \@images );
+    my $note = $cgi->param('note') // '';
+    my $res  = KohaEasy::Cataloguing::Vision::extract( $conf, \@images,
+        { instructions => KohaEasy::Cataloguing::Vision::load_instructions($VISION_PROMPT), note => $note } );
     if ( !$res->{ok} ) {
         my $code = $res->{error_code} eq 'CONFIG' ? $res->{error} : $res->{error_code};
         my $msg  = $T{v_err_model} . ' ' . ( $T{"e_$code"} // $code );
@@ -12853,6 +12870,8 @@ sub render_settings {
         return qq{<input type="$type" id="$name" name="$name" value="} . h($value) . '"' . ( $placeholder ? ' placeholder="' . h($placeholder) . '"' : '' ) . '>';
     };
     my $d = $KohaEasy::Cataloguing::Vision::DEFAULTS{ $c->{provider} };
+    # After a test or an error the text as it was typed; otherwise the saved one.
+    my $instructions = $conf && defined $cgi->param('instructions') ? $cgi->param('instructions') : KohaEasy::Cataloguing::Vision::load_instructions($VISION_PROMPT);
     $body .= '<form method="post">'
         . '<input type="hidden" name="csrf_token" value="' . h( csrf($cgi) ) . '">'
         . '<label for="provider">' . h( $T{s_provider} ) . '</label>'
@@ -12873,6 +12892,10 @@ sub render_settings {
         . '<label for="table">' . h( $T{s_table} ) . '</label>'
         . $sel->( 'table', $c->{table}, [ auto => $T{t_auto} ], [ pha => $T{table_pha} ], [ cutter => $T{table_cutter} ], [ none => $T{t_none} ] )
         . '<label for="ddc_edition">' . h( $T{s_ddc_ed} ) . '</label>' . $text->( 'ddc_edition', $c->{ddc_edition}, 'text' )
+        . '<label for="instructions">' . h( $T{s_instructions} ) . '</label>'
+        . '<p class="hint">' . h( $T{s_instructions_hint} ) . '</p>'
+        . '<textarea id="instructions" name="instructions" rows="18">' . h($instructions) . '</textarea>'
+        . '<p><input type="checkbox" id="instructions_default" name="instructions_default" value="1"> <label class="inline" for="instructions_default">' . h( $T{s_instructions_default} ) . '</label></p>'
         . '<button type="submit" name="op" value="cud-vision-settings">' . h( $T{s_save} ) . '</button> '
         . '<button type="submit" name="op" value="cud-vision-test">' . h( $T{s_test} ) . '</button>'
         . '</form>';
@@ -12915,7 +12938,8 @@ sub do_settings {
         render_settings( $cgi, ( $ok ? '<div class="msg ok">' . h("$T{s_test_ok} $msg") . '</div>' : err_box("$T{s_test_fail} $msg") ), $conf );
         return;
     }
-    if ( !eval { KohaEasy::Cataloguing::Vision::save_conf( $VISION_CONF, $conf ); 1 } ) {
+    my $instructions = $cgi->param('instructions_default') ? '' : $cgi->param('instructions') // '';
+    if ( !eval { KohaEasy::Cataloguing::Vision::save_conf( $VISION_CONF, $conf ); KohaEasy::Cataloguing::Vision::save_instructions( $VISION_PROMPT, $instructions ); 1 } ) {
         render_settings( $cgi, err_box( $T{s_err_save} . ' ' . short_error($@) ), $conf );
         return;
     }
@@ -13152,14 +13176,86 @@ sub prepare_image {
 
 my %LANG_NAME = ( por => 'Portuguese', eng => 'English', spa => 'Spanish', fre => 'French', ger => 'German', ita => 'Italian' );
 
-# The instructions: one JSON object with a fixed set of keys, null for
-# anything not legible, no invented digits.
+# The cataloguing instructions of the library (tab "AI settings"): what the
+# model is asked to do, in the library's own words. {language} becomes the
+# language of cataloguing. The answer format below is fixed and always
+# follows them, so no customisation can break the draft.
+our $MAX_INSTRUCTIONS = 8000;
+our $MAX_NOTE         = 2000;
+
+sub default_instructions {
+    return <<'TXT';
+You are an experienced professional library cataloguer. Catalogue the book in the photos following all the rules of MARC 21 (Format for Bibliographic Data), AACR2 and ISBD punctuation, as a national library would.
+- Language of cataloguing: {language}. Subject headings and notes are written in {language}; titles, names, edition and statement of responsibility are copied exactly as printed and never translated.
+- Chief source: the title page. Then the verso of the title page and its cataloguing-in-publication (CIP) block, then the cover.
+- Use the context of the book (genre, audience, country, period, series) to choose precise subject headings and the Dewey class, but never invent data that is not printed.
+- Names in the inverted form of the authority files (Surname, Forename); compound surnames follow the national rules.
+Example of a well-catalogued record (MARC 21):
+020 __ |a 9788508040350
+082 04 |a 869.3 |2 23
+100 1_ |a Assis, Machado de, |d 1839-1908.
+245 10 |a Dom Casmurro / |c Machado de Assis.
+250 __ |a 3. ed.
+260 __ |a São Paulo : |b Ática, |c 1997.
+300 __ |a 208 p. ; |c 21 cm.
+490 0_ |a Bom livro ; |v 12
+650 _4 |a Romance brasileiro.
+TXT
+}
+
+# The saved instructions (a text file next to the settings), or the default.
+sub load_instructions {
+    my ($path) = @_;
+    if ( defined $path && open( my $fh, '<:encoding(UTF-8)', $path ) ) {
+        local $/;
+        my $t = <$fh> // '';
+        close $fh;
+        return substr( $t, 0, $MAX_INSTRUCTIONS ) if $t =~ /\S/;
+    }
+    return default_instructions();
+}
+
+# Saves the instructions atomically; empty text (or the default itself)
+# removes the file, so the default of new versions is used.
+sub save_instructions {
+    my ( $path, $text ) = @_;
+    $text //= '';
+    $text =~ s/\r\n?/\n/g;
+    $text =~ s/[\x00-\x08\x0B-\x1F\x7F]//g;
+    $text = substr( $text, 0, $MAX_INSTRUCTIONS );
+    ( my $cmp = $text ) =~ s/\s+/ /g;
+    ( my $def = default_instructions() ) =~ s/\s+/ /g;
+    if ( $text !~ /\S/ || $cmp eq $def ) {
+        unlink $path;
+        return 1;
+    }
+    my $tmp = "$path.tmp$$";
+    open( my $fh, '>:encoding(UTF-8)', $tmp ) or die "cannot write $tmp: $!\n";
+    chmod 0640, $tmp;
+    print {$fh} $text;
+    close($fh) or die "cannot write $tmp: $!\n";
+    rename( $tmp, $path ) or die "cannot replace $path: $!\n";
+    return 1;
+}
+
+# The whole prompt: the instructions of the library, the note of the
+# cataloguer for this book only (never saved), then the fixed answer
+# format: one JSON object with a fixed set of keys, null for anything not
+# legible, no invented digits.
 sub prompt_text {
     my (%o) = @_;
     my $lang = $LANG_NAME{ $o{lang} // 'por' } // 'Portuguese';
     my $shown = $o{roles} && @{ $o{roles} } ? join( '; ', map { 'photo ' . ( $_ + 1 ) . ' = ' . _role_name( $o{roles}[$_] ) } 0 .. $#{ $o{roles} } ) : 'photos of the book';
+    my $instructions = defined $o{instructions} && $o{instructions} =~ /\S/ ? $o{instructions} : default_instructions();
+    $instructions =~ s/\{language\}/$lang/g;
+    $instructions =~ s/\s+$//;
+    my $note = defined $o{note} ? substr( $o{note}, 0, $MAX_NOTE ) : '';
+    $note =~ s/\s+$//;
+    $note = $note =~ /\S/ ? "\nInstructions of the cataloguer for this book only (they take precedence over the general ones above):\n$note\n" : '';
     return <<"PROMPT";
-You are a professional library cataloguer. The images show one printed book ($shown).
+$instructions
+$note
+ANSWER FORMAT. The images show one printed book ($shown).
 Read them and answer with ONLY one JSON object (no Markdown, no comments) with exactly these keys:
 {
   "title": "main title as printed on the title page (prefer the title page to the cover), without the subtitle",
@@ -13399,11 +13495,12 @@ sub missing_fields {
 # Public calls
 # ----------------------------------------------------------------------
 
-# extract(CONF, [ { role, mime, data } ... ]) -> {
+# extract(CONF, [ { role, mime, data } ... ], { instructions, note }) -> {
 #   ok, data (coerce), missing, raw (text of the answer), provider, model,
 #   seconds, error_code (CONFIG / UNREACHABLE / HTTP / EMPTY / NO_JSON), error }
 sub extract {
-    my ( $conf, $images ) = @_;
+    my ( $conf, $images, $opts ) = @_;
+    $opts ||= {};
     my $c = with_defaults($conf);
     my %r = ( ok => 0, provider => $c->{provider}, model => $c->{model}, raw => '', error => '', error_code => '', seconds => 0 );
     my $empty = coerce( {} );
@@ -13413,7 +13510,7 @@ sub extract {
     if ( !$images || !@$images )         { @r{qw( error_code error )} = ( 'CONFIG', 'NO_IMAGES' ); return \%r }
 
     my $t0     = time;
-    my $prompt = prompt_text( lang => $c->{lang}, roles => [ map { $_->{role} } @$images ] );
+    my $prompt = prompt_text( lang => $c->{lang}, roles => [ map { $_->{role} } @$images ], instructions => $opts->{instructions}, note => $opts->{note} );
     my ( $res, $data ) = eval { _call( $c, 'POST', _endpoint($c), _auth_headers($c), _request_body( $c, $prompt, $images ) ) };
     $r{seconds} = sprintf( '%.1f', time - $t0 );
     if ( !$res ) { @r{qw( error_code error )} = ( 'UNREACHABLE', _short($@) ); return \%r }
@@ -14024,6 +14121,12 @@ mr_text() {
         t_auto)           t "Automatic (PHA, otherwise Cutter-Sanborn)" ;;
         t_none)           t "None" ;;
         s_ddc_ed)         t "CDD edition (field 082)" ;;
+        s_instructions)   t "Cataloguing instructions for the model" ;;
+        s_instructions_hint) t "Sent with every book, before the fixed answer format. Write the rules and the practice of the library; {language} becomes the language of cataloguing. Empty: the default instructions." ;;
+        s_instructions_default) t "Restore the default instructions" ;;
+        v_note)           t "Instructions for this book only (optional)" ;;
+        v_note_hint)      t "Sent with these photos only and never saved: the next book starts with an empty field." ;;
+        v_note_example)   t "e.g. The author is also the illustrator; this is a translated edition." ;;
         s_save)           t "Save the settings" ;;
         s_test)           t "Test the connection" ;;
         s_saved)          t "Settings saved." ;;
@@ -14049,12 +14152,33 @@ mr_text() {
 # Link in the staff interface: "Replace the record (MARC file)" in the Edit
 # menu of the record page (a marked block in IntranetUserJS).
 mr_js_block() {
-    local label
+    local label home_label vision_label v
     label=$(t "Replace the record (MARC file)")
-    label=${label//\\/\\\\}; label=${label//\"/\\\"}; label=${label//</\\u003c}
+    home_label=$(t "Replace a MARC record")
+    vision_label=$(t "AI cataloguing")
+    for v in label home_label vision_label; do
+        declare -n _s=$v
+        _s=${_s//\\/\\\\}; _s=${_s//\"/\\\"}; _s=${_s//</\\u003c}
+        unset -n _s
+    done
     cat <<MRJS
 ${MR_JS_BEGIN}
 \$(document).ready(function () {
+    // Cataloguing home page: shortcuts in the column of the tools (the list
+    // with the inventory, the MARC modification templates or the labels;
+    // otherwise the last list of tools of the page).
+    if (/\/cgi-bin\/koha\/cataloguing\/cataloging-home\.pl\$/.test(location.pathname)) {
+        var tools = \$("a[href*='tools/inventory.pl'], a[href*='marc_modification_templates.pl'], a[href*='labels/label-home.pl']").closest("ul").first();
+        if (!tools.length) tools = \$("a[href*='/cgi-bin/koha/tools/']").closest("ul").last();
+        if (tools.length && !tools.find("a[href*='marc_replace.pl']").length) {
+            var cls = tools.find("a").first().attr("class") || "circ-button";
+            \$.each([["/cgi-bin/koha/tools/marc_replace.pl", "fa-exchange", "${home_label}"], ["/cgi-bin/koha/tools/marc_replace.pl?op=vision", "fa-camera", "${vision_label}"]], function (i, l) {
+                var a = \$("<a></a>").attr({ "class": cls, href: l[0] }).append(\$("<i></i>").attr("class", "fa " + l[1])).append(document.createTextNode(" " + l[2]));
+                tools.append(\$("<li></li>").append(a));
+            });
+        }
+        return;
+    }
     var m = location.pathname.match(/\/cgi-bin\/koha\/catalogue\/(detail|MARCdetail|ISBDdetail|labeledMARCdetail|moredetail)\.pl\$/);
     var bn = new URLSearchParams(location.search).get("biblionumber");
     if (!m || !bn || !/^[0-9]+\$/.test(bn)) return;
@@ -14083,6 +14207,10 @@ mr_js_sql() {   # mr_js_sql add|remove FILE: SQL that rewrites IntranetUserJS
 
 mr_installed() { [ -f "$MR_FILE" ]; }
 mr_js_on() { mr_js_current | grep -qxF "$MR_JS_BEGIN"; }
+# The block in IntranetUserJS is the one of this version (an update of the
+# page brings new shortcuts to libraries that already had the link).
+mr_js_current_block() { mr_js_current | awk -v b="$MR_JS_BEGIN" -v e="$MR_JS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }'; }
+mr_js_latest() { [ "$(mr_js_current_block)" = "$(mr_js_block)" ]; }
 
 function_marc_replace() {
     require_database || return 0
@@ -14108,7 +14236,7 @@ lt_mr_install() {
         return 1
     fi
     local link="no"
-    prompt_yes_no "$(t "Replace a MARC record")" "$(t "Also add Replace the record (MARC file) to the Edit menu of the record page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 11 76 && link="yes"
+    prompt_yes_no "$(t "Replace a MARC record")" "$(t "Also add the shortcuts in the staff interface: Replace the record (MARC file) in the Edit menu of each record, and Replace a MARC record and AI cataloguing in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 12 76 && link="yes"
     tools_locked _lt_mr_install "$link"
 }
 
@@ -14132,7 +14260,7 @@ _lt_mr_install() {
     mr_installed && updating=1
     mkdir -p "$MR_DIR" && chown "${INSTANCE}-koha:${INSTANCE}-koha" "$MR_DIR" 2>/dev/null
     chmod 750 "$MR_DIR"
-    if [ "$link" = "yes" ] && ! mr_js_on; then
+    if [ "$link" = "yes" ] && ! mr_js_latest; then
         tools_safety_backup MARC-REPLACE || return 1
         sql="$TOOLS_WORK/intranetuserjs.sql"
         mr_js_sql add "$sql"
