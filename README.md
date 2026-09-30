@@ -2,6 +2,10 @@
   🇺🇸 English &nbsp;|&nbsp; <a href="README.pt-BR.md">🇧🇷 Português</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/koha-logo-green.png" alt="Koha logo" width="320">
+</p>
+
 # Koha Easy Installer & Manager
 
 A single Bash script that installs, tunes and maintains the **[Koha](https://koha-community.org/) Integrated Library System** on Debian/Ubuntu, through a friendly menu-driven control panel (whiptail, dark theme) available in **22 languages**.
@@ -17,6 +21,8 @@ It was born from real-life experience facing technical barriers in collection ma
 - **Safe restore** of `.sql` / `.sql.gz` backups: the file is checked (gzip test, complete mysqldump, Koha tables) and imported into a temporary database first; the current catalog is only replaced after a verified safety copy exists, is put back automatically if anything fails, and a restore cannot be left half-done by CTRL+C or a lost SSH connection.
 - **Search engine**: switch between Zebra and Elasticsearch 7, indexer watchdog and repair/rebuild tools.
 - **Publishing to the internet**: Cloudflare Tunnel (no open ports), free SSL certificate (Certbot) and a Google Search Console assistant.
+- **Free address (in testing)**: a public catalog address without buying a domain or opening a Cloudflare account. The library sends a short request from the panel, and once the address service approves it the server connects on its own. The link can be shared as a QR code on screen, a printable QR image or a link. Remote staff access adds a password checked at Cloudflare before Koha's own login. The address service is still being tested and is not open to libraries yet.
+- **QR code sign-in**: when Cloudflare or Google Drive asks you to authorize the server, the panel lets you choose how to open the page. Cloudflare offers a QR code to scan with your phone, the browser of this computer (the Windows browser under WSL) or a link to copy. Google Drive offers the browser or the link: Google only returns to the computer running rclone, so a phone cannot finish that login, and on a server with no screen the panel explains the SSH tunnel. The Google token is never shown on screen.
 - **Diagnostics**: full health check with a detailed report, server status, real-time Apache log viewer and deep database maintenance.
 - **Security**: Fail2ban, UFW firewall (with option to restrict the staff port 8080) and database password rotation.
 - **Koha settings**: server sizing profiles, e-mail notices (Koha's own schedule, enabled with `koha-email-enable`), super librarian creation, SIP2 and Z39.50, clock and timezone.
@@ -24,6 +30,7 @@ It was born from real-life experience facing technical barriers in collection ma
 - **Brazil: localization & migration** (opt-in, never applied by the installation or by a schedule): MARC migration from Biblivre, SophiA and Pergamum (UTF-8 conversion, items moved to Koha's 952), collection spreadsheets (Biblioteca Fácil), legacy patron spreadsheets with CPF check, CPF audit (modulo 11), Pimaco label templates, the Brazilian cataloguing card (ficha catalográfica) with the ABNT reference of the record, Brazilian holidays in the Koha calendar, government census reports (MEC/INEP/IBGE/SNBP) and bibliographies and collection listings by ABNT NBR 6023 (see [Brazil: localization & migration](#brazil-localization--migration)).
 - **Messaging: WhatsApp and Telegram** (opt-in): Koha's own notices (checkout, check-in, overdue, due, hold) delivered through a self-hosted WhatsApp gateway (Evolution API or similar) or a Telegram bot, with the patrons' numbers completed and corrected on the way (see [Messaging](#messaging-whatsapp-and-telegram)).
 - **Cataloguing aids**: author notation with the PHA or Cutter-Sanborn table loaded by the library, Dewey (CDD) lookup, and a staff-interface page that replaces a record by its biblionumber without touching its items (see [Cataloguing aids](#cataloguing-aids-pha-cutter-sanborn-cdd) and [Replace a MARC record](#replace-a-marc-record-staff-interface)).
+- **Windows 10/11 (WSL 2)**: Koha on a single Windows PC, with Start/Stop shortcuts that use the official Koha icon, a status icon, Windows notifications, one-click diagnostics and a disk watchdog (see [Windows (WSL 2)](#windows-wsl-2)).
 - **Languages**: installs Koha language packs and translates the panel itself (22 languages).
 - **Self-update** from GitHub with SHA-256 verification.
 
@@ -31,7 +38,7 @@ It was born from real-life experience facing technical barriers in collection ma
 
 | Item | Minimum |
 |------|---------|
-| Operating system | Debian 11/12/13 or Ubuntu 22.04/24.04, 64-bit (amd64 or arm64, e.g. Oracle Ampere, AWS Graviton, Raspberry Pi 4/5) |
+| Operating system | Debian 11/12/13 or Ubuntu 22.04/24.04, 64-bit (amd64 or arm64, e.g. Oracle Ampere, AWS Graviton, Raspberry Pi 4/5), or Windows 10/11 through WSL 2 (see [Windows](#windows-wsl-2)) |
 | RAM | 2 GB (4 GB+ recommended; Elasticsearch needs ~1.5 GB more) |
 | Free disk | 5 GB (10 GB+ recommended) |
 | Access | `root` or a user with `sudo` |
@@ -67,6 +74,69 @@ sudo config.sh
 2. Log in with the database user and password shown at the end of the installation (also saved in `/root/koha_credentials.txt`) and complete Koha's **Web Installer**.
 3. Back in the panel, create your own super librarian (**9 – Koha settings > Create super librarian**).
 4. The public catalog (OPAC) is at `http://SERVER-IP:80`.
+
+## Windows (WSL 2)
+
+Koha can also run on a single Windows 10 or 11 PC. This suits small single-desk libraries, staff training and evaluations. Libraries with several desks should keep a dedicated Linux server.
+
+Koha runs inside a Debian system in **WSL 2** (the Windows Subsystem for Linux), managed by the same panel. Small **PowerShell** tools let the librarian control it from Windows without opening a terminal.
+
+### What works on Windows
+
+- **WSL mode in the panel**: WSL 2 is detected automatically. WSL 1 is refused, with an explanation.
+  - The host tasks are left to Windows: no swapfile, NTP, UFW, Fail2ban or avahi.
+  - The timezone is chosen inside Debian during the installation, with the Windows zone offered first. A different zone is kept across WSL restarts (`useWindowsTimezone=false` in `/etc/wsl.conf`).
+  - "Reboot server" becomes **Restart Koha services**.
+  - systemd must be enabled in WSL (the Windows installer does it).
+  - Screens are always UTF-8, and the installer and the panel show emoji. When Windows Terminal is installed (it comes with Windows 11), the installer and the control panel open in it. The classic Windows console has no emoji font, so on a PC without Windows Terminal they show plain symbols such as `[OK]` instead of boxes.
+  - The Windows side talks to the panel through `/etc/koha-easy-install/windows.conf`. It is read with a whitelist of keys and never executed.
+- **Networking**: Apache listens on every address, on ports 80 (catalog) and 8080 (staff interface). The installer opens both ports to the local network only, in the Windows firewall and, on Windows 11, in the Hyper-V firewall that guards WSL, so other PCs of the library reach Koha at this PC's address. Windows 11 uses mirrored networking, with `hostAddressLoopback` so this PC can also reach Koha by its own address. The network mode is read from WSL itself, not from `.wslconfig`: when WSL falls back to NAT (Windows 10, or a Windows 11 where mirrored networking cannot start), the *Koha network* task points `netsh interface portproxy` at Debian's address each time Koha starts, and back in mirrored mode it removes that forwarding. Other PCs can use this PC's name (`http://<pc-name>:8080/`), which stays the same when the router hands out a new address. To publish Koha on the internet, use the panel's built-in **Cloudflare Tunnel**.
+- **Library network test**: at the end of the install, with the **Test the library network** button of the Koha window and in the diagnostics, Koha is asked through this PC's own network address, the way the other PCs reach it. The result says whether it answered and what could block the other PCs: a missing firewall rule, missing port forwarding in NAT mode, or another firewall product that needs ports 80 and 8080 opened too.
+- **Koha window**: a native Windows window, opened by the **Koha** icon on the desktop, *Koha - Status* and the tray. It works even when Koha does not answer, because it asks Debian directly through WSL and never needs Koha's web server. It shows whether Debian, MariaDB, Apache, RabbitMQ, Memcached and koha-common are running, and whether the staff page answers. It also shows the latest backup. Its buttons start and stop Koha, restart Koha's services without restarting WSL, restart Debian and Koha, open the staff interface, the catalog and the control panel, export diagnostics and test the library network. **Debian terminal (advanced)** opens a Debian shell as your Debian user in its own window while Koha runs. It also shows the addresses other PCs use.
+- **No console windows**: the shortcuts, the tray, and the tasks that run at sign-in and keep Debian running start through `KohaEasy.exe`, a small launcher the installer compiles on the PC from its C# source (`windows/KohaEasy.Launcher.cs`) with the compiler that comes with Windows, so nothing is downloaded. It is a Windows program that starts PowerShell with no window at all, so Windows Terminal never opens an empty window at sign-in. It also gives the Koha window, the Start menu entry and the notifications Koha's own name and icon on the taskbar. If Windows does not let it run (Smart App Control or an antivirus), everything starts through a hidden console instead.
+- **Control panel window**: the control panel and the Debian terminal open in their own window (Windows Terminal when it is installed), which closes as soon as you leave with **Exit**: anything still holding that window is stopped first, so it never stays open and black. If the panel ends with an error, the window waits for Enter so the message can be read.
+- **Koha icon and shortcuts**: one **Koha** icon on the desktop, which opens the Koha window, and a *Koha* folder in the Start menu, all with the official `koha.ico`. None of them opens a console window. The folder holds:
+  - Staff interface, Public catalog, Control panel and Backups folder
+  - **Start**, **Stop** and **Restart**
+  - Status, Export diagnostics and Status icon
+- **Start and stop**: Koha can start automatically when you sign in to Windows, or only when you click *Koha - Start*. Change this at any time from the tray menu. After **Stop**, Koha stays off until you start it again, and nothing starts it behind your back.
+- **Clean stops and repair after a power cut**: Stop, Restart and every other step that stops Debian first stop Koha's services inside it in order (the web server, then the queue and the cache, then MariaDB) and only then let WSL stop Debian, so the database and the search index are never cut off mid-write. A clean stop leaves a mark. When Debian starts without it (a power cut, a forced Windows shutdown, a crash), Koha checks its database, makes a fresh backup and brings the Zebra search index up to date, rebuilding it from scratch when needed, and a Windows notification says how it went. Linux servers get the same check after an unclean reboot.
+- **Data-safety settings**: MariaDB's crash-safety settings (doublewrite, a log flush at every commit, one file per table, no binary log) are pinned in `98-koha-durability.cnf`; the system journal is capped at 100 MB and one month, the panel's logs are rotated, and the weekly log rotation and TRIM timers are switched on. On Windows, when Windows shuts down, restarts or signs out while Koha runs, the tray stops Koha cleanly first; a power cut or a forced shutdown still relies on the repair above. The diagnostics warn when Windows' write-cache buffer flushing is turned off for the disk that holds Koha. The Koha window has a **Rebuild search index** button.
+- **Status icon (notification area)**: the Koha icon with a coloured dot (green running, yellow starting, red not responding, grey stopped). Double-click it, or pick **Service status**, to open the Koha window. The menu also opens the staff interface, the catalog and the control panel, starts and stops Koha, restarts Koha's services, rebuilds the search index and exports diagnostics. **Close this icon** asks whether Koha keeps running in the background or stops too. If the icon crashes or is ended some other way while Koha runs, it comes back within a minute. The first time it starts, it asks Windows 11 to show it next to the clock instead of among the hidden icons (^), and a notification tells where it is.
+- **Windows notifications**:
+  - Koha stops responding, stops unexpectedly or recovers
+  - Koha was not shut down properly, and what the repair afterwards found
+  - the nightly backup succeeds (can be switched off), fails, or has not run for 36 hours
+  - disk space runs low
+- **Diagnostics in one click**, both ready to send to whoever supports your library, with passwords, tokens and keys removed:
+  - `diagnostico_koha.txt` on the desktop: WSL and Windows versions, each service, the latest service errors inside Debian and the Windows logs of the last days. It starts nothing, so it also works while Koha is down.
+  - a `.zip` on the desktop with the full WSL, Windows, Apache, MariaDB, Koha and panel logs and the system status. No configuration file is included.
+- **Disk watchdog**: warns when the drive that holds Koha's virtual disk (`ext4.vhdx`) has less than 10 GB free, and critically below 5 GB. When the virtual disk holds a lot of unused space, **Compact** gives it back to Windows (needs administrator rights).
+- **Languages**: the Windows tools use the panel's 22 languages.
+
+### Installing on Windows
+
+Open **PowerShell** (Start menu, type *PowerShell*; no need to run it as administrator), paste this line and press Enter:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/PauloFBaldiFH/Koha-Easy-Installer/main/windows/install.ps1 | iex
+```
+
+This line is the only way to install Koha on Windows.
+
+The installer does everything else and shows each step in plain language:
+
+1. It checks the PC: Windows 10 version 2004 or later, or Windows 11; 64-bit; at least 4 GB of memory (8 GB recommended); at least 10 GB free on C:; virtualization turned on in the BIOS.
+2. It asks for a user name and password for Debian, before anything is installed. You use them to open Debian and with `sudo`; they are not the Koha staff login. The password is never saved or logged, and it is asked again if Windows restarts before Debian is ready.
+3. It installs WSL 2. Windows asks for permission once. If Windows needs a restart, the installer continues by itself after you sign in again.
+4. It has WSL install Debian from Microsoft's own WSL list as `koha` in `C:\KohaEasy\wsl`. On an older WSL it downloads the same image itself, checks its SHA-256 and imports it.
+5. It creates your Debian user with `sudo` rights and enables systemd. On Windows 11 22H2 or later it also adds mirrored networking and `hostAddressLoopback` to your `.wslconfig`, keeping your own settings and a backup. Then it restarts Debian and waits until systemd is fully running before going on.
+6. It opens the Koha control panel. Choose your language, then **1 – Install Koha server** (it asks for the timezone), and leave the panel with **Exit** when it finishes.
+7. It asks whether Koha should start when you sign in to Windows. Then it builds `KohaEasy.exe`, creates the scheduled tasks, the shortcuts and the status icon, gives Debian's own Start menu entry and Windows Terminal profile the Koha icon, opens Koha to the library network (Windows asks for permission once), starts Koha, tests the library network and opens the staff interface. It shows the addresses other PCs use, by this PC's name and by its address. From then on, the **Koha** icon on the desktop opens the Koha window. Running the one-line command again is safe: it updates `KohaEasy.exe`, the scheduled tasks, the shortcuts and the status icon, brings the library network settings of an earlier version up to date (Windows asks for permission once), finishes a Koha install that stopped half-way, and if Koha does not start it prints what Debian reports and saves the diagnostics on the desktop. When `.wslconfig` gets new settings, or Koha still runs with an earlier version's window, Koha is stopped cleanly and started again.
+
+Running it again is safe: it continues from the last step it finished. An install made by an earlier version, whose Debian was called `KohaEasy`, is renamed to `koha` with its data kept. The first-access user and password are in the control panel, option 2. Everything is kept in `C:\KohaEasy`, with the installer's log in `C:\KohaEasy\logs`.
+
+Real-Windows behaviour (the installer, notifications, the tray, Task Scheduler, `KohaEasy.exe`, the library network test and disk compaction) is still being checked on physical machines, so please report anything odd.
 
 ## Main menu
 
@@ -206,6 +276,8 @@ E-mail notices are left to Koha's own schedule (`koha-common`): overdue and adva
 | `/usr/local/lib/site_perl/SMS/Send/KohaEasy/Gateway.pm` | The messaging driver of Koha (with `KohaEasy/Messaging.pm`) |
 | `/etc/koha-easy-install/tables/` | Author tables and CDD schedule loaded by the library |
 | `/var/lib/koha/library/kei-marc-replace/` | Records as they were before each replacement |
+| `/etc/koha-easy-install/windows.conf` | Windows only: what the Windows tools tell the panel (network mode, automatic start...) |
+| `C:\KohaEasy\` | Windows only: `bin\` (scripts, `KohaEasy.exe` and `koha.ico`), `logs\`, `Backups\`, `state.json` |
 
 If the installation stops, the panel shows the failed step. The full package manager output is in `/var/log/koha-easy-install/apt.log`.
 
@@ -222,7 +294,7 @@ Copy your backups somewhere else before running it.
 
 ## Tests (for contributors)
 
-`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card, collection spreadsheets, census reports, ABNT references), the messaging driver (against a WhatsApp / Telegram test double), the author notation and CDD lookup, `marc_replace.pl` (run as a CGI) and the schedule upgrade.
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card, collection spreadsheets, census reports, ABNT references), the messaging driver (against a WhatsApp / Telegram test double), the author notation and CDD lookup, `marc_replace.pl` (run as a CGI), the schedule upgrade, the WSL mode, the QR code / browser / link sign-in, and the Windows tools (their PowerShell tests run with [Pester 5](https://pester.dev) when `pwsh` is installed).
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \
@@ -262,3 +334,5 @@ Koha Easy Installer & Manager is free software under the [GNU General Public Lic
 ---
 
 Created with dedication by **Paulo F. Baldi FH** — Library Assistant, Castro Alves Public Library, Palotina, Paraná, Brazil.
+
+<sub>The Koha name and logo belong to the Koha community (koha-community.org); this installer is an independent project.</sub>

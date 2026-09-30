@@ -23,6 +23,17 @@ set -o pipefail
 umask 022
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# Every screen is drawn in UTF-8. A shell started by wsl.exe, cron or a bare
+# SSH session can arrive without any locale; the dialogs then print accents
+# and symbols byte by byte, as garbage (â†’ for →). C.UTF-8 is built into
+# Debian's libc: no locale package is needed. When even that fails, the
+# panel falls back to plain ASCII symbols (KEI_PLAIN_GLYPHS, below).
+kei_is_utf8() { case "$(locale charmap 2>/dev/null)" in UTF-8|utf-8|utf8) return 0 ;; esac; return 1; }
+if ! kei_is_utf8; then
+    if [ -n "${LC_ALL:-}" ]; then export LC_ALL=C.UTF-8; else export LC_CTYPE=C.UTF-8; fi
+    kei_is_utf8 || KEI_PLAIN_GLYPHS=1
+fi
+
 # ======================================================================
 # 1. CLEANUP ON EXIT (Declarado ANTES do trap)
 # ======================================================================
@@ -280,6 +291,10 @@ t() {
             _t_is_safe "$__t_src" "$__t_val" && __t_res="$__t_val"
         fi
     fi
+    if [ "${KEI_PLAIN_GLYPHS:-0}" = "1" ]; then
+        kei_plain_text "$__t_res"
+        __t_res=$REPLY
+    fi
     if [[ "$__t_res" == *'$'* ]]; then
         _t_expand "$__t_res"
     else
@@ -492,11 +507,55 @@ ui_layout() {
     return 0
 }
 
+# Plain symbols for the classic Windows console (conhost), which has no
+# font for emoji and most pictographs: they show as boxes or question marks
+# and push the dialogs' borders out of line. KEI_PLAIN_GLYPHS=1 (set below
+# for WSL outside Windows Terminal, or passed by the Windows installer)
+# turns them into ASCII; the menu icons are dropped.
+declare -A KEI_GLYPH_ASCII=(
+    ["✔"]="+" ["✓"]="+" ["☑"]="+" ["✖"]="x" ["●"]="*" ["•"]="*" ["◆"]="*"
+    ["⚠"]="!" ["→"]="->" ["⇄"]="<->" ["↔"]="<->"
+)
+KEI_GLYPH_ICONS=("⚙" "ℹ" "↻" "↶" "▣" "▤" "▦" "⌁" "⌕" "☁" "◈" "◌" "◷" "⏱" "✦" "★" "⟳" "⇩" "✉" "✎" "✏" "📖" "📋" "️")
+KEI_GLYPH_SED=""
+for _g in "${!KEI_GLYPH_ASCII[@]}"; do KEI_GLYPH_SED+="s/${_g}/${KEI_GLYPH_ASCII[$_g]}/g;"; done
+for _g in "${KEI_GLYPH_ICONS[@]}"; do KEI_GLYPH_SED+="s/${_g} *//g;"; done
+unset _g
+
+# REPLY = $1 with those symbols replaced (an icon goes with the spaces after it).
+kei_plain_text() {
+    local s="$1" g
+    if [[ "$s" != *[![:ascii:]]* ]]; then REPLY="$s"; return 0; fi
+    for g in "${!KEI_GLYPH_ASCII[@]}"; do s=${s//"$g"/"${KEI_GLYPH_ASCII[$g]}"}; done
+    for g in "${KEI_GLYPH_ICONS[@]}"; do
+        s=${s//"$g  "/}; s=${s//"$g "/}; s=${s//"$g"/}
+    done
+    REPLY="$s"
+}
+
+# Applies kei_plain_text to every dialog argument; a --textbox file is shown
+# from a converted copy (removed on exit with the other /tmp/koha_tmp_* files).
+kei_plain_args() {
+    local i n=${#UI_ARGS[@]} f
+    for ((i = 0; i < n; i++)); do
+        if [ "${UI_ARGS[i]}" = "--textbox" ] && [ $((i + 1)) -lt "$n" ] && [ -f "${UI_ARGS[i+1]}" ]; then
+            if f=$(mktemp /tmp/koha_tmp_glyphs.XXXXXX) && sed "$KEI_GLYPH_SED" "${UI_ARGS[i+1]}" > "$f"; then
+                UI_ARGS[i+1]=$f
+            fi
+            i=$((i + 1))
+            continue
+        fi
+        kei_plain_text "${UI_ARGS[i]}"
+        UI_ARGS[i]=$REPLY
+    done
+}
+
 # Every dialog gets the panel's look, geometry and translated buttons.
 # Options given by the caller come later on the command line, so they still
 # win (e.g. --cancel-button "Back").
 whiptail() {
     ui_layout "$@"
+    [ "${KEI_PLAIN_GLYPHS:-0}" = "1" ] && kei_plain_args
     NEWT_COLORS="$UI_THEME" command whiptail --backtitle "Koha Easy Installer & Manager v${PANEL_VERSION# }" \
         --yes-button "${WT_YES:-Yes}" --no-button "${WT_NO:-No}" \
         --ok-button "${WT_OK:-OK}" --cancel-button "${WT_CANCEL:-Cancel}" "${UI_ARGS[@]}"
@@ -641,10 +700,19 @@ REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)"
 # ======================================================================
 PANEL_LOCK_FILE="/var/run/koha_panel.lock"
 
-exec 9> "$PANEL_LOCK_FILE"
-if ! flock -n 9; then
-    echo "$(t "The panel is already running in another session. Aborting to prevent conflicts.")"
-    exit 1
+# Commands for the Windows tools (section 21.5) run next to an open panel:
+# no lock, no dependency install, no menu. All are read-only except
+# --install-data-safety, which only (re)writes the data-safety settings,
+# and --rebuild-search-index (the Koha window's button).
+KEI_CLI_MODE=""
+case "${1:-}" in --status-json|--export-diagnostics|--broker-heartbeat|--install-data-safety|--rebuild-search-index) KEI_CLI_MODE="$1" ;; esac
+
+if [ -z "$KEI_CLI_MODE" ]; then
+    exec 9> "$PANEL_LOCK_FILE"
+    if ! flock -n 9; then
+        echo "$(t "The panel is already running in another session. Aborting to prevent conflicts.")"
+        exit 1
+    fi
 fi
 
 # ======================================================================
@@ -717,9 +785,163 @@ log() { printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RUN_LOG" 2>/
 log "===== panel started (v$PANEL_VERSION, user=$REAL_USER) ====="
 
 # ======================================================================
+# 6.5. PLATFORM: LINUX SERVER OR WINDOWS (WSL)
+# ----------------------------------------------------------------------
+# On Windows the panel runs inside WSL 2. Windows then owns the host:
+# swap (.wslconfig), clock, firewall, startup and reboot. Call sites ask
+# "host_can <capability>" instead of testing the platform, so the rules
+# live in one place.
+#   KEI_PLATFORM   linux | wsl2 | wsl1
+#   KEI_WSL_NET    mirrored | nat | unknown   (WSL networking mode)
+# The Windows installer writes $KEI_WIN_CONF (key=value). It is parsed with
+# a whitelist and never sourced.
+# ======================================================================
+KEI_PROC="${KEI_PROC:-/proc}"
+KEI_SYSTEMD_RUNDIR="${KEI_SYSTEMD_RUNDIR:-/run/systemd/system}"
+KEI_WIN_CONF="${KEI_WIN_CONF:-${CONF_DIR}/windows.conf}"
+KEI_WSL_CONF="${KEI_WSL_CONF:-/etc/wsl.conf}"
+KEI_WIN_KEYS="KEI_WIN_VERSION WIN_BUILD WIN_EDITION WIN_NET_MODE WIN_LAN_IP WIN_HOSTNAME WIN_USER WIN_BACKUP_DIR WIN_MEM_GB WIN_UPDATED_AT WIN_AUTOSTART"
+KEI_PLATFORM="linux"
+KEI_WSL_NET=""
+
+# Prints linux, wsl1 or wsl2. WSL 1 kernels end in "-Microsoft"
+# (4.4.0-19041-Microsoft); WSL 2 kernels contain "microsoft-standard-WSL2",
+# and custom WSL 2 kernels at least "microsoft" or the WSLInterop handler.
+# WSL_DISTRO_NAME is not used: sudo, cron and systemd units drop it.
+_detect_platform_kind() {
+    case "${KEI_PLATFORM_OVERRIDE:-}" in
+        linux|wsl1|wsl2) printf '%s' "$KEI_PLATFORM_OVERRIDE"; return 0 ;;
+    esac
+    local kernel="" f
+    [ -r "$KEI_PROC/sys/kernel/osrelease" ] && kernel=$(head -c 200 "$KEI_PROC/sys/kernel/osrelease" 2>/dev/null)
+    case "$kernel" in
+        *-Microsoft) printf 'wsl1'; return 0 ;;
+        *[Mm]icrosoft*|*WSL2*) printf 'wsl2'; return 0 ;;
+    esac
+    for f in "$KEI_PROC"/sys/fs/binfmt_misc/WSLInterop*; do
+        [ -e "$f" ] && { printf 'wsl2'; return 0; }
+    done
+    printf 'linux'
+}
+
+# WSL networking mode guessed from the default gateway ($1), for when the
+# Windows installer left no windows.conf: NAT puts WSL behind a virtual
+# switch in 172.16.0.0/12; mirrored mode shares the LAN router of Windows.
+_wsl_net_from_gateway() {
+    case "$1" in
+        "") printf 'unknown' ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) printf 'nat' ;;
+        *) printf 'mirrored' ;;
+    esac
+}
+
+# Checks one windows.conf value; an invalid value is dropped (left empty).
+_win_conf_valid() {
+    local key="$1" val="$2"
+    case "$key" in
+        WIN_NET_MODE)   [[ "$val" == mirrored || "$val" == nat ]] ;;
+        WIN_AUTOSTART)  [[ "$val" == logon || "$val" == manual ]] ;;
+        WIN_BUILD|WIN_MEM_GB) [[ "$val" =~ ^[0-9]{1,6}$ ]] ;;
+        WIN_LAN_IP)     [[ "$val" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ;;
+        WIN_HOSTNAME)   [[ "$val" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62})$ ]] ;;
+        WIN_USER)       [[ "$val" =~ ^[A-Za-z0-9._\ -]{1,64}$ && "$val" != *..* ]] ;;
+        WIN_BACKUP_DIR) [[ "$val" =~ ^/mnt/[a-z]/[A-Za-z0-9._/\ -]*$ && "$val" != *..* ]] ;;
+        *)              [ "${#val}" -le 64 ] ;;
+    esac
+}
+
+# Reads the Windows handshake file ($1, default $KEI_WIN_CONF) into the
+# WIN_* variables named in KEI_WIN_KEYS. Only KEY=value lines with a known
+# key and plain characters are taken; everything else is logged and
+# skipped. The file must be a regular file owned by root and not writable
+# by others (it describes the host the panel trusts). Returns 1 when the
+# file is missing or refused.
+read_windows_conf() {
+    local file="${1:-$KEI_WIN_CONF}" key val line n=0 owner mode
+    local re='^([A-Z][A-Z_]*)=([A-Za-z0-9._:/ -]*)$'
+    for key in $KEI_WIN_KEYS; do printf -v "$key" '%s' ""; done
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+    read -r owner mode < <(stat -c '%u %a' "$file" 2>/dev/null)
+    if [ "${owner:-x}" != "0" ] || [ -z "$mode" ] || (( (8#$mode & 8#022) != 0 )); then
+        log "windows.conf refused: owner ${owner:-?}, mode ${mode:-?} (must be root and not writable by others)"
+        return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        [ "$n" -gt 200 ] && break
+        [ "$n" -eq 1 ] && line="${line#$'\xEF\xBB\xBF'}"   # BOM of Windows PowerShell 5.1
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ ! "$line" =~ $re ]]; then
+            log "windows.conf: line $n ignored (not KEY=value with plain characters)"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        if [[ " $KEI_WIN_KEYS " != *" $key "* ]]; then
+            log "windows.conf: unknown key ignored: $key"
+        elif ! _win_conf_valid "$key" "$val"; then
+            log "windows.conf: invalid value ignored for $key"
+        else
+            printf -v "$key" '%s' "$val"
+        fi
+    done < "$file"
+    return 0
+}
+
+detect_platform() {
+    local gw=""
+    KEI_PLATFORM=$(_detect_platform_kind)
+    KEI_WSL_NET=""
+    [ "$KEI_PLATFORM" = "linux" ] && return 0
+    read_windows_conf "$KEI_WIN_CONF" || true
+    if [ -n "${WIN_NET_MODE:-}" ]; then
+        KEI_WSL_NET="$WIN_NET_MODE"
+    else
+        command -v ip >/dev/null 2>&1 && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+        KEI_WSL_NET=$(_wsl_net_from_gateway "$gw")
+    fi
+    log "platform: $KEI_PLATFORM (network: $KEI_WSL_NET, Windows build: ${WIN_BUILD:-?})"
+}
+
+is_wsl() { [ "$KEI_PLATFORM" != "linux" ]; }
+
+# host_can CAPABILITY: may the panel manage this part of the host?
+#   swap      create /swapfile          ntp       NTP sync (timesyncd)
+#   timezone  change the timezone       firewall  UFW
+#   fail2ban  Fail2ban jails            mdns      avahi-daemon
+#   reboot    reboot the machine        lan_direct other PCs reach ports 80/8080
+# Unknown capabilities are a programming error: logged, answer "no" (2).
+host_can() {
+    case "$1" in
+        swap|ntp|timezone|firewall|fail2ban|mdns|reboot|lan_direct) ;;
+        *) log "host_can: unknown capability '$1'"; return 2 ;;
+    esac
+    [ "$KEI_PLATFORM" = "linux" ] && return 0
+    [ "$1" = "lan_direct" ] && [ "$KEI_WSL_NET" = "mirrored" ] && return 0
+    # The zone inside Debian is the panel's to set (apply_timezone keeps WSL
+    # from putting Windows' zone back at the next start).
+    [ "$1" = "timezone" ] && return 0
+    return 1
+}
+
+# sd_booted(): systemd is PID 1 when /run/systemd/system exists.
+systemd_is_pid1() { [ -d "$KEI_SYSTEMD_RUNDIR" ]; }
+
+detect_platform
+
+# Plain symbols (see kei_plain_text) when the Windows installer asked for
+# them, or under WSL outside Windows Terminal (which marks its sessions with
+# WT_SESSION). A value other than 0 or 1 is ignored.
+case "${KEI_PLAIN_GLYPHS:-}" in
+    0|1) ;;
+    *) KEI_PLAIN_GLYPHS=0
+       is_wsl && [ -z "${WT_SESSION:-}" ] && KEI_PLAIN_GLYPHS=1 ;;
+esac
+
+# ======================================================================
 # 7. PANEL DEPENDENCIES
 # ======================================================================
-timedatectl set-ntp true >/dev/null 2>&1 || true
+[ -z "$KEI_CLI_MODE" ] && host_can ntp && { timedatectl set-ntp true >/dev/null 2>&1 || true; }
 
 MISSING_DEPS=()
 for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg wget:wget fuser:psmisc ss:iproute2 flock:util-linux; do
@@ -728,7 +950,7 @@ for dep in whiptail:whiptail curl:curl xmllint:libxml2-utils unzip:unzip gpg:gpg
     fi
 done
 
-if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+if [ ${#MISSING_DEPS[@]} -gt 0 ] && [ -z "$KEI_CLI_MODE" ]; then
     echo "$(t "Installing panel dependencies... Please wait.")"
     wait_for_apt_locks || { echo "$(t "APT is locked. Aborting.")"; exit 1; }
     apt_update_indices
@@ -996,10 +1218,11 @@ EOF
     chown root:root "$KOHA_WAIT_SCRIPT" 2>/dev/null
     mkdir -p /etc/systemd/system/koha-common.service.d /etc/systemd/system/apache2.service.d
     cat > /etc/systemd/system/koha-common.service.d/koha-easy-install.conf << EOF
-# Koha Easy Installer: Plack must start after Memcached and MariaDB.
+# Koha Easy Installer: Plack must start after Memcached and MariaDB, and
+# Koha's background workers after RabbitMQ (their message queue).
 [Unit]
 Wants=memcached.service mariadb.service
-After=memcached.service mariadb.service network-online.target
+After=memcached.service mariadb.service rabbitmq-server.service network-online.target
 
 [Service]
 # "active" is not "answering": wait until both respond. The "-" lets Koha
@@ -1015,19 +1238,427 @@ EOF
     return 0
 }
 
+# ======================================================================
+# CLEAN-STOP GUARD (power cuts, forced shutdowns, crashes)
+# ----------------------------------------------------------------------
+# A clean stop leaves a mark on disk; a boot that does not find it knows
+# MariaDB or Zebra may have been cut off mid-write, and repairs Koha:
+#   koha-stop-guard.service           before MariaDB at boot, so it stops
+#                                     after MariaDB and Koha at shutdown:
+#                                     reads and clears the mark at boot,
+#                                     writes it at a clean stop
+#   koha-stop-guard-recover.service   after an unclean stop only: waits
+#                                     for MariaDB's crash recovery, checks
+#                                     the database, makes a fresh backup
+#                                     and brings the Zebra index up to date
+#                                     (a full rebuild when needed)
+# The Windows tools stop Koha's services in order and call
+# "koha-stop-guard stop" before WSL stops Debian. The result of the last
+# repair goes to --status-json, so Windows can tell the librarian.
+# ======================================================================
+STOP_GUARD_SCRIPT="/usr/local/sbin/koha-stop-guard"
+STOP_GUARD_UNIT="/etc/systemd/system/koha-stop-guard.service"
+STOP_GUARD_RECOVER_UNIT="/etc/systemd/system/koha-stop-guard-recover.service"
+STOP_GUARD_STATE_DIR="/var/lib/koha-easy-install"
+STOP_GUARD_STATUS="${STOP_GUARD_STATE_DIR}/recovery.status"
+
+# Writes stdin to $1 (mode $2) only when the content changed. Returns 0 when
+# the file was written, 1 when it was already up to date.
+write_if_changed() {
+    local dst="$1" mode="$2" tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    cat > "$tmp"
+    if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod "$mode" "$tmp"
+    chown root:root "$tmp" 2>/dev/null
+    mv -f "$tmp" "$dst"
+    return 0
+}
+
+stop_guard_script() {
+    cat << EOF
+#!/bin/bash
+# Koha Easy Installer: remembers whether Koha was stopped cleanly and
+# repairs it after a power cut, a forced shutdown or a crash.
+#   koha-stop-guard boot      at boot, before MariaDB (koha-stop-guard.service)
+#   koha-stop-guard stop      at a clean stop, once MariaDB and Zebra are down
+#   koha-stop-guard recover   after an unclean stop (koha-stop-guard-recover.service)
+#   koha-stop-guard status    the result of the last repair (key=value)
+set -uo pipefail
+INST="${INSTANCE}"
+DB="${DB_NAME}"
+STATE_DIR="${STOP_GUARD_STATE_DIR}"
+STATUS="${STOP_GUARD_STATUS}"
+RUN_DIR="${MARKER_DIR}"
+LOG="${LOG_DIR}/stop-guard.log"
+BACKUP_LOG="${LOG_DIR}/backup_sql.log"
+ZEBRA_LOG="${LOG_DIR}/zebra-rebuild.log"
+EOF
+    cat << 'EOF'
+CLEAN="$STATE_DIR/clean-stop"
+ARMED="$STATE_DIR/stop-guard.armed"
+PENDING="$STATE_DIR/recovery.pending"
+FLAG="$RUN_DIR/unclean-stop"
+
+say() {
+    mkdir -p "${LOG%/*}" 2>/dev/null
+    printf '%s | %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null
+    logger -t koha-stop-guard "$*" 2>/dev/null || true
+}
+
+# The processes whose files a hard kill can damage: MariaDB and Zebra.
+data_daemons_running() { pgrep -x 'mariadbd|mysqld|zebrasrv|zebraidx' >/dev/null 2>&1; }
+
+db_up() { mysqladmin --connect-timeout=2 ping >/dev/null 2>&1; }
+
+write_status() {
+    local tmp="$STATUS.tmp"
+    printf 'epoch=%s\nstate=%s\nfinished=%s\ndb=%s\nbackup=%s\nindex=%s\n' "$@" > "$tmp" && mv -f "$tmp" "$STATUS"
+}
+
+# At boot, before MariaDB: was the last stop clean? A repair that did not
+# finish counts as unclean too. The very first boot with the guard is not.
+guard_boot() {
+    local verdict
+    mkdir -p "$STATE_DIR" "$RUN_DIR"
+    if [ -f "$PENDING" ]; then verdict="unclean (the last repair did not finish)"
+    elif [ -f "$CLEAN" ]; then verdict="clean"
+    elif [ -f "$ARMED" ]; then verdict="unclean"
+    else verdict="first boot with the guard"
+    fi
+    rm -f "$CLEAN"
+    case "$verdict" in unclean*) : > "$FLAG" ;; esac
+    : > "$ARMED"
+    sync
+    say "boot: the last stop was $verdict"
+}
+
+# Marks the stop clean only when MariaDB and Zebra are really down and
+# MariaDB's own stop succeeded (not killed after its timeout).
+guard_stop() {
+    local result
+    mkdir -p "$STATE_DIR"
+    if data_daemons_running; then
+        say "stop: MariaDB or Zebra is still running; this stop is not marked clean"
+        return 1
+    fi
+    result=$(systemctl show -p Result --value mariadb.service 2>/dev/null)
+    case "${result:-success}" in
+        success) ;;
+        *) say "stop: MariaDB's stop ended with '$result'; this stop is not marked clean"; return 1 ;;
+    esac
+    sync
+    : > "$CLEAN"
+    sync
+    say "stop: clean"
+    return 0
+}
+
+guard_recover() {
+    local start db="ok" backup="skipped" index="skipped" engine="" out rc check last i
+    mkdir -p "$STATE_DIR" "$RUN_DIR"
+    # The indexing watchdogs stay away while this runs (maintenance marker).
+    printf '%s\n' "$$" > "$RUN_DIR/recovery.in-progress"
+    : > "$PENDING"
+    sync
+    start=$(date +%s)
+    write_status "$start" running 0 "" "" ""
+    say "recover: the last stop was not clean; checking Koha"
+
+    # MariaDB answers once InnoDB has finished its crash recovery.
+    for i in $(seq 1 "${GUARD_DB_WAIT:-300}"); do db_up && break; sleep 2; done
+    if ! db_up; then
+        db="unreachable"
+    elif [ -z "$(mysql -Nse "SHOW DATABASES LIKE '$DB'" 2>/dev/null)" ]; then
+        db="none"
+    else
+        check=$(command -v mariadb-check || command -v mysqlcheck)
+        out=$("$check" --check --quick --databases "$DB" 2>&1)
+        rc=$?
+        if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qiE '^error|corrupt'; then
+            db="errors"
+            say "recover: the database check found problems:"
+            printf '%s\n' "$out" | grep -viE '[[:space:]]OK$' | head -n 50 | while IFS= read -r l; do say "  $l"; done
+        fi
+    fi
+
+    # A fresh backup while the catalog is known to be readable.
+    if [ "$db" = "ok" ] || [ "$db" = "errors" ]; then
+        if [ -f /root/backup_sql.sh ]; then
+            bash /root/backup_sql.sh >/dev/null 2>&1
+            last=$(grep -E '\| (OK|FAILED|INFO)' "$BACKUP_LOG" 2>/dev/null | tail -n 1)
+            case "$last" in
+                *"| OK: "*) backup="ok" ;;
+                *"| INFO"*) backup="busy" ;;
+                *) backup="failed" ;;
+            esac
+        else
+            backup="none"
+        fi
+        engine=$(mysql -Nse "SELECT value FROM ${DB}.systempreferences WHERE variable='SearchEngine'" 2>/dev/null)
+    fi
+
+    # Zebra's index files are not crash-safe: bring the index up to date,
+    # and rebuild it from scratch when that fails or the database had errors.
+    if [ -n "$engine" ] && [ "$engine" != "Elasticsearch" ] && [ -x /usr/sbin/koha-rebuild-zebra ]; then
+        index="updated"
+        if [ "$db" = "errors" ] || ! /usr/sbin/koha-rebuild-zebra -v -b -a "$INST" >> "$ZEBRA_LOG" 2>&1; then
+            if /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INST" >> "$ZEBRA_LOG" 2>&1; then
+                index="rebuilt"
+                /usr/sbin/koha-zebra --restart "$INST" >/dev/null 2>&1 || true
+            else
+                index="failed"
+            fi
+        fi
+    elif [ "$engine" = "Elasticsearch" ]; then
+        index="elasticsearch"
+    fi
+
+    write_status "$start" done "$(date +%s)" "$db" "$backup" "$index"
+    rm -f "$PENDING" "$FLAG" "$RUN_DIR/recovery.in-progress"
+    sync
+    say "recover: finished (database: $db, backup: $backup, search index: $index)"
+    return 0
+}
+
+case "${1:-}" in
+    boot) guard_boot ;;
+    stop) guard_stop ;;
+    recover) guard_recover ;;
+    status) cat "$STATUS" 2>/dev/null ;;
+    *) echo "usage: koha-stop-guard boot|stop|recover|status" >&2; exit 2 ;;
+esac
+EOF
+}
+
+# Installs (or refreshes) the guard. Safe to run at every panel start: the
+# files are rewritten and systemd reloaded only when something changed.
+install_stop_guard() {
+    local changed=0
+    mkdir -p "${STOP_GUARD_SCRIPT%/*}" "$STOP_GUARD_STATE_DIR" /etc/systemd/system 2>/dev/null
+    stop_guard_script | write_if_changed "$STOP_GUARD_SCRIPT" 755 && changed=1
+    write_if_changed "$STOP_GUARD_UNIT" 644 << EOF && changed=1
+# Koha Easy Installer: remembers whether Koha was stopped cleanly.
+# Ordered before MariaDB and Koha, so that at shutdown it stops after them.
+[Unit]
+Description=Koha Easy: clean-stop guard
+DefaultDependencies=no
+After=local-fs.target
+Before=mariadb.service koha-common.service apache2.service memcached.service rabbitmq-server.service elasticsearch.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${STOP_GUARD_SCRIPT} boot
+ExecStop=-${STOP_GUARD_SCRIPT} stop
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    write_if_changed "$STOP_GUARD_RECOVER_UNIT" 644 << EOF && changed=1
+# Koha Easy Installer: checks and repairs Koha after an unclean stop.
+# Type=exec: the boot does not wait for it (a full reindex can take long).
+[Unit]
+Description=Koha Easy: repair after an unclean stop
+After=koha-stop-guard.service mariadb.service koha-common.service apache2.service
+ConditionPathExists=${MARKER_DIR}/unclean-stop
+
+[Service]
+Type=exec
+ExecStart=${STOP_GUARD_SCRIPT} recover
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if [ "$changed" = "1" ]; then
+        systemctl enable koha-stop-guard.service koha-stop-guard-recover.service >/dev/null 2>&1
+        [ -d "$KEI_SYSTEMD_RUNDIR" ] && systemctl daemon-reload >/dev/null 2>&1
+        log "stop guard installed or updated"
+    fi
+    # The guard must be active to run its stop step at the next shutdown.
+    # Started now, it cannot know how the current boot began: counted clean.
+    if [ -d "$KEI_SYSTEMD_RUNDIR" ] && ! systemctl is-active --quiet koha-stop-guard.service; then
+        mkdir -p "$STOP_GUARD_STATE_DIR" && : > "${STOP_GUARD_STATE_DIR}/clean-stop"
+        systemctl start koha-stop-guard.service >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# Everything that protects Koha's data against sudden stops. Idempotent:
+# run with every install and repair, at panel start and by the Windows
+# installer (--install-data-safety).
+install_data_safety() {
+    install_stop_guard
+    install_mariadb_durability
+    install_log_limits
+}
+
+# MariaDB's crash-safety settings, pinned in their own file so that no later
+# tuning (99-koha-tuning.cnf, loaded after it, only sets the buffer pool)
+# turns them off. They are MariaDB's defaults: nothing changes on a stock
+# server, and they take effect at MariaDB's next start. innodb_flush_method
+# is left out on purpose: MariaDB 11 deprecates it, and O_DIRECT has been
+# the default since 10.6.
+KEI_MARIADB_CONF_DIR="${KEI_MARIADB_CONF_DIR:-/etc/mysql/mariadb.conf.d}"
+install_mariadb_durability() {
+    [ -d "${KEI_MARIADB_CONF_DIR%/*}" ] || return 0
+    mkdir -p "$KEI_MARIADB_CONF_DIR"
+    write_if_changed "${KEI_MARIADB_CONF_DIR}/98-koha-durability.cnf" 644 << 'EOF' && log "MariaDB durability settings written"
+# Koha Easy Installer: MariaDB's crash-safety settings (a power cut loses no
+# committed transaction and tears no page). Do not change them.
+[mysqld]
+innodb_doublewrite = 1
+innodb_flush_log_at_trx_commit = 1
+innodb_file_per_table = 1
+skip-log-bin
+EOF
+    return 0
+}
+
+# Logs that never fill the disk: the system journal capped at 100 MB (30 MB
+# in memory) and one month, the panel's own logs rotated once they pass
+# 5 MB, and the weekly log rotation and TRIM timers switched on. Koha's own
+# /etc/logrotate.d/koha-common belongs to its package and is left as it is.
+KEI_JOURNALD_DIR="${KEI_JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
+KEI_LOGROTATE_DIR="${KEI_LOGROTATE_DIR:-/etc/logrotate.d}"
+install_log_limits() {
+    local t
+    if [ -d "${KEI_JOURNALD_DIR%/*}" ]; then
+        mkdir -p "$KEI_JOURNALD_DIR"
+        if write_if_changed "${KEI_JOURNALD_DIR}/00-koha-limits.conf" 644 << 'EOF'
+# Koha Easy Installer: the system journal keeps at most 100 MB on disk,
+# 30 MB in memory, and one month.
+[Journal]
+SystemMaxUse=100M
+RuntimeMaxUse=30M
+MaxRetentionSec=1month
+EOF
+        then
+            [ -d "$KEI_SYSTEMD_RUNDIR" ] && systemctl restart systemd-journald >/dev/null 2>&1
+            log "journald limits written"
+        fi
+    fi
+    if [ -d "$KEI_LOGROTATE_DIR" ]; then
+        write_if_changed "${KEI_LOGROTATE_DIR}/koha-easy-install" 644 << EOF && log "logrotate rule for ${LOG_DIR} written"
+# Koha Easy Installer: the panel's logs, rotated once they pass 5 MB (the
+# last line of backup_sql.log is what the Windows tray reads).
+${LOG_DIR}/*.log {
+    size 5M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    fi
+    [ -d "$KEI_SYSTEMD_RUNDIR" ] || return 0
+    for t in logrotate.timer fstrim.timer; do
+        systemctl cat "$t" >/dev/null 2>&1 || continue
+        systemctl is-enabled --quiet "$t" 2>/dev/null && systemctl is-active --quiet "$t" && continue
+        systemctl enable --now "$t" >/dev/null 2>&1 && log "$t enabled"
+    done
+    return 0
+}
+
+# Result of the last repair after an unclean stop, for --status-json:
+# "epoch state finished db backup index" ("0 none 0 - - -" when there was none).
+stop_guard_summary() {
+    local epoch=0 state=none finished=0 db=- backup=- index=- k v
+    if [ -r "$STOP_GUARD_STATUS" ]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                epoch) epoch="$v" ;; state) state="$v" ;; finished) finished="$v" ;;
+                db) db="$v" ;; backup) backup="$v" ;; index) index="$v" ;;
+            esac
+        done < "$STOP_GUARD_STATUS"
+    fi
+    printf '%s %s %s %s %s %s\n' "$epoch" "${state:-none}" "$finished" "${db:--}" "${backup:--}" "${index:--}"
+}
+
+# Stops Plack and waits until it is really gone before starting it again:
+# "koha-plack --start" does nothing while the old Plack is still running,
+# which would keep the old workers (and their missing cache) alive.
+plack_fresh_start() {
+    local i
+    koha_ctl /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        plack_running || break
+        sleep 1
+    done
+    koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+}
+
+# Memcached answering on its port is not enough: Koha uses it only if its
+# own Perl client (Cache::Memcached::Fast::Safe) loads and connects when
+# Plack starts. Otherwise About Koha says "Memcached: not running" with an
+# empty "Effective caching method". This asks Koha itself, as the instance
+# user, and prints one word:
+#   ok       Koha reads and writes its cache in Memcached
+#   module   the Perl client does not load (broken or missing package)
+#   connect  the client loads but cannot use Memcached
+#   unknown  Koha could not be asked
+# The details of a failure go to the panel log.
+koha_cache_state() {
+    local probe out state
+    probe=$(mktemp /tmp/kei-cache-probe.XXXXXX) || { echo unknown; return 1; }
+    cat > "$probe" << 'EOF'
+use strict;
+use warnings;
+my $err = eval { require Cache::Memcached::Fast::Safe; 1 } ? '' : ( $@ || 'load failed' );
+if ($err) { $err =~ s/\s+/ /g; print 'KEI-CACHE module ', substr( $err, 0, 300 ), "\n"; exit 0 }
+require Koha::Caches;
+my $cache = Koha::Caches->get_instance;
+my $ok = ref( $cache->cache ) =~ /Memcached/ && $cache->set_in_cache( 'kei_cache_probe', 1, { expiry => 60 } );
+print 'KEI-CACHE ', ( $ok ? 'ok' : 'connect' ), "\n";
+EOF
+    chmod 644 "$probe"
+    out=$(cd /tmp && timeout 60 /usr/sbin/koha-shell "$INSTANCE" -c "/usr/bin/perl $(kq "$probe")" 2>&1 </dev/null 7>&- 8>&- 9>&-)
+    rm -f "$probe"
+    state=$(printf '%s\n' "$out" | sed -n 's/^KEI-CACHE \([a-z]*\).*/\1/p' | head -n1)
+    [ -n "$state" ] || state=unknown
+    [ "$state" = ok ] || log "koha cache: $state: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-400)"
+    echo "$state"
+    [ "$state" = ok ]
+}
+
+# One line for the dialogs and the validation report.
+koha_cache_text() {
+    case "$1" in
+        ok)      t "Koha is using Memcached." ;;
+        module)  t "Koha cannot use Memcached: the Perl module Cache::Memcached::Fast::Safe does not load." ;;
+        connect) t "Koha cannot use Memcached: it does not answer to Koha on 127.0.0.1:11211." ;;
+        *)       t "Could not ask Koha whether it is using Memcached." ;;
+    esac
+}
+
 # Koha only uses Memcached if it answers when Plack starts: a Plack started
 # first (e.g. after a reboot) runs without cache until it is restarted
-# ("Memcached: not running" in About Koha). This makes Memcached answer,
-# makes koha-conf.xml point to it, orders the services at boot and then
-# restarts Plack and Apache. MariaDB is a hard dependency: without it Plack
-# is not started at all. Memcached is waited for, but Koha still starts
-# (without cache) if it never answers. Returns 1 if anything is not up.
+# ("Memcached: not running" in About Koha). This makes Memcached answer on
+# 127.0.0.1, makes koha-conf.xml point to it, orders the services at boot,
+# restarts Plack and Apache and then asks Koha itself whether it uses the
+# cache, reinstalling the Perl client if it does not load. MariaDB is a hard
+# dependency: without it Plack is not started at all. Memcached is waited
+# for, but Koha still starts (without cache) if it never answers. Returns 1
+# if anything is not up.
 ensure_koha_services() {
-    local i servers db_rc=0
+    local i servers db_rc=0 cache
     if ! command -v memcached >/dev/null 2>&1; then
         apt_install memcached libcache-memcached-fast-perl >/dev/null 2>&1
     fi
-    if [ -f /etc/memcached.conf ] && ! grep -qE '^-l[[:space:]]' /etc/memcached.conf; then
+    # Koha connects to 127.0.0.1:11211: Memcached must listen there, also
+    # when memcached.conf only lists other addresses (e.g. "-l ::1").
+    if [ -f /etc/memcached.conf ] \
+        && ! grep -E '^-l[[:space:]]' /etc/memcached.conf | grep -qE '127\.0\.0\.1|0\.0\.0\.0|localhost'; then
         echo '-l 127.0.0.1' >> /etc/memcached.conf
     fi
     systemctl enable memcached >/dev/null 2>&1
@@ -1045,13 +1676,12 @@ ensure_koha_services() {
     fi
 
     install_boot_ordering
+    install_data_safety
 
     db_admin_check || db_rc=$?
     if [ "$db_rc" -ne 1 ]; then
         koha_ctl /usr/sbin/koha-plack --enable "$INSTANCE" >/dev/null 2>&1
-        koha_ctl /usr/sbin/koha-plack --stop "$INSTANCE" >/dev/null 2>&1
-        sleep 1
-        koha_ctl /usr/sbin/koha-plack --start "$INSTANCE" >/dev/null 2>&1
+        plack_fresh_start
     else
         log "MariaDB is down: Plack not started"
     fi
@@ -1061,7 +1691,19 @@ ensure_koha_services() {
         plack_running && break
         sleep 1
     done
-    [ "$db_rc" -ne 1 ] && memcached_alive && plack_running
+    [ "$db_rc" -ne 1 ] && memcached_alive && plack_running || return 1
+
+    # Koha's view. A Perl client that does not load (a broken or half
+    # upgraded package) is reinstalled once; then Plack is restarted so that
+    # it picks the cache up.
+    cache=$(koha_cache_state)
+    if [ "$cache" = module ]; then
+        log "reinstalling the Perl Memcached client for Koha"
+        apt_install --reinstall libcache-memcached-fast-safe-perl libcache-memcached-fast-perl libposix-atfork-perl >/dev/null 2>&1
+        plack_fresh_start
+        cache=$(koha_cache_state)
+    fi
+    case "$cache" in ok|unknown) return 0 ;; *) return 1 ;; esac
 }
 
 # Zebra is run by koha-zebra (koha-common has no systemd unit for it).
@@ -1371,6 +2013,22 @@ validate_mariadb() {
         "")      : ;;
         *)       v_warn "${DB_NAME}: charset '$charset' ($(t "utf8mb4 is recommended"))." ;;
     esac
+    # Crash safety: doublewrite (can read 1, ON or fast), a log flush at every
+    # commit and one file per table.
+    local dw fl fpt
+    IFS=$'\t' read -r dw fl fpt < <(run_sql "SELECT @@innodb_doublewrite, @@innodb_flush_log_at_trx_commit, @@innodb_file_per_table;")
+    if [ "$fl" = "1" ] && [ "$fpt" = "1" ] && [ -n "$dw" ] && [ "$dw" != "0" ] && [ "$dw" != "OFF" ]; then
+        v_ok "MariaDB: $(t "crash-safe settings on (doublewrite, flush at every commit, one file per table)")."
+    elif [ -n "$fl" ]; then
+        v_warn "MariaDB: $(t "crash-safe settings off; a power cut can lose or damage data") (innodb_doublewrite=$dw, innodb_flush_log_at_trx_commit=$fl, innodb_file_per_table=$fpt)."
+    fi
+    if is_koha_installed && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet koha-stop-guard.service 2>/dev/null; then
+            v_ok "$(t "Clean-stop guard: active (Koha is checked and repaired after a power cut).")"
+        else
+            v_warn "$(t "Clean-stop guard: not active (open the panel again to install it).")"
+        fi
+    fi
     return 0
 }
 
@@ -1455,6 +2113,10 @@ validate_cron() {
 }
 
 validate_ufw() {
+    if ! host_can firewall; then
+        v_info "UFW: $(t "not used on Windows (WSL): the firewall is Windows Defender Firewall")."
+        return 0
+    fi
     if ! command -v ufw >/dev/null 2>&1; then
         v_warn "UFW: $(t "not installed")."; return 1
     fi
@@ -1516,9 +2178,13 @@ validate_network_and_system() {
     else v_fail "$(t "Disk"): ${free_disk:-0} MB $(t "free (under 2 GB)")."; fi
     
     swapon --show 2>/dev/null | grep -q '/' && v_ok "SWAP: $(t "active")." || v_warn "SWAP: $(t "none")."
-    timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$' \
-        && v_ok "NTP: $(t "synchronized")." \
-        || v_warn "NTP: $(t "unconfirmed")."
+    if ! host_can ntp; then
+        v_info "NTP: $(t "clock kept by Windows")."
+    elif timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
+        v_ok "NTP: $(t "synchronized")."
+    else
+        v_warn "NTP: $(t "unconfirmed")."
+    fi
     v_info "$(t "Timezone"): $(timedatectl show -p Timezone --value 2>/dev/null)"
 }
 
@@ -1536,9 +2202,21 @@ validate_complete_system() {
     else
         v_fail "Memcached: 127.0.0.1:11211 $(t "not responding (Koha runs without cache)")."
     fi
+    local cache_state=none
+    [ -x /usr/sbin/koha-shell ] && [ -f "$KOHA_CONF" ] && cache_state=$(koha_cache_state)
+    case "$cache_state" in
+        none)    ;;
+        ok)      v_ok   "$(koha_cache_text ok)" ;;
+        unknown) v_warn "$(koha_cache_text unknown)" ;;
+        *)       v_fail "$(koha_cache_text "$cache_state")" ;;
+    esac
     validate_service koha-common  "Koha common"
     validate_service cron         "Cron"
-    validate_service fail2ban     "Fail2ban" "no"
+    if host_can fail2ban; then
+        validate_service fail2ban "Fail2ban" "no"
+    else
+        v_info "Fail2ban: $(t "not used on Windows (WSL): Windows protects the network")."
+    fi
     
     if plack_running; then
         v_ok "Plack (${INSTANCE}): $(t "running")."
@@ -1636,6 +2314,46 @@ platform_check() {
         amd64|arm64) v_ok "$(t "Architecture"): ${arch} (${machine})." ;;
         *) v_warn "$(t "Architecture"): ${arch:-?} (${machine:-?}) - $(t "only amd64 and arm64 are tested")." ;;
     esac
+    platform_wsl_check
+}
+
+# The panel runs Koha's services through systemd. A plain Linux server
+# always has it (the pre-installation check tests systemctl); under WSL it
+# is PID 1 only with [boot] systemd=true in /etc/wsl.conf, and never on WSL 1.
+require_systemd() {
+    is_wsl || return 0
+    if [ "$KEI_PLATFORM" = "wsl1" ]; then
+        msg_error "" "$(t "This Linux runs on WSL 1, which cannot run Koha.\n\nIn Windows PowerShell, convert it to WSL 2:\n  wsl --set-version <distribution> 2\n\nThen open the panel again.")" 14 76
+        return 1
+    fi
+    systemd_is_pid1 && return 0
+    msg_error "" "$(t "Koha needs systemd, which is not running in this WSL distribution.\n\nAdd these lines to /etc/wsl.conf:\n  [boot]\n  systemd=true\n\nThen run 'wsl --shutdown' in Windows PowerShell and open the panel again.")" 16 76
+    return 1
+}
+
+# Windows (WSL) lines of the validation reports: WSL 1 cannot run Koha's
+# services, and WSL 2 needs systemd as PID 1 ([boot] systemd=true).
+platform_wsl_check() {
+    local net
+    case "$KEI_PLATFORM" in
+        wsl1)
+            v_fail "$(t "Platform"): $(t "Windows (WSL 1) cannot run Koha: convert it to WSL 2")."
+            ;;
+        wsl2)
+            case "$KEI_WSL_NET" in
+                mirrored) net="$(t "mirrored (other computers can connect)")" ;;
+                nat)      net="$(t "NAT (this computer only)")" ;;
+                *)        net="$(t "unknown")" ;;
+            esac
+            v_ok "$(t "Platform"): Windows (WSL 2)${WIN_BUILD:+, build ${WIN_BUILD}}, $(t "network"): ${net}."
+            if systemd_is_pid1; then
+                v_ok "Systemd: $(t "running as PID 1")."
+            else
+                v_fail "Systemd: $(t "not running in WSL (add [boot] systemd=true to /etc/wsl.conf)")."
+            fi
+            ;;
+    esac
+    return 0
 }
 
 # Elasticsearch 7 is only packaged for amd64 and arm64.
@@ -1823,6 +2541,56 @@ prepare_koha_broker() {
     dpkg -s rabbitmq-server >/dev/null 2>&1 || return 1
     rabbitmq-plugins enable rabbitmq_stomp >/dev/null 2>&1
     systemctl enable --now rabbitmq-server >/dev/null 2>&1
+    return 0
+}
+
+# RabbitMQ under WSL. koha-common's post-install script enables the STOMP
+# plugin and restarts RabbitMQ, which then refuses to start when it cannot
+# open STOMP's port 61613 ("could_not_start, rabbitmq_stomp"): with mirrored
+# networking Linux shares the ports of Windows, and Windows reserves blocks
+# of its dynamic range (49152-65535, where 61613 falls) for Hyper-V. Before
+# the package is configured, the plugin is enabled and its listener put on
+# 127.0.0.1 at a port below that range that nothing listens on;
+# koha-sites.conf then gives Koha the same address (define_koha_sites_conf).
+KEI_RABBITMQ_DIR="${KEI_RABBITMQ_DIR:-/etc/rabbitmq}"
+KOHA_WSL_STOMP_PORTS=(16613 26613 36613)
+
+port_in_use() { ss -lnt 2>/dev/null | grep -qE "[:.]$1[[:space:]]"; }
+
+# The STOMP port RabbitMQ listens on (61613 unless rabbitmq.conf says otherwise).
+koha_stomp_port() {
+    local p
+    p=$(sed -n -E 's/^[[:space:]]*stomp\.listeners\.tcp\.1[[:space:]]*=[[:space:]]*([0-9.]+:)?([0-9]+)[[:space:]]*$/\2/p' \
+        "$KEI_RABBITMQ_DIR/rabbitmq.conf" 2>/dev/null | tail -n1)
+    printf '%s' "${p:-61613}"
+}
+
+prepare_wsl_broker() {
+    is_wsl || return 0
+    local conf="$KEI_RABBITMQ_DIR/rabbitmq.conf" plugins="$KEI_RABBITMQ_DIR/enabled_plugins" port="" p
+    mkdir -p "$KEI_RABBITMQ_DIR" || return 1
+    if ! grep -q '^# koha-easy-installer' "$conf" 2>/dev/null; then
+        for p in "${KOHA_WSL_STOMP_PORTS[@]}"; do
+            port_in_use "$p" || { port="$p"; break; }
+        done
+        [ -n "$port" ] || port="${KOHA_WSL_STOMP_PORTS[0]}"
+        {
+            [ -f "$conf" ] && grep -v -E '^[[:space:]]*stomp\.listeners\.' "$conf"
+            echo "# koha-easy-installer (WSL): STOMP for Koha on the loopback, on a port Windows does not reserve"
+            echo "stomp.listeners.tcp.1 = 127.0.0.1:${port}"
+        } > "$conf.tmp" && chmod 644 "$conf.tmp" && mv -f "$conf.tmp" "$conf" || return 1
+    fi
+    # The listener setting is only valid while the plugin is enabled.
+    if ! grep -q 'rabbitmq_stomp' "$plugins" 2>/dev/null; then
+        if [ -f "$plugins" ] && command -v rabbitmq-plugins >/dev/null 2>&1; then
+            rabbitmq-plugins enable --offline rabbitmq_stomp >/dev/null 2>&1 || return 1
+        else
+            echo '[rabbitmq_stomp].' > "$plugins" || return 1
+            chmod 644 "$plugins"
+        fi
+    fi
+    id rabbitmq >/dev/null 2>&1 && chown rabbitmq:rabbitmq "$plugins" 2>/dev/null
+    dpkg -s rabbitmq-server >/dev/null 2>&1 && systemctl restart rabbitmq-server >/dev/null 2>&1
     return 0
 }
 
@@ -2249,8 +3017,9 @@ validate_elasticsearch() {
         && v_ok "$(t "Indexer"): $(t "systemd unit installed (auto-restart)")." \
         || v_warn "$(t "Indexer"): $(t "no dedicated systemd unit")."
 
-    ss -lnt 2>/dev/null | grep -q ':61613' \
-        && v_ok "Broker: RabbitMQ/STOMP (61613) OK." \
+    local stomp; stomp=$(koha_stomp_port)
+    ss -lnt 2>/dev/null | grep -q ":${stomp} " \
+        && v_ok "Broker: RabbitMQ/STOMP (${stomp}) OK." \
         || v_warn "Broker: $(t "no RabbitMQ; Koha will read the queue straight from the database")."
 
     pend=$(get_pending_es_jobs)
@@ -2532,6 +3301,7 @@ EOF
 }
 
 configure_firewall() {
+    host_can firewall || { log "UFW skipped: the firewall is managed by Windows (WSL)"; return 0; }
     command -v ufw >/dev/null 2>&1 || return 0
     local p
     for p in $(get_ssh_ports); do ufw allow "${p}/tcp" >/dev/null 2>&1; done
@@ -2550,10 +3320,9 @@ write_banner() {
     
     # Detecta URLs do Cloudflare Tunnel se configurado
     local cf_opac="" cf_staff=""
-    if [ -f /etc/cloudflared/config.yml ]; then
-        cf_opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        cf_staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-    fi
+    read -r cf_opac cf_staff < <(tunnel_public_hosts)
+    [ "$cf_opac" = "-" ] && cf_opac=""
+    [ "$cf_staff" = "-" ] && cf_staff=""
 
     local staff_cf_text opac_cf_text
     staff_cf_text="$(t "(Configure in panel)")"
@@ -2674,6 +3443,10 @@ EOF
     fi
     grep -q '^USE_MEMCACHED=' "$conf" || echo 'USE_MEMCACHED="yes"' >> "$conf"
     grep -q '^MEMCACHED_SERVERS=' "$conf" || echo 'MEMCACHED_SERVERS="127.0.0.1:11211"' >> "$conf"
+    if is_wsl; then     # the STOMP address prepare_wsl_broker gave RabbitMQ
+        sed -i -E '/^[[:space:]]*MESSAGE_BROKER_(HOST|PORT)=/d' "$conf"
+        printf 'MESSAGE_BROKER_HOST="127.0.0.1"\nMESSAGE_BROKER_PORT="%s"\n' "$(koha_stomp_port)" >> "$conf"
+    fi
 }
 
 # Shows why the installation stopped, with the end of the APT log, instead of
@@ -2710,6 +3483,7 @@ ensure_elastic_repo() {
 # On Debian 12+ there is no /var/log/auth.log (logs live in journald) and the
 # default fail2ban sshd jail refuses to start. Use the systemd backend there.
 configure_fail2ban() {
+    host_can fail2ban || { log "Fail2ban skipped: not used on Windows (WSL)"; return 0; }
     command -v fail2ban-client >/dev/null 2>&1 || return 0
     if [ ! -f /var/log/auth.log ] && [ -d /etc/fail2ban/jail.d ]; then
         apt_install python3-systemd >/dev/null 2>&1 || true
@@ -2758,9 +3532,88 @@ install_panel_copy() {
     fi
 }
 
+# Packages of the "essential dependencies" step, one per line. Under WSL
+# the host tools are left out: UFW and Fail2ban (Windows Defender Firewall
+# filters the network) and avahi-daemon (mDNS belongs to Windows).
+essential_packages() {
+    printf '%s\n' nano curl wget gpg ca-certificates apt-transport-https \
+        libsasl2-modules rclone memcached libcache-memcached-fast-perl \
+        libxml2-utils unzip pv psmisc
+    host_can firewall && printf '%s\n' ufw
+    host_can fail2ban && printf '%s\n' fail2ban
+    host_can mdns && printf '%s\n' avahi-daemon
+    return 0
+}
+
+# Install step: NTP. Under WSL the clock belongs to Windows (timesyncd would
+# fight with the time WSL takes from the host).
+install_clock_sync() {
+    if ! host_can ntp; then
+        echo "$(t "[INFO] Clock kept by Windows (WSL): NTP skipped.")"
+        log "install: NTP skipped (clock kept by Windows)"
+        return 0
+    fi
+    display_explanation "Synchronizing the clock (NTP)..."
+    apt_install systemd-timesyncd >/dev/null 2>&1
+    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
+    timeout 15 bash -c 'until timedatectl show -p NTPSynchronized --value | grep -q yes; do sleep 1; done' >/dev/null 2>&1
+    return 0
+}
+
+# Install step: 4 GB swapfile. Under WSL swap is set by Windows (.wslconfig)
+# and a swapfile in /etc/fstab would only waste the virtual disk.
+install_swap() {
+    if ! host_can swap; then
+        echo "$(t "[INFO] SWAP managed by Windows (WSL, .wslconfig): swapfile skipped.")"
+        log "install: swapfile skipped (swap managed by Windows)"
+        return 0
+    fi
+    display_explanation "Creating virtual memory (4 GB SWAP)..."
+    if [ -z "$(swapon --noheadings --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+        if [ "$(get_free_space_mb /)" -ge 8192 ] 2>/dev/null; then
+            fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null 2>&1
+            if swapon /swapfile 2>/dev/null; then
+                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            else
+                rm -f /swapfile
+                echo "$(t "[WARN] SWAP could not be enabled (normal on WSL/containers).")"
+            fi
+        else
+            echo "$(t "[WARN] Not enough space for a 4 GB SWAP. Skipping.")"
+        fi
+    fi
+    return 0
+}
+
+# Apache answers on every address of the machine (0.0.0.0 and ::), on 80
+# (public catalog) and 8080 (staff interface): the other PCs of the library,
+# and Windows' port forwarding under WSL, reach Koha by the machine's own
+# address. A Listen bound to one address on those ports (127.0.0.1,
+# localhost, [::1], a LAN address) is widened to all of them, and the
+# duplicates this can leave are dropped (Apache refuses to start on two
+# Listen lines for the same port).
+apache_listen_all() {
+    local conf="${KEI_APACHE_PORTS:-/etc/apache2/ports.conf}" tmp
+    [ -f "$conf" ] || return 1
+    sed -i -E 's/^([[:space:]]*Listen[[:space:]]+)([0-9.]+|localhost|\[[0-9a-fA-F:]+\]):(80|8080)([[:space:]]*)$/\1\3\4/' "$conf"
+    tmp=$(mktemp "${conf}.XXXXXX") || return 1
+    awk '/^[[:space:]]*Listen[[:space:]]+(80|8080)[[:space:]]*$/ { if (seen[$2]++) next } { print }' "$conf" > "$tmp" \
+        && chmod 644 "$tmp" && mv -f "$tmp" "$conf" || rm -f "$tmp"
+    grep -qE '^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$' "$conf" \
+        || sed -i '1i Listen 80' "$conf"
+    grep -qE '^[[:space:]]*Listen[[:space:]]+8080[[:space:]]*$' "$conf" \
+        || sed -i -E '0,/^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$/s//&\nListen 8080/' "$conf"
+    awk '/^[[:space:]]*Listen[[:space:]]/ { l = l " " $2 } END { print "apache: listening on" l }' "$conf" | while IFS= read -r m; do log "$m"; done
+    return 0
+}
+
 function_install_koha() {
     validate_pre_installation || return 1
 
+    # Asked on Windows (WSL) too: the zone WSL copied from Windows is offered
+    # first, so due dates and circulation logs follow the library's clock.
     local tz
     if tz=$(choose_timezone) && [ -n "$tz" ]; then
         apply_timezone "$tz" || echo "$(t '[WARN] Could not apply the timezone ${tz}.')"
@@ -2786,27 +3639,8 @@ function_install_koha() {
     locale-gen "$sys_locale" en_US.UTF-8 >/dev/null 2>&1 || locale-gen >/dev/null 2>&1
     update-locale LANG="$sys_locale" >/dev/null 2>&1 || true
 
-    display_explanation "Synchronizing the clock (NTP)..."
-    apt_install systemd-timesyncd >/dev/null 2>&1
-    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
-    timeout 15 bash -c 'until timedatectl show -p NTPSynchronized --value | grep -q yes; do sleep 1; done' >/dev/null 2>&1
-
-    display_explanation "Creating virtual memory (4 GB SWAP)..."
-    if [ -z "$(swapon --noheadings --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
-        if [ "$(get_free_space_mb /)" -ge 8192 ] 2>/dev/null; then
-            fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-            chmod 600 /swapfile
-            mkswap /swapfile >/dev/null 2>&1
-            if swapon /swapfile 2>/dev/null; then
-                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-            else
-                rm -f /swapfile
-                echo "$(t "[WARN] SWAP could not be enabled (normal on WSL/containers).")"
-            fi
-        else
-            echo "$(t "[WARN] Not enough space for a 4 GB SWAP. Skipping.")"
-        fi
-    fi
+    install_clock_sync
+    install_swap
 
     wait_for_apt_locks || { install_step_failed "dpkg --configure -a"; return 1; }
     display_explanation "Upgrading the system..."
@@ -2818,14 +3652,15 @@ function_install_koha() {
     fi
 
     display_explanation "Installing essential dependencies..."
-    apt_install nano curl wget gpg ca-certificates ufw apt-transport-https \
-                fail2ban libsasl2-modules rclone avahi-daemon memcached libcache-memcached-fast-perl \
-                libxml2-utils unzip pv psmisc || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
+    local essentials=()
+    mapfile -t essentials < <(essential_packages)
+    apt_install "${essentials[@]}" || { install_step_failed "$(t "Installing essential dependencies...")"; return 1; }
 
     # Labels utility installed separately to prevent batch failure if missing from repository
     apt_install glabels >/dev/null 2>&1 || true
 
-    systemctl enable --now avahi-daemon memcached >/dev/null 2>&1
+    systemctl enable --now memcached >/dev/null 2>&1
+    host_can mdns && systemctl enable --now avahi-daemon >/dev/null 2>&1
     configure_fail2ban
 
     display_explanation "Adding Koha and Elasticsearch repositories..."
@@ -2844,6 +3679,7 @@ function_install_koha() {
 
     apt_update_indices || { install_step_failed "apt-get update (Koha)"; return 1; }
     display_explanation "Installing MariaDB and Koha (longest step)..."
+    prepare_wsl_broker || echo "[WARN] RabbitMQ could not be prepared for WSL." >>"$APT_LOG"
     apt_install mariadb-server koha-common || { install_step_failed "mariadb-server koha-common"; return 1; }
     ensure_koha_conffiles || { install_step_failed "$(t "Restoring missing Koha configuration files...")"; return 1; }
     systemctl enable --now mariadb >/dev/null 2>&1
@@ -2860,10 +3696,7 @@ function_install_koha() {
     display_explanation "Configuring Apache and Koha defaults..."
     define_koha_sites_conf
     a2enmod rewrite cgi deflate headers proxy proxy_http >/dev/null 2>&1
-    grep -qE '^[[:space:]]*Listen[[:space:]]+8080' /etc/apache2/ports.conf 2>/dev/null \
-        || sed -i '/^[[:space:]]*Listen[[:space:]]\+80$/a Listen 8080' /etc/apache2/ports.conf
-    grep -qE '^[[:space:]]*Listen[[:space:]]+8080' /etc/apache2/ports.conf 2>/dev/null \
-        || echo 'Listen 8080' >> /etc/apache2/ports.conf
+    apache_listen_all
     systemctl restart apache2 memcached >/dev/null 2>&1
 
     local exists="no"
@@ -2946,8 +3779,10 @@ function_install_koha() {
 
     a2enmod headers proxy proxy_http >/dev/null 2>&1
     a2ensite "$INSTANCE" >/dev/null 2>&1
-    systemctl enable --now memcached >/dev/null 2>&1
-    systemctl restart apache2 memcached koha-common >/dev/null 2>&1
+    # Memcached first: a Plack started before it runs without cache.
+    systemctl enable memcached >/dev/null 2>&1
+    systemctl restart memcached >/dev/null 2>&1
+    systemctl restart apache2 koha-common >/dev/null 2>&1
 
     # Automatic detection and installation of system language package in Koha
     local auto_lang
@@ -3051,6 +3886,13 @@ EOF
         fi
     fi
 
+    if ! host_can reboot; then
+        display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
+        restart_koha_stack || true
+        msg_info "$(t "Koha is ready")" "$(t "All set! Koha services were restarted.\n\nCredentials have been saved to /root/koha_credentials.txt.")" 11 74
+        return 0
+    fi
+
     if prompt_yes_no "$(t "Reboot Server (Recommended)")" \
 "$(t "To enable full Plack speed, initialize SWAP, and ensure peak catalog performance, rebooting the system now is strongly recommended.\n\nCredentials have been saved to /root/koha_credentials.txt.\n\nDo you want to reboot the server immediately?")" 15 76; then
         clear
@@ -3085,14 +3927,13 @@ function_view_credentials() {
     ip=$(get_server_ip)
     ssh_login=$(get_ssh_login "$ip")
 
-    if [ -f /etc/cloudflared/config.yml ]; then
-        cf_opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        cf_staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-        if [ -n "$cf_opac" ] || [ -n "$cf_staff" ]; then
-            cf_section="$(t "\n[ INTERNET / CLOUDFLARE TUNNEL ]\n")"
-            [ -n "$cf_opac" ] && cf_section+="  $(t "OPAC  (catalog)       :") https://${cf_opac}\n"
-            [ -n "$cf_staff" ] && cf_section+="  $(t "Staff (administration):") https://${cf_staff}\n"
-        fi
+    read -r cf_opac cf_staff < <(tunnel_public_hosts)
+    [ "$cf_opac" = "-" ] && cf_opac=""
+    [ "$cf_staff" = "-" ] && cf_staff=""
+    if [ -n "$cf_opac" ] || [ -n "$cf_staff" ]; then
+        cf_section="$(t "\n[ INTERNET / CLOUDFLARE TUNNEL ]\n")"
+        [ -n "$cf_opac" ] && cf_section+="  $(t "OPAC  (catalog)       :") https://${cf_opac}\n"
+        [ -n "$cf_staff" ] && cf_section+="  $(t "Staff (administration):") https://${cf_staff}\n"
     fi
 
     local body
@@ -3994,6 +4835,54 @@ require_koha_tables() {
     return 0
 }
 
+# Unlocks Zebra and rebuilds both of its indices from scratch: the core of
+# "Repair / rebuild indexing", also run by the Koha window on Windows
+# (--rebuild-search-index). The rebuild's output goes to zebra-rebuild.log,
+# and to the screen too with "show". Returns 1 if anything failed.
+zebra_full_rebuild() {
+    local show="${1:-}" ok=0
+    maintenance_begin
+    repair_koha_conf_xml
+    [ -n "$show" ] && display_explanation "Unlocking Zebra..."
+    zebra_stop
+    force_stop_koha_zebra
+    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
+    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
+    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
+        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
+        "/var/lock/koha/${INSTANCE}" 2>/dev/null
+    zebra_start >/dev/null 2>&1
+    write_cron_zebra
+    if [ -n "$show" ]; then
+        display_explanation "Rebuilding the indices..."
+        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || ok=1
+    else
+        koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" > "${LOG_DIR}/zebra-rebuild.log" 2>&1 || ok=1
+    fi
+    zebra_stop
+    zebra_start >/dev/null 2>&1 || ok=1
+    maintenance_end
+    ensure_search_indexing >/dev/null 2>&1 || ok=1
+    return "$ok"
+}
+
+# config.sh --rebuild-search-index: the search index of the active engine
+# rebuilt from scratch, without questions (the Koha window's "Rebuild search
+# index"). Exit 0 when it worked, 2 when Koha is not installed.
+kei_rebuild_search_index() {
+    local rc=0
+    is_koha_installed || return 2
+    if [ "$(get_search_engine)" = "Elasticsearch" ]; then
+        # No screen to show "already running" on: it goes to the log.
+        msg_info() { log "$1: $2"; }
+        rebuild_koha_elasticsearch || rc=1
+    else
+        zebra_full_rebuild || rc=1
+    fi
+    log "search index rebuilt from the Windows tools (exit $rc)"
+    return "$rc"
+}
+
 function_repair_indexing() {
     require_koha_tables || return 0
     local engine; engine=$(get_search_engine)
@@ -4001,7 +4890,7 @@ function_repair_indexing() {
         local es_up idx broker pend bibs docs
         es_up=$(curl -s --max-time 5 http://127.0.0.1:9200 >/dev/null 2>&1 && echo "OK" || echo "$(t "DOWN")")
         is_koha_indexer_running && idx="$(t "running")" || idx="$(t "STOPPED")"
-        ss -lnt 2>/dev/null | grep -q ':61613' && broker="OK" || broker="$(t "absent")"
+        ss -lnt 2>/dev/null | grep -q ":$(koha_stomp_port) " && broker="OK" || broker="$(t "absent")"
         pend=$(get_pending_es_jobs); bibs=$(get_total_biblios); docs=$(get_total_es_documents)
         msg_info "$(t "Diagnostics")" \
 "Elasticsearch (9200) : ${es_up}
@@ -4048,25 +4937,8 @@ $(t "Growing queue + smaller index = indexer is down.")" 18 76
 
     prompt_yes_no "$(t "Repair Zebra")" "$(t "Unlock Zebra and rebuild the indices from scratch?")" 10 70 || return 0
     clear
-    maintenance_begin
-    repair_koha_conf_xml
-    display_explanation "Unlocking Zebra..."
-    zebra_stop
-    force_stop_koha_zebra
-    rm -f /var/lock/koha/${INSTANCE}/rebuild/*.LCK 2>/dev/null
-    rm -f /var/run/koha/${INSTANCE}/zebrasrv.pid 2>/dev/null
-    chown -R "${INSTANCE}-koha:${INSTANCE}-koha" \
-        "/var/lib/koha/${INSTANCE}/biblios" "/var/lib/koha/${INSTANCE}/authorities" \
-        "/var/lock/koha/${INSTANCE}" 2>/dev/null
-    zebra_start >/dev/null 2>&1
-    write_cron_zebra
-    display_explanation "Rebuilding the indices..."
     local zebra_ok="yes"
-    koha_ctl /usr/sbin/koha-rebuild-zebra -f -v -b -a "$INSTANCE" 2>&1 | tee "${LOG_DIR}/zebra-rebuild.log" || zebra_ok="no"
-    zebra_stop
-    zebra_start >/dev/null 2>&1 || zebra_ok="no"
-    maintenance_end
-    ensure_search_indexing >/dev/null 2>&1 || zebra_ok="no"
+    zebra_full_rebuild show || zebra_ok="no"
     display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
     ensure_koha_services >/dev/null 2>&1
 
@@ -4206,6 +5078,231 @@ validate_and_register_rclone() {
     return 0
 }
 
+# ======================================================================
+# AUTHORIZATION LINKS: QR CODE, BROWSER OR COPY
+# ----------------------------------------------------------------------
+# rclone and cloudflared print a link and wait until someone authorizes it
+# in a browser. The panel runs them in the background, catches the link and
+# lets the person choose how to open it: a QR code for a phone, the browser
+# of this computer (Windows under WSL, or the desktop session on Linux) or
+# the plain link to copy. Every method stays available while the tool waits.
+# ======================================================================
+KEI_WIN_OPENER="${KEI_WIN_OPENER:-/mnt/c/Windows/System32/rundll32.exe}"
+AUTH_CANCELLED=0 AUTH_PID="" AUTH_URL="" RCLONE_TOKEN=""
+
+# Only plain http(s) links are ever shown, encoded or opened.
+is_auth_url() {
+    case "$1" in http://?*|https://?*) ;; *) return 1 ;; esac
+    case "$1" in *[[:space:]\"\'\`\<\>\\]*) return 1 ;; esac
+    [ "${#1}" -le 2048 ]
+}
+
+# First link matching the extended regex $2 in file $1 (tool output).
+extract_auth_url() {
+    local url
+    url=$(grep -oE "$2" "$1" 2>/dev/null | head -n1)
+    is_auth_url "$url" || return 1
+    printf '%s' "$url"
+}
+
+# How a link can be opened on this computer: "windows" (WSL: the Windows
+# default browser), "desktop" (xdg-open in the Linux graphical session) or
+# nothing (a server reached over SSH).
+browser_opener() {
+    if is_wsl && [ -x "$KEI_WIN_OPENER" ]; then printf 'windows'; return 0; fi
+    if { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && command -v xdg-open >/dev/null 2>&1; then
+        printf 'desktop'; return 0
+    fi
+    return 1
+}
+
+open_in_browser() {
+    local url="$1" how
+    is_auth_url "$url" || return 1
+    how=$(browser_opener) || return 1
+    log "authorization link opened in the browser ($how)"
+    if [ "$how" = "windows" ]; then
+        # rundll32 takes the link as one argument: no cmd.exe parsing of "&".
+        ( cd /mnt/c 2>/dev/null || cd /; "$KEI_WIN_OPENER" url.dll,FileProtocolHandler "$url" ) >/dev/null 2>&1 &
+    elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && command -v sudo >/dev/null 2>&1; then
+        # The browser belongs to the person logged in, not to root.
+        sudo -u "$SUDO_USER" env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+            XAUTHORITY="${XAUTHORITY:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+            xdg-open "$url" >/dev/null 2>&1 &
+    else
+        xdg-open "$url" >/dev/null 2>&1 &
+    fi
+    return 0
+}
+
+# Prints the link as a QR code (qrencode, installed on first use). Low error
+# correction keeps long OAuth links small enough for an 80x24 terminal.
+show_auth_qr() {
+    local url="$1" rows
+    is_auth_url "$url" || return 1
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echo "$(t "Installing the QR code generator (qrencode)...")"
+        apt_install qrencode >/dev/null 2>&1
+        command -v qrencode >/dev/null 2>&1 || {
+            echo "$(t "[WARN] The QR code generator could not be installed: use the link or the browser.")"
+            return 1
+        }
+    fi
+    qrencode -t ANSIUTF8 -l L -m 2 "$url" || return 1
+    rows=$(qrencode -t ANSIUTF8 -l L -m 2 "$url" 2>/dev/null | wc -l)
+    if [ -t 1 ] && [ "${rows:-0}" -gt "$(tput lines 2>/dev/null || echo 24)" ]; then
+        echo "$(t "[WARN] The QR code is taller than this window: enlarge it or use the link.")"
+    fi
+    echo "$(t "Scan it with the phone camera and authorize in the page that opens.")"
+    return 0
+}
+
+# Methods offered for a link, one tag per line: qr (only when $2 = yes, as
+# some flows must return to this very computer), browser (only when one can
+# be opened here) and link (always).
+auth_methods() {
+    [ "${2:-yes}" = "yes" ] && echo qr
+    browser_opener >/dev/null && echo browser
+    echo link
+    return 0
+}
+
+# Runs one method: qr | browser | link.
+auth_link_render() {
+    local method="$1" url="$2"
+    case "$method" in
+        qr)      show_auth_qr "$url" ;;
+        browser) open_in_browser "$url" && echo "$(t "The link was opened in the browser. Authorize there, then come back here.")" ;;
+        link)
+            echo "$(t "Open this link in a browser:")"
+            echo ""
+            printf '%s\n' "$url"
+            echo ""
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# auth_link_session PID URL QR_OK [HINT]: lets the person pick a method, then
+# waits for the tool (PID, a child of this shell) to finish, with keys to
+# switch method or cancel. Returns the tool's exit status, or 130 when
+# cancelled (the tool is stopped).
+auth_link_session() {
+    local pid="$1" url="$2" qr_ok="$3" hint="${4:-}" methods=() items=() m choice key keys rc
+    mapfile -t methods < <(auth_methods "$url" "$qr_ok")
+    for m in "${methods[@]}"; do
+        case "$m" in
+            qr)      items+=("qr"      "$(t "QR code: scan it with a phone")") ;;
+            browser) items+=("browser" "$(t "Open the browser of this computer")") ;;
+            link)    items+=("link"    "$(t "Show the link to copy")") ;;
+        esac
+    done
+    choice=$(ui_menu "$(t "Authorization")" "$(t "How do you want to open the authorization page?")" "${items[@]}") \
+        || choice="${methods[0]}"
+    [ -n "$choice" ] || choice="${methods[0]}"
+
+    AUTH_CANCELLED=0
+    trap 'AUTH_CANCELLED=1' INT
+    clear
+    auth_link_render "$choice" "$url"
+    [ -n "$hint" ] && printf '%b\n\n' "$hint"
+    keys="[L] $(t "link")"
+    [[ " ${methods[*]} " == *" browser "* ]] && keys="[B] $(t "browser")  $keys"
+    [[ " ${methods[*]} " == *" qr "* ]] && keys="[Q] $(t "QR code")  $keys"
+    echo -e "\e[1;33m$(t "Waiting for the authorization...")\e[0m  $keys  [C] $(t "cancel")"
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$AUTH_CANCELLED" = "1" ] && break
+        key=""
+        read -r -s -n1 -t 2 key </dev/tty 2>/dev/null
+        rc=$?
+        [ "$rc" -ne 0 ] && [ "$rc" -le 128 ] && sleep 1    # no terminal: just wait
+        case "$key" in
+            q|Q) [[ " ${methods[*]} " == *" qr "* ]] && { echo ""; auth_link_render qr "$url"; } ;;
+            b|B) [[ " ${methods[*]} " == *" browser "* ]] && auth_link_render browser "$url" ;;
+            l|L) echo ""; auth_link_render link "$url" ;;
+            c|C) AUTH_CANCELLED=1 ;;
+        esac
+    done
+    unshield_signals
+    if [ "$AUTH_CANCELLED" = "1" ]; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        log "authorization cancelled"
+        return 130
+    fi
+    wait "$pid" 2>/dev/null
+}
+
+# Starts COMMAND... in the background with its output in FILE ($1, created
+# 0600: rclone prints the OAuth token there) and waits up to 30 s for a link
+# matching the regex $2. Sets AUTH_PID and AUTH_URL (no command substitution:
+# the tool must stay a child of this shell); returns 1, with the tool
+# stopped, when no link appears.
+auth_tool_start() {
+    local out="$1" pattern="$2" i
+    shift 2
+    AUTH_PID="" AUTH_URL=""
+    ( umask 077; : > "$out" )
+    # Without the panel's lock descriptors (see koha_ctl).
+    "$@" > "$out" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+    AUTH_PID=$!
+    for i in $(seq 1 60); do
+        AUTH_URL=$(extract_auth_url "$out" "$pattern") && return 0
+        kill -0 "$AUTH_PID" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill "$AUTH_PID" 2>/dev/null
+    wait "$AUTH_PID" 2>/dev/null
+    AUTH_URL=""
+    return 1
+}
+
+RCLONE_AUTH_URL_RE='http://127\.0\.0\.1:53682/auth\?state=[A-Za-z0-9_-]+'
+CLOUDFLARE_AUTH_URL_RE='https://dash\.cloudflare\.com/argotunnel\?[^[:space:]]+'
+
+# Google Drive authorization on this computer. Google only sends the answer
+# back to 127.0.0.1:53682 of the machine running rclone, so a phone cannot
+# finish it: no QR code here. On a server reached over SSH the link works
+# through a tunnel (ssh -L), which the hint explains. The token is left in
+# RCLONE_TOKEN and never printed.
+rclone_authorize_here() {
+    local out hint="" token rc
+    RCLONE_TOKEN=""
+    out=$(mktemp /root/.kei-rclone-auth.XXXXXX) || return 1
+    if ! auth_tool_start "$out" "$RCLONE_AUTH_URL_RE" rclone authorize "drive" --auth-no-open-browser; then
+        echo -e "\e[1;31m[ERROR] $(t "rclone did not print an authorization link (is port 53682 busy?).")\e[0m"
+        grep -v '_token' "$out" | tail -n 5
+        rm -f "$out"
+        return 1
+    fi
+    if ! browser_opener >/dev/null; then
+        hint="$(t "This server has no browser. On your PC, first open an SSH tunnel:")\n  ssh -L 53682:127.0.0.1:53682 ${REAL_USER:-root}@$(get_server_ip)\n$(t "then open the link in the browser of that PC.")\n"
+    fi
+    hint+="$(t "A QR code is not offered: Google returns only to the computer running rclone.")"
+    auth_link_session "$AUTH_PID" "$AUTH_URL" no "$hint"
+    rc=$?
+    token=$(grep -o '{.*}' "$out" 2>/dev/null | head -n1)
+    rm -f "$out"
+    [ "$rc" -eq 0 ] && is_rclone_token "$token" || return 1
+    RCLONE_TOKEN="$token"
+}
+
+# Cloudflare authorization: the page can be opened on any device (the cert
+# is fetched by cloudflared itself), so the QR code is offered.
+cloudflare_login() {
+    local out rc
+    out=$(mktemp /root/.kei-cloudflared-login.XXXXXX) || return 1
+    if ! auth_tool_start "$out" "$CLOUDFLARE_AUTH_URL_RE" cloudflared tunnel login; then
+        tail -n 5 "$out"
+        rm -f "$out"
+        return 1
+    fi
+    auth_link_session "$AUTH_PID" "$AUTH_URL" yes "$(t "Select the domain you activated in Cloudflare and click Authorize. Nothing needs to be pasted back.")"
+    rc=$?
+    rm -f "$out"
+    return "$rc"
+}
+
 # A complete rclone OAuth token as printed by "rclone authorize": one JSON
 # object with the access and refresh tokens and the expiry (a copy cut
 # short loses the end). rclone itself checks it with a real write test.
@@ -4298,38 +5395,26 @@ function_configure_rclone() {
         echo "======================================================================"
         echo ""
         echo "$(t "Rclone will start an authentication server on this machine on port 53682.")"
-        echo "$(t "An authorization link will be printed below.")"
+        echo "$(t "Log in with the library Google account and authorize: the token is captured automatically.")"
         echo ""
-        echo "$(t "1. Open the generated link in any browser with network access to this server.")"
-        echo "$(t "2. Log in with your Google account and authorize the app.")"
-        echo "$(t "3. The terminal will capture the token automatically without copy-pasting!")"
-        echo ""
-        echo "----------------------------------------------------------------------"
-        echo -e "\e[1;33m$(t "Waiting for browser authorization (Press CTRL+C to cancel)...")\e[0m"
-        echo "----------------------------------------------------------------------"
-        echo ""
-
-        local token_output
         ALLOW_CTRL_C_RETURN=1
-        token_output=$(rclone authorize "drive" --auth-no-open-browser 2>&1 | tee /dev/tty)
-        ALLOW_CTRL_C_RETURN=0
-        local extracted_token
-        extracted_token=$(echo "$token_output" | grep -o '{.*}' | head -n 1)
-
-        if [ -n "$extracted_token" ] && is_rclone_token "$extracted_token"; then
+        if rclone_authorize_here; then
+            ALLOW_CTRL_C_RETURN=0
             echo ""
             echo -e "\e[1;32m[OK] $(t "Token captured automatically!")\e[0m"
             rclone config delete gdrive >/dev/null 2>&1 || true
-            if rclone config create gdrive drive config_is_local false token "$extracted_token" --non-interactive < /dev/null >/dev/null 2>&1; then
+            if rclone config create gdrive drive config_is_local false token "$RCLONE_TOKEN" --non-interactive < /dev/null >/dev/null 2>&1; then
+                RCLONE_TOKEN=""
                 echo -e "\e[1;32m[OK] $(t "'gdrive' remote successfully created!")\e[0m"
                 validate_and_register_rclone "gdrive"
             else
+                RCLONE_TOKEN=""
                 msg_error "" "$(t "Failed to register gdrive remote in Rclone.")" 8 66
             fi
         else
+            ALLOW_CTRL_C_RETURN=0
             echo ""
             echo -e "\e[1;31m[ERROR] $(t "Could not capture token automatically. Try Option 1.")\e[0m"
-            echo "$token_output" | tail -n 10
             echo ""
             pause_terminal
         fi
@@ -4507,17 +5592,18 @@ SQLEOF
 # 14. CLOUDFLARE MANAGER
 # ======================================================================
 function_cloudflare_status() {
-    if [ ! -f /etc/cloudflared/config.yml ]; then
+    if [ ! -f /etc/cloudflared/config.yml ] && ! tunnel_mode_is broker; then
         msg_error "" "$(t "The tunnel is not configured yet.\nUse the installation option first.")" 9 70
         return
     fi
 
     local opac_host staff_host c_status
-    opac_host=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-    staff_host=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
-
-    [ -z "$opac_host" ] && opac_host="$(t "Not configured")"
-    [ -z "$staff_host" ] && staff_host="$(t "Not configured")"
+    read -r opac_host staff_host < <(tunnel_public_hosts)
+    [ "$opac_host" = "-" ] && opac_host="$(t "Not configured")"
+    if [ "$staff_host" = "-" ]; then
+        staff_host="$(t "Not configured")"
+        tunnel_mode_is broker && staff_host="$(t "local network only (remote staff access is off)")"
+    fi
 
     c_status="OFFLINE"
     systemctl is-active --quiet cloudflared && c_status="ONLINE"
@@ -4549,39 +5635,78 @@ EOF
     rm -f "$tmp_cf"
 }
 
+# set_koha_public_urls OPAC_URL [STAFF_URL]: OPACBaseURL / staffClientBaseURL
+# and the defaults for new instances. An empty STAFF_URL leaves it as is.
+set_koha_public_urls() {
+    local opac="$1" staff="${2:-}" k_sites="/etc/koha/koha-sites.conf"
+    [[ "$opac" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || return 1
+    [ -z "$staff" ] || [[ "$staff" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || return 1
+    is_database_ready || return 0
+    display_explanation "Setting Koha URL system preferences..."
+    mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('OPACBaseURL', '${opac}', 'Free') ON DUPLICATE KEY UPDATE value='${opac}';" >/dev/null 2>&1 || true
+    [ -n "$staff" ] && { mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('staffClientBaseURL', '${staff}', 'Free') ON DUPLICATE KEY UPDATE value='${staff}';" >/dev/null 2>&1 || true; }
+    if [ -f "$k_sites" ]; then
+        sed -i -E "s|^[[:space:]]*DEFAULTSOPACURL=.*|DEFAULTSOPACURL=\"${opac}\"|" "$k_sites" 2>/dev/null || true
+        [ -n "$staff" ] && { sed -i -E "s|^[[:space:]]*DEFAULTSINTRAURL=.*|DEFAULTSINTRAURL=\"${staff}\"|" "$k_sites" 2>/dev/null || true; }
+    fi
+    systemctl restart memcached >/dev/null 2>&1 || true
+    plack_restart || true
+}
+
+# cloudflare_route_dns TUNNEL HOST: points HOST at the tunnel. An existing
+# DNS record is never replaced silently: it may be another site of the same
+# domain, so the person is asked first.
+cloudflare_route_dns() {
+    local tunnel="$1" host="$2"
+    cloudflared tunnel route dns "$tunnel" "$host" && return 0
+    if prompt_yes_no "$(t "DNS record exists")" "$(t "The address \$host already exists in your Cloudflare DNS.\n\nReplace it so it points to this Koha? Answer No if it belongs to another site.")" 11 74 defaultno; then
+        cloudflared tunnel route dns -f "$tunnel" "$host" || true
+    fi
+    return 0
+}
+
+# Installs cloudflared from Cloudflare's signed APT repository (once).
+cloudflared_install() {
+    command -v cloudflared >/dev/null 2>&1 && return 0
+    display_explanation "Installing cloudflared..."
+    if ! wait_for_apt_locks; then return 1; fi
+    mkdir -p /etc/apt/keyrings && chmod 0755 /etc/apt/keyrings
+    if ! curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg; then
+        restore_apt_timers
+        msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
+        return 1
+    fi
+    apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
+    if ! apt_update_indices; then
+        rm -f /etc/apt/sources.list.d/cloudflared.list
+        restore_apt_timers
+        msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72
+        return 1
+    fi
+    if ! apt_install cloudflared; then
+        restore_apt_timers
+        return 1
+    fi
+    restore_apt_timers
+}
+
 function_cloudflare_setup() {
     msg_info "$(t "Step 1: Domain & Nameservers")" \
 "$(t "HOW TO LINK YOUR DOMAIN TO CLOUDFLARE:\n\n1. GET A FREE DOMAIN:\n    - Digital Plat (fast/automated): https://domain.digitalplat.org/\n    - nic.eu.org (manual, takes 14 to 45 days): https://nic.eu.org\n    - Or ask local IT for an official CNAME (e.g. catalog.palotina.pr.gov.br)\n\n2. ADD TO CLOUDFLARE (dash.cloudflare.com):\n    - Click 'Add a site/domain', type your domain and select Free.\n    - Cloudflare provides TWO Nameservers. Copy both.\n\n3. UPDATE AT YOUR DOMAIN REGISTRAR:\n    - Replace existing servers with the TWO from Cloudflare.\n    - In Cloudflare, click 'Check nameservers' until status is Active.\n\nThis part can't be automated, but everything from here on is fully automatic.")" 22 78
 
-    clear
-    display_explanation "Installing cloudflared..."
-    if ! command -v cloudflared >/dev/null 2>&1; then
-        if ! wait_for_apt_locks; then return 1; fi
-        mkdir -p /etc/apt/keyrings && chmod 0755 /etc/apt/keyrings
-        if ! curl -fsSL --retry 3 --max-time 60 https://pkg.cloudflare.com/cloudflare-main.gpg -o /etc/apt/keyrings/cloudflare-main.gpg; then
-            restore_apt_timers
-            msg_error "" "$(t "Failed to download the Cloudflare key.")" 8 66
-            return 1
-        fi
-        apt_source_line /etc/apt/keyrings/cloudflare-main.gpg https://pkg.cloudflare.com/cloudflared any main > /etc/apt/sources.list.d/cloudflared.list
-        if ! apt_update_indices; then
-            rm -f /etc/apt/sources.list.d/cloudflared.list
-            restore_apt_timers
-            msg_error "" "$(t "Could not update the Cloudflare repository.")" 9 72
-            return 1
-        fi
-        if ! apt_install cloudflared; then
-            restore_apt_timers
-            return 1
-        fi
-        restore_apt_timers
+    if tunnel_mode_is broker; then
+        msg_error "" "$(t "This server uses a free address. Leave it first (Free address menu), then set up your own domain.")" 10 74
+        return 0
     fi
+    clear
+    cloudflared_install || return 1
 
     if [ ! -f "$REAL_HOME/.cloudflared/cert.pem" ] && [ ! -f "/root/.cloudflared/cert.pem" ]; then
         msg_info "$(t "Cloudflare Tunnel")" \
-"$(t "AUTHORIZATION (first time only):\n\nA link will appear below. Copy it into any browser, select the\ndomain you already activated in Cloudflare, and click Authorize.\n\nNo need to paste anything back - the server detects it automatically.")" 12 76
-        clear
-        cloudflared tunnel login
+"$(t "AUTHORIZATION (first time only):\n\nNext, choose how to open the Cloudflare page: a QR code for your phone,\nthe browser of this computer, or a link to copy. Select the domain\nyou already activated in Cloudflare and click Authorize.\n\nNo need to paste anything back - the server detects it automatically.")" 14 76
+        ALLOW_CTRL_C_RETURN=1
+        cloudflare_login
+        ALLOW_CTRL_C_RETURN=0
         echo ""
     fi
 
@@ -4656,8 +5781,8 @@ ingress:
 EOF
 
     display_explanation "Registering subdomains in DNS..."
-    cloudflared tunnel route dns -f "$tunnel_name" "${opac_sub}.${dominio}" || true
-    cloudflared tunnel route dns -f "$tunnel_name" "${staff_sub}.${dominio}" || true
+    cloudflare_route_dns "$tunnel_name" "${opac_sub}.${dominio}"
+    cloudflare_route_dns "$tunnel_name" "${staff_sub}.${dominio}"
 
     display_explanation "Installing tunnel as a service..."
     cloudflared service uninstall >/dev/null 2>&1 || true
@@ -4667,28 +5792,633 @@ EOF
     sleep 3
 
     if systemctl is-active --quiet cloudflared; then
-        if is_database_ready; then
-            display_explanation "Setting Koha URL system preferences..."
-            local full_opac="https://${opac_sub}.${dominio}"
-            local full_staff="https://${staff_sub}.${dominio}"
-
-            mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('OPACBaseURL', '${full_opac}', 'Free') ON DUPLICATE KEY UPDATE value='${full_opac}';" >/dev/null 2>&1 || true
-            mysql -e "INSERT INTO ${DB_NAME}.systempreferences (variable, value, type) VALUES ('staffClientBaseURL', '${full_staff}', 'Free') ON DUPLICATE KEY UPDATE value='${full_staff}';" >/dev/null 2>&1 || true
-
-            local k_sites="/etc/koha/koha-sites.conf"
-            if [ -f "$k_sites" ]; then
-                sed -i -E "s|^[[:space:]]*DEFAULTSOPACURL=.*|DEFAULTSOPACURL=\"${full_opac}\"|" "$k_sites" 2>/dev/null || true
-                sed -i -E "s|^[[:space:]]*DEFAULTSINTRAURL=.*|DEFAULTSINTRAURL=\"${full_staff}\"|" "$k_sites" 2>/dev/null || true
-            fi
-
-            systemctl restart memcached >/dev/null 2>&1 || true
-            plack_restart || true
-        fi
+        set_koha_public_urls "https://${opac_sub}.${dominio}" "https://${staff_sub}.${dominio}"
 
         function_cloudflare_status
     else
         msg_error "" "$(t "The service is not active. Check: journalctl -u cloudflared -n 30")" 9 74
     fi
+}
+
+# ----------------------------------------------------------------------
+# 14.1 FREE ADDRESS (SUBDOMAIN BROKER)
+# ----------------------------------------------------------------------
+# A library without its own domain asks the Koha broker (broker/ in this
+# repository, a Cloudflare Worker) for an address such as
+# palotina-pr.<central domain>. The request is approved on the broker's
+# side; the panel only ever receives the token of its own tunnel, never a
+# Cloudflare API credential. Every call after the request is signed with
+# an Ed25519 key that never leaves this server (same format as
+# broker/scripts/kei-sign.sh).
+#
+#   tunnel.conf        mode, library id and public hostnames (no secrets)
+#   broker.key         Ed25519 private key (0600)
+#   broker-enroll.conf request waiting for approval (0600: holds its code)
+#   koha-broker.env    TUNNEL_TOKEN for the cloudflared service (0600)
+# ----------------------------------------------------------------------
+KEI_BROKER_URL="${KEI_BROKER_URL:-https://koha-broker.bibliotecamunicipalpalotina.org}"
+TUNNEL_CONF="${CONF_DIR}/tunnel.conf"
+BROKER_KEY="${CONF_DIR}/broker.key"
+BROKER_ENROLL="${CONF_DIR}/broker-enroll.conf"
+BROKER_ENV="${KEI_BROKER_ENV:-/etc/cloudflared/koha-broker.env}"
+CLOUDFLARED_UNIT="${KEI_CLOUDFLARED_UNIT:-/etc/systemd/system/cloudflared.service}"
+CRON_BROKER="/etc/cron.d/koha_broker"
+BROKER_STATUS="" BROKER_BODY=""
+
+# KEY=value files written by the panel. Read line by line, never sourced;
+# only known keys and plain values are accepted.
+kv_get() {    # kv_get FILE KEY -> value
+    local line
+    [ -f "$1" ] || return 1
+    line=$(grep -E "^$2=" "$1" 2>/dev/null | tail -n1) || return 1
+    line="${line#*=}"
+    [[ "$line" =~ ^[A-Za-z0-9._:/@+=?-]*$ ]] || return 1
+    printf '%s' "$line"
+}
+
+kv_write() {  # kv_write FILE MODE KEY VALUE [KEY VALUE ...]: merges into FILE
+    local file="$1" mode="$2" tmp k v
+    shift 2
+    declare -A kv=()
+    if [ -f "$file" ]; then
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ ^[A-Z_]+$ ]] && kv[$k]="$v"
+        done < "$file"
+    fi
+    while [ $# -ge 2 ]; do
+        [[ "$1" =~ ^[A-Z_]+$ && "$2" =~ ^[A-Za-z0-9._:/@+=?-]*$ ]] || return 1
+        kv[$1]="$2"
+        shift 2
+    done
+    mkdir -p "$(dirname "$file")"
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    chmod "$mode" "$tmp"
+    for k in $(printf '%s\n' "${!kv[@]}" | sort); do
+        printf '%s=%s\n' "$k" "${kv[$k]}"
+    done > "$tmp"
+    mv -f "$tmp" "$file"
+}
+
+tunnel_conf_get() { kv_get "$TUNNEL_CONF" "$1"; }
+tunnel_mode_is() { [ "$(tunnel_conf_get TUNNEL_MODE 2>/dev/null)" = "$1" ]; }
+broker_url() { tunnel_conf_get BROKER_URL 2>/dev/null || printf '%s' "$KEI_BROKER_URL"; }
+
+# Public hostnames: "OPAC STAFF" (either may be "-"). The free address
+# publishes the staff interface only while remote staff access is on.
+tunnel_public_hosts() {
+    local opac="" staff=""
+    if tunnel_mode_is broker; then
+        opac=$(tunnel_conf_get OPAC_HOST 2>/dev/null)
+        [ "$(tunnel_conf_get STAFF_REMOTE 2>/dev/null)" = "yes" ] && staff=$(tunnel_conf_get STAFF_HOST 2>/dev/null)
+    elif [ -f /etc/cloudflared/config.yml ]; then
+        opac=$(grep -B1 "localhost:80$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
+        staff=$(grep -B1 "localhost:8080$" /etc/cloudflared/config.yml | grep "hostname:" | awk '{print $NF}' 2>/dev/null)
+    fi
+    printf '%s %s\n' "${opac:--}" "${staff:--}"
+}
+
+# json_field FILE KEY [KEY ...]: string, number or boolean at that path of a
+# small JSON document (the broker's answers). Pure Bash, like the rest of
+# the panel; prints nothing and returns 1 when the path is missing.
+json_field() {
+    local _j _i=0 _k _JS=""
+    [ -r "$1" ] || return 1
+    _j=$(<"$1")
+    shift
+    for _k in "$@"; do
+        _json_ws
+        [ "${_j:_i:1}" = "{" ] || return 1
+        _i=$((_i + 1))
+        _json_find_key "$_k" || return 1
+    done
+    _json_ws
+    case "${_j:_i:1}" in
+        '"') _json_string || return 1; printf '%s' "$_JS" ;;
+        '{'|'['|'') return 1 ;;
+        *)
+            _k="${_j:_i}"
+            _k="${_k%%[,\}\] $'\t\r\n']*}"
+            [[ "$_k" =~ ^(true|false|-?[0-9][0-9.eE+-]*)$ ]] || return 1
+            printf '%s' "$_k"
+            ;;
+    esac
+}
+# Helpers of json_field: they work on its _j (text) and _i (position).
+_json_ws() {
+    while [[ "${_j:_i:1}" == [$' \t\r\n'] ]]; do _i=$((_i + 1)); done
+}
+_json_string() {    # the string at _i, decoded, into _JS
+    local rest part c
+    [ "${_j:_i:1}" = '"' ] || return 1
+    _i=$((_i + 1))
+    _JS=""
+    while true; do
+        rest="${_j:_i}"
+        part="${rest%%[\"\\]*}"
+        [ ${#part} -lt ${#rest} ] || return 1
+        _JS+="$part"
+        _i=$((_i + ${#part}))
+        c="${_j:_i:1}"
+        _i=$((_i + 1))
+        [ "$c" = '"' ] && return 0
+        c="${_j:_i:1}"
+        _i=$((_i + 1))
+        case "$c" in
+            n) _JS+=$'\n' ;;
+            t) _JS+=$'\t' ;;
+            r) _JS+=$'\r' ;;
+            b|f) ;;
+            u) [[ "${_j:_i:4}" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+               printf -v c "\\u${_j:_i:4}"; _JS+="$c"; _i=$((_i + 4)) ;;
+            *) _JS+="$c" ;;
+        esac
+    done
+}
+_json_skip() {      # any value at _i
+    local depth=0 c
+    while true; do
+        _json_ws
+        c="${_j:_i:1}"
+        case "$c" in
+            '') return 1 ;;
+            '"') _json_string || return 1; [ "$depth" -eq 0 ] && return 0 ;;
+            '{'|'[') depth=$((depth + 1)); _i=$((_i + 1)) ;;
+            '}'|']')
+                [ "$depth" -eq 0 ] && return 0
+                depth=$((depth - 1)); _i=$((_i + 1))
+                [ "$depth" -eq 0 ] && return 0
+                ;;
+            ',') [ "$depth" -eq 0 ] && return 0; _i=$((_i + 1)) ;;
+            *) _i=$((_i + 1)) ;;
+        esac
+    done
+}
+_json_find_key() {  # inside an object: moves _i to the value of key $1
+    local key
+    while true; do
+        _json_ws
+        _json_string || return 1
+        key="$_JS"
+        _json_ws
+        [ "${_j:_i:1}" = ":" ] || return 1
+        _i=$((_i + 1))
+        _json_ws
+        [ "$key" = "$1" ] && return 0
+        _json_skip || return 1
+        _json_ws
+        [ "${_j:_i:1}" = "," ] || return 1
+        _i=$((_i + 1))
+    done
+}
+
+broker_ensure_key() {
+    [ -s "$BROKER_KEY" ] && return 0
+    mkdir -p "$CONF_DIR"
+    ( umask 077 && openssl genpkey -algorithm ed25519 -out "$BROKER_KEY" ) >/dev/null 2>&1 || return 1
+    chmod 600 "$BROKER_KEY"
+}
+
+broker_public_key() {
+    openssl pkey -in "$BROKER_KEY" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n'
+}
+
+# broker_sign_headers METHOD PATH BODYFILE: the four X-KEI-* headers.
+broker_sign_headers() {
+    local method="$1" path="$2" body="$3" lib ts nonce hash msg sig
+    lib=$(tunnel_conf_get LIBRARY_ID) || return 1
+    ts=$(date +%s)
+    nonce=$(openssl rand -hex 16)
+    hash=$(sha256sum < "$body" | cut -d' ' -f1)
+    msg=$(mktemp) || return 1
+    printf 'KEI-SIG-v1\n%s\n%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$nonce" "$hash" > "$msg"
+    sig=$(openssl pkeyutl -sign -inkey "$BROKER_KEY" -rawin -in "$msg" 2>/dev/null | base64 | tr -d '\n')
+    rm -f "$msg"
+    [ -n "$sig" ] || return 1
+    printf 'X-KEI-Library: %s\nX-KEI-Timestamp: %s\nX-KEI-Nonce: %s\nX-KEI-Signature: %s\n' "$lib" "$ts" "$nonce" "$sig"
+}
+
+# broker_request METHOD PATH yes|no [JSON]: calls the broker (signed or
+# not). The answer goes to BROKER_BODY, a 0600 file (it may hold the tunnel
+# token), and the HTTP code to BROKER_STATUS. Returns 0 on 2xx.
+broker_request() {
+    local method="$1" path="$2" signed="$3" json="${4:-}" req h args=()
+    broker_cleanup
+    req=$(umask 077; mktemp /root/.kei-broker-req.XXXXXX) || return 1
+    BROKER_BODY=$(umask 077; mktemp /root/.kei-broker-res.XXXXXX) || { rm -f "$req"; return 1; }
+    printf '%s' "$json" > "$req"
+    if [ "$signed" = "yes" ]; then
+        while IFS= read -r h; do args+=(-H "$h"); done < <(broker_sign_headers "$method" "$path" "$req")
+        [ ${#args[@]} -eq 8 ] || { rm -f "$req"; BROKER_STATUS=000; return 1; }
+    fi
+    [ -n "$json" ] && args+=(-H "Content-Type: application/json" --data-binary "@$req")
+    BROKER_STATUS=$(curl -sS --max-time 30 -X "$method" "${args[@]}" -o "$BROKER_BODY" -w '%{http_code}' \
+        "$(broker_url)$path" 2>/dev/null) || BROKER_STATUS=000
+    rm -f "$req"
+    [[ "$BROKER_STATUS" == 2[0-9][0-9] ]]
+}
+
+broker_cleanup() {
+    [ -n "$BROKER_BODY" ] && rm -f "$BROKER_BODY"
+    BROKER_BODY=""
+}
+
+# Error text of the last answer, for the dialogs.
+broker_error() {
+    local e=""
+    [ -n "$BROKER_BODY" ] && e=$(json_field "$BROKER_BODY" error)
+    [ "$BROKER_STATUS" = "000" ] && e="$(t "The address service could not be reached. Check the internet connection.")"
+    printf '%s' "${e:-HTTP $BROKER_STATUS}"
+}
+
+# Runs in the background while the request link is on screen: ends with 0
+# once the request is approved, 1 when it is denied or expired.
+broker_wait_approval() {
+    local code="$1" st
+    while true; do
+        if broker_request POST /v1/device/poll no "{\"device_code\":$(json_str "$code")}"; then
+            st=$(json_field "$BROKER_BODY" status)
+            case "$st" in
+                approved) broker_cleanup; exit 0 ;;
+                denied|expired|consumed) broker_cleanup; exit 1 ;;
+            esac
+        elif [ "$BROKER_STATUS" = "404" ]; then
+            broker_cleanup; exit 1
+        fi
+        broker_cleanup
+        sleep "${KEI_BROKER_POLL:-10}"
+    done
+}
+
+# Asks for a new address. Leaves the request in BROKER_ENROLL.
+broker_new_request() {
+    local inst email name body
+    inst=$(ui_input "$(t "Free address")" "$(t "Name of the library or institution:")") || return 1
+    inst=$(printf '%s' "$inst" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ ${#inst} -ge 3 ] || { msg_error "" "$(t "Type the name of the library (at least 3 characters).")" 8 66; return 1; }
+    email=$(ui_input "$(t "Free address")" "$(t "Contact e-mail of the library (preferably the institutional one):")") || return 1
+    email=$(printf '%s' "$email" | tr -d '[:space:]')
+    [[ "$email" =~ ^[^@]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { msg_error "" "$(t "Invalid e-mail address.")" 8 60; return 1; }
+    name=$(ui_input "$(t "Free address")" "$(t "Name wanted for the address (letters, numbers and hyphens, e.g. palotina-pr). Leave blank to use the library name:")") || return 1
+    name=$(printf '%s' "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    clear
+    display_explanation "Sending the request..."
+    body="{\"institution_name\":$(json_str "$inst"),\"contact_email\":$(json_str "$email"),\"requested_name\":$(json_str "$name")}"
+    if ! broker_request POST /v1/device/start no "$body"; then
+        msg_error "" "$(t "The request was not accepted:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    local device user url slug
+    device=$(json_field "$BROKER_BODY" device_code)
+    user=$(json_field "$BROKER_BODY" user_code)
+    url=$(json_field "$BROKER_BODY" verification_uri)
+    slug=$(json_field "$BROKER_BODY" suggested_slug)
+    broker_cleanup
+    if [ -z "$device" ] || ! is_auth_url "$url"; then
+        msg_error "" "$(t "The address service gave an unexpected answer. Try again later.")" 8 70
+        return 1
+    fi
+    kv_write "$BROKER_ENROLL" 600 DEVICE_CODE "$device" USER_CODE "$user" VERIFY_URL "$url" SLUG "$slug" \
+        BROKER_URL "$(broker_url)" CREATED "$(date +%s)" || return 1
+    log "broker: request $user sent for '$slug'"
+}
+
+# Shows the request link (QR code, browser or link) and waits for the
+# approval. The request stays saved when the person leaves: approval may
+# take a while, and this menu picks it up again.
+broker_wait_request() {
+    local user url pid rc
+    user=$(kv_get "$BROKER_ENROLL" USER_CODE)
+    url=$(kv_get "$BROKER_ENROLL" VERIFY_URL)
+    ( KEI_BROKER_URL="$(kv_get "$BROKER_ENROLL" BROKER_URL)" broker_wait_approval "$(kv_get "$BROKER_ENROLL" DEVICE_CODE)" ) \
+        >/dev/null 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+    pid=$!
+    ALLOW_CTRL_C_RETURN=1
+    auth_link_session "$pid" "$url" yes "$(t "Request code: \$user\nThe page shows the status of the request. It is reviewed by the address service; this screen continues on its own once it is approved.\nYou can leave with [C] and come back to this menu later: the request stays saved.")"
+    rc=$?
+    ALLOW_CTRL_C_RETURN=0
+    return "$rc"
+}
+
+# After approval: registers this server's key, waits for the tunnel and
+# installs it.
+broker_complete_request() {
+    local device pub lib job opac staff st i
+    broker_ensure_key || { msg_error "" "$(t "Could not create the key of this server (openssl).")" 8 66; return 1; }
+    pub=$(broker_public_key)
+    device=$(kv_get "$BROKER_ENROLL" DEVICE_CODE)
+    KEI_BROKER_URL="$(kv_get "$BROKER_ENROLL" BROKER_URL)"
+    clear
+    display_explanation "Registering this server..."
+    if ! broker_request POST /v1/enroll no "{\"device_code\":$(json_str "$device"),\"public_key\":$(json_str "$pub")}"; then
+        msg_error "" "$(t "The registration was not accepted:")\n\n$(broker_error)" 10 74
+        [ "$BROKER_STATUS" = "409" ] && rm -f "$BROKER_ENROLL"
+        broker_cleanup
+        return 1
+    fi
+    lib=$(json_field "$BROKER_BODY" library_id)
+    job=$(json_field "$BROKER_BODY" job_id)
+    opac=$(json_field "$BROKER_BODY" hostnames opac)
+    staff=$(json_field "$BROKER_BODY" hostnames staff)
+    broker_cleanup
+    kv_write "$TUNNEL_CONF" 644 TUNNEL_MODE broker BROKER_URL "$KEI_BROKER_URL" LIBRARY_ID "$lib" \
+        OPAC_HOST "$opac" STAFF_HOST "$staff" STAFF_REMOTE no JOB_ID "$job" || return 1
+    rm -f "$BROKER_ENROLL"
+    log "broker: library $lib registered ($opac)"
+
+    display_explanation "Creating the tunnel and the address..."
+    st=""
+    for i in $(seq 1 "${KEI_BROKER_WAIT:-90}"); do
+        if broker_request GET "/v1/jobs/$job" yes; then
+            st=$(json_field "$BROKER_BODY" state)
+            [ "$st" = "done" ] || [ "$st" = "failed" ] && break
+        fi
+        sleep 2
+    done
+    broker_cleanup
+    if [ "$st" != "done" ]; then
+        msg_error "" "$(t "The address is not ready yet. Try again later with the same menu option.")" 9 70
+        return 1
+    fi
+    broker_connect share
+}
+
+# broker_connect [share]: fetches the tunnel token and runs cloudflared as a
+# service with it. The token goes to a 0600 environment file, never to the
+# command line. "share" (first connection) then offers the sharing menu.
+broker_connect() {
+    local token opac staff_url="" bin
+    cloudflared_install || return 1
+    display_explanation "Connecting the tunnel..."
+    if ! broker_request GET /v1/tunnel-token yes; then
+        msg_error "" "$(t "Could not get the tunnel of this library:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    token=$(json_field "$BROKER_BODY" tunnel_token)
+    broker_cleanup
+    [[ "$token" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]] || { msg_error "" "$(t "The address service gave an unexpected answer. Try again later.")" 8 70; return 1; }
+
+    # One cloudflared service per server: the own-domain setup steps aside.
+    if [ -f /etc/cloudflared/config.yml ]; then
+        cloudflared service uninstall >/dev/null 2>&1 || true
+        mv -f /etc/cloudflared/config.yml /etc/cloudflared/config.yml.own-domain 2>/dev/null || true
+    fi
+    mkdir -p "$(dirname "$BROKER_ENV")"
+    ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" > "$BROKER_ENV" )
+    chmod 600 "$BROKER_ENV"
+    bin=$(command -v cloudflared)
+    cat > "$CLOUDFLARED_UNIT" <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Koha (free address)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=${BROKER_ENV}
+ExecStart=${bin} --no-autoupdate tunnel run
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable cloudflared >/dev/null 2>&1 || true
+    systemctl restart cloudflared >/dev/null 2>&1 || true
+    broker_install_cron
+
+    read -r opac _ < <(tunnel_public_hosts)
+    [ "$(tunnel_conf_get STAFF_REMOTE 2>/dev/null)" = "yes" ] && staff_url="https://$(tunnel_conf_get STAFF_HOST)"
+    set_koha_public_urls "https://${opac}" "$staff_url"
+
+    display_explanation "Checking the address from the internet..."
+    if tunnel_check_url "https://${opac}"; then
+        if [ "${1:-}" = "share" ]; then
+            msg_ok "$(t "Your catalog is online:")\n\n  https://${opac}\n\n$(t "Next, choose how to share the link.")" 12 70
+            function_share_catalog_link
+        else
+            msg_ok "$(t "Your catalog is online:")\n\n  https://${opac}" 10 70
+        fi
+    else
+        msg_info "$(t "Free address")" "$(t "The tunnel is installed, but the address does not answer yet:")\n\n  https://${opac}\n\n$(t "It can take a few minutes. Check again with \"View Public Links and Security Status\".")" 13 74
+    fi
+}
+
+# tunnel_check_url URL: waits until the address answers through Cloudflare.
+tunnel_check_url() {
+    local code i
+    for i in $(seq 1 "${KEI_TUNNEL_CHECKS:-12}"); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null)
+        [[ "$code" == [23][0-9][0-9] ]] && return 0
+        sleep "${KEI_TUNNEL_CHECK_DELAY:-5}"
+    done
+    return 1
+}
+
+# Daily signed heartbeat: tells the address service the library is alive
+# (unused addresses are released after months without one).
+broker_install_cron() {
+    local panel="/usr/local/bin/config.sh"
+    [ -x "$panel" ] || panel="$(readlink -f "$_SCRIPT_PATH")"
+    printf 'SHELL=/bin/bash\n%d %d * * * root %s --broker-heartbeat >/dev/null 2>&1\n' \
+        "$((RANDOM % 60))" "$((RANDOM % 5 + 1))" "$panel" > "$CRON_BROKER"
+    chmod 644 "$CRON_BROKER"
+}
+
+# config.sh --broker-heartbeat (cron)
+broker_heartbeat() {
+    tunnel_mode_is broker || return 0
+    local koha
+    koha=$(dpkg-query -W -f='${Version}' koha-common 2>/dev/null | cut -c1-32)
+    broker_request POST /v1/heartbeat yes \
+        "{\"koha_version\":$(json_str "$koha"),\"installer_version\":$(json_str "${PANEL_VERSION# }")}"
+    local rc=$?
+    broker_cleanup
+    return "$rc"
+}
+
+function_cloudflare_free_address() {
+    if tunnel_mode_is broker; then
+        function_broker_manage
+        return 0
+    fi
+    local tool
+    require_koha || return 0
+    for tool in openssl perl curl; do
+        command -v "$tool" >/dev/null 2>&1 || { msg_error "" "$(t "Missing tool:") $tool" 8 60; return 0; }
+    done
+
+    if [ ! -f "$BROKER_ENROLL" ]; then
+        if [ -f /etc/cloudflared/config.yml ]; then
+            prompt_yes_no "$(t "Free address")" "$(t "This server already publishes Koha with your own domain. A free address replaces it (your domain's tunnel is switched off).\n\nContinue?")" 11 74 defaultno || return 0
+        fi
+        msg_info "$(t "Free address")" "$(t "GET A FREE ADDRESS FOR YOUR CATALOG\n\nNo domain or Cloudflare account is needed. You send a short request\n(library name, contact e-mail and the name you want); the address service\nreviews it and this server then connects on its own.\n\nThe public catalog (OPAC) goes online. The staff interface stays on the\nlocal network until you turn on remote staff access, which adds a password\nchecked before anyone reaches Koha.")" 17 78
+        broker_new_request || return 0
+    fi
+
+    broker_wait_request
+    case $? in
+        0) broker_complete_request ;;
+        130) msg_info "$(t "Free address")" "$(t "The request stays saved. Come back to this menu to continue once it is approved.")" 9 70 ;;
+        *)
+            rm -f "$BROKER_ENROLL"
+            msg_error "" "$(t "The request was not approved or has expired. You can send a new one.")" 9 70
+            ;;
+    esac
+}
+
+# Menu of a server that already has a free address.
+function_broker_manage() {
+    local choice opac staff remote
+    while true; do
+        opac=$(tunnel_conf_get OPAC_HOST)
+        remote="$(t "off")"
+        [ "$(tunnel_conf_get STAFF_REMOTE)" = "yes" ] && remote="$(t "on")"
+        choice=$(ui_menu "$(t "Free address")" "$(t "Catalog address: https://\$opac\nRemote staff access: \$remote")" \
+            "1" "$(t "Remote staff access (password at the edge)")" \
+            "2" "$(t "Reconnect the tunnel (fetch the token again)")" \
+            "3" "$(t "Renew the tunnel token")" \
+            "4" "$(t "Give up the free address")") || return 0
+        case "$choice" in
+            1) function_broker_staff_access ;;
+            2) clear; broker_connect ;;
+            3)
+                clear
+                display_explanation "Renewing the tunnel token..."
+                if broker_request POST /v1/rotate yes "{}"; then
+                    broker_cleanup
+                    broker_connect
+                else
+                    msg_error "" "$(broker_error)" 9 70
+                    broker_cleanup
+                fi
+                ;;
+            4) function_broker_leave && return 0 ;;
+        esac
+    done
+}
+
+# Remote staff access: the staff hostname answers only after a user and
+# password checked by the broker at Cloudflare's edge (then Koha's own login).
+function_broker_staff_access() {
+    local user pass pass2 cidrs c list="" staff
+    staff=$(tunnel_conf_get STAFF_HOST)
+    local choice
+    choice=$(ui_menu "$(t "Remote staff access")" "$(t "Staff interface from outside the library: https://\$staff\n\nBefore Koha's own login, the browser asks for a user and password that only the library knows. Optionally, only some networks are allowed.")" \
+        "on" "$(t "Turn on or change the password")" \
+        "off" "$(t "Turn off (staff interface only on the local network)")") || return 0
+
+    if [ "$choice" = "off" ]; then
+        if broker_request DELETE /v1/staff-credentials yes; then
+            broker_cleanup
+            kv_write "$TUNNEL_CONF" 644 STAFF_REMOTE no
+            set_koha_public_urls "https://$(tunnel_conf_get OPAC_HOST)" "http://$(get_server_ip):8080"
+            msg_ok "$(t "Remote staff access is off.")" 8 60
+        else
+            msg_error "" "$(broker_error)" 9 70
+            broker_cleanup
+        fi
+        return 0
+    fi
+
+    user=$(ui_input "$(t "Remote staff access")" "$(t "User for the remote access (not a Koha user):")" "biblioteca") || return 0
+    [[ "$user" =~ ^[A-Za-z0-9._@-]{3,64}$ ]] || { msg_error "" "$(t "Use 3 to 64 letters, numbers or . _ @ -")" 8 60; return 0; }
+    pass=$(whiptail --title "$(t "Password")" --passwordbox "$(t "Password for the remote access (at least 12 characters):")" 9 70 3>&1 1>&2 2>&3) || return 0
+    [ ${#pass} -ge 12 ] || { msg_error "" "$(t "The password must have at least 12 characters.")" 8 60; return 0; }
+    pass2=$(whiptail --title "$(t "Confirm Password")" --passwordbox "$(t "Type the password again:")" 9 64 3>&1 1>&2 2>&3) || return 0
+    [ "$pass" = "$pass2" ] || { msg_error "" "$(t "The passwords do not match.")" 8 60; return 0; }
+    cidrs=$(ui_input "$(t "Remote staff access")" "$(t "Allowed networks (optional), e.g. 200.10.0.0/16, separated by spaces. Leave blank to allow any network:")") || return 0
+    for c in $cidrs; do
+        [[ "$c" =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ ]] || { msg_error "" "$(t "Invalid network:") $c" 8 60; return 0; }
+        list+="${list:+,}$(json_str "$c")"
+    done
+
+    clear
+    display_explanation "Saving the remote access..."
+    if broker_request PUT /v1/staff-credentials yes \
+        "{\"username\":$(json_str "$user"),\"password\":$(json_str "$pass"),\"allow_cidrs\":[${list}]}"; then
+        broker_cleanup
+        kv_write "$TUNNEL_CONF" 644 STAFF_REMOTE yes
+        set_koha_public_urls "https://$(tunnel_conf_get OPAC_HOST)" "https://${staff}"
+        msg_ok "$(t "Remote staff access is on:")\n\n  https://${staff}\n\n$(t "The browser asks for the remote access user and password first, then shows Koha's login.")" 13 74
+    else
+        msg_error "" "$(t "The remote access was not saved:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+    fi
+    unset pass pass2
+}
+
+function_broker_leave() {
+    local opac
+    opac=$(tunnel_conf_get OPAC_HOST)
+    prompt_yes_no "$(t "Give up the free address")" "$(t "The address https://\$opac is released and the catalog goes offline to the internet (it stays on the local network).\n\nContinue?")" 11 74 defaultno || return 1
+    clear
+    display_explanation "Releasing the address..."
+    if ! broker_request DELETE /v1/library yes && [ "$BROKER_STATUS" != "401" ]; then
+        msg_error "" "$(t "The address service did not confirm:")\n\n$(broker_error)" 10 74
+        broker_cleanup
+        return 1
+    fi
+    broker_cleanup
+    systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    rm -f "$CLOUDFLARED_UNIT" "$BROKER_ENV" "$CRON_BROKER" "$TUNNEL_CONF" "$BROKER_KEY"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    set_koha_public_urls "http://$(get_server_ip)" "http://$(get_server_ip):8080"
+    log "broker: address $opac released"
+    msg_ok "$(t "The free address was released.\nKoha is now only accessible on the local network.")" 10 70
+    return 0
+}
+
+# Share the catalog link: QR code on this screen, a QR code image to print,
+# the browser of this computer, or the link to copy.
+function_share_catalog_link() {
+    local opac url items=() choice png
+    read -r opac _ < <(tunnel_public_hosts)
+    if [ "$opac" = "-" ]; then
+        msg_error "" "$(t "The catalog has no internet address yet. Set up the tunnel first.")" 9 70
+        return 0
+    fi
+    url="https://${opac}"
+    is_auth_url "$url" || return 0
+    while true; do
+        items=("qr" "$(t "QR code on this screen")" "png" "$(t "Save a QR code image to print")")
+        browser_opener >/dev/null && items+=("browser" "$(t "Open in the browser of this computer")")
+        items+=("link" "$(t "Show the link to copy")")
+        choice=$(ui_menu "$(t "Share the catalog")" "$url" "${items[@]}") || return 0
+        case "$choice" in
+            qr)
+                clear
+                ensure_qrencode && qrencode -t ANSIUTF8 -l M -m 2 "$url"
+                printf '\n  %s\n\n' "$url"
+                pause_terminal
+                ;;
+            png)
+                png="${REAL_HOME:-/root}/koha-catalog-qr.png"
+                if ensure_qrencode && qrencode -t PNG -l M -s 12 -m 4 -o "$png" "$url"; then
+                    [ -n "${REAL_USER:-}" ] && chown "$REAL_USER" "$png" 2>/dev/null
+                    msg_ok "$(t "QR code image saved:")\n\n  $png" 10 70
+                else
+                    msg_error "" "$(t "Could not create the image.")" 8 60
+                fi
+                ;;
+            browser) open_in_browser "$url" ;;
+            link)
+                clear
+                printf '%s\n\n  %s\n\n' "$(t "Link of the catalog:")" "$url"
+                pause_terminal
+                ;;
+        esac
+    done
+}
+
+ensure_qrencode() {
+    command -v qrencode >/dev/null 2>&1 && return 0
+    echo "$(t "Installing the QR code generator (qrencode)...")"
+    apt_install qrencode >/dev/null 2>&1
+    command -v qrencode >/dev/null 2>&1
 }
 
 function_configure_cloudflare() {
@@ -4700,24 +6430,32 @@ function_configure_cloudflare() {
         local choice
         choice=$(whiptail --title "$(t "Cloudflare Tunnel Manager")" \
             --cancel-button "$(t "Back")" \
-            --menu "$(t "Tunnel Status: \$tunnel_active\n\nCloudflare Tunnel safely exposes Koha without opening ports.\n\nWhat do you want to do?")" 18 78 4 \
-            "1" "$(t "⚙  Install and Configure Tunnel (First Use)")" \
-            "2" "$(t "ℹ  View Public Links and Security Status")" \
-            "3" "$(t "↻  Restart Tunnel Service")" \
-            "4" "$(t "✖  Disable and Remove Tunnel (Go Offline)")" \
+            --menu "$(t "Tunnel Status: \$tunnel_active\n\nCloudflare Tunnel safely exposes Koha without opening ports.\n\nWhat do you want to do?")" 20 78 6 \
+            "1" "$(t "★  Free Address (no domain needed)")" \
+            "2" "$(t "⚙  Use My Own Domain (Cloudflare account)")" \
+            "3" "$(t "ℹ  View Public Links and Security Status")" \
+            "4" "$(t "▣  Share the Catalog Link (QR code, link)")" \
+            "5" "$(t "↻  Restart Tunnel Service")" \
+            "6" "$(t "✖  Disable and Remove Tunnel (Go Offline)")" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && break
 
         case "$choice" in
-            1) function_cloudflare_setup ;;
-            2) function_cloudflare_status ;;
-            3)
+            1) function_cloudflare_free_address ;;
+            2) function_cloudflare_setup ;;
+            3) function_cloudflare_status ;;
+            4) function_share_catalog_link ;;
+            5)
                 clear
                 display_explanation "Restarting Cloudflare Tunnel..."
                 systemctl restart cloudflared >/dev/null 2>&1
                 msg_ok "$(t "Service restarted successfully.")" 8 60
                 ;;
-            4)
+            6)
+                if tunnel_mode_is broker; then
+                    function_broker_leave
+                    continue
+                fi
                 if prompt_yes_no "$(t "Disable Tunnel")" "$(t "This will stop the service and remove auto-start.\nYour catalog will go offline to the internet.\n\nContinue?")" 10 70; then
                     clear
                     display_explanation "Uninstalling service..."
@@ -4997,13 +6735,47 @@ get_current_timezone() {
     printf '%s' "${tz:-UTC}"
 }
 
+# Sets KEY=VALUE in [SECTION] of an INI file such as /etc/wsl.conf, keeping
+# every other line; the section is added when missing. Replaced atomically.
+ini_set_value() {
+    local file="$1" section="$2" key="$3" value="$4" tmp
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    { cat "$file" 2>/dev/null || true; } | awk -v sec="$section" -v key="$key" -v val="$value" '
+        function put() { if (insec && !done) { print key "=" val; done = 1 } }
+        /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            name = $0; gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", name)
+            put()
+            insec = (tolower(name) == tolower(sec))
+            print; next
+        }
+        insec && index($0, "=") {
+            k = substr($0, 1, index($0, "=") - 1); gsub(/[[:space:]]/, "", k)
+            if (tolower(k) == tolower(key)) { if (!done) { print key "=" val; done = 1 }; next }
+        }
+        { print }
+        END { put(); if (!done) { if (NR) print ""; print "[" sec "]"; print key "=" val } }
+    ' > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" && mv -f "$tmp" "$file"
+}
+
 # Applies a timezone, with a fallback for systems where timedatectl fails.
+# Under WSL, Windows' zone is copied into Debian at every start; a library
+# that picks another zone has that switched off in /etc/wsl.conf
+# ([time] useWindowsTimezone=false), or the choice would last one boot.
 apply_timezone() {
-    local tz="$1"
+    local tz="$1" before
     [ -n "$tz" ] && [ -f "/usr/share/zoneinfo/$tz" ] || return 1
+    before=$(get_current_timezone)
     if ! timedatectl set-timezone "$tz" >/dev/null 2>&1; then
         ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime || return 1
         printf '%s\n' "$tz" > /etc/timezone
+    fi
+    if is_wsl && [ "$tz" != "$before" ]; then
+        if ini_set_value "$KEI_WSL_CONF" time useWindowsTimezone false; then
+            log "timezone: $tz differs from Windows ($before), useWindowsTimezone=false in $KEI_WSL_CONF"
+        else
+            log "timezone: could not update $KEI_WSL_CONF"
+        fi
     fi
     log "timezone set to $tz"
     return 0
@@ -5067,15 +6839,14 @@ choose_timezone() {
 }
 
 function_configure_clock() {
-    local tz
+    local tz cur_tz cur_time
     if tz=$(choose_timezone) && [ -n "$tz" ]; then
         if ! apply_timezone "$tz"; then
             msg_error "" "$(t 'Could not apply the timezone ${tz}.')" 9 70
         fi
     fi
-    systemctl enable --now systemd-timesyncd >/dev/null 2>&1
+    host_can ntp && systemctl enable --now systemd-timesyncd >/dev/null 2>&1
     systemctl restart cron >/dev/null 2>&1
-    local cur_tz cur_time
     cur_tz=$(get_current_timezone)
     cur_time=$(date '+%Y-%m-%d %H:%M')
     msg_ok "$(t 'Timezone set to: ${cur_tz}\nCurrent time: ${cur_time}\n\nCron was restarted to pick up the new time.')" 11 74
@@ -5190,15 +6961,21 @@ function_repair_services() {
     is_koha_zebra_running || zebra_start >/dev/null 2>&1
     ensure_search_indexing >/dev/null 2>&1
     ensure_koha_services >/dev/null 2>&1
-    local mc_state plack_state details=""
+    local mc_state plack_state details="" cache cache_line
     memcached_alive && mc_state="$(t "active")" || mc_state="$(t "inactive")"
     plack_running && plack_state="$(t "running")" || plack_state="$(t "stopped")"
-    log "services repaired: memcached=$mc_state plack=$plack_state"
-    if memcached_alive && plack_running; then
-        msg_ok "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')" 11 70
+    cache=$(koha_cache_state)
+    cache_line=$(koha_cache_text "$cache")
+    log "services repaired: memcached=$mc_state plack=$plack_state koha-cache=$cache"
+    if memcached_alive && plack_running && [ "$cache" != module ] && [ "$cache" != connect ]; then
+        msg_ok "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${cache_line}" 13 76
     else
-        details=$(tail -n 8 "/var/log/koha/${INSTANCE}/plack-error.log" 2>/dev/null | cut -c1-76)
-        msg_error "" "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${details}" 20 80
+        if ! memcached_alive; then
+            details=$(journalctl -u memcached -n 6 --no-pager 2>/dev/null | cut -c1-76)
+        else
+            details=$(tail -n 8 "/var/log/koha/${INSTANCE}/plack-error.log" 2>/dev/null | cut -c1-76)
+        fi
+        msg_error "" "$(t 'Koha services restarted.\n\nMemcached: ${mc_state}\nPlack: ${plack_state}')\n\n${cache_line}\n\n${details}" 22 80
     fi
 }
 
@@ -5283,6 +7060,207 @@ $(t "MACHINE")
 $(t "BACKUP")
   $(t "Latest SQL")    : $(find "$DIR_SQL" -name '*.sql.gz' -printf '%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort -r | head -n1 || echo '-')
   $(t "Cloud")         : $(grep -o 'RCLONE_REMOTE="[^"]*"' "$BACKUP_CONF" 2>/dev/null | cut -d'"' -f2 | grep . || echo "$(t "not configured")")" 29 78 2>/dev/null || true
+}
+
+# ======================================================================
+# 21.5. READ-ONLY COMMANDS FOR THE WINDOWS TOOLS (AND SUPPORT)
+# ----------------------------------------------------------------------
+#   config.sh --status-json               one JSON object on stdout
+#   config.sh --export-diagnostics DIR    a support folder inside DIR
+# The Windows tray polls the first and "Export diagnostics" calls the
+# second. Both only read: they skip the panel lock (they work while a panel
+# is open), install nothing and never print a password or token.
+# ======================================================================
+KEI_DIAG_REDACT='[REDACTED]'
+
+# JSON string literal of $1 (quotes, backslashes and control characters escaped).
+json_str() {
+    local s="$1" out="" c i
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == [$'\x01'-$'\x1f'] ]]; then
+            printf -v c '\\u%04x' "'$c"
+        fi
+        out+="$c"
+    done
+    printf '"%s"' "$out"
+}
+
+# Plain number, or 0.
+json_num() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$((10#$1))" ;; esac; }
+
+# HTTP status of a local Koha page, 000 when nothing answers.
+kei_http_code() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-4}" "$1" 2>/dev/null)
+    case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+
+# Newest nightly SQL backup and the last line the backup script logged.
+# Prints: epoch size result file   (result: ok | failed | skipped | none)
+kei_backup_summary() {
+    local newest epoch=0 size=0 file="" last result="none"
+    newest=$(find "$DIR_SQL" -maxdepth 1 -name '*.sql.gz' -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -n1)
+    if [ -n "$newest" ]; then
+        epoch="${newest%%.*}"
+        size=$(printf '%s' "$newest" | awk '{print $2}')
+        file="${newest#* * }"
+    fi
+    last=$(grep -E '\| (OK|FAILED|INFO: SQL backup skipped)' "${LOG_DIR}/backup_sql.log" 2>/dev/null | tail -n1)
+    case "$last" in
+        *'| OK:'*) result="ok" ;;
+        *'| FAILED'*) result="failed" ;;
+        *skipped*) result="skipped" ;;
+    esac
+    printf '%s %s %s %s\n' "$(json_num "$epoch")" "$(json_num "$size")" "$result" "$file"
+}
+
+# Time of the last line of the backup log (epoch), 0 when there is none.
+kei_backup_log_epoch() {
+    local stamp
+    stamp=$(grep -E '\| (OK|FAILED|INFO: SQL backup skipped)' "${LOG_DIR}/backup_sql.log" 2>/dev/null | tail -n1 | cut -d'|' -f1)
+    [ -n "$stamp" ] && date -d "$stamp" +%s 2>/dev/null || printf '0'
+}
+
+# Overall state for the tray: ok | degraded | stopped | not_installed.
+kei_overall_state() {
+    local apache="$1" db="$2" koha="$3" staff="$4"
+    is_koha_installed || { printf 'not_installed'; return 0; }
+    if [ "$apache" = active ] && [ "$db" = active ] && [ "$koha" = active ] && [ "$staff" != 000 ] && [ "$staff" -lt 500 ]; then
+        printf 'ok'
+    elif [ "$apache" != active ] && [ "$db" != active ] && [ "$koha" != active ]; then
+        printf 'stopped'
+    else
+        printf 'degraded'
+    fi
+}
+
+kei_status_json() {
+    local svc state json="" first=1 apache="" db="" koha="" staff opac plack=false
+    local b_epoch b_size b_result b_file df_line d_total d_free mem_total mem_avail
+    local r_epoch r_state r_finished r_db r_backup r_index
+    for svc in apache2 mariadb memcached koha-common cron elasticsearch cloudflared; do
+        state=$(systemctl is-active "$svc" 2>/dev/null | head -n1)
+        [ -n "$state" ] || state="unknown"
+        case "$svc" in apache2) apache="$state" ;; mariadb) db="$state" ;; koha-common) koha="$state" ;; esac
+        [ "$first" = 1 ] || json+=","
+        first=0
+        json+="$(json_str "$svc"):$(json_str "$state")"
+    done
+    staff=$(kei_http_code "http://127.0.0.1:8080/")
+    opac=$(kei_http_code "http://127.0.0.1/")
+    plack_running 2>/dev/null && plack=true
+    read -r b_epoch b_size b_result b_file < <(kei_backup_summary)
+    read -r r_epoch r_state r_finished r_db r_backup r_index < <(stop_guard_summary)
+    df_line=$(df -P -B1 / 2>/dev/null | awk 'NR==2{print $2" "$4}')
+    d_total="${df_line%% *}" d_free="${df_line##* }"
+    mem_total=$(awk '/^MemTotal:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
+    printf '{"schema":1,"generated_at":%s,"panel_version":%s,' "$(date +%s)" "$(json_str "${PANEL_VERSION# }")"
+    printf '"platform":%s,"wsl_net":%s,"autostart":%s,' "$(json_str "$KEI_PLATFORM")" "$(json_str "${KEI_WSL_NET:-}")" "$(json_str "${WIN_AUTOSTART:-}")"
+    printf '"state":%s,"koha_installed":%s,' "$(json_str "$(kei_overall_state "$apache" "$db" "$koha" "$staff")")" "$(is_koha_installed && echo true || echo false)"
+    printf '"services":{%s},"plack":%s,' "$json" "$plack"
+    printf '"http":{"staff":%s,"opac":%s},' "$(json_num "$staff")" "$(json_num "$opac")"
+    printf '"backup":{"last_file":%s,"last_epoch":%s,"last_size":%s,"last_result":%s,"log_epoch":%s},' \
+        "$(json_str "${b_file##*/}")" "$(json_num "$b_epoch")" "$(json_num "$b_size")" "$(json_str "$b_result")" "$(json_num "$(kei_backup_log_epoch)")"
+    printf '"recovery":{"epoch":%s,"state":%s,"finished":%s,"db":%s,"backup":%s,"index":%s},' \
+        "$(json_num "$r_epoch")" "$(json_str "$r_state")" "$(json_num "$r_finished")" "$(json_str "$r_db")" "$(json_str "$r_backup")" "$(json_str "$r_index")"
+    printf '"disk":{"total":%s,"free":%s},' "$(json_num "$d_total")" "$(json_num "$d_free")"
+    printf '"memory":{"total":%s,"available":%s}}\n' "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+}
+
+# Removes secrets from text on stdin: key=value / key: value pairs whose key
+# names a password, token or secret, <pass> elements, HTTP authorization
+# headers, user:password@ in URLs and Google tokens (ya29., 1//).
+kei_redact() {
+    sed -E \
+        -e "s#(<(pass|password|user_pass|encryption_key|api_key)>)[^<]*(</[a-z_]+>)#\1${KEI_DIAG_REDACT}\3#Ig" \
+        -e "s#([a-z_-]*(pass(word)?|passwd|pwd|secret|token|api[_-]?key)[a-z_-]*[\"']?[[:space:]]*[:=][[:space:]]*[\"']?)[^\"'[:space:],;&}]+#\1${KEI_DIAG_REDACT}#Ig" \
+        -e "s#((proxy-)?authorization:[[:space:]]*[a-z]+)[[:space:]]+[^[:space:]]+#\1 ${KEI_DIAG_REDACT}#Ig" \
+        -e "s#(bearer|basic)[[:space:]]+[A-Za-z0-9._~+/=-]{8,}#\1 ${KEI_DIAG_REDACT}#Ig" \
+        -e "s#://[^/@[:space:]:]+:[^/@[:space:]]+@#://${KEI_DIAG_REDACT}@#g" \
+        -e "s#ya29\.[A-Za-z0-9._-]+#${KEI_DIAG_REDACT}#g" \
+        -e "s#1//[A-Za-z0-9._-]{20,}#${KEI_DIAG_REDACT}#g"
+}
+
+# Last $2 lines (default 400) of a log, redacted, into $3. Missing logs are skipped.
+kei_diag_tail() {
+    local src="$1" n="${2:-400}" dst="$3"
+    [ -f "$src" ] && [ -r "$src" ] || return 0
+    case "$src" in *.gz) zcat -- "$src" 2>/dev/null | tail -n "$n" ;; *) tail -n "$n" -- "$src" 2>/dev/null ;; esac \
+        | kei_redact > "$dst"
+}
+
+# Output of a command, redacted, into $1 (never fails the export).
+kei_diag_cmd() {
+    local dst="$1"; shift
+    { printf '$ %s\n' "$*"; timeout 20 "$@" 2>&1 | head -n 2000; printf '\n'; } | kei_redact >> "$dst"
+}
+
+# config.sh --export-diagnostics DIR: writes DIR/koha-diagnostics-HOST-DATE
+# and prints its path. Only logs and command output go in, each through
+# kei_redact; no configuration file (koha-conf.xml, rclone.conf, vision.conf,
+# the credentials file) is ever copied.
+kei_export_diagnostics() {
+    local dir="$1" out f svc name
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        echo "usage: config.sh --export-diagnostics <existing folder>" >&2
+        return 2
+    fi
+    out="${dir%/}/koha-diagnostics-$(hostname -s 2>/dev/null || echo koha)-$(date +%Y%m%d-%H%M%S)"
+    mkdir -m 700 "$out" "$out/logs" || return 1
+    kei_status_json > "$out/status.json" 2>/dev/null
+    {
+        printf 'Koha Easy Install %s  |  %s\n' "${PANEL_VERSION# }" "$(date '+%F %T %z')"
+        printf 'platform=%s  wsl_net=%s  autostart=%s  windows_build=%s\n\n' "$KEI_PLATFORM" "${KEI_WSL_NET:--}" "${WIN_AUTOSTART:--}" "${WIN_BUILD:--}"
+    } > "$out/system.txt"
+    kei_diag_cmd "$out/system.txt" uname -a
+    kei_diag_cmd "$out/system.txt" cat /etc/os-release
+    kei_diag_cmd "$out/system.txt" uptime
+    kei_diag_cmd "$out/system.txt" free -m
+    kei_diag_cmd "$out/system.txt" df -h
+    kei_diag_cmd "$out/system.txt" df -i /
+    kei_diag_cmd "$out/system.txt" timedatectl
+    kei_diag_cmd "$out/system.txt" ip -brief address
+    kei_diag_cmd "$out/system.txt" ip route
+    kei_diag_cmd "$out/system.txt" ss -tlnp
+    kei_diag_cmd "$out/system.txt" systemctl --failed --no-pager
+    kei_diag_cmd "$out/system.txt" dpkg-query -W koha-common mariadb-server apache2 elasticsearch cloudflared rclone
+    for svc in apache2 mariadb memcached koha-common cron elasticsearch cloudflared; do
+        kei_diag_cmd "$out/services.txt" systemctl status "$svc" --no-pager -n 30
+    done
+    kei_diag_cmd "$out/services.txt" journalctl -p err -b --no-pager -n 300
+    # Error logs only: access logs and the MariaDB query log hold patron data.
+    for f in /var/log/apache2/error.log /var/log/mysql/error.log \
+             /var/log/koha/"$INSTANCE"/*error*.log /var/log/koha/"$INSTANCE"/worker*.log \
+             /var/log/koha/"$INSTANCE"/indexer*.log /var/log/koha/"$INSTANCE"/zebra*.log \
+             "$LOG_DIR"/backup_*.log "$LOG_DIR"/stop-guard.log; do
+        [ -f "$f" ] || continue
+        name=$(printf '%s' "${f#/var/log/}" | tr '/' '_')
+        kei_diag_tail "$f" 400 "$out/logs/$name"
+    done
+    while IFS= read -r f; do
+        kei_diag_tail "$f" 1000 "$out/logs/panel_${f##*/}"
+    done < <(find "$LOG_DIR" -maxdepth 1 -name 'painel-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 3 | cut -d' ' -f2-)
+    kei_diag_cmd "$out/logs/mariadb_journal.txt" journalctl -u mariadb --no-pager -n 300
+    kei_diag_cmd "$out/logs/wsl_dmesg.txt" dmesg --ctime
+    cat > "$out/README.txt" << 'EOF'
+Koha diagnostics for support.
+status.json   services, web pages, last backup, disk and memory
+system.txt    operating system, network and package versions
+services.txt  state of each service and the recent system errors
+logs/         the last lines of the Apache, MariaDB, Koha and panel logs
+Passwords, tokens and keys are replaced by [REDACTED]. No configuration
+file, database content or credentials file is included.
+EOF
+    chmod -R go-rwx "$out" 2>/dev/null
+    log "diagnostics exported to $out"
+    printf '%s\n' "$out"
 }
 
 # ======================================================================
@@ -5470,8 +7448,18 @@ function_autoupdate() {
 # ======================================================================
 # 26.1. SECURITY CENTER
 # ======================================================================
+# Security center under WSL: UFW and Fail2ban are not installed, network
+# access to Koha is filtered by Windows Defender Firewall.
+windows_firewall_notice() {
+    msg_info "$(t "Windows firewall")" "$(t "On Windows (WSL), Koha is protected by Windows Defender Firewall: UFW and Fail2ban are not used.\n\nOther computers reach ports 80 and 8080 only when Windows allows it (Windows 11 with mirrored networking). To publish the catalog, use option 6 (Cloudflare Tunnel).")" 14 76
+}
+
 function_fail2ban_status() {
     local info="" jail
+    if ! host_can fail2ban; then
+        windows_firewall_notice
+        return 0
+    fi
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         msg_error "" "$(t "Fail2ban is not installed. Install Koha first (option 1).")" 9 70
         return 0
@@ -5483,6 +7471,10 @@ function_fail2ban_status() {
 }
 
 function_staff_firewall() {
+    if ! host_can firewall; then
+        windows_firewall_notice
+        return 0
+    fi
     if ! command -v ufw >/dev/null 2>&1; then
         msg_error "" "$(t "UFW firewall is not installed. Install Koha first (option 1).")" 9 70
         return 0
@@ -5553,6 +7545,10 @@ function_rotate_db_password() {
 
 function_ufw_rules() {
     local rules
+    if ! host_can firewall; then
+        windows_firewall_notice
+        return 0
+    fi
     rules=$(ufw status verbose 2>/dev/null)
     [ -z "$rules" ] && rules="$(t "UFW firewall is not installed. Install Koha first (option 1).")"
     whiptail --title "$(t '☑ UFW')" --scrolltext --msgbox "$rules" 24 78 || true
@@ -5564,6 +7560,13 @@ function_ufw_rules() {
 # Reboots even when a desktop session is open: on machines with a graphical
 # login, GNOME/KDE "inhibit" a plain "reboot" while a user is logged in.
 reboot_now() {
+    # Inside WSL a reboot only shuts the Linux environment down, and nothing
+    # starts it again until Windows does: Koha would stay offline.
+    if ! host_can reboot; then
+        log "reboot refused: Windows (WSL) owns the machine"
+        msg_error "" "$(t "On Windows (WSL) the panel does not reboot the computer.\nUse 'Restart Koha services' (option 16), or restart Windows.")" 10 76
+        return 1
+    fi
     sync
     systemctl reboot -i >/dev/null 2>&1 \
         || systemctl reboot --check-inhibitors=no >/dev/null 2>&1 \
@@ -5575,7 +7578,36 @@ reboot_now() {
     return 1
 }
 
+# Restarts Koha's services without rebooting: MariaDB and the search engine
+# first, then koha-common, and ensure_koha_services for Memcached, Plack and
+# Apache (the boot order of install_boot_ordering). Used instead of a reboot
+# under WSL.
+restart_koha_stack() {
+    local rc=0
+    log "restart of Koha services requested"
+    systemctl restart mariadb >/dev/null 2>&1 || rc=1
+    if systemctl is-active --quiet elasticsearch 2>/dev/null; then
+        systemctl restart elasticsearch >/dev/null 2>&1 || rc=1
+    fi
+    systemctl restart koha-common >/dev/null 2>&1 || rc=1
+    ensure_koha_services >/dev/null 2>&1 || rc=1
+    systemctl restart cron >/dev/null 2>&1
+    log "restart of Koha services finished (rc=$rc)"
+    return "$rc"
+}
+
 function_reboot_server() {
+    if ! host_can reboot; then
+        prompt_yes_no "$(t "Restart Koha services")" "$(t "Restart Koha services now?\nEveryone using the catalog will be disconnected for a minute.")" 10 74 || return 0
+        clear
+        display_explanation "Restarting Koha services (Memcached, Plack, Apache)..."
+        if restart_koha_stack; then
+            msg_ok "$(t "Koha services restarted.")"
+        else
+            msg_error "" "$(t "Some services did not restart. Open Diagnostics (option 7) for details.")" 9 74
+        fi
+        return 0
+    fi
     prompt_yes_no "$(t "Reboot")" "$(t "Reboot the server now?\nEveryone using the catalog will be disconnected.")" 10 74 || return 0
     clear
     echo "$(t "Rebooting in 5 seconds...")"
@@ -11755,6 +13787,23 @@ lt_mr_versions() {
 # Loaded with "source installer" (tests/): functions only, no menu.
 (return 0 2>/dev/null) && return 0
 
+# Read-only commands (section 21.5): answer and exit before anything else runs.
+# The panel's exit cleanup is not used: it removes /tmp/koha_tmp_* files that
+# belong to a panel open at the same time.
+if [ -n "$KEI_CLI_MODE" ]; then
+    trap - EXIT
+    case "$KEI_CLI_MODE" in
+        --status-json) kei_status_json ;;
+        --export-diagnostics) kei_export_diagnostics "${2:-}" ;;
+        --broker-heartbeat) broker_heartbeat ;;
+        # Not read-only, but idempotent: the Windows installer refreshes the
+        # data-safety settings of an existing Koha without opening the panel.
+        --install-data-safety) is_koha_installed && install_data_safety ;;
+        --rebuild-search-index) kei_rebuild_search_index ;;
+    esac
+    exit $?
+fi
+
 # ======================================================================
 # KEEP THE INSTALLED PANEL UP TO DATE
 # ----------------------------------------------------------------------
@@ -11771,6 +13820,8 @@ fi
 
 # Schedules written by older versions of the panel (see upgrade_cron_tasks).
 is_koha_installed && upgrade_cron_tasks
+# Data-safety settings for installs made before they existed.
+is_koha_installed && install_data_safety
 # Catalogue card enabled (Library tools > Brazil): stylesheets for new languages.
 is_koha_installed && ficha_refresh
 
@@ -11820,6 +13871,7 @@ while true; do
     m14=$(t '⟳  Update center')
     m15=$(t 'ℹ  About the program & support')
     m16=$(t '↻  Reboot server')
+    host_can reboot || m16=$(t '↻  Restart Koha services')
     m17=$(t '✖  Exit')
 
     MAIN_OPT=$(whiptail --title "${title_dash}" \
@@ -11842,6 +13894,12 @@ while true; do
         "15" "$m15" \
         "16" "$m16" \
         "17" "$m17" 3>&1 1>&2 2>&3) || { clear; exit 0; }
+
+    # Under WSL nothing works without systemd: only About and Exit are left.
+    case "$MAIN_OPT" in
+        15|17) ;;
+        *) require_systemd || continue ;;
+    esac
 
     case "$MAIN_OPT" in
         1) function_install_koha ;;

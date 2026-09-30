@@ -3,6 +3,9 @@
 KEI_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KEI_S=/run/kei-mock
 PANEL="$KEI_REPO/tests/lib/panel.sh"
+# The battery describes a Linux server, even when it runs inside WSL;
+# tests/wsl_mode.bats sets the platform per test.
+export KEI_PLATFORM_OVERRIDE="${KEI_PLATFORM_OVERRIDE:-linux}"
 # Shell used for the panel and the generated scripts: KEI_BASH=/path/to/bash
 # runs the battery with another Bash release (e.g. 5.1 of Debian 11 / Ubuntu 22.04).
 KEI_SH="${KEI_BASH:-bash}"
@@ -154,7 +157,7 @@ kei_reset_env() {
     kei_kill_daemons
     rm -rf "$KEI_S/calls.log" "$KEI_S/dialogs.log" "$KEI_S/answers" "$KEI_S/syslog" \
            "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs" \
-           "$KEI_S/inputs" "$KEI_S/textbox.last" "$KEI_S/textboxes.log" "$KEI_S/last-staged.mrc" "$KEI_S"/batch-*.biblios
+           "$KEI_S/inputs" "$KEI_S/cache-module-broken" "$KEI_S/textbox.last" "$KEI_S/textboxes.log" "$KEI_S/last-staged.mrc" "$KEI_S"/batch-*.biblios
     rm -rf /var/log/koha-easy-install/tools /var/lib/koha/library/email.enabled /root/koha_patrons_template.csv
     mkdir -p "$KEI_S/run" "$KEI_S/svc" "$KEI_S/svc-fail" "$KEI_S/fail" "$KEI_S/pkgs"
     touch "$KEI_S/svc/mariadb" "$KEI_S/svc/memcached" "$KEI_S/svc/apache2" "$KEI_S/svc/cron"

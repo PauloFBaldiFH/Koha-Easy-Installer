@@ -1,0 +1,84 @@
+# Koha Easy Installer subdomain broker — Cloudflare Worker configuration.
+#
+# Deploy this Worker in the SAME Cloudflare account as the zone below:
+# routes and custom domains can only attach to zones of the Worker's own
+# account. (The API token could reach another account, but the staff
+# gate route could not.)
+#
+# Nothing secret lives in this file. Secrets are set with:
+#   npx wrangler secret put CF_API_TOKEN       # Tunnel Edit (account) + DNS Edit (this zone only)
+#   npx wrangler secret put ADMIN_TOKEN        # >= 32 random chars: openssl rand -base64 36
+#   npx wrangler secret put STAFF_SESSION_KEY  # >= 32 random chars: openssl rand -base64 36
+# For `wrangler dev`, put the same three names in .dev.vars (git-ignored).
+
+name = "kei-broker"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = true   # handy while testing; set to false once the custom domain works
+
+# Broker API on its own hostname, and the edge gate on every staff hostname.
+# The "*-admin" pattern matches <prefix><slug>-admin.<zone> [verify: wildcard
+# prefix matching on routes]. It never matches the OPAC hostnames, so public
+# catalog traffic goes straight to the tunnel without running this Worker.
+routes = [
+  { pattern = "koha-broker.bibliotecamunicipalpalotina.org", custom_domain = true },
+  { pattern = "*-admin.bibliotecamunicipalpalotina.org/*", zone_name = "bibliotecamunicipalpalotina.org" },
+]
+
+[vars]
+CF_ACCOUNT_ID = "f83c00aacc5df31f0f68867a84119072"   # account that holds the zone (not secret)
+CF_ZONE_ID = "aed272371f5da83f84fd05f1109dc91e"      # zone id of bibliotecamunicipalpalotina.org (not secret)
+ZONE_NAME = "bibliotecamunicipalpalotina.org"
+BROKER_HOST = "koha-broker.bibliotecamunicipalpalotina.org"
+NAME_PREFIX = "t-"          # test zone: every library name starts with t- so real records are never touched
+STAFF_SUFFIX = "-admin"
+AUTO_APPROVE = "false"      # keep false until the verification gates on /join exist
+PBKDF2_ITERATIONS = "100000"
+MAX_LIBRARIES_PER_DAY = "20"   # circuit breaker for new registrations
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kei-broker"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"   # printed by: npx wrangler d1 create kei-broker
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "PROVISIONER"
+class_name = "Provisioner"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Provisioner"]
+
+[[queues.producers]]
+binding = "PROVISION_QUEUE"
+queue = "kei-provision"
+
+[[queues.consumers]]
+queue = "kei-provision"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 10            # the code gives up earlier (6 attempts) and rolls back
+dead_letter_queue = "kei-provision-dlq"
+
+# Rate limiting bindings. namespace_id is any number unique within the account.
+[[ratelimits]]
+name = "RL_DEVICE"          # new enrollment requests, per client IP
+namespace_id = "7101"
+simple = { limit = 3, period = 60 }
+
+[[ratelimits]]
+name = "RL_API"             # polling and signed calls, per IP or per library
+namespace_id = "7102"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "RL_STAFF"           # staff gate attempts without a valid session, per IP + library
+namespace_id = "7103"
+simple = { limit = 20, period = 60 }
+
+[triggers]
+crons = ["17 * * * *"]      # hourly reconciliation and cleanup
+
+[observability]
+enabled = true

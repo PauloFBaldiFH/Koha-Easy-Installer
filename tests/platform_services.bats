@@ -112,6 +112,34 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
     assert '! grep -q "koha-plack --start" "$KEI_S/calls.log"' "Plack must not start without MariaDB"
 }
 
+@test "P15 Koha's own view of the cache: a Perl client that does not load is reinstalled" {
+    panel koha_cache_state
+    assert '[ "$status" -eq 0 ] && [ "$output" = ok ]' "healthy cache: $output"
+    touch "$KEI_S/cache-module-broken"
+    # The reinstall "fixes" the module, like apt-get install --reinstall would.
+    printf 'apt_install() { printf "apt_install %%s\\n" "$*" >> "$KEI_S/calls.log"; rm -f "$KEI_S/cache-module-broken"; }\n' > "$BATS_TEST_TMPDIR/extra.sh"
+    : > "$KEI_S/calls.log"
+    KEI_EXTRA="$BATS_TEST_TMPDIR/extra.sh" panel ensure_koha_services
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'grep -q "apt_install --reinstall libcache-memcached-fast-safe-perl" "$KEI_S/calls.log"'
+    assert '[ "$(grep -c "koha-plack --start" "$KEI_S/calls.log")" -ge 2 ]' "Plack must be restarted after the reinstall"
+    kei_kill_daemons
+}
+
+@test "P16 a cache Koha cannot use is a failure in the validation and the repair dialog" {
+    touch "$KEI_S/cache-module-broken"
+    panel koha_cache_state
+    assert '[ "$status" -ne 0 ] && [ "$output" = module ]' "$output"
+    panel function_repair_services
+    assert 'dialogs | grep -q "^ERROR.*Cache::Memcached::Fast::Safe does not load"' "the dialog must name the cause"
+    rm -f "$KEI_S/cache-module-broken"
+    kei_stop_memcached
+    panel koha_cache_state
+    assert '[ "$output" = connect ]' "$output"
+    kei_start_memcached
+    kei_kill_daemons
+}
+
 # --- static quality gates ---------------------------------------------------------
 
 @test "P09 scripts parse and pass ShellCheck (warnings)" {
@@ -158,7 +186,8 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
 
 @test "P14 uninstall.sh removes everything the panel now installs" {
     local f
-    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf /root/koha_patrons_template.csv; do
+    for f in /usr/local/bin/koha-zebra-watchdog.sh /usr/local/bin/koha-wait-services.sh apache2.service.d/koha-easy-install.conf /root/koha_patrons_template.csv \
+             /usr/local/sbin/koha-stop-guard /etc/systemd/system/koha-stop-guard.service /etc/systemd/system/koha-stop-guard-recover.service /var/lib/koha-easy-install; do
         assert 'grep -qF "$f" "$KEI_REPO/uninstall.sh"' "uninstall.sh must remove $f"
     done
 }
