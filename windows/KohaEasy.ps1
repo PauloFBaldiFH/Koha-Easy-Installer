@@ -26,6 +26,7 @@
     KohaEasy.ps1 UpdatePortProxy               action of the "Koha network" task (NAT networking)
     -Quiet: no dialog boxes (scheduled tasks).
     -Pause: Install waits for Enter before its window closes (Windows Terminal).
+    -Hidden: started with no console (every shortcut, task and tray launch).
     Windows PowerShell 5.1.
 #>
 param(
@@ -36,7 +37,9 @@ param(
     [ValidateSet('logon', 'manual')][string]$Mode,
     [switch]$Force,
     [switch]$Quiet,
-    [switch]$Pause
+    [switch]$Pause,
+    # Set by every hidden launch (Get-KohaHiddenLaunch); see below.
+    [switch]$Hidden
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +51,16 @@ Import-KeiLanguage -LangDir $langDir
 Set-KohaUtf8Console
 $cfg = Get-KohaConfig
 if ($Trigger -eq 'logon') { $Quiet = $true }
+
+# Started with a console someone can see (a shortcut, sign-in entry or task
+# of an earlier version, or powershell.exe itself, which Windows Terminal
+# keeps as an empty window): start again the hidden way and end here, so
+# that console closes at once.
+if (Test-KohaRelaunchHidden -Command $Command -Hidden $Hidden.IsPresent) {
+    Write-KohaLog ('{0}: started with a console, starting again with none' -f $Command)
+    Start-KohaHidden (Get-KohaRelaunchArguments -Command $Command -Bound $PSBoundParameters)
+    return
+}
 
 function Show-Box {
     param([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information')

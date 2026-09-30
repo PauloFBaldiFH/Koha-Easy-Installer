@@ -486,11 +486,11 @@ Describe 'Shortcuts' {
         $desk = @($list | Where-Object { $_.ContainsKey('Desktop') -and $_.Desktop })
         $desk.Count | Should -Be 1
         $desk[0].Name | Should -Be 'Koha'
-        $desk[0].Arguments | Should -BeLike '* Window'
-        ($list | Where-Object { $_.Name -like '*Control panel*' }).Arguments | Should -BeLike '* Panel'
-        ($list | Where-Object { $_.Name -like '*Status' -and $_.Kind -eq 'lnk' }).Arguments | Should -BeLike '* Window'
-        ($list | Where-Object { $_.Name -like '*Export diagnostics' }).Arguments | Should -BeLike '* ExportReport'
-        ($list | Where-Object { $_.Arguments -like '* Stop' }).Target | Should -BeLike '*powershell.exe'
+        $desk[0].Arguments | Should -BeLike '* Window -Hidden'
+        ($list | Where-Object { $_.Name -like '*Control panel*' }).Arguments | Should -BeLike '* Panel -Hidden'
+        ($list | Where-Object { $_.Name -like '*Status' -and $_.Kind -eq 'lnk' }).Arguments | Should -BeLike '* Window -Hidden'
+        ($list | Where-Object { $_.Name -like '*Export diagnostics' }).Arguments | Should -BeLike '* ExportReport -Hidden'
+        ($list | Where-Object { $_.Arguments -like '* Stop -Hidden' }).Target | Should -BeLike '*powershell.exe'
     }
 
     It 'removes the web shortcuts older versions put on the desktop' {
@@ -519,7 +519,7 @@ Describe 'Shortcuts' {
         Set-Content -LiteralPath $conhost -Value ''
         $l = Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost $conhost
         $l.Target | Should -Be $conhost
-        $l.Arguments | Should -Match '^--headless ".*powershell\.exe" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ".*KohaEasy\.ps1" Tray$'
+        $l.Arguments | Should -Match '^--headless ".*powershell\.exe" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ".*KohaEasy\.ps1" Tray -Hidden$'
         $f = Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost (Join-Path $TestDrive 'missing.exe')
         $f.Target | Should -BeLike '*powershell.exe'
         $f.Arguments | Should -BeLike '-NoProfile -WindowStyle Hidden *'
@@ -532,7 +532,7 @@ Describe 'Shortcuts' {
         Set-Content -LiteralPath $conhost -Value ''
         $l = Get-KohaHiddenLaunch -Arguments 'Start -Trigger logon' -Conhost $conhost -Launcher $exe
         $l.Target | Should -Be $exe
-        $l.Arguments | Should -Be 'Start -Trigger logon'
+        $l.Arguments | Should -Be 'Start -Trigger logon -Hidden'
         (Get-KohaHiddenLaunch -Arguments 'Tray' -Conhost $conhost -Launcher (Join-Path $TestDrive 'missing.exe')).Target | Should -Be $conhost
         Set-KohaState @{ launcher = 'failed' } | Out-Null
         Get-KohaLauncherPath | Should -Be ''
@@ -542,7 +542,7 @@ Describe 'Shortcuts' {
     }
 
     It 'writes .url files with IconFile, program shortcuts through WScript.Shell, and copies koha.ico' {
-        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { [System.IO.File]::WriteAllText($Path, '') }
         Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { $true }
         $sm = Join-Path $TestDrive 'Programs/Koha'
         $dt = Join-Path $TestDrive 'Desktop'
@@ -1063,5 +1063,148 @@ Describe 'Koha icon next to the clock' {
     It 'does nothing where Windows has no such list' {
         Set-KohaTrayPromoted -Root (Join-Path $TestDrive 'no-such-key') | Should -Be 'unsupported'
         (Get-KohaState).trayPromoted | Should -BeFalse
+    }
+}
+
+Describe 'No console window, whatever started Koha' {
+    AfterEach { Set-KohaState @{ launcher = ''; hiddenLaunch = 'conhost' } | Out-Null }
+
+    It 'prefers Windows Script Host over conhost, and gives it no PowerShell command line' {
+        $js = [System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.Hidden.js')
+        New-Item -ItemType Directory -Path (Split-Path -Parent $js) -Force | Out-Null
+        Set-Content -LiteralPath $js -Value '//'
+        $ws = Join-Path $TestDrive 'wscript.exe'
+        Set-Content -LiteralPath $ws -Value ''
+        $conhost = Join-Path $TestDrive 'conhost.exe'
+        Set-Content -LiteralPath $conhost -Value ''
+        try {
+            $l = Get-KohaHiddenLaunch -Arguments 'Window' -Conhost $conhost -Launcher '' -Wscript $ws
+            $l.Target | Should -Be $ws
+            $l.Arguments | Should -Be ('//B //Nologo "{0}" Window -Hidden' -f $js)
+            $l.Arguments | Should -Not -Match 'powershell|Bypass'
+            Get-KohaWscriptPath | Should -BeLike '*wscript.exe'
+            Set-KohaState @{ hiddenLaunch = 'nowscript' } | Out-Null
+            Get-KohaWscriptPath | Should -Be ''
+            Get-KohaConhostPath | Should -BeLike '*conhost.exe'
+        } finally { Remove-Item -LiteralPath $js -Force }
+    }
+
+    It 'KohaEasy.Hidden.js is plain ASCII, hides PowerShell and waits for it' {
+        $src = [System.IO.File]::ReadAllText((Join-Path $repo 'windows/KohaEasy.Hidden.js'))
+        @([System.Text.Encoding]::UTF8.GetBytes($src) | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        $src | Should -Match 'shell\.Run\(cmd, 0, true\)'
+        $src | Should -Match 'KohaEasy\.ps1'
+    }
+
+    It 'starts again the hidden way when it was started with a console someone sees' {
+        $exe = 'C:\KohaEasy\bin\KohaEasy.exe'
+        Test-KohaRelaunchHidden -Command 'Window' -Hidden $false -Target $exe | Should -BeTrue
+        Test-KohaRelaunchHidden -Command 'Tray' -Hidden $false -Target 'C:\Windows\System32\wscript.exe' | Should -BeTrue
+        Test-KohaRelaunchHidden -Command 'Window' -Hidden $true -Target $exe | Should -BeFalse
+        Test-KohaRelaunchHidden -Command 'Run' -Hidden $false -Target $exe | Should -BeFalse
+        Test-KohaRelaunchHidden -Command 'Install' -Hidden $false -Target $exe | Should -BeFalse
+        Test-KohaRelaunchHidden -Command 'SetupNetwork' -Hidden $false -Target $exe | Should -BeFalse
+        # Never into powershell.exe again: that would loop.
+        Test-KohaRelaunchHidden -Command 'Window' -Hidden $false -Target 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' | Should -BeFalse
+        Get-KohaRelaunchArguments -Command 'Start' -Bound @{ Trigger = 'logon'; Quiet = [switch]$true } | Should -Be 'Start -Trigger logon -Quiet'
+        Get-KohaRelaunchArguments -Command 'Stop' -Bound @{ Force = [switch]$true; Pause = [switch]$false } | Should -Be 'Stop -Force'
+        $ps = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw
+        $ps.IndexOf('Test-KohaRelaunchHidden') | Should -BeLessThan $ps.IndexOf('switch ($Command)')
+    }
+}
+
+Describe 'Desktop shortcut' {
+    It 'uses the desktop that exists, never the Public one' {
+        $user = Join-Path $TestDrive 'Users/paulo'
+        $od = Join-Path $user 'OneDrive - Biblioteca/Desktop'
+        New-Item -ItemType Directory -Path $od -Force | Out-Null
+        Get-KohaDesktopPath -Known (Join-Path $user 'Desktop') -Registry '' -UserProfile $user | Should -Be $od
+        $plain = Join-Path $user 'Desktop'
+        New-Item -ItemType Directory -Path $plain -Force | Out-Null
+        Get-KohaDesktopPath -Known $plain -Registry $od -UserProfile $user | Should -Be $plain
+        Get-KohaDesktopPath -Known 'C:\Users\Public\Desktop' -Registry '' -UserProfile '' | Should -Be ''
+        Get-KohaDesktopPath -Known (Join-Path $TestDrive 'nowhere') -Registry '' -UserProfile '' | Should -Be ''
+    }
+
+    It 'does not count a shortcut that is gone right after it was written' {
+        Mock -ModuleName KohaEasy.Core Save-KohaLnkShortcut { }
+        Mock -ModuleName KohaEasy.Core Set-KohaShortcutAppId { $true }
+        $dt = Join-Path $TestDrive 'Desk2'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        $made = @(New-KohaShortcuts -StartMenu (Join-Path $TestDrive 'Programs2/Koha') -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico'))
+        @($made | Where-Object { $_ -like '*.lnk' }).Count | Should -Be 0
+        @($made | Where-Object { $_ -like '*.url' }).Count | Should -Be 2
+    }
+}
+
+Describe 'Cold boot' {
+    It 'reads a Koha that should run as starting in the first seconds after Windows starts' {
+        $st = @{ desired = 'running'; startedAt = 0; autostart = 'logon' }
+        Resolve-KohaState -Installed $true -Running $false -Linux $null -State $st -Now 1000 -GraceUntil 1045 | Should -Be 'starting'
+        Resolve-KohaState -Installed $true -Running $true -Linux $null -State $st -Now 1000 -GraceUntil 1045 | Should -Be 'starting'
+        Resolve-KohaState -Installed $true -Running $false -Linux $null -State $st -Now 1050 -GraceUntil 1045 | Should -Be 'stopped'
+        Resolve-KohaState -Installed $true -Running $true -Linux $null -State $st -Now 1050 -GraceUntil 1045 | Should -Be 'not_responding'
+        Resolve-KohaState -Installed $true -Running $false -Linux $null -State @{ desired = 'stopped'; startedAt = 0 } -Now 1000 -GraceUntil 1045 | Should -Be 'stopped_by_user'
+        Resolve-KohaState -Installed $true -Running $false -Linux $null -State @{ desired = 'running'; startedAt = 0; autostart = 'manual' } -Now 1000 -GraceUntil 1045 | Should -Be 'stopped'
+    }
+
+    It 'counts the grace from when Windows started' {
+        Get-KohaBootGraceUntil -UptimeMs 10000 -Now 5000 | Should -Be 5035
+        Get-KohaBootGraceUntil -UptimeMs 600000 -Now 5000 | Should -Be 4445
+        # TickCount wraps negative after 24.9 days: that is a long uptime.
+        Get-KohaBootGraceUntil -UptimeMs -1000 -Now 5000000 | Should -BeLessThan 5000000
+    }
+
+    It 'sends no failure notification during the grace' {
+        $n = Get-KohaNotifications -Previous 'running' -Status ([pscustomobject]@{ State = 'starting'; Linux = $null }) -Disk $null -State @{ desired = 'running' }
+        @($n.Notifications).Count | Should -Be 0
+    }
+}
+
+Describe 'Clean stop when Windows ends the session' {
+    BeforeEach { Set-KohaState @{ stopScriptHash = '' } | Out-Null }
+    AfterAll { Set-KohaState @{ stopScriptHash = '' } | Out-Null }
+
+    It 'writes the stop script into Debian once, and again when it changes' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { $script:sent = $Script; $script:body = $InputText; [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Update-KohaStopScript | Should -Be 'written'
+        $script:sent | Should -Match "f='/usr/local/sbin/koha-easy-stop'"
+        $script:body | Should -Match 'koha-stop-guard stop'
+        Update-KohaStopScript | Should -Be 'current'
+        Should -Invoke -ModuleName KohaEasy.Core Invoke-KohaLinuxScript -Times 1 -Exactly
+    }
+
+    It 'runs the stop and the terminate through wsl.exe with no console, and never asks WSL first' {
+        Set-KohaState @{ stopScriptHash = (Get-KohaStopScriptHash) } | Out-Null
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { throw 'must not ask WSL' }
+        Mock -ModuleName KohaEasy.Core Stop-KohaDebianGracefully { throw 'must not run' }
+        $script:ran = New-Object System.Collections.ArrayList
+        $d = { param($c, $ms) [void]$script:ran.Add(@{ C = $c; Ms = $ms }); 0 }
+        Stop-KohaForSessionEnd -RunDetached $d | Should -Be 'clean'
+        $script:ran[0].C | Should -Match '"[^"]*wsl\.exe" -d koha -u root -- timeout -k 5 60 sh /usr/local/sbin/koha-easy-stop$'
+        $script:ran[0].Ms | Should -Be 70000
+        $script:ran[1].C | Should -Match '"[^"]*wsl\.exe" --terminate koha$'
+        $d2 = { param($c, $ms) if ($c -match 'koha-easy-stop') { Start-Sleep -Milliseconds 2100; 1 } else { 0 } }
+        Stop-KohaForSessionEnd -RunDetached $d2 | Should -Be 'forced'
+    }
+
+    It 'falls back to the usual stop when the script is not in Debian yet or wsl.exe cannot start' {
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
+        Mock -ModuleName KohaEasy.Core Stop-KohaDebianGracefully { 'clean' }
+        Stop-KohaForSessionEnd -RunDetached { throw 'must not run' } | Should -Be 'clean'
+        Set-KohaState @{ stopScriptHash = (Get-KohaStopScriptHash) } | Out-Null
+        Stop-KohaForSessionEnd -RunDetached { param($c, $ms) -2 } | Should -Be 'clean'
+        # wsl.exe failed at once: it stopped nothing.
+        Stop-KohaForSessionEnd -RunDetached { param($c, $ms) 1 } | Should -Be 'clean'
+        Should -Invoke -ModuleName KohaEasy.Core Stop-KohaDebianGracefully -Times 3 -Exactly
+    }
+
+    It 'the tray asks to be told first, and uses the detached stop' {
+        $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
+        $t | Should -Match 'SetProcessShutdownParameters\(0x3FF, 0\)'
+        $t | Should -Match 'DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP'
+        $t | Should -Match '\[KohaSessionWindow\]::ShutDownFirst\(\)'
+        $t | Should -Match 'Update-KohaStopScript'
     }
 }

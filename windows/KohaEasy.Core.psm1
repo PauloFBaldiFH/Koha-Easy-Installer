@@ -27,6 +27,8 @@ $script:Cfg = @{
     OpacUrl     = 'http://localhost/'
     StartWaitS  = 180
     StopWaitS   = 60
+    BootGraceS  = 45
+    StopScript  = '/usr/local/sbin/koha-easy-stop'
     DiskWarnGB  = 10
     DiskCritGB  = 5
     StaleBackupH = 36
@@ -65,16 +67,8 @@ function Get-KohaPath {
     }
 }
 
-# The Koha window's terminal area: while it is set (a ConcurrentQueue of
-# strings), every log line is also queued there for the window to show.
-$script:OutputSink = $null
-function Set-KohaOutputSink { param($Queue) $script:OutputSink = $Queue }
-
 function Write-KohaLog {
     param([string]$Message, [string]$Name = 'koha')
-    if ($null -ne $script:OutputSink) {
-        try { $script:OutputSink.Enqueue(('{0}  {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message)) } catch { }
-    }
     try {
         $dir = Get-KohaPath Logs
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -99,6 +93,7 @@ $script:StateDefaults = [ordered]@{
     notifyBackupOk       = $true
     handshakePending     = $false
     hiddenLaunch         = 'conhost'
+    stopScriptHash       = ''
     launcher             = ''
     launcherHash         = ''
     appIdShortcut        = $false
@@ -375,29 +370,47 @@ function Get-KohaLinuxStatus {
 
 # One-word state for the tray and the Status shortcut:
 #   running | starting | not_responding | stopped_by_user | stopped | not_installed
+# Pure. Until $GraceUntil (the first seconds after Windows starts, see
+# Get-KohaBootGraceUntil), a Koha that should run and is not up yet is
+# starting, not stopped or not responding: WSL, systemd and Koha's services
+# take a while after a cold boot, and the sign-in task may not have run yet.
 function Resolve-KohaState {
-    param($Installed, $Running, $Linux, [System.Collections.IDictionary]$State, [int64]$Now = (Get-UnixTime))
+    param($Installed, $Running, $Linux, [System.Collections.IDictionary]$State, [int64]$Now = (Get-UnixTime), [int64]$GraceUntil = 0)
     if (-not $Installed) { return 'not_installed' }
+    $grace = ($Now -lt $GraceUntil) -and ($State.desired -ne 'stopped') -and ($State.autostart -ne 'manual')
     if (-not $Running) {
         if ($State.desired -eq 'stopped') { return 'stopped_by_user' }
+        if ($grace) { return 'starting' }
         return 'stopped'
     }
-    $recent = ($State.startedAt -gt 0) -and (($Now - [int64]$State.startedAt) -lt $script:Cfg.StartWaitS)
+    $recent = $grace -or (($State.startedAt -gt 0) -and (($Now - [int64]$State.startedAt) -lt $script:Cfg.StartWaitS))
     if ($null -ne $Linux -and $Linux.state -eq 'ok') { return 'running' }
     if ($null -ne $Linux -and $Linux.state -eq 'not_installed') { return 'not_installed' }
     if ($recent) { return 'starting' }
     return 'not_responding'
 }
 
+# When the boot grace ends: $Cfg.BootGraceS after Windows started (the
+# tray also passes its own start, since Fast Startup keeps Windows' uptime).
+function Get-KohaBootGraceUntil {
+    param([int64]$UptimeMs = [int64][Environment]::TickCount, [int64]$Now = (Get-UnixTime))
+    # TickCount is an Int32 that wraps after 24.9 days.
+    if ($UptimeMs -lt 0) { $UptimeMs += 4294967296 }
+    return ($Now - [int64]($UptimeMs / 1000) + [int64]$script:Cfg.BootGraceS)
+}
+
 function Get-KohaStatus {
+    param([int64]$GraceUntil = 0)
     $state = Get-KohaState
+    $boot = Get-KohaBootGraceUntil
+    if ($boot -gt $GraceUntil) { $GraceUntil = $boot }
     $installed = Test-KohaDistroInstalled
     $running = $false
     $linux = $null
     if ($installed) { $running = Test-KohaDistroRunning }
     if ($running) { $linux = Get-KohaLinuxStatus }
     return [pscustomobject]@{
-        State     = (Resolve-KohaState -Installed $installed -Running $running -Linux $linux -State $state)
+        State     = (Resolve-KohaState -Installed $installed -Running $running -Linux $linux -State $state -GraceUntil $GraceUntil)
         Desired   = $state.desired
         Autostart = $state.autostart
         Linux     = $linux
@@ -704,23 +717,36 @@ function Invoke-KohaDiskpart {
 #   1. KohaEasy.exe, built on this PC (KohaEasy.Launcher.cs): a Windows
 #      program, so Windows opens no console for it, and it starts PowerShell
 #      with CREATE_NO_WINDOW;
-#   2. conhost.exe --headless: a console nobody sees (Windows 10 1903 and
+#   2. wscript.exe KohaEasy.Hidden.js: Windows Script Host is a Windows
+#      program too, and it starts PowerShell with its window hidden from the
+#      start (window style 0), so Windows Terminal does not take it over.
+#      Its shortcuts hold no PowerShell command line, which antivirus
+#      programs treat as suspicious in a .lnk;
+#   3. conhost.exe --headless: a console nobody sees (Windows 10 1903 and
 #      later, which WSL 2 needs anyway);
-#   3. powershell.exe -WindowStyle Hidden, the last resort: it flashes a
+#   4. powershell.exe -WindowStyle Hidden, the last resort: it flashes a
 #      console, and where Windows Terminal is the default terminal (Windows
 #      11) it leaves an empty Windows Terminal window open.
 # The shortcuts, the tray at sign-in and the scheduled tasks all use it.
+# -Hidden tells KohaEasy.ps1 it was started this way (see
+# Test-KohaRelaunchHidden).
 function Get-KohaHiddenLaunch {
     param(
         [string]$Arguments,
         [string]$Conhost = (Get-KohaConhostPath),
-        [string]$Launcher = (Get-KohaLauncherPath)
+        [string]$Launcher = (Get-KohaLauncherPath),
+        [string]$Wscript = (Get-KohaWscriptPath)
     )
+    $Arguments = ($Arguments + ' -Hidden').Trim()
     if ($Launcher -and (Test-Path -LiteralPath $Launcher)) {
         return [pscustomobject]@{ Target = $Launcher; Arguments = $Arguments }
     }
     $ps = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     $a = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f (Get-KohaScriptPath), $Arguments
+    if ($Wscript -and (Test-Path -LiteralPath $Wscript)) {
+        $js = [System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.Hidden.js')
+        return [pscustomobject]@{ Target = $Wscript; Arguments = ('//B //Nologo "{0}" {1}' -f $js, $Arguments) }
+    }
     if ($Conhost -and (Test-Path -LiteralPath $Conhost)) {
         return [pscustomobject]@{ Target = $Conhost; Arguments = ('--headless "{0}" {1}' -f $ps, $a) }
     }
@@ -732,6 +758,44 @@ function Get-KohaHiddenLaunch {
 function Get-KohaConhostPath {
     if ((Get-KohaState).hiddenLaunch -eq 'powershell') { return '' }
     return [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'conhost.exe')
+}
+
+# wscript.exe with KohaEasy.Hidden.js next to KohaEasy.ps1, unless the
+# installer found that it does not start Koha's tools on this PC
+# (hiddenLaunch = nowscript, or powershell).
+function Get-KohaWscriptPath {
+    if (@('nowscript', 'powershell') -contains (Get-KohaState).hiddenLaunch) { return '' }
+    if (-not (Test-Path -LiteralPath ([System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.Hidden.js')))) { return '' }
+    return [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wscript.exe')
+}
+
+# KohaEasy.ps1 commands that must never show a console: the windows, the
+# tray and what the shortcuts and the tray menu run. The scheduled tasks'
+# Run and UpdatePortProxy, and the commands the installer waits on, are
+# left alone.
+$script:HiddenCommands = @('Window', 'Tray', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'ExportReport', 'ExportDiagnostics', 'CheckDisk')
+
+# Pure: whether KohaEasy.ps1 should start itself again the hidden way and
+# end, which closes the console it was given. That console comes from a
+# launch without -Hidden: a shortcut, sign-in entry or task of an earlier
+# version, or powershell.exe itself (Windows Terminal keeps an empty window
+# for it). Only when the hidden launch is not powershell.exe itself, so it
+# can never loop.
+function Test-KohaRelaunchHidden {
+    param([string]$Command, [bool]$Hidden, [string]$Target = (Get-KohaHiddenLaunch -Arguments '').Target)
+    if ($Hidden -or $env:KOHAEASY_NO_RELAUNCH -eq '1') { return $false }
+    if ($script:HiddenCommands -notcontains $Command) { return $false }
+    return (($Target -split '[\\/]')[-1] -ne 'powershell.exe')
+}
+
+# Pure: the command line of that second start, from KohaEasy.ps1's own
+# parameters.
+function Get-KohaRelaunchArguments {
+    param([string]$Command, [System.Collections.IDictionary]$Bound)
+    $a = @($Command)
+    foreach ($k in 'Trigger', 'Mode') { if ($Bound.Contains($k)) { $a += ('-{0} {1}' -f $k, $Bound[$k]) } }
+    foreach ($k in 'Force', 'Quiet', 'Pause') { if ($Bound.Contains($k) -and [bool]$Bound[$k]) { $a += ('-' + $k) } }
+    return ($a -join ' ')
 }
 
 # KohaEasy.exe, once the installer built it and Windows let it run
@@ -1072,9 +1136,36 @@ function Start-Koha {
 # changing what the librarian wants, so it starts again at the next sign-in
 # in automatic mode. A power cut or a forced shutdown never gets here; the
 # clean-stop guard inside Debian repairs Koha at the next start instead.
+# At the end of a session Windows closes every console program with it
+# (CTRL_SHUTDOWN_EVENT), and every wsl.exe the other stops start is one:
+# the stop could be cut off halfway, and the next start then reported an
+# unclean stop. So the tray runs the stop script already written into
+# Debian (Update-KohaStopScript) through a wsl.exe with no console at all
+# (DETACHED_PROCESS, $RunDetached), then ends the distro the same way.
+# The tray calls it only while Koha runs, so it never asks WSL first.
 function Stop-KohaForSessionEnd {
+    param([scriptblock]$RunDetached = { param($CommandLine, $TimeoutMs) [KohaSessionWindow]::RunDetached($CommandLine, $TimeoutMs) })
+    $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
+    if ((Get-KohaState).stopScriptHash -eq (Get-KohaStopScriptHash)) {
+        Write-KohaLog 'Windows is ending the session: stopping Koha cleanly'
+        $cmd = '"{0}" -d {1} -u root -- timeout -k 5 {2} sh {3}' -f $wsl, $script:Cfg.Distro, $script:Cfg.StopWaitS, $script:Cfg.StopScript
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $code = [int](& $RunDetached $cmd (([int]$script:Cfg.StopWaitS + 10) * 1000))
+        # A wsl.exe that failed at once (it could not run without a console)
+        # stopped nothing: the usual stop below still can.
+        $quick = ($code -gt 0 -and $clock.Elapsed.TotalSeconds -lt 2)
+        if ($code -ne -2 -and -not $quick) {
+            $how = 'clean'
+            if ($code -ne 0) { $how = 'forced' }
+            & $RunDetached ('"{0}" --terminate {1}' -f $wsl, $script:Cfg.Distro) 30000 | Out-Null
+            Write-KohaLog ('session end: {0} stopped: {1} (exit {2})' -f $script:Cfg.Distro, $how, $code)
+            return $how
+        }
+        Write-KohaLog ('session end: wsl.exe without a console did not run the stop (exit {0}); trying the usual stop' -f $code)
+    } else {
+        Write-KohaLog 'Windows is ending the session: the stop script is not in Debian yet; trying the usual stop'
+    }
     if (-not (Test-KohaDistroRunning)) { return 'not_running' }
-    Write-KohaLog 'Windows is ending the session: stopping Koha cleanly'
     return (Stop-KohaDebianGracefully)
 }
 
@@ -1117,6 +1208,28 @@ else
 fi
 exit $rc
 '@
+
+# The stop script as a file in Debian ($Cfg.StopScript), for the end of a
+# Windows session. Written while Debian runs, again whenever the script
+# changes; state.json stopScriptHash records the version written.
+function Get-KohaStopScriptHash {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($script:GracefulStopScript -replace "`r", '')))
+        return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally { $sha.Dispose() }
+}
+
+function Update-KohaStopScript {
+    $hash = Get-KohaStopScriptHash
+    if ((Get-KohaState).stopScriptHash -eq $hash) { return 'current' }
+    if (-not (Test-KohaDistroRunning)) { return 'not_running' }
+    $r = Invoke-KohaLinuxScript -Script ($script:WindowScriptInstall.Replace('__PATH__', $script:Cfg.StopScript)) -InputText $script:GracefulStopScript
+    if ($r.ExitCode -ne 0) { Write-KohaLog ('stop script not written: ' + $r.Output); return 'failed' }
+    Set-KohaState @{ stopScriptHash = $hash } | Out-Null
+    Write-KohaLog ('stop script written to ' + $script:Cfg.StopScript)
+    return 'written'
+}
 
 # The one way the Windows tools stop Debian (Stop, Restart, disk compaction,
 # diagnostics, the installer's restarts): Koha's services are stopped
@@ -1185,6 +1298,7 @@ function Invoke-KohaRun {
     Start-Sleep -Seconds 2
     Update-KohaHandshake | Out-Null
     Start-KohaNetworkTask | Out-Null
+    Update-KohaStopScript | Out-Null
     # Stop pressed meanwhile: not a failure.
     if (-not (Wait-KohaHttp) -and (Get-KohaState).desired -eq 'running') {
         Write-KohaLog 'keep-alive: the staff interface did not answer in time' 'health'
@@ -1808,20 +1922,6 @@ function Get-KohaServiceName {
     return [string]$Row.Name
 }
 
-# The Koha window's command line: one command, not interactive, as the Debian
-# user (WSL's default user) in a login shell, from the home folder. Its
-# stdin is empty, and Linux's timeout ends it after $TimeoutSeconds.
-# Returns ExitCode (124 on timeout) and Output. Never starts Debian.
-function Invoke-KohaUserCommand {
-    param([Parameter(Mandatory = $true)][string]$Command, [int]$TimeoutSeconds = 120)
-    if (-not (Test-KohaDistroRunning)) { return $null }
-    # The command crosses on stdin, like every script here (see
-    # Invoke-KohaLinuxScript); "exit $?" ends it before Windows' CR LF.
-    $body = ($Command -replace "`r", '') + "`nexit `$?`n"
-    $wslArgs = @('-d', $script:Cfg.Distro, '--cd', '~', '--', 'timeout', '-k', '5', [string]$TimeoutSeconds, 'bash', '-l')
-    return (Invoke-KohaWsl -Arguments $wslArgs -InputText $body)
-}
-
 # Read-only, like the tray: a stopped Debian is reported, never started.
 function Get-KohaServiceHealth {
     $lines = @(Get-KohaQuickCheck)
@@ -2125,12 +2225,45 @@ function Save-KohaLnkShortcut {
     $lnk.Save()
 }
 
+# The signed-in user's own desktop, the one Explorer shows: Windows' answer
+# (it follows OneDrive's desktop backup), else the folder Explorer's
+# registry value names, else OneDrive's and the profile's Desktop folders.
+# Only a folder that exists, and never the Public desktop or another
+# account's. '' when there is none.
+function Get-KohaDesktopPath {
+    param(
+        [string]$Known = [Environment]::GetFolderPath('Desktop'),
+        [string]$Registry = (Get-KohaRegistryDesktop),
+        [string]$UserProfile = $env:USERPROFILE
+    )
+    $candidates = @($Known, $Registry)
+    if ($UserProfile) {
+        $candidates += @(Get-ChildItem -LiteralPath $UserProfile -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
+                ForEach-Object { [System.IO.Path]::Combine($_.FullName, 'Desktop') })
+        $candidates += [System.IO.Path]::Combine($UserProfile, 'Desktop')
+    }
+    foreach ($c in $candidates) {
+        if (-not $c) { continue }
+        if ($c -match '\\Users\\(Public|Default)\\') { continue }
+        if ($UserProfile -and -not $c.StartsWith($UserProfile, [System.StringComparison]::OrdinalIgnoreCase) -and $c -match '^[A-Za-z]:\\Users\\') { continue }
+        if (Test-Path -LiteralPath $c -PathType Container) { return $c }
+    }
+    return ''
+}
+
+function Get-KohaRegistryDesktop {
+    try {
+        $v = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -Name Desktop -ErrorAction Stop).Desktop
+        return [Environment]::ExpandEnvironmentVariables([string]$v)
+    } catch { return '' }
+}
+
 # Creates (or refreshes) every shortcut with the Koha icon. The icon is copied
 # next to KohaEasy.ps1 first, so shortcuts keep it if the ZIP folder is deleted.
 function New-KohaShortcuts {
     param(
         [string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'),
-        [string]$Desktop = [Environment]::GetFolderPath('Desktop'),
+        [string]$Desktop = (Get-KohaDesktopPath),
         [string]$IconSource = [System.IO.Path]::Combine($PSScriptRoot, 'koha.ico')
     )
     $icon = Get-KohaIconPath
@@ -2161,7 +2294,10 @@ function New-KohaShortcuts {
                 Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
                 if ($s.ContainsKey('AppId') -and $s.AppId -and (Set-KohaShortcutAppId -Path $file) -and $d -eq $StartMenu) { $identity = $true }
             }
-            [void]$made.Add($file)
+            # Counted only once Windows shows it there (an antivirus can
+            # remove a shortcut as soon as it is written).
+            if (Test-Path -LiteralPath $file) { [void]$made.Add($file) }
+            else { Write-KohaLog ('shortcut missing right after it was written: ' + $file) }
         }
     }
     # Only with the Start menu shortcut does Windows know Koha's name and

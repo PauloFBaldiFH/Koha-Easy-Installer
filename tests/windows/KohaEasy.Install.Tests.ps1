@@ -449,6 +449,50 @@ Describe 'Install messages' {
         Should -Invoke -ModuleName KohaEasy.Install Write-Host -ParameterFilter { "$Object" -like '*notification area*' }
     }
 
+    It 'tries Windows Script Host, then conhost, when the tray does not start' {
+        Set-KohaState @{ launcher = 'failed'; hiddenLaunch = 'conhost' } | Out-Null
+        $script:running = [System.Collections.Queue]::new(@($false, $true, $true))
+        Mock -ModuleName KohaEasy.Install Get-KohaWscriptPath { 'C:\Windows\System32\wscript.exe' }
+        Mock -ModuleName KohaEasy.Install Restart-KohaTray { [void]$script:calls.Add('tray restart') }
+        Mock -ModuleName KohaEasy.Install Start-KohaTray { [void]$script:calls.Add('tray ' + (Get-KohaState).hiddenLaunch) }
+        Mock -ModuleName KohaEasy.Install Start-Sleep { }
+        Mock -ModuleName KohaEasy.Install Test-KohaTrayRunning { $script:running.Dequeue() }
+        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { }
+        Mock -ModuleName KohaEasy.Install Register-KohaTasks { }
+        Start-KohaTrayChecked
+        $script:calls | Should -Be @('tray restart', 'tray nowscript')
+        (Get-KohaState).hiddenLaunch | Should -Be 'nowscript'
+        Set-KohaState @{ launcher = ''; hiddenLaunch = 'conhost' } | Out-Null
+    }
+
+    It 'tries every hidden launch again at each run of the installer' {
+        Mock -ModuleName KohaEasy.Install Install-KohaLauncher { $script:seen = Get-KohaState; 'current' }
+        Set-KohaState @{ launcher = 'refused'; launcherHash = 'abc'; hiddenLaunch = 'powershell' } | Out-Null
+        Install-KohaLauncherStep
+        $script:seen.launcher | Should -Be ''
+        $script:seen.launcherHash | Should -Be ''
+        $script:seen.hiddenLaunch | Should -Be 'conhost'
+        Set-KohaState @{ launcher = 'ok'; launcherHash = 'abc'; hiddenLaunch = 'conhost' } | Out-Null
+        Install-KohaLauncherStep
+        $script:seen.launcherHash | Should -Be 'abc'
+        Set-KohaState @{ launcher = ''; launcherHash = '' } | Out-Null
+    }
+
+    It 'says the desktop shortcut was made only when it is there' {
+        $dt = Join-Path $TestDrive 'DeskInstall'
+        New-Item -ItemType Directory -Path $dt -Force | Out-Null
+        Mock -ModuleName KohaEasy.Install Get-KohaDesktopPath { $dt }
+        Mock -ModuleName KohaEasy.Install Set-KohaTrayAtSignIn { }
+        Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { }
+        Install-KohaShortcuts
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like '*could not be put on the desktop*' }
+        Mock -ModuleName KohaEasy.Install New-KohaShortcuts { Set-Content -LiteralPath (Join-Path $dt 'Koha.lnk') -Value '' }
+        Install-KohaShortcuts
+        Should -Invoke -ModuleName KohaEasy.Install Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -like ('*Shortcuts created*' + $dt + '*') }
+    }
+
     It 'goes to a hidden PowerShell for the tray, the shortcuts and the tasks when conhost does not start the tray' {
         Set-KohaState @{ launcher = 'failed'; hiddenLaunch = 'conhost' } | Out-Null
         $script:running = [System.Collections.Queue]::new(@($false, $false, $true, $true))
@@ -955,7 +999,7 @@ Describe 'Koha window' {
     }
 }
 
-Describe 'The Koha window banner and terminal area' {
+Describe 'The Koha window banner' {
     BeforeAll {
         function New-Health {
             param([bool]$Debian = $true, [hashtable]$States = @{})
@@ -1016,30 +1060,7 @@ Describe 'The Koha window banner and terminal area' {
         (Get-KohaHealthSummary -Health $null -State 'running').Level | Should -Be 'unknown'
     }
 
-    It 'runs one command as the Debian user, from home, with a time limit and the command on stdin' {
-        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
-        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { throw 'must not run' }
-        Invoke-KohaUserCommand -Command 'df -h' | Should -BeNullOrEmpty
-        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
-        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { $script:wargs = $Arguments; $script:win = $InputText; [pscustomobject]@{ ExitCode = 0; Output = 'ok' } }
-        (Invoke-KohaUserCommand -Command "df -h`r").Output | Should -Be 'ok'
-        ($script:wargs -join ' ') | Should -Be '-d koha --cd ~ -- timeout -k 5 120 bash -l'
-        $script:wargs | Should -Not -Contain '-u'
-        $script:win | Should -Be "df -h`nexit `$?`n"
-    }
-
-    It 'sends the log lines of an action to the terminal area while it is set' {
-        $q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-        Set-KohaOutputSink $q
-        try { Write-KohaLog 'restart services: [OK] mariadb' } finally { Set-KohaOutputSink $null }
-        Write-KohaLog 'not shown'
-        $q.Count | Should -Be 1
-        $line = $null
-        [void]$q.TryDequeue([ref]$line)
-        $line | Should -Match '^\d\d:\d\d:\d\d  restart services: \[OK\] mariadb$'
-    }
-
-    It 'shows each restarted service in the terminal area' {
+    It 'logs each restarted service' {
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $true }
         Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [pscustomobject]@{ ExitCode = 0; Output = "[OK] mariadb`n[OK] apache2`n" } }
         Mock -ModuleName KohaEasy.Core Wait-KohaHttp { $true }
@@ -1052,9 +1073,10 @@ Describe 'The Koha window banner and terminal area' {
     It 'the window keeps three actions on its surface, Staff before the catalog, and no Refresh button' {
         $w = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Window.ps1') -Raw
         $w.IndexOf("T 'Staff interface'") | Should -BeLessThan $w.IndexOf("T 'Public catalog (OPAC)'")
-        $w | Should -Match 'foreach \(\$b in \$btnPanel, \$btnServices, \$btnConsole, \$btnMore\)'
+        $w | Should -Match 'foreach \(\$b in \$btnPanel, \$btnServices, \$btnTerminal, \$btnMore\)'
+        $w | Should -Match "\(T 'Open the Debian terminal'\)\) 'secondary' \{ Start-KohaHidden 'Terminal' \}"
         $w | Should -Not -Match "T 'Refresh'"
-        $w | Should -Match "'command'\s+\{"
+        $w | Should -Not -Match 'RichTextBox|Invoke-KohaUserCommand'
         $w | Should -Match 'SetDarkTitleBar'
     }
 }
