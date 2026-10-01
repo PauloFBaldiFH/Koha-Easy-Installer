@@ -26,8 +26,8 @@ die() { echo "tests/run.sh: $*" >&2; exit 1; }
 if dpkg-query -W -f='${Status}' koha-common 2>/dev/null | grep -q 'ok installed'; then
     die "a real koha-common is installed here; the tests would destroy it."
 fi
-for c in bats mysql mysqldump mariadbd memcached whiptail gzip flock setsid yaz-marcdump xsltproc python3; do
-    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 libmarc-record-perl)."
+for c in bats mysql mysqldump mariadbd memcached whiptail gzip zip flock setsid yaz-marcdump xsltproc python3; do
+    command -v "$c" >/dev/null 2>&1 || die "missing '$c' (apt-get install bats mariadb-server memcached whiptail zip yaz xsltproc python3 libmarc-record-perl)."
 done
 # The MARC tools, the messaging driver and marc_replace.pl run on Koha's own
 # Perl stack (koha-common depends on these packages).

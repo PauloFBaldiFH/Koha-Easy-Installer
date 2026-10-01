@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Library tools 15: Koha's own plugin system turned on or off in
+# Library tools 14: Koha's own plugin system turned on or off in
 # koha-conf.xml (enable_plugins, pluginsdir, plugins_restricted and the
 # plugin repositories), Koha restarted, and the plugins copied into the
 # folder by hand registered with Koha's own script.
@@ -47,8 +47,8 @@ open(p, "w").write(s)
 PY
 }
 
-@test "K01 menu: Library tools 15 opens the plugins menu, which shows the current state" {
-    assert 'grep -q "^            15) function_koha_plugins ;;$" "$KEI_REPO/installer"' "entry 15 of Library tools"
+@test "K01 menu: Library tools 14 opens the plugins menu, which shows the current state" {
+    assert 'grep -q "^            14) function_koha_plugins ;;$" "$KEI_REPO/installer"' "entry 14 of Library tools"
     inputs CANCEL
     panel function_koha_plugins
     assert '[ "$status" -eq 0 ] && dialogs | grep -q "MENU \[⌁  Koha plugins (turn on or off)\] => CANCEL"' "$(dialogs)"

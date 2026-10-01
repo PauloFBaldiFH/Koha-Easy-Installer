@@ -1,9 +1,9 @@
 #!/usr/bin/env bats
-# Library tools 11-13 and the Biblioteca Fácil preset: WhatsApp / Telegram
+# Library tools 10-12 and the readers of the old systems: WhatsApp / Telegram
 # messaging (the SMS::Send driver of the panel, run by the real SMS::Send
 # against tests/mocks/http-mock), cataloguing aids (author tables and CDD,
-# real MariaDB), collection spreadsheets (real MARC::Record and
-# yaz-marcdump) and marc_replace.pl (run as a CGI with the Koha doubles of
+# real MariaDB), the Biblioteca Fácil and ISIS readers (real MARC::Record)
+# and marc_replace.pl (run as a CGI with the Koha doubles of
 # tests/mocks/perl5).
 
 setup() {
@@ -346,57 +346,7 @@ EOF
     assert 'dialogs | grep -q "Invalid class number"'
 }
 
-# --- Collection spreadsheets (Biblioteca Fácil) -----------------------------------
-
-biblioteca_facil_csv() {
-    cat <<'EOF' | iconv -f UTF-8 -t WINDOWS-1252 > "$W/acervo.csv"
-Tombo;Título;Subtítulo;Autor;Editora;Local;Ano;Edição;ISBN;CDD;Cutter;Assunto;Exemplar;Tipo;Data de aquisição;Valor;Observação da escola
-0001;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";1;Livro;05/03/2020;R$ 25,90;x
-0002;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";2;Livro;05/03/2020;;
-0003;Revista Ciência Hoje;n. 300;;SBPC;Rio de Janeiro;2013;;;505;;Ciência;;revista;;;
-0001;Duplicado;;Autor, Teste;;;;;;;;;;;;;
-;;;Sem título;;;;;;;;;;;;;
-EOF
-}
-
-@test "F01 Biblioteca Fácil: Windows-1252 spreadsheet becomes UTF-8 MARC with one record per title and its items in 952" {
-    biblioteca_facil_csv
-    export KEI_SELECT_FILE="$W/acervo.csv"
-    inputs CPL LIVRO new
-    answer yes yes
-    panel lt_br_migrate_sheet
-    assert '[ "$status" -eq 0 ]' "$output"
-    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
-    assert 'grep -q "Título *-> title" "$p" && grep -q "Tombo *-> barcode" "$p" && grep -q "Observação da escola *-> -" "$p" && grep -q "Encoding: Windows-1252" "$p"' "$(cat "$p")"
-    assert 'grep -q "Records: 3" "$p" && grep -q "Items created: 4" "$p" && grep -q "Rows without title: 1" "$p" && grep -q "Repeated barcodes (kept on the first row only): 1" "$p"'
-    assert '[ -s "$f" ] && iconv -f UTF-8 -t UTF-8 "$f" >/dev/null && [ "$(head -c 10 "$f" | tail -c 1)" = "a" ]' "UTF-8 with leader/09 a"
-    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "3" ]' "$(marc_dump "$f")"
-    assert 'marc_dump "$f" | grep -qx "245 12 \$a O cortiço"' "nonfiling article: $(marc_dump "$f" | grep ^245)"
-    assert 'marc_dump "$f" | grep -qx "260    \$a São Paulo : \$b Ática, \$c 1997" && marc_dump "$f" | grep -qx "250    \$a 2. ed."'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0001 \$t 1 \$d 2020-03-05 \$g 25.90"' "$(marc_dump "$f" | grep ^952)"
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0002 \$t 2 \$d 2020-03-05"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y REV \$o 505 \$p 0003"' "item type from its description"
-    assert 'marc_dump "$f" | grep -qx "020    \$a 9788508000013" && marc_dump "$f" | grep -qx "090    \$a 869.3 \$b A994c" && marc_dump "$f" | grep -qx "650  4 \$a Naturalismo"'
-    assert 'marc_dump "$f" | grep -A12 "Duplicado" | grep -q "^952    \$a CPL \$b CPL \$y LIVRO$"' "the repeated tombo is dropped, the item kept"
-    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \".*sheet2marc.pl\".*--dry-run" "$KEI_S/calls.log" && grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
-}
-
-@test "F02 spreadsheet without a title column, or declined after the preview: nothing staged" {
-    printf 'Tombo;Autor\n1;Fulano\n' > "$W/semtitulo.csv"
-    export KEI_SELECT_FILE="$W/semtitulo.csv"
-    inputs CPL LIVRO new
-    panel lt_br_migrate_sheet
-    assert 'dialogs | grep -q "needs a title column"' "$(dialogs | tail -2)"
-    biblioteca_facil_csv
-    export KEI_SELECT_FILE="$W/acervo.csv"
-    inputs CPL LIVRO keep
-    answer no
-    panel lt_br_migrate_sheet
-    assert 'grep -q "sheet2marc.pl.*--dry-run" "$KEI_S/calls.log" && ! grep -q "sheet2marc.pl.*--out" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
-}
-
-# --- Biblioteca Fácil database (.bkp and data folder) -----------------------------
+# --- Biblioteca Fácil and ISIS readers (their imports: tests/magic_import.bats) -----
 
 # Synthetic backup (tests/lib/bf_backup.py): the program's 15 DBISAM tables
 # with made-up patrons, copies, loans and holds, compressed like the real one.
@@ -407,37 +357,6 @@ bf_circ_schema() {
       CREATE TABLE reserves (reserve_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11) NOT NULL, reservedate date,
         biblionumber int(11) NOT NULL, branchcode varchar(10), priority smallint(6) NOT NULL DEFAULT 1, expirationdate date)
         DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
-}
-
-@test "F03 Biblioteca Fácil database: the backup's tables become MARC 21 records, patrons and a preview, never the operators' passwords" {
-    bf_backup "$W/biblioteca.bkp"
-    bf_circ_schema
-    tools_sql "INSERT INTO borrower_attribute_types VALUES ('CPF', 'CPF');"
-    export KEI_SELECT_FILE="$W/biblioteca.bkp"
-    inputs CPL LIVRO PT new
-    answer yes yes no yes
-    panel lt_br_migrate_bfdb
-    assert '[ "$status" -eq 0 ]' "$output"
-    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
-    assert 'grep -q "Tables read: 15 of 15" "$p" && grep -q "Backup: Backup do dia 30/09/2026 08:15:18 (2026-09-30 08:15)" "$p"' "$(cat "$p")"
-    assert 'grep -q "T09  collection (one row per copy)  105 row(s), 1 deleted, 1 removed in the program" "$p" && grep -q "T04_LEIT: 1 record(s) failed the checksum" "$p"'
-    assert 'grep -q "^Records: 103$" "$p" && grep -q "^Items created: 104$" "$p" && grep -q "BF<number> (tombo missing or repeated): 1" "$p"'
-    assert 'grep -q "^Patrons ready: 3$" "$p" && grep -q "Invalid CPF (not kept): 1    Repeated CPF (kept on the first only): 1" "$p"'
-    assert 'grep -q "^Open loans: 1$" "$p" && grep -q "^Returned loans: 1$" "$p" && grep -q "^Holds still valid: 2$" "$p" && grep -q "Item types: LIVRO -> LIVRO, Revista -> REV" "$p"'
-    assert 'grep -q "loan period 7 days; up to 3 items per patron" "$p"'
-    assert '! grep -rq "segredo123" "$p" /var/log/koha-easy-install 2>/dev/null' "the operators' passwords never reach a screen or a log"
-    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "103" ]' "$(marc_dump "$f" | head -40)"
-    assert 'marc_dump "$f" | grep -qx "245 12 \$a O cortiço" && marc_dump "$f" | grep -qx "100 1  \$a Azevedo, Aluísio"'
-    assert 'marc_dump "$f" | grep -qx "505 0  \$a Capítulo I (p. 9) -- Capítulo II (p. 21)" && marc_dump "$f" | grep -qx "655  4 \$a ROMANCE"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 1001 \$t 1 \$c EST1 \$d 2020-03-05 \$x Biblioteca Fácil: acervo 1"' "$(marc_dump "$f" | grep ^952 | head -3)"
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$p 1002 \$t 2 \$c EST1 \$d 2020-03-05 \$x Biblioteca Fácil: acervo 2" || marc_dump "$f" | grep -q "\$p 1002 .*acervo 2"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$p BF5 \$0 1 \$x Biblioteca Fácil: acervo 5"' "repeated tombo, withdrawn: $(marc_dump "$f" | grep 'acervo 5')"
-    assert 'marc_dump "$f" | grep -qx "700 0  \$a Coautora Teste" && marc_dump "$f" | grep -qx "041 0  \$a eng" && ! marc_dump "$f" | grep -q "Autor Apagado\|Livro apagado\|Registro excluído"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y REV \$p 1003 \$7 1 \$x Biblioteca Fácil: acervo 3"' "not for loan, item type from its description"
-    assert '[ "$(tools_sql "SELECT GROUP_CONCAT(cardnumber ORDER BY cardnumber) FROM borrowers WHERE categorycode = \"PT\" AND cardnumber IN (\"1\",\"2\",\"4\",\"3\",\"5\");")" = "1,2,4" ]' "$(tools_sql "SELECT cardnumber, surname, categorycode FROM borrowers;")"
-    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log" && grep -q "^import_patrons.pl .*--matchpoint cardnumber .*--confirm \[pre=2\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'dialogs | grep -q "No loan or hold to add"' "the mock import has no Biblioteca Fácil items: $(dialogs | tail -3)"
-    assert '[ "$(pre_backups CIRCULATION)" = "0" ] && [ -z "$(ls -A /tmp/koha_tools.* 2>/dev/null)" ]' "no circulation change; the work copies (patron data) are gone"
 }
 
 @test "F04 Biblioteca Fácil loans and holds: linked by card number and barcode, one transaction, ids above old_issues" {
@@ -470,63 +389,11 @@ bf_circ_schema() {
     assert '[ "$(tools_sql "SELECT COUNT(*) FROM issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM old_issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM reserves;")" = "3" ] && [ "$(pre_backups CIRCULATION)" = "1" ]' "$(tools_sql "SELECT * FROM reserves;")"
 }
 
-@test "F05 Biblioteca Fácil: data folder read like the backup; a file that is not a backup, or a declined preview, changes nothing" {
-    bf_backup --folder "$W/Dados"
-    bf_circ_schema
-    export KEI_SELECT_FILE="$W/Dados/T09_ACER.dat"
-    inputs CPL LIVRO PT new
-    answer no
-    panel lt_br_migrate_bfdb
-    assert 'grep -q "^Records: 103$" "$KEI_S/textboxes.log" && grep -q "^Patrons ready: 3$" "$KEI_S/textboxes.log"' "$(cat "$KEI_S/textboxes.log")"
-    head -c 4000 /dev/urandom > "$W/estragado.bkp"
-    export KEI_SELECT_FILE="$W/estragado.bkp"
-    inputs CPL LIVRO PT new
-    panel lt_br_migrate_bfdb
-    assert 'dialogs | grep -q "not a Biblioteca Fácil backup"' "$(dialogs | tail -3)"
-    bf_backup "$W/biblioteca.bkp"
-    head -c 6000 "$W/biblioteca.bkp" > "$W/cortado.bkp"
-    export KEI_SELECT_FILE="$W/cortado.bkp"
-    inputs CPL LIVRO PT new
-    panel lt_br_migrate_bfdb
-    assert '[ "$(dialogs | grep -c "not a Biblioteca Fácil backup")" = "2" ]' "a cut backup is refused: $(dialogs | tail -3)"
-    assert '! grep -q "bfdb2koha.pl.*--marc" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl\|^import_patrons.pl" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
-}
-
-# --- ISIS catalogue (PostgreSQL export) --------------------------------------------
-
 # Synthetic export (tests/lib/isis_dump.py): pg_dump of the acervo and ocorrencias
 # tables with noise around it and the tombo quirks of the real exports.
 isis_dump() { python3 "$KEI_REPO/tests/lib/isis_dump.py" "$@"; }
 
-@test "F06 ISIS: the PostgreSQL export becomes MARC 21 with one item per tombo, the noise left out and the tombos cleaned" {
-    isis_dump "$W/Backup_ISIS.backup"
-    export KEI_SELECT_FILE="$W/Backup_ISIS.backup"
-    inputs CPL LIVRO new
-    answer yes yes
-    panel lt_br_migrate_isis
-    assert '[ "$status" -eq 0 ]' "$output"
-    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
-    assert 'grep -q "Noise left out: 25 byte(s) before the dump, 19 byte(s) after it" "$p" && grep -q "encoding UTF8" "$p"' "$(cat "$p")"
-    assert 'grep -q "acervo *9 row(s)  collection" "$p" && grep -q "registro *-> 952 \$p \$h (one item per tombo)" "$p"'
-    assert 'grep -q "^Records: 8$" "$p" && grep -q "^Items created: 26$" "$p" && grep -q "^Barcodes ISIS<MFN>-<n> (tombo already used): 1$" "$p"'
-    assert 'grep -q "Not imported (no title, but a tombo in the row): MFN 8" "$p" && grep -q "title with a caret .*: MFN 2" "$p" && grep -q "Patrons, loans and holds: not in this backup" "$p"'
-    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "8" ] && [ "$(marc_dump "$f" | grep -c "^952")" = "26" ]' "$(marc_dump "$f" | head -40)"
-    assert 'marc_dump "$f" | grep -qx "245 12 \$a O CORTIÇO" && marc_dump "$f" | grep -qx "250    \$a 2ª ed" && marc_dump "$f" | grep -qx "260    \$a Sao Paulo : \$b Atica, \$c 1990"' "<O> article, ª repaired, place split"
-    assert 'marc_dump "$f" | grep -qx "650  4 \$a ROMANCE BRASILEIRO" && marc_dump "$f" | grep -qx "650  4 \$a ROMANCE" && marc_dump "$f" | grep -qx "100 1  \$a CANSI, BERNARDO \$c FREI"'
-    assert 'marc_dump "$f" | grep -qx "245 10 \$a INTRODUÇÃO A TEOLOGIA" && marc_dump "$f" | grep -qx "245 00 \$a MANUAL DE IDENTIFICAÇÃO" && ! marc_dump "$f" | grep -q "Informação não encontrada"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 823 A95 \$p 2135 \$h v. II \$d 2022-09-13 \$x ISIS MFN 2; registro: -2134 I^f2135 II^f2136 III"' "$(marc_dump "$f" | grep ^952)"
-    local b
-    b=$(marc_dump "$f" | grep "^952" | sed -n "s/.*\\\$p \([^ ]*\).*/\1/p" | tr "\n" " ")
-    assert '[ "$b" = "1001 2134 2135 2136 3377 3404 3462 18705 12452 669 670 671 672 148 2717 12730 516 ISIS6-1 1655 1656 1657 ISIS7 4475 4779 4495 9010 " ]' "barcodes: $b"
-    assert 'marc_dump "$f" | grep -q "\$p 12730 \$0 1 \$1 1 \$x .*Ocorrência 2021-01-29: O LIVRO FOI EXTRAVIADO" && marc_dump "$f" | grep -q "\$p 2717 .*tombo marcado com \\\$ no ISIS"' "withdrawn, lost, \$ kept in the note"
-    assert 'marc_dump "$f" | grep -q "\$p ISIS6-1 .*tombo 1001 repetido (já usado no MFN 1)" && marc_dump "$f" | grep -q "\$p 4779 \$h v. 5 " && marc_dump "$f" | grep -q "\$p 4495 \$h v. 6 "' "repeated tombo, volume glued to the next tombo"
-    assert '! marc_dump "$f" | grep -q "\$p 863\|\$p 54495\|\$p 42 "' "a call number typed in the tombo field is not a barcode"
-    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ -z "$(ls -A /tmp/koha_tools.* 2>/dev/null)" ]' "the work copies are gone"
-}
-
-@test "F07 ISIS: gzip, INSERT statements and Latin-1 give the same records; a cut, damaged or custom-format file, or a declined preview, changes nothing" {
+@test "F07 ISIS reader: gzip, INSERT statements and Latin-1 give the same records; a cut or custom-format dump is reported" {
     "$KEI_SH" "$PANEL" isis_write_reader "$W/isis2koha.pl"
     isis_dump "$W/plain.backup"
     isis_dump "$W/other.backup.gz" --inserts --gzip --latin1
@@ -540,17 +407,6 @@ isis_dump() { python3 "$KEI_REPO/tests/lib/isis_dump.py" "$@"; }
     printf 'PGDMP\001\016\000' > "$W/custom.backup"
     run perl "$W/isis2koha.pl" --in "$W/custom.backup" --dry-run
     assert '[ "$status" -eq 4 ] && echo "$output" | grep -q "custom-format dump"' "$output"
-    head -c 4000 /dev/urandom > "$W/estragado.backup"
-    export KEI_SELECT_FILE="$W/estragado.backup"
-    inputs CPL LIVRO new
-    panel lt_br_migrate_isis
-    assert 'dialogs | grep -q "not an ISIS backup"' "$(dialogs | tail -3)"
-    export KEI_SELECT_FILE="$W/plain.backup"
-    inputs CPL LIVRO keep
-    answer no
-    panel lt_br_migrate_isis
-    assert 'grep -q "isis2koha.pl.*--dry-run" "$KEI_S/calls.log" && ! grep -q "isis2koha.pl.*--marc" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
 }
 
 # --- marc_replace.pl ---------------------------------------------------------------
@@ -919,7 +775,7 @@ vision_preview() {
     panel true
     assert '[ ! -e /usr/local/lib/site_perl/KohaEasy ] && [ ! -e /etc/cron.d/koha_messaging ] && [ ! -e /etc/koha-easy-install/tables ] && [ "$(pref SMSSendDriver)" = "Email" ]'
     local f callers
-    for f in msg_install_files _lt_msg_notices_set _lt_msg_letters _lt_msg_phones_fix cat_table_import _lt_br_migrate_sheet_run _lt_mr_install _lt_mr_remove; do
+    for f in msg_install_files _lt_msg_notices_set _lt_msg_letters _lt_msg_phones_fix cat_table_import _lt_magic_run magic_engine _lt_mr_install _lt_mr_remove; do
         callers=$(grep -nE "(^|[^_a-z])${f}( |$|\))" "$KEI_REPO/installer" | grep -vE "^[0-9]+:${f}\(\) \{" | grep -vE "^[0-9]+:\s*#" | cut -d: -f1)
         assert '[ -n "$callers" ]' "$f is used"
         local l

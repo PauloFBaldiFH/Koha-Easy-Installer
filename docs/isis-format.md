@@ -1,7 +1,7 @@
 # ISIS catalogue: PostgreSQL export format
 
 How the panel reads the catalogue of a library that ran CDS/ISIS (Library
-tools > Brazil: localization & migration > Migrate the ISIS catalogue).
+tools > Magic Import Tool, which recognises the export and calls this reader).
 Written from one real export; nothing below comes from a vendor. Anything the
 importer does not recognise is counted in the preview before a change is made.
 
