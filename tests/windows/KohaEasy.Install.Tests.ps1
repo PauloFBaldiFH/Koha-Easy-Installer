@@ -897,6 +897,19 @@ Describe 'Checks inside Debian' {
         $l.File | Should -Match 'wt\.exe$'
         $l.Arguments | Should -Be '-w new --title Koha "C:\Windows\System32\wsl.exe" -d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=0 /usr/local/bin/koha-window /usr/local/bin/koha-panel'
     }
+
+    It 'opens the terminal straight on one routine for the Koha window, and only on a plain action name' {
+        $l = Get-KohaPanelLaunch -Wsl 'C:\Windows\System32\wsl.exe' -Terminal '' -Action 'restore'
+        $l.Arguments | Should -Be '-d koha -u root --cd /root -- env KEI_PLAIN_GLYPHS=1 /usr/local/bin/koha-window /usr/local/bin/koha-panel --run restore'
+        foreach ($bad in 'restore; reboot', 'Restore', '-x', '../a', 'a b') {
+            (Get-KohaPanelLaunch -Wsl 'wsl.exe' -Terminal '' -Action $bad).Arguments | Should -Not -Match '--run'
+        }
+        Mock -ModuleName KohaEasy.Core Start-Koha { }
+        Mock -ModuleName KohaEasy.Core Start-Process { $script:args = $ArgumentList }
+        Mock -ModuleName KohaEasy.Core Confirm-KohaWindowScript { $true }
+        Open-KohaPanel -Action 'backup-manual'
+        ([string]$script:args) | Should -Match 'koha-panel --run backup-manual$'
+    }
 }
 
 Describe 'Emoji and UTF-8' {

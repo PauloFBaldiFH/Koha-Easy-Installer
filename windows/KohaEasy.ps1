@@ -11,6 +11,7 @@
     KohaEasy.ps1 Status                        the same summary in a message box
     KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
     KohaEasy.ps1 Panel                         the Koha window and the tray: starts Koha, opens the control panel
+    KohaEasy.ps1 Panel -Action <name>          the Koha window's Painel de Gestão: the same, straight on one routine (installer --run <name>)
     KohaEasy.ps1 Terminal                      the Koha window: a Debian shell as the Debian user (advanced), while Debian runs
     KohaEasy.ps1 RebuildIndex                  the tray: rebuilds the search index, with notifications
     KohaEasy.ps1 Open                          starts Koha if needed, opens the staff interface
@@ -40,6 +41,9 @@ param(
     [switch]$Force,
     [switch]$Quiet,
     [switch]$Pause,
+    # Panel: open the terminal straight on one routine of the panel
+    # (installer --run <action>), as the Koha window's Painel de Gestão does.
+    [ValidatePattern('^[a-z][a-z0-9-]*$')][string]$Action,
     # Set by every hidden launch (Get-KohaHiddenLaunch); see below.
     [switch]$Hidden
 )
@@ -143,7 +147,7 @@ switch ($Command) {
     }
     'Panel' {
         if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
-        Open-KohaPanel
+        Open-KohaPanel -Action $Action
     }
     'Terminal' {
         # Never starts Debian: WSL would end it abruptly after the shell.
