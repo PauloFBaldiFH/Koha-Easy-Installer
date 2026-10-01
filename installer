@@ -4807,7 +4807,7 @@ function_restore_database() {
     # 3) Import into a temporary database: the current catalog is only
     #    touched after the backup has proven to be a complete Koha database.
     RESTORE_TRIAL_DB="koha_restore_check"
-    if ! tui_run "$(t "Testing the backup in a temporary database")" restore_task_trial "$file" "$import_log"; then
+    if ! tui_run "$(t "Testing the backup")" restore_task_trial "$file" "$import_log"; then
         restore_release
         details=$(grep -v "^=====" "$import_log" | tail -n 6 | cut -c1-76)
         msg_error "" "$(t 'The backup could not be imported. Nothing was changed in the current catalog.\n\nLast error lines:\n${details}')" 18 80
