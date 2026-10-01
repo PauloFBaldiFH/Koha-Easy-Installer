@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 title Koha Easy Installer
 
 :: Verifica se já está a rodar como Administrador
@@ -8,7 +9,7 @@ if %errorLevel% == 0 (
     goto :run
 ) else (
     echo Solicitando privilegios de Administrador...
-    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    powershell -Command "Start-Process '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs"
     exit
 )
 
