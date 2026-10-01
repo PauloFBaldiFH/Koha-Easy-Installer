@@ -25,6 +25,7 @@ sub selectrow_array {
 sub selectall_arrayref {
     my ( $self, $sql, $attr, @bind ) = @_;
     return cdd_query( $1, @bind ) if $sql =~ m{/\* kei-cdd:(\w+) \*/};
+    return cutter_used(@bind) if $sql =~ m{/\* kei-cutter:used \*/};
     return [] unless $sql =~ /FROM biblioitems/;
     ( my $isbn = $bind[0] ) =~ s/%//g;
     KeiKohaState::note( 'select-isbn', $isbn );
@@ -38,6 +39,19 @@ sub selectall_arrayref {
         push @rows, [ $n, $title ];
     }
     return \@rows;
+}
+# The call numbers of cutter_calculator.pl (/* kei-cutter:used */): the items
+# of $S/items.tsv whose call number matches the REGEXP, other records than
+# the second parameter: [ call number, author, title ].
+sub cutter_used {
+    my ( $re, $bn ) = @_;
+    KeiKohaState::note( 'cutter-used', $re, $bn );
+    my @rows;
+    for ( split /\n/, Encode::decode( 'UTF-8', KeiKohaState::slurp( KeiKohaState::path('items.tsv') ) // '' ) ) {
+        my ( $b, $cn, $title, $author ) = split /\t/;
+        push @rows, [ $cn, $author // '', $title // '' ] if $cn =~ /$re/ && $b ne $bn;
+    }
+    return [ sort { $a->[0] cmp $b->[0] } @rows ];
 }
 sub cdd_query {
     my ( $kind, @bind ) = @_;
