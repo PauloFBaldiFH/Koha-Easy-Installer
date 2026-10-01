@@ -532,6 +532,12 @@ XML
     assert '[[ "$js" == "/* the library'"'"'s own code */"$'"'"'\n'"'"'"\$(document).ready(function () { var re = /a\\b/; });"* ]]' "the library code is kept as it was: $js"
     assert 'grep -q "tools/marc_replace.pl?biblionumber=" <<< "$js" && grep -q "Replace the record (MARC file)" <<< "$js"'
     assert 'grep -qF "cataloguing\/cataloging-home\.pl" <<< "$js" && grep -q "\"/cgi-bin/koha/tools/marc_replace.pl\", \"fa-exchange\", \"Replace a MARC record\"" <<< "$js" && grep -q "marc_replace.pl?op=vision\", \"fa-camera\", \"AI cataloguing\"" <<< "$js"' "shortcuts in the tools of the cataloguing home page"
+    assert 'grep -q "#newRecord" <<< "$js" && grep -q "kei-mr-new\", \"class\".*marc_replace.pl?op=vision" <<< "$js" && grep -qF "MARC Injection & AI" <<< "$js" && grep -q "#newbiblio" <<< "$js"' "MARC Injection & AI next to New record (new record from photos)"
+    assert 'grep -q "kei-mr-replace" <<< "$js" && grep -qF "Replace via MARC / AI" <<< "$js" && grep -qF "[url, \"MARC file or text\"], [url.replace(\"?\", \"?op=vision&\"), \"Photos of the book (AI)\"]" <<< "$js"' "Replace via MARC / AI next to Edit, with this biblionumber"
+    if command -v node >/dev/null; then
+        awk '/marc_replace begin/ { on = 1 } on { print } /marc_replace end/ { on = 0 }' <<< "$js" > "$BATS_TEST_TMPDIR/mr.js"
+        assert 'node --check "$BATS_TEST_TMPDIR/mr.js"' "the block is valid JavaScript: $(node --check "$BATS_TEST_TMPDIR/mr.js" 2>&1)"
+    fi
     answer yes
     panel lt_mr_install
     js=$(mysql -N -B --raw -e "SELECT value FROM systempreferences WHERE variable = 'IntranetUserJS';" "$DB")

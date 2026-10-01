@@ -15080,11 +15080,15 @@ mr_text() {
 # Link in the staff interface: "Replace the record (MARC file)" in the Edit
 # menu of the record page (a marked block in IntranetUserJS).
 mr_js_block() {
-    local label home_label vision_label v
+    local label home_label vision_label new_label repl_label repl_marc repl_ai v
     label=$(t "Replace the record (MARC file)")
     home_label=$(t "Replace a MARC record")
     vision_label=$(t "AI cataloguing")
-    for v in label home_label vision_label; do
+    new_label=$(t "MARC Injection & AI")
+    repl_label=$(t "Replace via MARC / AI")
+    repl_marc=$(t "MARC file or text")
+    repl_ai=$(t "Photos of the book (AI)")
+    for v in label home_label vision_label new_label repl_label repl_marc repl_ai; do
         declare -n _s=$v
         _s=${_s//\\/\\\\}; _s=${_s//\"/\\\"}; _s=${_s//</\\u003c}
         unset -n _s
@@ -15092,6 +15096,22 @@ mr_js_block() {
     cat <<MRJS
 ${MR_JS_BEGIN}
 \$(document).ready(function () {
+    // MARC Injection & AI beside New record (cataloguing home, cataloguing
+    // search, catalogue search results): the AI cataloguing of the page,
+    // which drafts a new record from photos of the book.
+    var nr = \$("#newRecord");
+    if (!nr.length) nr = \$("#toolbar a.btn[href*='cataloguing/addbiblio.pl']").not("[href*='biblionumber=']").first();
+    if (nr.length && !\$("#kei-mr-new").length) {
+        var nb = \$("<a></a>").attr({ id: "kei-mr-new", "class": (nr.attr("class") || "btn btn-default").replace(/\s*dropdown-toggle/, ""), href: "/cgi-bin/koha/tools/marc_replace.pl?op=vision" })
+            .append(\$("<i></i>").attr("class", "fa fa-magic")).append(document.createTextNode(" ${new_label}"));
+        var grp = nr.closest(".btn-group");
+        if (grp.length) grp.after(\$("<div class=\"btn-group\"></div>").append(nb)); else nr.after(nb);
+    }
+    // The same entry in the New menu of the record pages.
+    var nm = \$("#newbiblio");
+    if (nm.length && !\$("#kei-mr-new-item").length) {
+        nm.closest("li").after(\$("<li></li>").append(\$("<a></a>").attr({ id: "kei-mr-new-item", "class": nm.attr("class") || "", href: "/cgi-bin/koha/tools/marc_replace.pl?op=vision" }).text("${new_label}")));
+    }
     // Cataloguing home page: shortcuts in the column of the tools (the list
     // with the inventory, the MARC modification templates or the labels;
     // otherwise the last list of tools of the page).
@@ -15110,10 +15130,25 @@ ${MR_JS_BEGIN}
     var m = location.pathname.match(/\/cgi-bin\/koha\/catalogue\/(detail|MARCdetail|ISBDdetail|labeledMARCdetail|moredetail)\.pl\$/);
     var bn = new URLSearchParams(location.search).get("biblionumber");
     if (!m || !bn || !/^[0-9]+\$/.test(bn)) return;
-    var menu = \$("#editbiblio").closest(".dropdown-menu");
+    var eb = \$("#editbiblio");
+    var menu = eb.closest(".dropdown-menu");
     if (!menu.length) return;
-    var a = \$("<a class=\"dropdown-item\"></a>").attr("href", "/cgi-bin/koha/tools/marc_replace.pl?biblionumber=" + bn).text("${label}");
+    var url = "/cgi-bin/koha/tools/marc_replace.pl?biblionumber=" + bn;
+    var a = \$("<a class=\"dropdown-item\"></a>").attr("href", url).text("${label}");
     menu.append(\$("<li></li>").append(a));
+    // Replace via MARC / AI next to Edit: both open the page with this
+    // record, which shows a preview to confirm before anything is replaced.
+    var eg = menu.closest(".btn-group");
+    var toggle = eg.children(".dropdown-toggle").first();
+    if (!eg.length || !toggle.length || \$("#kei-mr-replace").length) return;
+    var ic = eb.attr("class") || "";
+    var items = \$("<ul class=\"dropdown-menu\"></ul>");
+    \$.each([[url, "${repl_marc}"], [url.replace("?", "?op=vision&"), "${repl_ai}"]], function (i, l) {
+        items.append(\$("<li></li>").append(\$("<a></a>").attr({ "class": ic, href: l[0] }).text(l[1])));
+    });
+    var rb = toggle.clone().removeAttr("id").attr({ id: "kei-mr-replace", "aria-expanded": "false" }).empty()
+        .append(\$("<i></i>").attr("class", "fa fa-refresh")).append(document.createTextNode(" ${repl_label} "));
+    eg.after(\$("<div class=\"btn-group\"></div>").append(rb).append(items));
 });
 ${MR_JS_END}
 MRJS
@@ -15164,7 +15199,7 @@ lt_mr_install() {
         return 1
     fi
     local link="no"
-    prompt_yes_no "$(t "Replace a MARC record")" "$(t "Also add the shortcuts in the staff interface: Replace the record (MARC file) in the Edit menu of each record, and Replace a MARC record and AI cataloguing in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 12 76 && link="yes"
+    prompt_yes_no "$(t "Replace a MARC record")" "$(t "Also add the shortcuts in the staff interface: MARC Injection & AI next to New record, Replace via MARC / AI next to Edit and Replace the record (MARC file) in the Edit menu of each record, and Replace a MARC record and AI cataloguing in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 14 76 && link="yes"
     tools_locked _lt_mr_install "$link"
 }
 
