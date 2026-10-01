@@ -352,6 +352,12 @@ Os avisos por e-mail ficam com a agenda do próprio Koha (`koha-common`): avisos
 
 A instalação mostra sete etapas numeradas, uma linha por tarefa com uma pequena barra de progresso do Pac-Man, e uma tela final com os endereços do catálogo e da interface da equipe. A saída dos comandos nunca aparece na tela: ela fica em `/var/log/koha-easy-install/apt.log`. Se uma tarefa falhar, o painel mostra a etapa que falhou, o que verificar e as últimas linhas desse log, que é o arquivo a enviar ao suporte de TI.
 
+As outras tarefas longas do painel têm o mesmo visual: troca do motor de busca, reparo do índice de busca, configuração do Cloudflare Tunnel, atualização do sistema, validação, reparo dos serviços, manutenção profunda e atualização de idiomas. A saída delas fica em `/var/log/koha-easy-install/` (por exemplo `search-engine.log`, `zebra-rebuild.log`, `cloudflare.log`, `restore.log` e `apt.log`). A restauração de backups e as ferramentas que o painel instala quando pedidas (Midnight Commander, links, htop e nethogs) têm o mesmo visual.
+
+As janelas do painel são desenhadas com o `dialog`, que o painel instala, então botões, itens de menu e caixas de seleção também aceitam cliques do mouse nos terminais que informam o mouse: Windows Terminal, os terminais do desktop Linux (GNOME Terminal, Konsole, xterm), PuTTY e a maioria dos clientes SSH. O console de texto do Linux só aceita com o `gpm` instalado. `KEI_UI=whiptail` mantém o visual antigo, só com teclado.
+
+Num PC Linux com desktop gráfico, o painel adiciona um atalho **Koha** (`koha-descomplicado.desktop`) ao menu de aplicativos do usuário que o executou com `sudo` e, na primeira vez, à área de trabalho desse usuário. Ele abre o painel num terminal e pede a senha do `sudo`. Em português, o painel se chama **Koha descomplicado : instalação e gestão**.
+
 ## Desinstalação
 
 O `uninstall.sh` **apaga definitivamente** o Koha, seus bancos de dados, os backups locais e as configurações, e pede confirmação antes:
