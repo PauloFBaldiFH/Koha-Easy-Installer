@@ -8762,7 +8762,8 @@ function_library_tools() {
             "11" "$(t "✉  Messaging: WhatsApp and Telegram")" \
             "12" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
             "13" "$(t "⇄  Replace a MARC record (staff tool)")" \
-            "14" "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" 3>&1 1>&2 2>&3) || return 0
+            "14" "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" \
+            "15" "$(t "⌁  Koha plugins (turn on or off)")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_marc_import ;;
             2) lt_marc_undo ;;
@@ -8778,6 +8779,7 @@ function_library_tools() {
             12) function_cataloguing ;;
             13) function_marc_replace ;;
             14) function_cdd ;;
+            15) function_koha_plugins ;;
         esac
         clear
     done
@@ -17098,6 +17100,296 @@ _lt_cdd_remove() {
     msg_ok "$(t "✔ The page was removed.")"
 }
 
+# ======================================================================
+# 35. KOHA PLUGINS (ON OR OFF)
+# ----------------------------------------------------------------------
+# Koha's own plugin system (Administration > Manage plugins) is off in a new
+# Debian instance: <enable_plugins>0</enable_plugins> in koha-conf.xml. This
+# turns it on or off without touching the plugins themselves: turned off,
+# the plugin files and their data stay where they are, and turning it on
+# again brings them back as they were. Also: whether .kpz files can be
+# uploaded in the staff interface or only plugins of the plugin
+# repositories installed (<plugins_restricted>), the plugins folder
+# (<pluginsdir>, owned by the instance user) and Koha's own registration of
+# plugins copied into that folder by hand (koha-plugins --install).
+# koha-conf.xml is only replaced by a well-formed copy that reads back with
+# the new values; the previous file stays next to it (koha-conf.xml.bak-*).
+# ======================================================================
+PLUGINS_DEFAULT_DIR="/var/lib/koha/${INSTANCE}/plugins"
+# The repositories Koha's koha-conf.xml lists (commented out) as examples.
+PLUGINS_REPOS="ByWater Solutions|bywatersolutions|github
+Theke Solutions|thekesolutions|gitlab
+PTFS Europe|ptfs-europe|github"
+
+# Values of the main <config> section, read with xmllint: a tag inside an
+# XML comment is not a setting and is never read.
+plugins_conf_get()   { xmllint --xpath "string(/yazgfs/config/$1[1])" "$KOHA_CONF" 2>/dev/null | tr -d '[:space:]'; }
+plugins_conf_count() { local n; n=$(xmllint --xpath "count(/yazgfs/config/$1)" "$KOHA_CONF" 2>/dev/null); printf '%s' "${n:-0}"; }
+plugins_enabled()    { [ "$(plugins_conf_get enable_plugins)" = "1" ]; }
+plugins_restricted() { [ "$(plugins_conf_get plugins_restricted)" = "1" ]; }
+plugins_dir()        { local d; d=$(plugins_conf_get pluginsdir); printf '%s' "${d:-$PLUGINS_DEFAULT_DIR}"; }
+
+# plugins_conf_edit TAG=VALUE [...]: new koha-conf.xml (path printed) with
+# each simple tag of the main <config> section set to VALUE. A tag already
+# there (outside comments) gets the new value; a missing one is added at the
+# end of the section, like the <elasticsearch> block (the main section is
+# closed by the LAST </config>; Zebra's <server> sections have <config>
+# elements too). With KEI_PLUGIN_REPOS set, the repositories are also put
+# into <plugin_repos> (inside an existing empty element, or a new one).
+plugins_conf_edit() {
+    local tmp
+    tmp=$(mktemp "${KOHA_CONF}.XXXXXX") || return 1
+    KEI_SET="$(printf '%s\n' "$@")" awk '
+        BEGIN {
+            n = split(ENVIRON["KEI_SET"], kv, "\n")
+            for (i = 1; i <= n; i++) {
+                if (kv[i] == "") continue
+                p = index(kv[i], "="); tag = substr(kv[i], 1, p - 1)
+                val[tag] = substr(kv[i], p + 1); order[++tags] = tag
+            }
+            m = split(ENVIRON["KEI_PLUGIN_REPOS"], rp, "\n")
+            for (i = 1; i <= m; i++) {
+                if (rp[i] == "") continue
+                split(rp[i], f, "|")
+                repos = repos "    <repo>\n        <name>" f[1] "</name>\n        <org_name>" f[2] "</org_name>\n        <service>" f[3] "</service>\n    </repo>\n"
+            }
+        }
+        { line[NR] = $0; if (index($0, "</config>")) last = NR }
+        END {
+            incomment = 0
+            for (i = 1; i <= NR; i++) {
+                s = line[i]
+                # Text of the line outside XML comments (a comment may span lines).
+                out = ""; rest = s
+                while (rest != "") {
+                    if (incomment) {
+                        e = index(rest, "-->"); if (!e) { rest = ""; break }
+                        rest = substr(rest, e + 3); incomment = 0
+                    } else {
+                        b = index(rest, "<!--"); if (!b) { out = out rest; break }
+                        out = out substr(rest, 1, b - 1); rest = substr(rest, b + 4); incomment = 1
+                    }
+                }
+                for (t = 1; t <= tags; t++) {
+                    tag = order[t]
+                    if (!done[tag] && index(out, "<" tag ">") && index(out, "</" tag ">")) {
+                        p = index(s, "<" tag ">"); q = index(s, "</" tag ">")
+                        s = substr(s, 1, p + length(tag) + 1) val[tag] substr(s, q)
+                        done[tag] = 1
+                    }
+                }
+                if (repos != "" && !repodone && index(out, "</plugin_repos>")) {
+                    q = index(s, "</plugin_repos>"); head = substr(s, 1, q - 1)
+                    if (head ~ /[^ \t]/) { print head; head = "" }
+                    printf "%s", repos
+                    s = head substr(s, q); repodone = 1
+                }
+                if (i == last) {
+                    p = index(s, "</config>")
+                    if (p > 1) print substr(s, 1, p - 1)
+                    for (t = 1; t <= tags; t++) if (!done[order[t]]) print " <" order[t] ">" val[order[t]] "</" order[t] ">"
+                    if (repos != "" && !repodone) printf " <plugin_repos>\n%s </plugin_repos>\n", repos
+                    s = substr(s, p)
+                }
+                print s
+            }
+        }' "$KOHA_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+    printf '%s' "$tmp"
+}
+
+# plugins_conf_apply LOG TAG=VALUE [...]: koha-conf.xml changed and checked;
+# on any failure the file is left exactly as it was. Keeps the previous
+# file as koha-conf.xml.bak-<time> (PLUGINS_BAK).
+plugins_conf_apply() {
+    local log="$1" tmp kv tag want
+    shift
+    command -v xmllint >/dev/null 2>&1 || apt_install libxml2-utils >/dev/null 2>&1
+    command -v xmllint >/dev/null 2>&1 || { printf 'xmllint not available\n' >> "$log"; return 1; }
+    local n=1 base
+    base="${KOHA_CONF}.bak-$(date +%Y%m%d-%H%M%S)"; PLUGINS_BAK="$base"
+    while [ -e "$PLUGINS_BAK" ]; do n=$((n + 1)); PLUGINS_BAK="${base}-${n}"; done
+    cp -p "$KOHA_CONF" "$PLUGINS_BAK" || { printf 'could not back up %s\n' "$KOHA_CONF" >> "$log"; return 1; }
+    tmp=$(plugins_conf_edit "$@") || return 1
+    _replace_koha_conf "$tmp" || { printf 'the new koha-conf.xml was not well-formed: not used\n' >> "$log"; return 1; }
+    for kv in "$@"; do
+        tag="${kv%%=*}"; want="${kv#*=}"
+        if [ "$(plugins_conf_get "$tag")" != "$want" ]; then
+            printf 'koha-conf.xml: %s does not read back as %s: previous file restored\n' "$tag" "$want" >> "$log"
+            cp -p "$PLUGINS_BAK" "$KOHA_CONF"
+            return 1
+        fi
+        printf 'koha-conf.xml: %s = %s\n' "$tag" "$want" >> "$log"
+    done
+    if [ -n "${KEI_PLUGIN_REPOS:-}" ] && [ "$(plugins_conf_count 'plugin_repos/repo')" -eq 0 ]; then
+        printf 'koha-conf.xml: the plugin repositories do not read back: previous file restored\n' >> "$log"
+        cp -p "$PLUGINS_BAK" "$KOHA_CONF"
+        return 1
+    fi
+    return 0
+}
+
+# The plugins folder exists and belongs to the instance user (Koha unpacks
+# uploaded .kpz files there). Only folders of this instance are chowned.
+plugins_dir_ready() {
+    local d
+    d=$(plugins_dir)
+    mkdir -p "$d" || return 1
+    case "$d" in
+        "/var/lib/koha/${INSTANCE}/"*) chown -R "${INSTANCE}-koha:${INSTANCE}-koha" "$d" 2>/dev/null || true ;;
+    esac
+    chmod 755 "$d"
+}
+
+# Koha reads koha-conf.xml when its processes start: Plack and the
+# background workers are restarted and the cached settings dropped.
+plugins_reload() {
+    memcached_flush || true
+    plack_restart
+    if [ -x /usr/sbin/koha-worker ]; then
+        koha_ctl /usr/sbin/koha-worker --restart "$INSTANCE" >/dev/null 2>&1 || true
+        koha_ctl /usr/sbin/koha-worker --restart --queue long_tasks "$INSTANCE" >/dev/null 2>&1 || true
+    fi
+}
+
+function_koha_plugins() {
+    require_database || return 0
+    [ -f "$KOHA_CONF" ] || { msg_error "" "$(t "koha-conf.xml of the instance was not found. Nothing was changed.")" 9 70; return 1; }
+    # The state shown comes from xmllint (package libxml2-utils).
+    command -v xmllint >/dev/null 2>&1 || apt_install libxml2-utils >/dev/null 2>&1
+    local opt state source status
+    while true; do
+        if plugins_enabled; then state="$(t "on")"; else state="$(t "off")"; fi
+        if plugins_restricted; then source="$(t "only the plugin repositories")"; else source="$(t ".kpz upload and the plugin repositories")"; fi
+        status="$(t 'Now: ${state}')"$'\n'"$(t 'Installation: ${source}')"$'\n'"$(t "Folder"): $(plugins_dir)"
+        opt=$(ui_menu "$(t "⌁  Koha plugins (turn on or off)")" "$(t "Koha's own plugin system (Administration > Manage plugins). Turning it off keeps the plugins and their data: turned on again, they come back as they were.")"$'\n\n'"$status" \
+            "1" "$(t "Turn Koha plugins on")" \
+            "2" "$(t "Turn Koha plugins off")" \
+            "3" "$(t "Where plugins can be installed from")" \
+            "4" "$(t "Register plugins copied into the folder")") || return 0
+        case "$opt" in
+            1) lt_plugins_on ;;
+            2) lt_plugins_off ;;
+            3) lt_plugins_source ;;
+            4) lt_plugins_register ;;
+        esac
+        clear
+    done
+}
+
+lt_plugins_on() {
+    if plugins_enabled && [ -d "$(plugins_dir)" ]; then
+        msg_info "$(t "Koha plugins")" "$(t "Koha plugins are already on.")" 8 60
+        return 0
+    fi
+    prompt_yes_no "$(t "Koha plugins")" "$(t "Turn on Koha's plugin system? Administration > Manage plugins appears in the staff interface, for the staff with the plugins permission. koha-conf.xml is changed (the previous file is kept next to it) and Koha is restarted.")" 12 76 || return 0
+    tools_locked _lt_plugins_set 1
+}
+
+lt_plugins_off() {
+    if ! plugins_enabled; then
+        msg_info "$(t "Koha plugins")" "$(t "Koha plugins are already off.")" 8 60
+        return 0
+    fi
+    prompt_yes_no "$(t "Koha plugins")" "$(t "Turn off Koha's plugin system? No plugin runs while it is off; the plugins and their data are kept for when it is turned on again. koha-conf.xml is changed (the previous file is kept next to it) and Koha is restarted.")" 12 76 defaultno || return 0
+    tools_locked _lt_plugins_set 0
+}
+
+_lt_plugins_set() {   # _lt_plugins_set 1|0
+    local want="$1" log args=()
+    log=$(tools_log plugins)
+    args=("enable_plugins=$want")
+    if [ "$want" = "1" ]; then
+        # A missing <pluginsdir> is added with Debian's own folder.
+        [ "$(plugins_conf_count pluginsdir)" -gt 0 ] || args+=("pluginsdir=$PLUGINS_DEFAULT_DIR")
+        [ "$(plugins_conf_count plugins_restricted)" -gt 0 ] || args+=("plugins_restricted=0")
+    fi
+    if ! plugins_conf_apply "$log" "${args[@]}"; then
+        msg_error "" "$(t 'koha-conf.xml could not be changed. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 1
+    fi
+    if [ "$want" = "1" ]; then
+        plugins_dir_ready || printf 'the plugins folder could not be prepared\n' >> "$log"
+        # Koha before 21.05 also needs the UseKohaPlugins preference (gone later).
+        if [ -n "$(run_sql "SELECT variable FROM ${DB_NAME}.systempreferences WHERE variable = 'UseKohaPlugins';")" ]; then
+            run_sql "UPDATE ${DB_NAME}.systempreferences SET value = '1' WHERE variable = 'UseKohaPlugins';" >/dev/null
+            printf 'UseKohaPlugins = 1\n' >> "$log"
+        fi
+    fi
+    plugins_reload
+    log "plugins: enable_plugins=$want (previous koha-conf.xml: $PLUGINS_BAK)"
+    if [ "$want" = "1" ]; then
+        msg_ok "$(t "✔ Koha plugins are on: Administration > Manage plugins in the staff interface.")" 9 72
+    else
+        msg_ok "$(t "✔ Koha plugins are off. The plugins and their data were kept.")" 8 70
+    fi
+}
+
+lt_plugins_source() {
+    local choice now
+    if plugins_restricted; then now="$(t "only the plugin repositories")"; else now="$(t ".kpz upload and the plugin repositories")"; fi
+    choice=$(ui_menu "$(t "Where plugins can be installed from")" "$(t 'Now: ${now}')" \
+        "open" "$(t "Upload .kpz files and the plugin repositories")" \
+        "restricted" "$(t "Only the plugin repositories (no .kpz upload)")") || return 0
+    tools_locked _lt_plugins_source "$choice"
+}
+
+_lt_plugins_source() {   # _lt_plugins_source open|restricted
+    local log want=0 repos=""
+    log=$(tools_log plugins)
+    [ "$1" = "restricted" ] && want=1
+    if [ "$want" = "1" ] && [ "$(plugins_conf_count 'plugin_repos/repo')" -eq 0 ]; then
+        if [ "$(plugins_conf_count plugin_repos)" -gt 1 ] || grep -q '<plugin_repos */>' "$KOHA_CONF"; then
+            printf 'plugin_repos: layout not recognised, left as it is\n' >> "$log"
+        elif prompt_yes_no "$(t "Where plugins can be installed from")" "$(t "No plugin repository is set, so nothing new could be installed from the staff interface. Add the repositories koha-conf.xml lists as examples (ByWater Solutions, Theke Solutions, PTFS Europe)?")" 11 76; then
+            repos="$PLUGINS_REPOS"
+        fi
+    fi
+    if ! KEI_PLUGIN_REPOS="$repos" plugins_conf_apply "$log" "plugins_restricted=$want"; then
+        msg_error "" "$(t 'koha-conf.xml could not be changed. Nothing was changed.\n\nLog: ${log}')" 10 72
+        return 1
+    fi
+    plugins_reload
+    log "plugins: plugins_restricted=$want (previous koha-conf.xml: $PLUGINS_BAK)"
+    if [ "$want" = "1" ]; then
+        msg_ok "$(t "✔ Plugins can only be installed from the plugin repositories.")" 8 70
+    else
+        msg_ok "$(t "✔ Plugins can be uploaded as .kpz files or installed from the plugin repositories.")" 9 72
+    fi
+}
+
+lt_plugins_register() {
+    local d
+    d=$(plugins_dir)
+    if ! plugins_enabled; then
+        msg_info "$(t "Koha plugins")" "$(t "Turn Koha plugins on first.")" 8 60
+        return 0
+    fi
+    prompt_yes_no "$(t "Koha plugins")" "$(t 'Register in Koha the plugins copied by hand into ${d} (the folder of an unpacked .kpz goes there, keeping its Koha/Plugin/... path)? A verified backup is made first.')" 12 76 || return 0
+    tools_locked _lt_plugins_register
+}
+
+_lt_plugins_register() {
+    local log rc=0
+    log=$(tools_log plugins)
+    plugins_dir_ready || true
+    tools_safety_backup PLUGINS || return 1
+    if [ -x /usr/sbin/koha-plugins ]; then
+        printf '$ koha-plugins --install %s\n' "$INSTANCE" >> "$log"
+        koha_ctl /usr/sbin/koha-plugins --install "$INSTANCE" >> "$log" 2>&1 </dev/null || rc=$?
+    elif [ -f "$KOHA_BIN/devel/install_plugins.pl" ]; then
+        koha_exec "$log" install_plugins.pl /usr/bin/perl "$KOHA_BIN/devel/install_plugins.pl" || rc=$?
+    else
+        msg_error "" "$(t "This Koha has no command to register plugins (koha-plugins). Install them in Administration > Manage plugins.")" 10 72
+        return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+        return 1
+    fi
+    plugins_reload
+    log "plugins: plugins registered"
+    ui_textbox "$(t "Koha plugins")" "$log"
+}
 # Loaded with "source installer" (tests/): functions only, no menu.
 (return 0 2>/dev/null) && return 0
 
