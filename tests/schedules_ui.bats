@@ -130,13 +130,14 @@ layout() {
     mkdir -p "$BATS_TEST_TMPDIR/bin"
     printf '#!/bin/bash\necho "COLORS=[$NEWT_COLORS]"\nprintf "ARG=%%s\\n" "$@"\n' > "$BATS_TEST_TMPDIR/bin/whiptail"
     chmod 755 "$BATS_TEST_TMPDIR/bin/whiptail"
-    # The real wrapper (the test doubles replace it) and a fake whiptail first in PATH.
+    # The real wrapper (the test doubles replace it), the whiptail program
+    # (KEI_UI=whiptail; dialog has its own colours file) and a fake whiptail first in PATH.
     local wrapper='PATH="$FAKEBIN:$PATH"; source <(sed -n "/^whiptail() {/,/^}/p" "$KEI_REPO/installer")'
-    run env FAKEBIN="$BATS_TEST_TMPDIR/bin" "$KEI_SH" "$PANEL" eval "$wrapper; whiptail --title T --msgbox hi 5 5; env | grep -c ^NEWT_COLORS= || true"
+    run env KEI_UI=whiptail FAKEBIN="$BATS_TEST_TMPDIR/bin" "$KEI_SH" "$PANEL" eval "$wrapper; whiptail --title T --msgbox hi 5 5; env | grep -c ^NEWT_COLORS= || true"
     assert 'echo "$output" | grep -q "^COLORS=\[.*window=[a-z0-9]*,[a-z0-9]*"' "$output"
     assert 'echo "$output" | grep -q "^ARG=Koha Easy Installer & Manager v"' "back title: $output"
     assert 'echo "$output" | tail -n1 | grep -qx 0' "NEWT_COLORS must not be exported: $output"
-    run env NO_COLOR=1 FAKEBIN="$BATS_TEST_TMPDIR/bin" "$KEI_SH" "$PANEL" eval "$wrapper; whiptail --msgbox hi 5 5"
+    run env KEI_UI=whiptail NO_COLOR=1 FAKEBIN="$BATS_TEST_TMPDIR/bin" "$KEI_SH" "$PANEL" eval "$wrapper; whiptail --msgbox hi 5 5"
     assert 'echo "$output" | grep -q "actlistbox=black,lightgray"' "NO_COLOR: monochrome: $output"
     assert '! grep -n "^export NEWT_COLORS\|^ *export NEWT_COLORS" "$KEI_REPO/installer"'
 }

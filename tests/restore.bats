@@ -257,7 +257,7 @@ EOF
     restore "$FIX/new.sql.gz"
     assert '[ "$(live_marker)" = "NEW" ]'
     local step
-    for step in "Testing the backup in a temporary database" "Saving a safety backup" "Importing the catalog" \
+    for step in "Testing the backup" "Saving a safety backup" "Importing the catalog" \
                 "Upgrading the database schema" "Reindexing the catalog" "Restarting Koha services"; do
         assert 'echo "$output" | grep -q "${step}.*Done!"' "missing '$step': $output"
     done
