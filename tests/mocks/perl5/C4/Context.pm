@@ -26,6 +26,7 @@ sub selectall_arrayref {
     my ( $self, $sql, $attr, @bind ) = @_;
     return cdd_query( $1, @bind ) if $sql =~ m{/\* kei-cdd:(\w+) \*/};
     return cutter_used(@bind) if $sql =~ m{/\* kei-cutter:used \*/};
+    return cutter_near( $1, @bind ) if $sql =~ m{/\* kei-cutter:(author|subject|words|sample) \*/};
     return [] unless $sql =~ /FROM biblioitems/;
     ( my $isbn = $bind[0] ) =~ s/%//g;
     KeiKohaState::note( 'select-isbn', $isbn );
@@ -52,6 +53,26 @@ sub cutter_used {
         push @rows, [ $cn, $author // '', $title // '' ] if $cn =~ /$re/ && $b ne $bn;
     }
     return [ sort { $a->[0] cmp $b->[0] } @rows ];
+}
+# The catalogue near a record for cutter_calculator.pl (/* kei-cutter:author
+# | subject | words | sample */), from $S/items.tsv (a fifth column holds the
+# subjects): [ call number, biblionumber ] of other records than the last
+# parameter; sample gives every call number.
+sub cutter_near {
+    my ( $kind, @bind ) = @_;
+    KeiKohaState::note( 'cutter-near', $kind, @bind );
+    my $bn = pop @bind;
+    my @like = map { lc s/^%|%$//gr } @bind;
+    my @rows;
+    for ( split /\n/, Encode::decode( 'UTF-8', KeiKohaState::slurp( KeiKohaState::path('items.tsv') ) // '' ) ) {
+        my ( $b, $cn, $title, $author, $subjects ) = map { $_ // '' } split /\t/;
+        if ( $kind eq 'sample' ) { push @rows, [$cn] if $cn ne ''; next }
+        next if $b eq ( $bn // '' ) || $cn eq '';
+        my $hay = lc( $kind eq 'author' ? $author : $kind eq 'subject' ? $subjects : $title );
+        next if grep { $kind eq 'author' ? index( $hay, $_ ) != 0 : index( $hay, $_ ) < 0 } @like;
+        push @rows, [ $cn, $b ];
+    }
+    return \@rows;
 }
 sub cdd_query {
     my ( $kind, @bind ) = @_;
