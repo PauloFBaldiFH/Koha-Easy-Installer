@@ -1,9 +1,9 @@
 #!/usr/bin/env bats
-# Library tools 11-13 and the Biblioteca Fácil preset: WhatsApp / Telegram
+# Library tools 10-12 and the readers of the old systems: WhatsApp / Telegram
 # messaging (the SMS::Send driver of the panel, run by the real SMS::Send
 # against tests/mocks/http-mock), cataloguing aids (author tables and CDD,
-# real MariaDB), collection spreadsheets (real MARC::Record and
-# yaz-marcdump) and marc_replace.pl (run as a CGI with the Koha doubles of
+# real MariaDB), the Biblioteca Fácil and ISIS readers (real MARC::Record)
+# and marc_replace.pl (run as a CGI with the Koha doubles of
 # tests/mocks/perl5).
 
 setup() {
@@ -346,54 +346,67 @@ EOF
     assert 'dialogs | grep -q "Invalid class number"'
 }
 
-# --- Collection spreadsheets (Biblioteca Fácil) -----------------------------------
+# --- Biblioteca Fácil and ISIS readers (their imports: tests/magic_import.bats) -----
 
-biblioteca_facil_csv() {
-    cat <<'EOF' | iconv -f UTF-8 -t WINDOWS-1252 > "$W/acervo.csv"
-Tombo;Título;Subtítulo;Autor;Editora;Local;Ano;Edição;ISBN;CDD;Cutter;Assunto;Exemplar;Tipo;Data de aquisição;Valor;Observação da escola
-0001;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";1;Livro;05/03/2020;R$ 25,90;x
-0002;O cortiço;;Azevedo, Aluísio;Ática;São Paulo;1997;2;978-85-08-00001-3;869.3;A994c;"Romance brasileiro; Naturalismo";2;Livro;05/03/2020;;
-0003;Revista Ciência Hoje;n. 300;;SBPC;Rio de Janeiro;2013;;;505;;Ciência;;revista;;;
-0001;Duplicado;;Autor, Teste;;;;;;;;;;;;;
-;;;Sem título;;;;;;;;;;;;;
-EOF
+# Synthetic backup (tests/lib/bf_backup.py): the program's 15 DBISAM tables
+# with made-up patrons, copies, loans and holds, compressed like the real one.
+bf_backup() { python3 "$KEI_REPO/tests/lib/bf_backup.py" "$@"; }
+# Columns and tables of Koha that the loans and holds are written to.
+bf_circ_schema() {
+    tools_sql "ALTER TABLE items ADD COLUMN itemnotes_nonpublic longtext, ADD COLUMN onloan date;
+      CREATE TABLE reserves (reserve_id int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, borrowernumber int(11) NOT NULL, reservedate date,
+        biblionumber int(11) NOT NULL, branchcode varchar(10), priority smallint(6) NOT NULL DEFAULT 1, expirationdate date)
+        DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
 }
 
-@test "F01 Biblioteca Fácil: Windows-1252 spreadsheet becomes UTF-8 MARC with one record per title and its items in 952" {
-    biblioteca_facil_csv
-    export KEI_SELECT_FILE="$W/acervo.csv"
-    inputs CPL LIVRO new
-    answer yes yes
-    panel lt_br_migrate_sheet
-    assert '[ "$status" -eq 0 ]' "$output"
-    local f="$KEI_S/last-staged.mrc" p="$KEI_S/textboxes.log"
-    assert 'grep -q "Título *-> title" "$p" && grep -q "Tombo *-> barcode" "$p" && grep -q "Observação da escola *-> -" "$p" && grep -q "Encoding: Windows-1252" "$p"' "$(cat "$p")"
-    assert 'grep -q "Records: 3" "$p" && grep -q "Items created: 4" "$p" && grep -q "Rows without title: 1" "$p" && grep -q "Repeated barcodes (kept on the first row only): 1" "$p"'
-    assert '[ -s "$f" ] && iconv -f UTF-8 -t UTF-8 "$f" >/dev/null && [ "$(head -c 10 "$f" | tail -c 1)" = "a" ]' "UTF-8 with leader/09 a"
-    assert '[ "$(marc_dump "$f" | grep -c "^245")" = "3" ]' "$(marc_dump "$f")"
-    assert 'marc_dump "$f" | grep -qx "245 12 \$a O cortiço"' "nonfiling article: $(marc_dump "$f" | grep ^245)"
-    assert 'marc_dump "$f" | grep -qx "260    \$a São Paulo : \$b Ática, \$c 1997" && marc_dump "$f" | grep -qx "250    \$a 2. ed."'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0001 \$t 1 \$d 2020-03-05 \$g 25.90"' "$(marc_dump "$f" | grep ^952)"
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A994c \$p 0002 \$t 2 \$d 2020-03-05"'
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y REV \$o 505 \$p 0003"' "item type from its description"
-    assert 'marc_dump "$f" | grep -qx "020    \$a 9788508000013" && marc_dump "$f" | grep -qx "090    \$a 869.3 \$b A994c" && marc_dump "$f" | grep -qx "650  4 \$a Naturalismo"'
-    assert 'marc_dump "$f" | grep -A12 "Duplicado" | grep -q "^952    \$a CPL \$b CPL \$y LIVRO$"' "the repeated tombo is dropped, the item kept"
-    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \".*sheet2marc.pl\".*--dry-run" "$KEI_S/calls.log" && grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
+@test "F04 Biblioteca Fácil loans and holds: linked by card number and barcode, one transaction, ids above old_issues" {
+    bf_backup "$W/biblioteca.bkp"
+    bf_circ_schema
+    "$KEI_SH" "$PANEL" bf_write_dbreader "$W/bfdb2koha.pl"
+    perl "$W/bfdb2koha.pl" --in "$W/biblioteca.bkp" --branch CPL --itype LIVRO --today 2026-09-30 --circ "$W/circ.sql" --circ-check "$W/check.sql" > /dev/null
+    tools_sql "INSERT INTO borrowers (cardnumber, surname, branchcode, categorycode) VALUES ('1', 'Silva', 'CPL', 'PT'), ('2', 'Pereira', 'CPL', 'PT'), ('4', 'Duplicado', 'CPL', 'PT');
+      INSERT INTO biblio (title, datecreated) VALUES ('O cortiço', CURDATE()); SET @b1 = LAST_INSERT_ID();
+      INSERT INTO biblio (title, datecreated) VALUES ('A menina', CURDATE()); SET @b2 = LAST_INSERT_ID();
+      INSERT INTO items (biblionumber, barcode, homebranch, itemnotes_nonpublic) VALUES (@b1, '1001', 'CPL', 'Biblioteca Fácil: acervo 1'),
+        (@b1, '1002', 'CPL', 'Biblioteca Fácil: acervo 2'), (@b2, 'BF5', 'CPL', 'Biblioteca Fácil: acervo 5');
+      INSERT INTO old_issues (issue_id, borrowernumber, itemnumber) VALUES (500, 1, 1);
+      INSERT INTO reserves (borrowernumber, reservedate, biblionumber, priority) VALUES (1, '2026-01-01', @b1, 1);"
+    answer yes
+    panel tools_locked _lt_br_bfdb_circ "$W/circ.sql" "$W/check.sql"
+    assert '[ "$status" -eq 0 ]' "$output $(tail -30 /var/log/koha-easy-install/tools/bf-circulation-*.log)"
+    assert 'grep -q "^Loans linked: 2 of 2" "$KEI_S/textboxes.log" && grep -q "^Holds linked: 2 of 2" "$KEI_S/textboxes.log"' "$(cat "$KEI_S/textboxes.log")"
+    assert 'dialogs | grep -q "^OK .*Returned loans: 1.*Open loans: 1.*Holds: 2" || dialogs | grep -A0 "^OK" | grep -q "Loans and holds added"' "$(dialogs | tail -3)"
+    local open
+    open=$(tools_sql "SELECT CONCAT(c.issue_id, '|', b.cardnumber, '|', i.barcode, '|', DATE(c.issuedate), '|', c.date_due, '|', i.onloan, '|', i.issues) FROM issues c JOIN borrowers b USING (borrowernumber) JOIN items i USING (itemnumber) WHERE i.barcode = '1001';")
+    assert '[ "$open" = "502|1|1001|2026-09-20|2026-09-27 23:59:00|2026-09-27|1" ]' "open loan: $open"
+    assert '[ "$(tools_sql "SELECT CONCAT(o.issue_id, \"|\", b.cardnumber, \"|\", i.barcode, \"|\", DATE(o.returndate)) FROM old_issues o JOIN borrowers b USING (borrowernumber) JOIN items i USING (itemnumber) WHERE o.issue_id > 500;")" = "501|2|1002|2025-03-07" ]'
+    assert '[ "$(tools_sql "SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = \"issues\";")" -ge 503 ]' "the next check-out never reuses an old_issues id"
+    assert '[ "$(tools_sql "SELECT GROUP_CONCAT(CONCAT(b.cardnumber, \":\", r.priority, \":\", r.expirationdate) ORDER BY r.reserve_id) FROM reserves r JOIN borrowers b USING (borrowernumber) WHERE r.reserve_id > 1;")" = "4:2:2099-12-31,1:1:2099-12-31" ]' "$(tools_sql "SELECT * FROM reserves;")"
+    assert '[ "$(pre_backups CIRCULATION)" = "1" ]'
+    # Run again: the same loans and holds are not added twice.
+    panel tools_locked _lt_br_bfdb_circ "$W/circ.sql" "$W/check.sql"
+    assert 'grep -q "^Loans already in Koha (skipped): 2" "$KEI_S/textboxes.log" && grep -q "^Holds already in Koha (skipped): 2" "$KEI_S/textboxes.log" && dialogs | grep -q "No loan or hold to add"' "$(dialogs | tail -3)"
+    assert '[ "$(tools_sql "SELECT COUNT(*) FROM issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM old_issues WHERE issue_id > 500;")" = "1" ] && [ "$(tools_sql "SELECT COUNT(*) FROM reserves;")" = "3" ] && [ "$(pre_backups CIRCULATION)" = "1" ]' "$(tools_sql "SELECT * FROM reserves;")"
 }
 
-@test "F02 spreadsheet without a title column, or declined after the preview: nothing staged" {
-    printf 'Tombo;Autor\n1;Fulano\n' > "$W/semtitulo.csv"
-    export KEI_SELECT_FILE="$W/semtitulo.csv"
-    inputs CPL LIVRO new
-    panel lt_br_migrate_sheet
-    assert 'dialogs | grep -q "needs a title column"' "$(dialogs | tail -2)"
-    biblioteca_facil_csv
-    export KEI_SELECT_FILE="$W/acervo.csv"
-    inputs CPL LIVRO keep
-    answer no
-    panel lt_br_migrate_sheet
-    assert 'grep -q "sheet2marc.pl.*--dry-run" "$KEI_S/calls.log" && ! grep -q "sheet2marc.pl.*--out" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "202" ]'
+# Synthetic export (tests/lib/isis_dump.py): pg_dump of the acervo and ocorrencias
+# tables with noise around it and the tombo quirks of the real exports.
+isis_dump() { python3 "$KEI_REPO/tests/lib/isis_dump.py" "$@"; }
+
+@test "F07 ISIS reader: gzip, INSERT statements and Latin-1 give the same records; a cut or custom-format dump is reported" {
+    "$KEI_SH" "$PANEL" isis_write_reader "$W/isis2koha.pl"
+    isis_dump "$W/plain.backup"
+    isis_dump "$W/other.backup.gz" --inserts --gzip --latin1
+    perl "$W/isis2koha.pl" --in "$W/plain.backup" --branch CPL --itype LIVRO --marc "$W/a.mrc" > "$W/a.txt"
+    perl "$W/isis2koha.pl" --in "$W/other.backup.gz" --branch CPL --itype LIVRO --marc "$W/b.mrc" > "$W/b.txt"
+    assert 'grep -q "^File: gzip + PostgreSQL plain SQL dump" "$W/b.txt" && grep -q "encoding LATIN1" "$W/b.txt" && grep -q "^Items created: 26$" "$W/b.txt"' "$(cat "$W/b.txt")"
+    assert 'cmp -s "$W/a.mrc" "$W/b.mrc"' "same records: $(diff <(marc_dump "$W/a.mrc") <(marc_dump "$W/b.mrc"))"
+    isis_dump "$W/cut.backup" --cut
+    perl "$W/isis2koha.pl" --in "$W/cut.backup" --dry-run > "$W/c.txt"
+    assert 'grep -q "The dump ends inside the data of table acervo" "$W/c.txt" && grep -q "^Records: 7$" "$W/c.txt"' "$(cat "$W/c.txt")"
+    printf 'PGDMP\001\016\000' > "$W/custom.backup"
+    run perl "$W/isis2koha.pl" --in "$W/custom.backup" --dry-run
+    assert '[ "$status" -eq 4 ] && echo "$output" | grep -q "custom-format dump"' "$output"
 }
 
 # --- marc_replace.pl ---------------------------------------------------------------
@@ -762,7 +775,7 @@ vision_preview() {
     panel true
     assert '[ ! -e /usr/local/lib/site_perl/KohaEasy ] && [ ! -e /etc/cron.d/koha_messaging ] && [ ! -e /etc/koha-easy-install/tables ] && [ "$(pref SMSSendDriver)" = "Email" ]'
     local f callers
-    for f in msg_install_files _lt_msg_notices_set _lt_msg_letters _lt_msg_phones_fix cat_table_import _lt_br_migrate_sheet_run _lt_mr_install _lt_mr_remove; do
+    for f in msg_install_files _lt_msg_notices_set _lt_msg_letters _lt_msg_phones_fix cat_table_import _lt_magic_run magic_engine _lt_mr_install _lt_mr_remove; do
         callers=$(grep -nE "(^|[^_a-z])${f}( |$|\))" "$KEI_REPO/installer" | grep -vE "^[0-9]+:${f}\(\) \{" | grep -vE "^[0-9]+:\s*#" | cut -d: -f1)
         assert '[ -n "$callers" ]' "$f is used"
         local l

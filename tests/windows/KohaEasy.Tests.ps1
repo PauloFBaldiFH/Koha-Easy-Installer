@@ -28,7 +28,7 @@ AfterAll {
 }
 
 Describe 'Windows PowerShell 5.1 compatibility' {
-    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Window.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1', 'KohaEasy.Install.psm1') {
+    It 'parses, is saved as UTF-8 with BOM and uses no PowerShell 7 operator: <_>' -ForEach @('KohaEasy.ps1', 'KohaEasy.Tray.ps1', 'KohaEasy.Window.ps1', 'KohaEasy.Shutdown.ps1', 'KohaEasy.Core.psm1', 'KohaEasy.Lang.psm1', 'KohaEasy.Install.psm1') {
         $file = Join-Path $repo ('windows/' + $_)
         $bytes = [System.IO.File]::ReadAllBytes($file)
         ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeTrue
@@ -329,7 +329,9 @@ Describe 'Start, Stop and automatic start' {
         $file = Join-Path $TestDrive 'stop.sh'
         Set-Content -LiteralPath $file -Value $sh -NoNewline
         $env:PATH = $bin + ':' + $env:PATH
-        try { & sh $file | Out-Null; $LASTEXITCODE | Should -Be 0 } finally { $env:PATH = $env:PATH.Substring($bin.Length + 1) }
+        try { $out = @(& sh $file); $LASTEXITCODE | Should -Be 0 } finally { $env:PATH = $env:PATH.Substring($bin.Length + 1) }
+        # The progress the Windows side shows, in the same order.
+        @($out | Where-Object { $_ -match '^@step ' }) | Should -Be @('@step 1', '@step 2', '@step 3', '@step 4')
         $lines = @(Get-Content -LiteralPath $trace)
         $lines | Should -Be @(
             'systemctl stop apache2.service koha-common.service'
@@ -347,7 +349,8 @@ Describe 'Start, Stop and automatic start' {
         Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [void]$script:calls.Add('stop Koha inside Debian'); [pscustomobject]@{ ExitCode = 0; Output = '' } }
         Set-KohaState @{ desired = 'running' } | Out-Null
         Stop-KohaForSessionEnd | Should -Be 'clean'
-        $script:calls | Should -Be @('stop Koha inside Debian', 'wsl --terminate koha')
+        # Windows is ending the session: all of WSL stops, its disk closed.
+        $script:calls | Should -Be @('stop Koha inside Debian', 'wsl --shutdown')
         (Get-KohaState).desired | Should -Be 'running'
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { $false }
         Stop-KohaForSessionEnd | Should -Be 'not_running'
@@ -552,10 +555,10 @@ Describe 'Shortcuts' {
         $url = Get-ChildItem -LiteralPath $sm -Filter '*.url' | Select-Object -First 1
         @(Get-ChildItem -LiteralPath $sm -Filter '*.url').Count | Should -Be 2
         Get-Content -Raw -LiteralPath $url.FullName | Should -Match ('IconFile=' + [regex]::Escape((Get-KohaIconPath)))
-        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 10 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
+        Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 11 -Exactly -ParameterFilter { $Icon -like '*koha.ico' }
         Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 1 -Exactly -ParameterFilter { $Path -eq [System.IO.Path]::Combine($dt, 'Koha.lnk') }
         Should -Invoke -ModuleName KohaEasy.Core Save-KohaLnkShortcut -Times 1 -Exactly -ParameterFilter { $Path -eq [System.IO.Path]::Combine($sm, 'Koha.lnk') }
-        $made.Count | Should -Be 12
+        $made.Count | Should -Be 13
         (Get-KohaState).appIdShortcut | Should -BeTrue
     }
 
@@ -1203,7 +1206,7 @@ Describe 'The Koha icon as the one way in' {
         New-Item -ItemType Directory -Path $dt -Force | Out-Null
         $made = @(New-KohaShortcuts -StartMenu $sm -Desktop $dt -IconSource (Join-Path $repo 'windows/koha.ico') -PublicDesktop '')
         # The desktop one is the Start menu one, copied as a plain file.
-        $made.Count | Should -Be 12
+        $made.Count | Should -Be 13
         Test-Path -LiteralPath (Join-Path $sm 'Koha.lnk') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $dt 'Koha.lnk') | Should -BeTrue
         Get-KohaIconPlace | Should -Be 'desktop'
@@ -1263,6 +1266,43 @@ Describe 'The Koha icon as the one way in' {
     }
 }
 
+Describe 'Koha icon and logo in the Koha window and the tray' {
+    It 'logs why koha.ico could not be loaded and returns nothing when KohaEasy.exe has no icon either' {
+        $missing = Join-Path $TestDrive 'no-such.ico'
+        Get-KohaIcon -Path $missing -Exe '' -Tries 1 | Should -BeNullOrEmpty
+        $log = Get-Content -LiteralPath (Join-Path (Get-KohaPath Logs) ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Raw
+        $log | Should -Match ([regex]::Escape('koha.ico could not be loaded from ' + $missing + ': the file is missing'))
+    }
+
+    It 'tries a busy koha.ico again, then falls back to the icon inside KohaEasy.exe' {
+        $core = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Core.psm1') -Raw
+        $core | Should -Match 'for \(\$i = 1; \$i -le \$Tries; \$i\+\+\)'
+        $core | Should -Match 'System.IO.File\]::ReadAllBytes\(\$Path\)'
+        $core | Should -Match 'System.Drawing.Icon\]::ExtractAssociatedIcon\(\$Exe\)'
+        $core | Should -Match '\$icon = Get-KohaIcon\s+if \(\$icon\) \{ \$form.Icon = \$icon \}'
+    }
+
+    It 'gives the Koha window koha.ico through Get-KohaIcon and the green Koha logo in its header' {
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match "Get-KohaIcon -Path \(Join-Path \`$here 'koha.ico'\) -Exe \(Join-Path \`$here 'KohaEasy.exe'\)"
+        $w | Should -Not -Match 'New-Object System.Drawing.Icon\('
+        $w | Should -Match "Join-Path \`$here 'koha-logo.png'"
+        $w | Should -Match "T 'The Koha name and logo belong to the Koha community.'"
+        $w.IndexOf('$root.Controls.Add($header)') | Should -BeLessThan $w.IndexOf('$root.Controls.Add($cardBanner)')
+        $png = [System.IO.File]::ReadAllBytes((Join-Path $repo 'windows/koha-logo.png'))
+        [System.BitConverter]::ToString($png, 0, 8) | Should -Be '89-50-4E-47-0D-0A-1A-0A'
+        $png.Length | Should -BeLessThan 50000
+    }
+
+    It 'draws the tray icon at the notification area size, the status dot ringed beside the leaf' {
+        $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
+        $t | Should -Match "Get-KohaIcon -Size 48 -Path \(Join-Path \`$here 'koha.ico'\)"
+        $t | Should -Match 'SystemInformation\]::SmallIconSize.Width'
+        $t | Should -Match '\$g.DrawEllipse\(\$ring'
+        $t | Should -Not -Match 'Test-Path -LiteralPath \$kohaIco'
+    }
+}
+
 Describe 'Cold boot' {
     It 'reads a Koha that should run as starting in the first seconds after Windows starts' {
         $st = @{ desired = 'running'; startedAt = 0; autostart = 'logon' }
@@ -1301,7 +1341,7 @@ Describe 'Clean stop when Windows ends the session' {
         Should -Invoke -ModuleName KohaEasy.Core Invoke-KohaLinuxScript -Times 1 -Exactly
     }
 
-    It 'runs the stop and the terminate through wsl.exe with no console, and never asks WSL first' {
+    It 'runs the stop and the WSL shutdown through wsl.exe with no console, and never asks WSL first' {
         Set-KohaState @{ stopScriptHash = (Get-KohaStopScriptHash) } | Out-Null
         Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { throw 'must not ask WSL' }
         Mock -ModuleName KohaEasy.Core Stop-KohaDebianGracefully { throw 'must not run' }
@@ -1310,7 +1350,7 @@ Describe 'Clean stop when Windows ends the session' {
         Stop-KohaForSessionEnd -RunDetached $d | Should -Be 'clean'
         $script:ran[0].C | Should -Match '"[^"]*wsl\.exe" -d koha -u root -- timeout -k 5 60 sh /usr/local/sbin/koha-easy-stop$'
         $script:ran[0].Ms | Should -Be 70000
-        $script:ran[1].C | Should -Match '"[^"]*wsl\.exe" --terminate koha$'
+        $script:ran[1].C | Should -Match '"[^"]*wsl\.exe" --shutdown$'
         $d2 = { param($c, $ms) if ($c -match 'koha-easy-stop') { Start-Sleep -Milliseconds 2100; 1 } else { 0 } }
         Stop-KohaForSessionEnd -RunDetached $d2 | Should -Be 'forced'
     }
@@ -1332,5 +1372,94 @@ Describe 'Clean stop when Windows ends the session' {
         $t | Should -Match 'DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP'
         $t | Should -Match '\[KohaSessionWindow\]::ShutDownFirst\(\)'
         $t | Should -Match 'Update-KohaStopScript'
+    }
+}
+
+Describe 'Shut down the PC safely' {
+    BeforeEach {
+        Set-KohaState @{ desired = 'running'; poweredOffAt = 0; stopScriptHash = '' } | Out-Null
+        $script:calls = New-Object System.Collections.ArrayList
+        Mock -ModuleName KohaEasy.Core Invoke-KohaWsl { [void]$script:calls.Add('wsl ' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock -ModuleName KohaEasy.Core Update-KohaStopScript { 'current' }
+    }
+    AfterAll { Set-KohaState @{ poweredOffAt = 0; stopScriptHash = '' } | Out-Null }
+
+    It 'reports each step as Debian reaches it, then step 5 before WSL closes Debian; the step lines are not logged as reasons' {
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript {
+            foreach ($l in '@step 1', '@step 2', '@step 3', 'did not stop: mariadb.service', '@step 4') { & $OnLine $l }
+            [pscustomobject]@{ ExitCode = 1; Output = "@step 1`n@step 2`n@step 3`ndid not stop: mariadb.service`n@step 4" }
+        }
+        $script:steps = New-Object System.Collections.ArrayList
+        Stop-KohaDebianGracefully -Shutdown -OnStep { param($n) [void]$script:steps.Add($n); [void]$script:calls.Add("step $n") } | Should -Be 'forced'
+        @($script:steps) | Should -Be @(1, 2, 3, 4, 5)
+        $script:calls[-2] | Should -Be 'step 5'
+        $script:calls[-1] | Should -Be 'wsl --shutdown'
+        $log = Get-Content -LiteralPath (Join-Path (Get-KohaPath Logs) ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Raw
+        $log | Should -Match 'incomplete \(exit 1\): did not stop: mariadb.service'
+        $log | Should -Not -Match 'incomplete \(exit 1\): @step'
+    }
+
+    It 'passes each line to -OnLine while wsl.exe is still writing, and keeps the whole output' -Skip:($IsWindows -or -not (Get-Command sh -ErrorAction SilentlyContinue)) {
+        $bin = Join-Path $TestDrive 'fakewsl'
+        New-Item -ItemType Directory -Path $bin -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $bin 'wsl.exe') -Value "#!/bin/sh`necho '@step 1'`necho done`nexit 3`n" -NoNewline
+        & chmod +x (Join-Path $bin 'wsl.exe')
+        $env:PATH = $bin + ':' + $env:PATH
+        try {
+            $script:seen = New-Object System.Collections.ArrayList
+            $r = Invoke-KohaWsl -Arguments @('-d', 'koha') -OnLine { param($l) [void]$script:seen.Add($l) }
+        } finally { $env:PATH = $env:PATH.Substring($bin.Length + 1) }
+        @($script:seen) | Should -Be @('@step 1', 'done')
+        $r.ExitCode | Should -Be 3
+        $r.Output | Should -Be "@step 1`ndone"
+    }
+
+    It 'stops Koha with all of WSL and keeps it wanted, so it starts at the next sign-in' {
+        Mock -ModuleName KohaEasy.Core Get-KohaRunningDistros { @('koha') }
+        Mock -ModuleName KohaEasy.Core Stop-KohaKeepAlive { [void]$script:calls.Add('stop task') }
+        Mock -ModuleName KohaEasy.Core Invoke-KohaLinuxScript { [void]$script:calls.Add('stop Koha inside Debian'); [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Stop-KohaForPowerOff | Should -Be 'clean'
+        $script:calls | Should -Be @('stop Koha inside Debian', 'wsl --shutdown')
+        (Get-KohaState).desired | Should -Be 'running'
+        [int64](Get-KohaState).poweredOffAt | Should -BeGreaterThan 0
+    }
+
+    It 'the tray does not stop Koha a second time (and start Debian for it) right after a safe shutdown' {
+        Set-KohaState @{ poweredOffAt = (Get-UnixTime); stopScriptHash = (Get-KohaStopScriptHash) } | Out-Null
+        Mock -ModuleName KohaEasy.Core Test-KohaDistroRunning { throw 'must not ask WSL' }
+        Stop-KohaForSessionEnd -RunDetached { throw 'must not run' } | Should -Be 'not_running'
+        # An old mark (Koha started again since) does not count.
+        Set-KohaState @{ poweredOffAt = ((Get-UnixTime) - 3600) } | Out-Null
+        Stop-KohaForSessionEnd -RunDetached { param($c, $ms) 0 } | Should -Be 'clean'
+    }
+
+    It 'a start clears the mark' {
+        Mock -ModuleName KohaEasy.Core Repair-KohaTasks { }
+        Mock -ModuleName KohaEasy.Core Start-KohaKeepAlive { }
+        Set-KohaState @{ poweredOffAt = (Get-UnixTime) } | Out-Null
+        Start-Koha -Trigger user | Should -Be 'started'
+        [int64](Get-KohaState).poweredOffAt | Should -Be 0
+    }
+
+    It 'asks Windows to shut down or restart at once' {
+        Get-KohaPowerOffArguments | Should -Be @('/s', '/t', '0')
+        Get-KohaPowerOffArguments -Restart | Should -Be @('/r', '/t', '0')
+    }
+
+    It 'has five steps in words' {
+        @(Get-KohaStopSteps).Count | Should -Be 5
+    }
+
+    It 'is in the Start menu, the tray and KohaEasy.ps1, and Windows is asked only after the stop' {
+        @(Get-KohaShortcutList | Where-Object { $_.Arguments -match 'SafeShutdown' }).Count | Should -Be 1
+        $t = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw
+        $t | Should -Match "T 'Shut down the PC safely'\) \{ Invoke-KohaCommand 'SafeShutdown'"
+        $k = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw
+        $k | Should -Match ([regex]::Escape("'SafeShutdown' { & (Join-Path `$PSScriptRoot 'KohaEasy.Shutdown.ps1') }"))
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Shutdown.ps1') -Raw
+        $w | Should -Match 'Stop-KohaForPowerOff -OnStep'
+        $w.IndexOf('Invoke-KohaPowerOff') | Should -BeGreaterThan $w.IndexOf('EndInvoke')
+        $w | Should -Match ([regex]::Escape('if ($null -ne $script:job) { $e.Cancel = $true }'))
     }
 }

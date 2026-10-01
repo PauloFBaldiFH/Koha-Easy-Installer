@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Brazil: localization & migration (Library tools > 10). Real yaz-marcdump,
+# Brazil: localization (Library tools > 9). Real yaz-marcdump,
 # MARC::Record, xsltproc, MariaDB and Memcached; the Koha scripts are the
 # test doubles of tests/mocks/koha-script and koha-mysql / koha-preferences
 # of tests/mocks/koha-mock.
@@ -23,33 +23,6 @@ teardown() {
 pre_backups() { find /var/backups/koha_sql -maxdepth 1 -name "PRE-${1:-}*" 2>/dev/null | wc -l; }
 extra()       { printf '%s\n' "$@" > "$W/extra.sh"; export KEI_EXTRA="$W/extra.sh"; }
 marc_dump()   { yaz-marcdump "$1" 2>/dev/null; }
-
-# A Biblivre-like export: accession numbers (tombo) in 949 $a, call number
-# in 090, Latin-1 text, leader/09 blank. Record 3 already has a 952.
-biblivre_xml() {
-    cat > "$W/biblivre.xml" <<'XML'
-<?xml version="1.0" encoding="UTF-8"?>
-<collection xmlns="http://www.loc.gov/MARC21/slim">
-<record><leader>00000nam  2200000 a 4500</leader><controlfield tag="001">1</controlfield>
-  <datafield tag="082" ind1="0" ind2="4"><subfield code="a">869.3</subfield></datafield>
-  <datafield tag="090" ind1=" " ind2=" "><subfield code="a">869.3</subfield><subfield code="b">A848d</subfield></datafield>
-  <datafield tag="100" ind1="1" ind2=" "><subfield code="a">Assis, Machado de,</subfield><subfield code="d">1839-1908.</subfield></datafield>
-  <datafield tag="245" ind1="1" ind2="0"><subfield code="a">Dom Casmurro /</subfield><subfield code="c">Machado de Assis.</subfield></datafield>
-  <datafield tag="260" ind1=" " ind2=" "><subfield code="a">São Paulo :</subfield><subfield code="b">Ática,</subfield><subfield code="c">1997.</subfield></datafield>
-  <datafield tag="949" ind1=" " ind2=" "><subfield code="a">000123</subfield></datafield>
-  <datafield tag="949" ind1=" " ind2=" "><subfield code="a">000124</subfield></datafield>
-</record>
-<record><leader>00000nam  2200000 a 4500</leader><controlfield tag="001">2</controlfield>
-  <datafield tag="245" ind1="0" ind2="0"><subfield code="a">Iracema :</subfield><subfield code="b">lenda do Ceará /</subfield><subfield code="c">José de Alencar.</subfield></datafield>
-  <datafield tag="949" ind1=" " ind2=" "><subfield code="b">sem tombo</subfield></datafield>
-</record>
-<record><leader>00000nam  2200000 a 4500</leader><controlfield tag="001">3</controlfield>
-  <datafield tag="245" ind1="0" ind2="0"><subfield code="a">Já catalogado no Koha</subfield></datafield>
-  <datafield tag="952" ind1=" " ind2=" "><subfield code="a">X</subfield><subfield code="p">999</subfield></datafield>
-</record>
-</collection>
-XML
-}
 
 # --- 3. CPF and calendar (pure functions) ----------------------------------
 
@@ -86,47 +59,9 @@ XML
     assert '! echo "$output" | grep -q "Consciência Negra"' "national only from 2024 (Lei 14.759/2023)"
 }
 
-# --- 1. Legacy migration -------------------------------------------------------
+# --- 1. Readers of the old systems (their imports: tests/magic_import.bats) --------
 
-@test "BR03 Biblivre: Latin-1 export becomes UTF-8, 949 tombo goes to 952, then Koha's staged import" {
-    biblivre_xml
-    kei_marc "$W/acervo.mrc" ISO-8859-1 "$W/biblivre.xml"
-    assert '! iconv -f UTF-8 -t UTF-8 "$W/acervo.mrc" >/dev/null 2>&1' "the fixture must be Latin-1"
-    export KEI_SELECT_FILE="$W/acervo.mrc"
-    inputs "biblivre" "ISO-8859-1" "CPL" "LIVRO" "new"
-    answer yes yes      # convert, then import
-    panel lt_br_migrate_marc
-    assert '[ "$status" -eq 0 ]' "$output"
-    local f="$KEI_S/last-staged.mrc"
-    assert '[ -s "$f" ] && iconv -f UTF-8 -t UTF-8 "$f" >/dev/null' "the staged file must be UTF-8"
-    assert '[ "$(head -c 10 "$f" | tail -c 1)" = "a" ]' "leader/09 must say Unicode"
-    assert 'marc_dump "$f" | grep -q "São Paulo : \$b Ática"' "accents kept: $(marc_dump "$f" | grep ^260)"
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A848d \$p 000123"' "$(marc_dump "$f" | grep ^952)"
-    assert 'marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$o 869.3 A848d \$p 000124"'
-    assert '[ "$(marc_dump "$f" | grep -n "000123" | cut -d: -f1)" -lt "$(marc_dump "$f" | grep -n "000124" | cut -d: -f1)" ]' "items keep their order"
-    assert '! marc_dump "$f" | grep -q "^949"' "legacy item fields removed once moved"
-    assert 'marc_dump "$f" | grep -qx "952    \$a X \$p 999"' "an existing 952 is left alone"
-    assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \".*remap952.pl\".*--dry-run" "$KEI_S/calls.log"' "the preview runs MARC::Record through koha-shell: $(calls)"
-    assert 'grep -q "^stage_file.pl .*--format ISO2709 --encoding UTF-8 .*\[pre=0\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "import only after the PRE-IMPORT backup"
-    assert 'grep -q "Items without barcode: 1" "$KEI_S/textboxes.log"' "the preview reports items without barcode"
-    assert '[ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "203" ]'
-    assert '[ -z "$(ls -A /tmp/koha_tools.* 2>/dev/null)" ]' "converted files are removed"
-}
-
-@test "BR04 migration declined after the preview: no staging, nothing imported" {
-    biblivre_xml
-    kei_marc "$W/acervo.mrc" UTF-8 "$W/biblivre.xml"
-    export KEI_SELECT_FILE="$W/acervo.mrc"
-    inputs "biblivre" "UTF-8" "CPL" "LIVRO" "keep"
-    answer no
-    panel lt_br_migrate_marc
-    assert 'grep -q "remap952.pl.*--dry-run" "$KEI_S/calls.log"'
-    assert '! grep -q "remap952.pl.*--out" "$KEI_S/calls.log" && ! grep -q "^stage_file.pl" "$KEI_S/calls.log"' "$(calls)"
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(tools_sql "SELECT COUNT(*) FROM biblio;")" = "200" ]'
-}
-
-@test "BR05 SophiA, Pergamum and custom maps move their item fields to 952" {
+@test "BR05 the item reader moves SophiA, Pergamum and custom item fields to 952" {
     cat > "$W/vendors.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <collection xmlns="http://www.loc.gov/MARC21/slim">
@@ -140,80 +75,15 @@ XML
 XML
     kei_marc "$W/v.mrc" UTF-8 "$W/vendors.xml"
     local p
-    for p in "pergamum|\$o 869.3 R194v \$p P-001 \$t 2" "sophia|\$o B869.3 R194 \$p S-001" "949 p=c,o=d+e|\$o 869.3 R194v \$p C-001"; do
-        panel eval "br_preset '${p%%|*}' || exit 9; br_write_remapper '$W/r.pl'; perl '$W/r.pl' --in '$W/v.mrc' --out '$W/o.mrc' --item-tag \"\$BR_ITEM_TAG\" --map \"\$BR_MAP\" --callnumber \"\$BR_CN\" --branch MPL --itype REV >/dev/null && yaz-marcdump '$W/o.mrc'"
-        assert '[ "$status" -eq 0 ]' "${p%%|*}: $output"
-        assert 'echo "$output" | grep -qF "952    \$a MPL \$b MPL \$y REV ${p#*|}"' "${p%%|*}: $output"
+    "$KEI_SH" "$PANEL" br_write_remapper "$W/r.pl"
+    # The layouts the Magic Import Tool recognises (Pergamum, SophiA) and a custom map.
+    for p in "852 p=p,o=h+i,t=t,z=z,x=x|\$o 869.3 R194v \$p P-001 \$t 2" "990 p=a,o=b|\$o B869.3 R194 \$p S-001" "949 p=c,o=d+e|\$o 869.3 R194v \$p C-001"; do
+        local spec="${p%%|*}"
+        run perl "$W/r.pl" --in "$W/v.mrc" --out "$W/o.mrc" --item-tag "${spec%% *}" --map "${spec#* }" --callnumber "090:ab|082:a" --branch MPL --itype REV
+        assert '[ "$status" -eq 0 ]' "$spec: $output"
+        run yaz-marcdump "$W/o.mrc"
+        assert 'echo "$output" | grep -qF "952    \$a MPL \$b MPL \$y REV ${p#*|}"' "$spec: $output"
     done
-    panel br_preset "952 p=a"
-    assert '[ "$status" -ne 0 ]' "952 itself cannot be the source"
-    panel br_preset "949 p=a;rm"
-    assert '[ "$status" -ne 0 ]' "malformed maps are refused"
-}
-
-@test "BR06 missing yaz-marcdump: offered install, and nothing happens without it" {
-    biblivre_xml
-    kei_marc "$W/acervo.mrc" UTF-8 "$W/biblivre.xml"
-    export KEI_SELECT_FILE="$W/acervo.mrc"
-    extra 'YAZ_MARCDUMP=/nonexistent/yaz-marcdump'
-    inputs "biblivre" "UTF-8" "CPL" "LIVRO" "new"
-    answer yes
-    panel lt_br_migrate_marc
-    assert 'grep -q "^apt_install yaz" "$KEI_S/calls.log"' "the yaz package must be offered: $(calls)"
-    assert 'dialogs | grep -q "could not be installed"'
-    assert '! grep -q "remap952\|stage_file" "$KEI_S/calls.log"'
-    : > "$KEI_S/calls.log"
-    inputs "biblivre" "UTF-8" "CPL" "LIVRO" "new"
-    answer no
-    panel lt_br_migrate_marc
-    assert '! grep -q "apt_install\|remap952\|stage_file" "$KEI_S/calls.log" 2>/dev/null' "refusing the install stops here"
-}
-
-# Windows-1252 spreadsheet with Portuguese headers, semicolons, quoted
-# fields, formatted CPFs, one invalid and one duplicate CPF, one line
-# without a name.
-legacy_csv() {
-    printf 'Nome;CPF;E-mail;Data de Nascimento;Sexo;Cidade\r\n"Ana Maria Souza";529.982.247-25;ana@x.br;05/03/2001;Feminino;S\xe3o Paulo\r\nJo\xe3o Lima;111.444.777-35;;12/12/1999;M;"Palotina; PR"\r\nPedro Errado;123.456.789-00;;;;\r\nAna Dup;52998224725;;;;\r\n;390.533.447-05;;;;\r\n' > "$W/leitores.csv"
-}
-
-@test "BR07 legacy patrons: Windows-1252 spreadsheet converted, CPFs checked, then Koha's dry run" {
-    legacy_csv
-    export KEI_SELECT_FILE="$W/leitores.csv"
-    inputs "CPL" "PT"
-    answer yes no yes    # convert; do not update existing; import
-    panel lt_br_patrons
-    assert '[ "$status" -eq 0 ]' "$output"
-    assert 'grep -q "Patrons ready: 2" "$KEI_S/textboxes.log" && grep -q "Rejected: 3" "$KEI_S/textboxes.log"' "$(cat "$KEI_S/textboxes.log")"
-    assert 'grep -q "line 4: invalid CPF 123.456.789-00" "$KEI_S/textboxes.log"'
-    assert 'grep -q "line 5: duplicate CPF (line 2)" "$KEI_S/textboxes.log" && grep -q "line 6: no name" "$KEI_S/textboxes.log"'
-    assert 'grep -q "the CPF is used as the card number" "$KEI_S/textboxes.log"'
-    assert 'grep -q "^import_patrons.pl .*--matchpoint cardnumber --default branchcode=CPL --default categorycode=PT -v -v \[pre=0\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'grep -q "^import_patrons.pl .*--confirm \[pre=1\]" "$KEI_S/calls.log"'
-    assert '[ "$(tools_sql "SELECT CONCAT(firstname, \"|\", surname) FROM borrowers WHERE cardnumber = \"52998224725\";")" = "Ana|Maria Souza" ]'
-    assert '[ "$(tools_sql "SELECT surname FROM borrowers WHERE cardnumber = \"11144477735\";")" = "Lima" ]'
-    assert '[ "$(tools_sql "SELECT COUNT(*) FROM borrowers WHERE cardnumber = \"12345678900\";")" = "0" ]' "invalid CPFs are not imported"
-}
-
-@test "BR08 legacy patrons with a card number column and CPF attribute, under mawk too" {
-    printf 'MATRÍCULA,Nome Completo,Endereço,Nº CPF,Validade\n2024001,Bia Rocha,"Rua A, 10",390.533.447-05,31/12/2026\n2024002,Caio Reis,,123.456.789-00,\n' > "$W/alunos.csv"
-    tools_sql "INSERT INTO borrower_attribute_types VALUES ('CPF', 'CPF');"
-    local awk_impl
-    for awk_impl in default mawk; do
-        if [ "$awk_impl" = "mawk" ]; then command -v mawk >/dev/null || continue; extra 'awk() { mawk "$@"; }'; fi
-        rm -f "$KEI_S/textboxes.log"
-        export KEI_SELECT_FILE="$W/alunos.csv"
-        answer no
-        panel lt_br_patrons
-        assert 'grep -qE "MATRÍCULA +-> cardnumber" "$KEI_S/textboxes.log" && grep -qE "Nº CPF +-> cpf" "$KEI_S/textboxes.log"' "$awk_impl: $(cat "$KEI_S/textboxes.log")"
-        assert 'grep -q "Patrons ready: 1" "$KEI_S/textboxes.log" && grep -q "invalid CPF 123.456.789-00" "$KEI_S/textboxes.log"' "$awk_impl"
-        assert '! grep -q "not stored" "$KEI_S/textboxes.log"' "the CPF goes to the CPF attribute"
-        unset KEI_EXTRA
-    done
-    # Converted file handed to Koha: card number from MATRÍCULA, CPF attribute, ISO dates.
-    inputs "CPL" "ST"; answer yes no yes
-    panel lt_br_patrons
-    assert 'grep -q "^import_patrons.pl .*--confirm \[pre=1\]" "$KEI_S/calls.log"'
-    assert '[ "$(tools_sql "SELECT surname FROM borrowers WHERE cardnumber = \"2024001\";")" = "Rocha" ]'
 }
 
 @test "BR09 CPF report is read-only: invalid, shared and non-CPF values" {
@@ -629,5 +499,5 @@ memcached_has() { ( exec 5<>/dev/tcp/127.0.0.1/11211; printf 'get kei_probe\r\n'
     body=$(sed -n '/^function_install_koha() {/,/^}/p' "$KEI_REPO/installer")
     assert '[ -n "$body" ] && ! echo "$body" | grep -qE "lt_br_|br_|ficha_|cpf_|function_brazil"' "the installation must not call the Brazil tools"
     assert '! sed -n "/^(return 0 2>\/dev\/null) \&\& return 0/,\$p" "$KEI_REPO/installer" | grep -qE "lt_br_|br_holidays|br_patrons|_lt_br"' "the startup only refreshes an already enabled card"
-    assert 'grep -qE "^ +10\) function_brazil_tools ;;" "$KEI_REPO/installer"' "reachable only from Library tools > 10"
+    assert 'grep -qE "^ +9\) function_brazil_tools ;;" "$KEI_REPO/installer"' "reachable only from Library tools > 9"
 }

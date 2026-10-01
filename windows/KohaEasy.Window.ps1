@@ -2,15 +2,18 @@
 # A native Windows window, so it keeps working when Koha does not: it reads
 # Debian's services through wsl.exe and never needs Koha's web server.
 # Dark, in cards, from top to bottom:
+#   * a header with the green Koha logo
 #   * a banner: green only when every component runs; when one fails it
 #     turns red and names it (only that row is highlighted), with the time
 #     of the check and the latest backup, and Start Koha while it is off
 #   * quick access: the staff interface first, then the public catalog
 #   * the components: Debian (WSL), MariaDB, Apache, RabbitMQ, Memcached,
 #     koha-common and the staff page's HTTP answer
-#   * the actions: the management panel (terminal menus), Restart Koha and
-#     Open the Debian terminal; More actions holds Stop, Restart Debian and
-#     Koha, Rebuild search index, the library network test and diagnostics
+#   * the actions: the management panel (terminal menus), Restart Koha,
+#     Open the Debian terminal and Shut down the PC safely (its own window,
+#     KohaEasy.Shutdown.ps1); More actions holds Stop, Restart Debian and
+#     Koha, Rebuild search index, the library network test and diagnostics.
+#     Stop and Restart Debian show which step of the safe stop they are on
 # The Debian terminal opens in a window of its own (Windows Terminal, or
 # the classic console), a real terminal where sudo, passwords and full-
 # screen programs work; an embedded one would need a terminal emulator
@@ -222,8 +225,10 @@ $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.AutoSize = $true
 $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
 $form.KeyPreview = $true
-$kohaIco = Join-Path $here 'koha.ico'
-if (Test-Path -LiteralPath $kohaIco) { try { $form.Icon = New-Object System.Drawing.Icon($kohaIco) } catch { } }
+# koha.ico on the title bar and the taskbar button (Get-KohaIcon: tried
+# again while the file is busy, then KohaEasy.exe's own icon, logged).
+$kohaIco = Get-KohaIcon -Path (Join-Path $here 'koha.ico') -Exe (Join-Path $here 'KohaEasy.exe')
+if ($kohaIco) { $form.Icon = $kohaIco }
 # A dark title bar to match (KohaEasy.exe; Windows 10 1809 and later).
 $form.add_HandleCreated({
         if (Import-KohaNative) { try { [void][KohaEasy.Native]::SetDarkTitleBar($form.Handle) } catch { } }
@@ -235,6 +240,36 @@ $root.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
 $root.ColumnCount = 1
 $root.Padding = New-Object System.Windows.Forms.Padding(16, 16, 16, 6)
 $root.BackColor = $theme.Bg
+
+# Header: the Koha logo (green, as the Koha community publishes it; the
+# name and logo are theirs, said on its tooltip) and the product name. The
+# PNG is read into memory, so the file is never held open. Without it the
+# window simply starts with the banner.
+$logoFile = Join-Path $here 'koha-logo.png'
+if (Test-Path -LiteralPath $logoFile) {
+    try {
+        $logo = New-Object System.Windows.Forms.PictureBox
+        $logo.Image = [System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($logoFile))))
+        $logo.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+        $logo.Size = New-Object System.Drawing.Size(140, 40)
+        $logo.Margin = New-Object System.Windows.Forms.Padding(0)
+        $logoTip = New-Object System.Windows.Forms.ToolTip
+        $logoTip.SetToolTip($logo, (T 'The Koha name and logo belong to the Koha community.'))
+        $header = New-Object System.Windows.Forms.TableLayoutPanel
+        $header.AutoSize = $true
+        $header.ColumnCount = 2
+        $header.MinimumSize = New-Object System.Drawing.Size($W, 0)
+        $header.MaximumSize = New-Object System.Drawing.Size($W, 0)
+        $header.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+        [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        $product = New-Text 'Koha Easy Installer' $fontSmall $theme.Muted
+        $product.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
+        [void]$header.Controls.Add($logo, 0, 0)
+        [void]$header.Controls.Add($product, 1, 0)
+        [void]$root.Controls.Add($header)
+    } catch { Write-KohaLog ('Koha logo not shown: ' + $_.Exception.Message) }
+}
 
 # Banner: a dot, the state in words, when it was checked and the latest
 # backup; Start Koha while Koha is off.
@@ -309,8 +344,9 @@ $main = New-Flow $true
 $btnPanel = New-FlatButton ([string][char]0x2699 + '  ' + (T 'Management panel')) 'secondary' { Start-KohaHidden 'Panel' }
 $btnServices = New-FlatButton ([string][char]0x27F3 + '  ' + (T 'Restart Koha')) 'secondary' { Invoke-Action 'services' }
 $btnTerminal = New-FlatButton ('>_  ' + (T 'Open the Debian terminal')) 'secondary' { Start-KohaHidden 'Terminal' }
+$btnPowerOff = New-FlatButton (T 'Shut down the PC safely') 'secondary' { Start-KohaHidden 'SafeShutdown' }
 $btnMore = New-FlatButton '' 'ghost' { Set-MoreOpen (-not $more.Visible) }
-foreach ($b in $btnPanel, $btnServices, $btnTerminal, $btnMore) { [void]$main.Controls.Add($b) }
+foreach ($b in $btnPanel, $btnServices, $btnTerminal, $btnPowerOff, $btnMore) { [void]$main.Controls.Add($b) }
 [void]$cardActions.Controls.Add($main)
 
 $more = New-Flow $true
@@ -358,16 +394,21 @@ $script:nextRefresh = [DateTime]::MinValue
 $script:status = $null
 $script:health = $null
 $script:spin = 0
+# Which step of the safe stop Stop and Restart Debian are on (1 to 5).
+$progress = [hashtable]::Synchronized(@{ Step = 0 })
+$stopSteps = @(Get-KohaStopSteps)
 
 $worker = {
-    param($LangDir, $Action)
+    param($LangDir, $Action, $Progress)
     Import-KeiLanguage -LangDir $LangDir
+    $Progress.Step = 0
+    $onStep = { param($n) $Progress.Step = $n }.GetNewClosure()
     $result = $null
     switch ($Action) {
         'start'    { $result = Start-Koha -Trigger user -Wait }
-        'stop'     { $result = Stop-Koha }
+        'stop'     { $result = Stop-Koha -OnStep $onStep }
         'services' { $result = Restart-KohaServices }
-        'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
+        'debian'   { Stop-Koha -OnStep $onStep | Out-Null; $Progress.Step = 0; $result = Start-Koha -Trigger user -Wait }
         'report'   { $result = Export-KohaDiagnosticsText }
         'reindex'  { $result = Invoke-KohaSearchReindex }
         'lan'      { $result = Test-KohaLanAccess }
@@ -401,6 +442,7 @@ function Set-Buttons {
     $btnLan.Enabled = (-not $Busy) -and $on
     $btnTerminal.Enabled = (-not $Busy) -and $on
     $btnReport.Enabled = -not $Busy
+    $btnPowerOff.Enabled = (-not $Busy) -and $installed
     $btnPanel.Enabled = $installed
 }
 
@@ -414,7 +456,7 @@ function Invoke-Action {
     Set-Buttons $true
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
-    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action)
+    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action).AddArgument($progress)
     $script:job = @{ PS = $ps; Handle = $ps.BeginInvoke(); Action = $Action }
 }
 
@@ -546,7 +588,12 @@ $timer.add_Tick({
             if (-not $script:job.Handle.IsCompleted) {
                 if ($script:job.Action -ne 'refresh') {
                     $script:spin = ($script:spin + 1) % 4
-                    $lblBusy.Text = [string]$spinner[$script:spin] + '  ' + $busyText[$script:job.Action]
+                    $text = $busyText[$script:job.Action]
+                    $step = [int]$progress.Step
+                    if ($step -ge 1 -and $step -le $stopSteps.Count -and @('stop', 'debian') -contains $script:job.Action) {
+                        $text = ((T 'Step {0} of {1}') -f $step, $stopSteps.Count) + ': ' + $stopSteps[$step - 1]
+                    }
+                    $lblBusy.Text = [string]$spinner[$script:spin] + '  ' + $text
                 }
                 return
             }

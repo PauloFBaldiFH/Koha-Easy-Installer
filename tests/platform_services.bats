@@ -153,10 +153,12 @@ platform() {     # platform ARCH MACHINE -> prints the validation lines
     assert '[ "$status" -eq 0 ]' "$output"
 }
 
-@test "P10 the runtime is pure Bash: no python/perl interpreters called by the panel" {
-    # Perl only runs inside Koha's environment (koha-shell / koha_exec), with Koha's libraries.
+@test "P10 the panel is Bash: Perl and the import engine's Python run only through koha_exec" {
+    # Perl and Python run only inside Koha's environment (koha-shell / koha_exec), as the instance user.
     assert '! grep -nE "(^|[^-])\b(python3?|perl)\b +(-|<<|\")" "$KEI_REPO/installer" | grep -v "koha-shell\|koha_exec\|hash_script\|sitemap"' "found interpreter calls"
     assert '! grep -nE "(^|[;&|(]|[[:space:]])python3?[[:space:]]" "$KEI_REPO/installer" | grep -v "^[0-9]*: *#"' "no Python run by the panel (package names are fine)"
+    assert '! grep -nE "\"\\\$MAGIC_PY\" +-" "$KEI_REPO/installer" | grep -v "koha_exec"' "the import engine runs only through koha_exec"
+    assert 'grep -qE "koha_exec .*\"\\\$MAGIC_PY\" -I " "$KEI_REPO/installer"' "the import engine runs in isolated mode"
 }
 
 @test "P11 files are UTF-8 and every dictionary line decodes" {

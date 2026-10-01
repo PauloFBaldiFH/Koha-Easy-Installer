@@ -6,7 +6,8 @@
 #   * menu: Service status (the Koha window), staff interface, catalog,
 #     Start, Stop, Restart Koha services, Rebuild search index, diagnostics
 #     (.txt and .zip), disk space, backups folder, control panel, automatic
-#     start, and a Close that asks whether Koha keeps running
+#     start, Shut down the PC safely (Koha stopped step by step, then
+#     Windows), and a Close that asks whether Koha keeps running
 #   * shown next to the clock the first time on Windows 11 (which hides new
 #     icons behind ^), with a one-time tip where it is
 #   * brought back by the keep-alive task within a minute if it crashed or
@@ -31,25 +32,40 @@ $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.e
 $STATUS_EVERY_S = 60
 $DISK_EVERY_S = 1800
 
-# The Koha icon (koha.ico) with a status dot in the lower right corner; a
-# plain dot when the icon file is missing.
-$kohaIco = Join-Path $here 'koha.ico'
+# The Koha icon (koha.ico) with a status dot in the lower right corner, at
+# the notification area's own size for this screen's scaling. The leaf is
+# drawn from koha.ico's largest frame, a little smaller, and the dot sits
+# beside it with a white ring: at 16 pixels the green leaf and a green dot
+# on top of it looked like one plain green dot. Get-KohaIcon tries the file
+# again while it is busy (at sign-in), then KohaEasy.exe's own icon, and
+# logs why; a plain dot only when neither can be read.
+$kohaIcon = Get-KohaIcon -Size 48 -Path (Join-Path $here 'koha.ico') -Exe (Join-Path $here 'KohaEasy.exe')
+$kohaLeaf = $null
+if ($kohaIcon) { try { $kohaLeaf = $kohaIcon.ToBitmap() } catch { Write-KohaLog ('tray icon: ' + $_.Exception.Message) } }
+$traySize = [Math]::Max(16, [System.Windows.Forms.SystemInformation]::SmallIconSize.Width)
 function New-DotIcon {
     param([System.Drawing.Color]$Color)
-    $bmp = New-Object System.Drawing.Bitmap 16, 16
+    $n = $traySize
+    $bmp = New-Object System.Drawing.Bitmap $n, $n
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 1.5
-    if (Test-Path -LiteralPath $kohaIco) {
-        $base = New-Object System.Drawing.Icon($kohaIco, 16, 16)
-        $g.DrawIcon($base, (New-Object System.Drawing.Rectangle 0, 0, 16, 16))
-        $base.Dispose()
-        $g.FillEllipse((New-Object System.Drawing.SolidBrush $Color), 8, 8, 7, 7)
-        $g.DrawEllipse($pen, 8, 8, 7, 7)
+    $brush = New-Object System.Drawing.SolidBrush $Color
+    if ($kohaLeaf) {
+        $leaf = [int][Math]::Round($n * 0.8)
+        $g.DrawImage($kohaLeaf, (New-Object System.Drawing.Rectangle 0, 0, $leaf, $leaf))
+        $d = [single]($n * 0.44)
+        $x = [single]($n - $d - 0.75)
+        $ring = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), ([single][Math]::Max(1.5, $n / 12))
+        $g.FillEllipse($brush, $x, $x, $d, $d)
+        $g.DrawEllipse($ring, $x, $x, $d, $d)
+        $ring.Dispose()
     } else {
-        $g.FillEllipse((New-Object System.Drawing.SolidBrush $Color), 1, 1, 14, 14)
+        $g.FillEllipse($brush, 1, 1, ($n - 2), ($n - 2))
     }
+    $brush.Dispose()
     $g.Dispose()
     return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
@@ -193,6 +209,8 @@ $miReindex = Add-Item (T 'Rebuild search index') {
     $q = (T 'Rebuild the search index from scratch?') + "`n`n" + (T 'Searches in the catalog may be incomplete until it finishes. On large catalogs this takes several minutes.')
     if ([string][System.Windows.Forms.MessageBox]::Show($q, 'Koha', 'YesNo', 'Question') -eq 'Yes') { Invoke-KohaCommand 'RebuildIndex' }
 }
+Add-Separator
+$miPowerOff = Add-Item (T 'Shut down the PC safely') { Invoke-KohaCommand 'SafeShutdown'; Request-Check 5 }
 Add-Separator
 Add-Item (T 'Export diagnostics (.txt)') { Invoke-KohaCommand 'ExportReport' } | Out-Null
 Add-Item (T 'Export diagnostics (.zip)') { Invoke-KohaCommand 'ExportDiagnostics' } | Out-Null

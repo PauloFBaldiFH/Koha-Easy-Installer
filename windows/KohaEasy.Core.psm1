@@ -101,6 +101,7 @@ $script:StateDefaults = [ordered]@{
     trayClosed           = $false
     trayPromoted         = $false
     trayTipShown         = $false
+    poweredOffAt         = 0
     netLaunch            = ''
 }
 
@@ -167,8 +168,9 @@ function Get-KohaTerminalPath {
 }
 
 # Runs wsl.exe with UTF-8 output. Returns ExitCode and Output (one string).
+# -OnLine gets each line as Linux writes it (the safe stop's progress).
 function Invoke-KohaWsl {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText)
+    param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$InputText, [scriptblock]$OnLine)
     # Whatever Linux writes to stderr is part of the answer, never a
     # PowerShell error: under 'Stop', Windows PowerShell 5.1 turns the first
     # stderr line of a native command redirected with 2>&1 into an exception
@@ -178,10 +180,11 @@ function Invoke-KohaWsl {
     $prev = [Console]::OutputEncoding
     try {
         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $relay = { process { $l = [string]$_; if ($OnLine) { try { & $OnLine $l } catch { } }; $l } }
         if ($PSBoundParameters.ContainsKey('InputText')) {
-            $out = $InputText | & wsl.exe @Arguments 2>&1
+            $out = $InputText | & wsl.exe @Arguments 2>&1 | & $relay
         } else {
-            $out = & wsl.exe @Arguments 2>&1
+            $out = & wsl.exe @Arguments 2>&1 | & $relay
         }
         $code = $LASTEXITCODE
     } finally {
@@ -193,10 +196,12 @@ function Invoke-KohaWsl {
 
 # Command inside the distro (Koha's by default), as root.
 function Invoke-KohaLinux {
-    param([Parameter(Mandatory = $true)][string[]]$Command, [string]$InputText, [string]$Distro = $script:Cfg.Distro)
+    param([Parameter(Mandatory = $true)][string[]]$Command, [string]$InputText, [string]$Distro = $script:Cfg.Distro, [scriptblock]$OnLine)
     $wslArgs = @('-d', $Distro, '-u', 'root', '--') + $Command
-    if ($PSBoundParameters.ContainsKey('InputText')) { return Invoke-KohaWsl -Arguments $wslArgs -InputText $InputText }
-    return Invoke-KohaWsl -Arguments $wslArgs
+    $more = @{}
+    if ($OnLine) { $more.OnLine = $OnLine }
+    if ($PSBoundParameters.ContainsKey('InputText')) { return Invoke-KohaWsl -Arguments $wslArgs -InputText $InputText @more }
+    return Invoke-KohaWsl -Arguments $wslArgs @more
 }
 
 # Runs a shell script as root inside the distro. The script crosses into
@@ -205,8 +210,9 @@ function Invoke-KohaLinux {
 # quotes inside a native command's arguments, and "sh -c <script>" arrived
 # in Linux cut into pieces. $InputText, when given, is the script's stdin.
 # With -TimeoutSeconds, Linux's timeout ends the script (exit code 124).
+# -OnLine as in Invoke-KohaWsl, for the script's own output.
 function Invoke-KohaLinuxScript {
-    param([Parameter(Mandatory = $true)][string]$Script, [string]$InputText, [string]$Distro = $script:Cfg.Distro, [int]$TimeoutSeconds = 0)
+    param([Parameter(Mandatory = $true)][string]$Script, [string]$InputText, [string]$Distro = $script:Cfg.Distro, [int]$TimeoutSeconds = 0, [scriptblock]$OnLine)
     $file = '/run/kohaeasy-{0}.sh' -f ([guid]::NewGuid().ToString('N'))
     # "exit $?" ends the script before the CR LF that Windows adds after
     # piped text, which sh would otherwise run as a command.
@@ -215,9 +221,11 @@ function Invoke-KohaLinuxScript {
     if ($w.ExitCode -ne 0) { return $w }
     $run = @('sh', $file)
     if ($TimeoutSeconds -gt 0) { $run = @('timeout', '-k', '5', [string]$TimeoutSeconds) + $run }
+    $more = @{}
+    if ($OnLine) { $more.OnLine = $OnLine }
     try {
-        if ($PSBoundParameters.ContainsKey('InputText')) { return (Invoke-KohaLinux -Command $run -InputText $InputText -Distro $Distro) }
-        return (Invoke-KohaLinux -Command $run -Distro $Distro)
+        if ($PSBoundParameters.ContainsKey('InputText')) { return (Invoke-KohaLinux -Command $run -InputText $InputText -Distro $Distro @more) }
+        return (Invoke-KohaLinux -Command $run -Distro $Distro @more)
     } finally {
         Invoke-KohaLinux -Command @('rm', '-f', $file) -Distro $Distro | Out-Null
     }
@@ -773,7 +781,7 @@ function Get-KohaWscriptPath {
 # tray and what the shortcuts and the tray menu run. The scheduled tasks'
 # Run and UpdatePortProxy, and the commands the installer waits on, are
 # left alone.
-$script:HiddenCommands = @('Launch', 'Window', 'Tray', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'ExportReport', 'ExportDiagnostics', 'CheckDisk')
+$script:HiddenCommands = @('Launch', 'Window', 'Tray', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'SafeShutdown', 'RestartServices', 'RebuildIndex', 'ExportReport', 'ExportDiagnostics', 'CheckDisk')
 
 # Pure: whether KohaEasy.ps1 should start itself again the hidden way and
 # end, which closes the console it was given. That console comes from a
@@ -990,8 +998,8 @@ function Show-KohaChoice {
     $form.TopMost = $true
     $form.AutoSize = $true
     $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $icon = Get-KohaIconPath
-    if (Test-Path -LiteralPath $icon) { try { $form.Icon = New-Object System.Drawing.Icon($icon) } catch { } }
+    $icon = Get-KohaIcon
+    if ($icon) { $form.Icon = $icon }
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.AutoSize = $true
     $layout.Padding = New-Object System.Windows.Forms.Padding(12)
@@ -1157,7 +1165,7 @@ function Start-Koha {
         Write-KohaLog 'sign-in: automatic start is off, nothing started'
         return 'skipped'
     }
-    Set-KohaState @{ desired = 'running'; startedAt = (Get-UnixTime) } | Out-Null
+    Set-KohaState @{ desired = 'running'; startedAt = (Get-UnixTime); poweredOffAt = 0 } | Out-Null
     try { Repair-KohaTasks | Out-Null } catch { Write-KohaLog ('Koha tasks not registered again: ' + $_.Exception.Message) }
     Start-KohaKeepAlive
     Write-KohaLog "start requested ($Trigger)"
@@ -1177,11 +1185,22 @@ function Start-Koha {
 # unclean stop. So the tray runs the stop script already written into
 # Debian (Update-KohaStopScript) through a wsl.exe with no console at all
 # (DETACHED_PROCESS, $RunDetached), then ends the distro the same way.
-# The tray calls it only while Koha runs, so it never asks WSL first.
+# The tray calls it only while Koha runs, so it never asks WSL first. After
+# "Shut down the PC safely" Koha is already stopped, and the tray may not
+# have noticed yet: running the stop then would start Debian again.
+# It ends with "wsl --shutdown", not "--terminate": Windows is ending the
+# session anyway, and the whole WSL virtual machine stops with Debian's
+# virtual disk (ext4.vhdx) closed, instead of being stopped by Windows.
 function Stop-KohaForSessionEnd {
     param([scriptblock]$RunDetached = { param($CommandLine, $TimeoutMs) [KohaSessionWindow]::RunDetached($CommandLine, $TimeoutMs) })
     $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
-    if ((Get-KohaState).stopScriptHash -eq (Get-KohaStopScriptHash)) {
+    $state = Get-KohaState
+    $off = [int64]$state.poweredOffAt
+    if ($off -gt 0 -and ((Get-UnixTime) - $off) -lt 600) {
+        Write-KohaLog 'Windows is ending the session: Koha was already stopped safely for it'
+        return 'not_running'
+    }
+    if ($state.stopScriptHash -eq (Get-KohaStopScriptHash)) {
         Write-KohaLog 'Windows is ending the session: stopping Koha cleanly'
         $cmd = '"{0}" -d {1} -u root -- timeout -k 5 {2} sh {3}' -f $wsl, $script:Cfg.Distro, $script:Cfg.StopWaitS, $script:Cfg.StopScript
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1192,7 +1211,7 @@ function Stop-KohaForSessionEnd {
         if ($code -ne -2 -and -not $quick) {
             $how = 'clean'
             if ($code -ne 0) { $how = 'forced' }
-            & $RunDetached ('"{0}" --terminate {1}' -f $wsl, $script:Cfg.Distro) 30000 | Out-Null
+            & $RunDetached ('"{0}" --shutdown' -f $wsl) 30000 | Out-Null
             Write-KohaLog ('session end: {0} stopped: {1} (exit {2})' -f $script:Cfg.Distro, $how, $code)
             return $how
         }
@@ -1201,15 +1220,67 @@ function Stop-KohaForSessionEnd {
         Write-KohaLog 'Windows is ending the session: the stop script is not in Debian yet; trying the usual stop'
     }
     if (-not (Test-KohaDistroRunning)) { return 'not_running' }
-    return (Stop-KohaDebianGracefully)
+    return (Stop-KohaDebianGracefully -Shutdown)
 }
 
 # KohaEasy.ps1 Stop: desired=stopped first, so the keep-alive task's
-# restart-on-failure does not bring Koha back a minute later.
+# restart-on-failure does not bring Koha back a minute later. -OnStep as in
+# Stop-KohaDebianGracefully.
 function Stop-Koha {
-    $how = Stop-KohaDebianGracefully -SetStopped
+    param([scriptblock]$OnStep)
+    $more = @{}
+    if ($OnStep) { $more.OnStep = $OnStep }
+    $how = Stop-KohaDebianGracefully -SetStopped @more
     Write-KohaLog "stopped by the user ($how)"
     return 'stopped'
+}
+
+# The five steps of a safe stop, as the librarian reads them. Steps 1 to 4
+# run inside Debian (the stop script says "@step N" as it reaches each),
+# step 5 is WSL closing Debian.
+function Get-KohaStopSteps {
+    return @(
+        (T 'Stopping the web interface and the search engine (Zebra)')
+        (T 'Stopping the message queue and the cache')
+        (T 'Closing the database (MariaDB) safely')
+        (T 'Writing everything to disk')
+        (T 'Closing Debian and its virtual disk')
+    )
+}
+
+# "Shut down the PC safely" (KohaEasy.ps1 SafeShutdown): Koha's services
+# stop in order, everything is written to disk and all of WSL stops, before
+# Windows is asked to shut down or restart. What the librarian wants stays
+# as it is, so Koha starts again at the next sign-in in automatic mode; and
+# poweredOffAt tells the tray's own end-of-session stop that there is
+# nothing left to stop. Should someone cancel the Windows shutdown, the
+# keep-alive task starts Koha again within a minute (it clears the mark).
+# Returns clean, forced or not_running, as Stop-KohaDebianGracefully.
+function Stop-KohaForPowerOff {
+    param([scriptblock]$OnStep)
+    Update-KohaStopScript | Out-Null
+    $more = @{}
+    if ($OnStep) { $more.OnStep = $OnStep }
+    $how = Stop-KohaDebianGracefully -Shutdown @more
+    Set-KohaState @{ poweredOffAt = (Get-UnixTime) } | Out-Null
+    Write-KohaLog "stopped to shut down the PC ($how)"
+    return $how
+}
+
+# Pure: shutdown.exe's arguments. No delay: Koha is already stopped, and
+# Windows still asks the open programs to close (unsaved work stops it).
+function Get-KohaPowerOffArguments {
+    param([switch]$Restart)
+    if ($Restart) { return @('/r', '/t', '0') }
+    return @('/s', '/t', '0')
+}
+
+function Invoke-KohaPowerOff {
+    param([switch]$Restart)
+    $exe = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'shutdown.exe')
+    $a = Get-KohaPowerOffArguments -Restart:$Restart
+    Write-KohaLog ('asking Windows to {0}' -f $(if ($Restart) { 'restart' } else { 'shut down' }))
+    Start-Process -FilePath $exe -ArgumentList $a -WindowStyle Hidden
 }
 
 # What Debian runs before WSL stops it: Koha's services in the order a
@@ -1221,20 +1292,25 @@ function Stop-Koha {
 $script:GracefulStopScript = @'
 if [ "$(ps -p 1 -o comm= 2>/dev/null)" != "systemd" ]; then sync; exit 0; fi
 rc=0
+# "@step N": how far the stop got, for the progress the Windows side shows.
 stop_units() {
   units=""
   for s in "$@"; do systemctl cat "$s.service" >/dev/null 2>&1 && units="$units $s.service"; done
   [ -n "$units" ] || return 0
   systemctl stop $units || { echo "did not stop:$units"; rc=1; }
 }
+echo "@step 1"
 stop_units apache2 koha-common
 for i in $(koha-list 2>/dev/null); do
   for t in koha-plack koha-worker koha-indexer koha-es-indexer koha-zebra; do
     command -v "$t" >/dev/null 2>&1 && "$t" --stop "$i" >/dev/null 2>&1
   done
 done
+echo "@step 2"
 stop_units rabbitmq-server memcached elasticsearch
+echo "@step 3"
 stop_units mariadb
+echo "@step 4"
 sync
 if [ -x /usr/local/sbin/koha-stop-guard ]; then
   /usr/local/sbin/koha-stop-guard stop || { echo "not marked clean (see /var/log/koha-easy-install/stop-guard.log)"; rc=1; }
@@ -1275,26 +1351,31 @@ function Update-KohaStopScript {
 #   -SetStopped  the librarian stopped Koha: desired=stopped and the
 #                keep-alive task ended first, so it does not start Koha again
 #   -Shutdown    "wsl --shutdown" (all of WSL) instead of "--terminate"
+#   -OnStep      called with 1 to 5 as the stop reaches each step of
+#                Get-KohaStopSteps (the progress windows show them)
 # Returns clean, forced (a service did not stop, or the timeout) or
 # not_running (nothing to stop: a stopped distro is never started for this).
 function Stop-KohaDebianGracefully {
-    param([string]$Distro = $script:Cfg.Distro, [switch]$SetStopped, [switch]$Shutdown, [int]$TimeoutSeconds = $script:Cfg.StopWaitS)
+    param([string]$Distro = $script:Cfg.Distro, [switch]$SetStopped, [switch]$Shutdown, [int]$TimeoutSeconds = $script:Cfg.StopWaitS, [scriptblock]$OnStep)
     if ($SetStopped) {
         Set-KohaState @{ desired = 'stopped'; startedAt = 0 } | Out-Null
         Stop-KohaKeepAlive
     }
     $how = 'not_running'
     if (@(Get-KohaRunningDistros) -contains $Distro) {
-        $r = Invoke-KohaLinuxScript -Script $script:GracefulStopScript -Distro $Distro -TimeoutSeconds $TimeoutSeconds
+        $more = @{}
+        if ($OnStep) { $more.OnLine = { param($l) if ($l -match '^@step (\d+)') { & $OnStep ([int]$Matches[1]) } }.GetNewClosure() }
+        $r = Invoke-KohaLinuxScript -Script $script:GracefulStopScript -Distro $Distro -TimeoutSeconds $TimeoutSeconds @more
         if ($r.ExitCode -eq 0) {
             $how = 'clean'
         } else {
             $how = 'forced'
-            $why = ([string]$r.Output).Trim()
+            $why = ((([string]$r.Output) -split "`n" | Where-Object { $_ -notmatch '^@step ' }) -join "`n").Trim()
             if ($r.ExitCode -eq 124) { $why = ('Koha did not stop within {0} s. {1}' -f $TimeoutSeconds, $why).Trim() }
             Write-KohaLog ('graceful stop of {0} incomplete (exit {1}): {2}' -f $Distro, $r.ExitCode, $why)
         }
     }
+    if ($OnStep) { try { & $OnStep 5 } catch { } }
     if ($Shutdown) {
         Invoke-KohaWsl -Arguments @('--shutdown') | Out-Null
     } else {
@@ -1329,6 +1410,7 @@ function Invoke-KohaRun {
         return 0
     }
     if (-not $Holder) { $Holder = { [System.Diagnostics.Process]::Start((Get-KohaHolderStartInfo)) } }
+    if ([int64]$state.poweredOffAt -gt 0) { Set-KohaState @{ poweredOffAt = 0 } | Out-Null }
     $proc = & $Holder
     Start-Sleep -Seconds 2
     Update-KohaHandshake | Out-Null
@@ -2214,6 +2296,48 @@ function Export-KohaDiagnostics {
 # ----------------------------------------------------------------------
 function Get-KohaIconPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'koha.ico') }
 
+# koha.ico as an icon for a window or the tray ($Size 0: the file's own
+# sizes). Read into memory, and tried again while a program still holds
+# the file (an antivirus scan at sign-in); then KohaEasy.exe's own icon,
+# the same koha.ico built in; then $null, and the window keeps Windows'
+# default icon. Every failure is logged with Windows' reason.
+function Get-KohaIcon {
+    param(
+        [int]$Size = 0,
+        [string]$Path = (Get-KohaIconPath),
+        [string]$Exe = ([System.IO.Path]::Combine((Get-KohaPath Bin), 'KohaEasy.exe')),
+        [int]$Tries = 3,
+        [int]$WaitMs = 700
+    )
+    try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch { }
+    $why = 'the file is missing'
+    if (Test-Path -LiteralPath $Path) {
+        for ($i = 1; $i -le $Tries; $i++) {
+            try {
+                $ms = New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($Path))
+                if ($Size -gt 0) { return (New-Object System.Drawing.Icon($ms, $Size, $Size)) }
+                return (New-Object System.Drawing.Icon($ms))
+            } catch {
+                $why = $_.Exception.Message
+                if ($i -lt $Tries) { Start-Sleep -Milliseconds $WaitMs }
+            }
+        }
+    }
+    $msg = 'koha.ico could not be loaded from {0}: {1}' -f $Path, $why
+    if ($Exe -and (Test-Path -LiteralPath $Exe)) {
+        try {
+            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($Exe)
+            if ($ico) {
+                Write-KohaLog ($msg + '; using the icon inside KohaEasy.exe')
+                if ($Size -gt 0) { return (New-Object System.Drawing.Icon($ico, $Size, $Size)) }
+                return $ico
+            }
+        } catch { $msg += '; KohaEasy.exe: ' + $_.Exception.Message }
+    }
+    Write-KohaLog $msg
+    return $null
+}
+
 # What to create (pure, tested). Kind "url" is an Internet shortcut (.url),
 # "lnk" a program shortcut. Commands run KohaEasy.ps1 in Windows PowerShell 5.1.
 function Get-KohaShortcutList {
@@ -2234,6 +2358,7 @@ function Get-KohaShortcutList {
         (& $lnk (T 'Koha - Start') 'Start')
         (& $lnk (T 'Koha - Stop') 'Stop')
         (& $lnk (T 'Koha - Restart') 'Restart')
+        (& $lnk (T 'Koha - Shut down the PC safely') 'SafeShutdown')
         (& $lnk (T 'Koha - Status') 'Window')
         (& $lnk (T 'Koha - Export diagnostics') 'ExportReport')
         (& $lnk (T 'Koha - Status icon') 'Tray')
