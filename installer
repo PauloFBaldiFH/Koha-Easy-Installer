@@ -9019,7 +9019,7 @@ function_library_tools() {
 # 30. BRAZIL: LOCALIZATION & MIGRATION (opt-in)
 # ----------------------------------------------------------------------
 # Presets for Brazilian libraries: the readers of the old systems' files
-# (Biblivre, SophiA and Pergamum item fields, Biblioteca Fácil, ISIS), called
+# (legacy item fields such as Biblivre's 949 or 852 holdings, Biblioteca Fácil, ISIS), called
 # by the Magic Import Tool, CPF checks, Pimaco label templates, the catalogue card (ficha
 # catalográfica), the national holidays, the government census reports
 # (MEC/INEP/IBGE) and references by ABNT NBR 6023. Nothing here runs
@@ -9099,25 +9099,50 @@ use MARC::File::USMARC;
 use MARC::Field;
 
 # koha-easy-installer: moves the item fields of a legacy export (one item
-# per occurrence of --item-tag) into Koha's 952. --map "p=a,o=h+i" builds
-# 952$p from $a and 952$o from $h and $i; --callnumber "090:ab|082:a" is the
-# record call number used when the item has none. 952$a/$b (library) and
-# $y (item type) come from --branch and --itype. Records that already have
-# a 952 are kept as they are.
-my %o = ( map => '', callnumber => '', sample => 3, branch => '', itype => '' );
+# per occurrence of --item-tag) into Koha's 952. --map "p=a,o=h+i|j" builds
+# 952$p from $a and 952$o from $h and $i (or $j when they are empty);
+# --callnumber "090:ab|082:a" is the record call number used when the item
+# has none. --values (written by the engine) holds what Koha gets for the
+# values of the checked subfields: a/b library and y item type (Koha codes),
+# c shelving location, d date, g price and S status (the 952 subfield it
+# sets: 0 withdrawn, 1 lost, 4 damaged, 7 not for loan; '-' none). A library
+# or item type the field lacks, or Koha does not have, comes from --branch
+# and --itype. Records that already have a 952 are kept as they are.
+my %o = ( map => '', callnumber => '', sample => 3, branch => '', itype => '', values => '' );
 GetOptions( \%o, 'in=s', 'out=s', 'item-tag=s', 'map=s', 'callnumber=s',
-    'branch=s', 'itype=s', 'dry-run', 'sample=i' ) or exit 2;
+    'branch=s', 'itype=s', 'values=s', 'dry-run', 'sample=i' ) or exit 2;
 die "usage: --in FILE --item-tag TAG --branch CODE (--out FILE | --dry-run)\n"
     unless $o{in} && $o{'item-tag'} && $o{branch} && ( $o{'dry-run'} || $o{out} );
 
-my @map = grep { $_->[0] !~ /^[aby]$/ } map { [ split /=/, $_, 2 ] } grep { /^[a-z0-9]=[a-z0-9+]+$/ } split /,/, $o{map};
+my @map = map { [ split /=/, $_, 2 ] } grep { /^[a-zA-Z0-9]=[a-z0-9+|]+$/ } split /,/, $o{map};
 my @cn  = map { [ split /:/, $_, 2 ] } grep { /^\d{3}:[a-z0-9]+$/ } split /\|/, $o{callnumber};
+my %checked = map { $_ => 1 } qw(a b y c d g S);
+my %koha;
+if ( length $o{values} ) {
+    open( my $vf, '<:raw', $o{values} ) or die "cannot read $o{values}\n";
+    while ( my $l = <$vf> ) {
+        chomp $l;
+        my ( $k, $raw, $v ) = split /\t/, $l, 3;
+        $koha{$k}{$raw} = $v // '' if defined $raw;
+    }
+    close $vf;
+}
 
 sub values_of {
     my ( $field, $codes ) = @_;
     my $v = join ' ', grep { defined && length } map { $field->subfield($_) } @$codes;
     $v =~ s/^\s+|\s+$//g;
     return $v;
+}
+
+# "h+i|j": the first alternative that gives a value.
+sub spec_value {
+    my ( $field, $spec ) = @_;
+    for my $alt ( split /\|/, $spec ) {
+        my $v = values_of( $field, [ split /\+/, $alt ] );
+        return $v if length $v;
+    }
+    return '';
 }
 
 sub callnumber {
@@ -9140,7 +9165,7 @@ unless ( $o{'dry-run'} ) {
 }
 binmode STDOUT, ':encoding(UTF-8)';
 
-my %n = map { $_ => 0 } qw(records converted items no_barcode kept_952 errors);
+my %n = map { $_ => 0 } qw(records converted items no_barcode kept_952 errors branch_field branch_unknown itype_field itype_unknown dropped);
 my @sample;
 while (1) {
     my $rec = eval { $in->next };
@@ -9154,15 +9179,35 @@ while (1) {
         my @src = grep { !$_->is_control_field } $rec->field( $o{'item-tag'} );
         my $cn  = callnumber($rec);
         for my $f (@src) {
-            my %s;
+            my ( %s, %bad );
             for my $m (@map) {
-                my $v = values_of( $f, [ split /\+/, $m->[1] ] );
-                $s{ $m->[0] } = $v if length $v;
+                my ( $k, $spec ) = @$m;
+                my $v = spec_value( $f, $spec );
+                next unless length $v;
+                if ( $checked{$k} ) {
+                    utf8::encode($v) if utf8::is_utf8($v);
+                    my $c = $koha{$k}{$v};
+                    if ( !defined $c || !length $c ) { $bad{$k} = 1; next }
+                    next if $c eq '-';
+                    $v = $c;
+                }
+                $s{$k} = $v;
             }
+            my $status = delete $s{S};
+            $s{$status} = 1 if defined $status;
             $s{o} = $cn if !defined $s{o} && length $cn;
             $n{no_barcode}++ unless defined $s{p};
-            my @subs = ( a => $o{branch}, b => $o{branch} );
-            push @subs, y => $o{itype} if length $o{itype};
+            $n{branch_field}++ if defined $s{a} || defined $s{b};
+            $n{branch_unknown}++ if $bad{a} || $bad{b};
+            $n{itype_field}++ if defined $s{y};
+            $n{itype_unknown}++ if $bad{y};
+            $n{dropped} += grep { $bad{$_} } qw(c d g S);
+            my $home = $s{a} // $s{b} // $o{branch};
+            my $hold = $s{b} // $s{a} // $o{branch};
+            my $type = $s{y} // $o{itype};
+            delete @s{qw(a b y)};
+            my @subs = ( a => $home, b => $hold );
+            push @subs, y => $type if length $type;
             push @subs, map { ( $_ => $s{$_} ) } sort keys %s;
             push @new, MARC::Field->new( '952', ' ', ' ', @subs );
         }
@@ -9187,6 +9232,11 @@ print "Records with new 952 items: $n{converted}\n";
 print "Items created: $n{items}\n";
 print "Items without barcode: $n{no_barcode}\n";
 print "Records that already had 952 (kept): $n{kept_952}\n";
+print "Items with their library from the field: $n{branch_field}\n";
+print "Libraries Koha does not have (your choice used): $n{branch_unknown}\n";
+print "Items with their item type from the field: $n{itype_field}\n";
+print "Item types Koha does not have (your choice used): $n{itype_unknown}\n";
+print "Values left out (location, date, price or status Koha cannot take): $n{dropped}\n";
 print "Unreadable records: $n{errors}\n";
 print "\n--- Sample ---\n", join( "\n\n", @sample ), "\n" if @sample;
 exit( $n{records} ? 0 : 1 );
@@ -18701,18 +18751,12 @@ import os
 import re
 from collections import Counter
 
-from . import intake, marc
+from . import holdings, intake, marc
 from . import rules as R
 from . import tables
 
 HEAD = 65536
 KOHA_TABLES = {"biblio", "biblio_metadata", "items", "borrowers", "systempreferences", "marc_subfield_structure"}
-ITEM_PRESETS = {
-    # tag: (system, 952 map, record call number) - the layouts of Brazil > Migrate MARC
-    "949": ("Biblivre", "p=a", "090:ab|082:a"),
-    "852": ("Pergamum", "p=p,o=h+i,t=t,z=z,x=x", "090:ab|082:a"),
-    "990": ("SophiA", "p=a,o=b", "090:ab|082:a"),
-}
 
 # Kinds of member and what the panel does with them.
 KINDS = {
@@ -18867,9 +18911,18 @@ def guess_iso_encoding(records):
     return "ISO_8859-1", 0.5, sample
 
 
-def inspect_marc(member, kind):
+def _raw(field):
+    """A MARCXML field as the data of an ISO 2709 field (UTF-8)."""
+    if field.is_control():
+        return (field.value or "").encode("utf-8")
+    return (field.ind1 + field.ind2).encode("utf-8") + b"".join(
+        b"\x1f" + c.encode("utf-8") + v.encode("utf-8") for c, v in field.subfields)
+
+
+def inspect_marc(member, kind, koha=None):
     """Records, item field layout and encoding of a MARC file (every record
-    is counted; the first 3000 are studied)."""
+    is counted; the first 3000 are studied). koha: Koha's libraries, item
+    types and shelving locations (normalised name or code -> code)."""
     recs = []
     n = n952 = 0
     tag_recs = Counter()
@@ -18877,7 +18930,7 @@ def inspect_marc(member, kind):
         if kind == "marc":
             stream = marc.iso2709_records(fh)
         else:
-            stream = ((r.leader, [(f.tag, b"") for f in r.fields]) for r in marc.marcxml_records(fh))
+            stream = ((r.leader, [(f.tag, _raw(f)) for f in r.fields]) for r in marc.marcxml_records(fh))
         for leader, fields in stream:
             n += 1
             tag_recs.update(set(tag for tag, _ in fields))
@@ -18890,36 +18943,347 @@ def inspect_marc(member, kind):
         info.update(encoding=enc, enc_conf=conf, enc_sample=sample)
     else:
         info.update(encoding="UTF-8", enc_conf=1.0, enc_sample="")
-    legacy = [(tag_recs[t], t) for t in ITEM_PRESETS if tag_recs.get(t)]
-    if legacy:
-        _, tag = max(legacy)
-        system, mp, cn = ITEM_PRESETS[tag]
-        info.update(item_tag=tag, item_map=mp, callnumber=cn, system=system, item_records=tag_recs[tag])
-    elif kind == "marc" and n:
-        # Another repeated local field in most records may hold the copies.
-        cands = [(c, t) for t, c in tag_recs.items() if t[0] == "9" and t not in ("942", "952", "999") and c >= 0.3 * n]
-        if cands:
-            _, tag = max(cands)
-            codes = Counter()
-            vals = {}
-            for _, fields in recs:
-                for t, d in fields:
-                    if t != tag:
-                        continue
-                    for code, v in marc.iso_subfields(d)[2]:
-                        codes[code] += 1
-                        vals.setdefault(code, []).append(v)
-            best = None
-            for code, vs in vals.items():
-                distinct = len(set(vs)) / len(vs)
-                digits = sum(1 for v in vs if re.search(rb"\d", v)) / len(vs)
-                score = distinct + digits
-                if best is None or score > best[0]:
-                    best = (score, code)
-            if best:
-                info.update(unknown_tag=tag, unknown_code=best[1],
-                            unknown_sample=", ".join(v.decode("latin-1") for v in vals[best[1]][:4]))
+    info.update(holdings.find(recs, tag_recs, n, info["encoding"], koha or {}))
     return info
+KEIPY
+    cat > "$d/kei_import/holdings.py" <<'KEIPY'
+"""Item fields of legacy exports (852, 949, 950, 990, or another 9XX that
+most records repeat): what each subfield holds and the 952 map that
+remap952.pl applies, one Koha item per field. 852 is read by its MARC 21
+definition; in a 9XX each subfield is judged by its values, never by its
+code, since every system lays them out its own way. Library, item type and
+shelving location count only when the values are Koha's own codes or
+names; what a field leaves out or Koha does not have comes from the
+operator's choices."""
+import re
+from datetime import date
+
+from . import marc
+from . import rules as R
+from .group import DAMAGED, LOST, NOT_FOR_LOAN, WITHDRAWN
+
+TAGS = ("852", "949", "950", "990")
+CALLNUMBER = "090:ab|082:a"     # the record's call number, for items without one
+AVAILABLE = {"disponivel", "normal", "emprestado", "circulante", "ativo", "em circulacao", "livre",
+             "available", "on loan", "checked out"}
+# Status word -> the 952 subfield it sets to 1 ("" = nothing to set).
+STATUS = {}
+for _words, _code in ((LOST, "1"), (WITHDRAWN, "0"), (DAMAGED, "4"), (NOT_FOR_LOAN, "7"), (AVAILABLE, "")):
+    STATUS.update((w, _code) for w in _words)
+# 852 by MARC 21 (library and shelving location only when Koha knows the values).
+HOLDINGS = {"a": "branch", "b": "branch", "c": "location", "h": "callnumber", "i": "callnumber",
+            "j": "callnumber", "k": "callnumber", "m": "callnumber", "p": "barcode", "t": "copy",
+            "x": "itemnote", "z": "publicnote"}
+# Role -> 952 subfield ("S" is the status, which sets $0, $1, $4 or $7).
+TARGET = {"itemtype": "y", "location": "c", "itemstatus": "S", "acqdate": "d", "price": "g", "volume": "h",
+          "copy": "t", "barcode": "p", "tombo": "i", "itemnote": "x", "publicnote": "z"}
+TEXT = {"branch": "library", "itemtype": "item type", "location": "shelving location",
+        "itemstatus": "status", "acqdate": "date acquired",
+        "price": "price", "volume": "volume", "copy": "copy number", "callnumber": "call number",
+        "barcode": "barcode", "tombo": "inventory number", "itemnote": "internal note", "publicnote": "public note"}
+# 952 subfields the engine checks or normalises before the remapper writes them.
+LOOKUP = {"a": "branch", "b": "branch", "y": "itemtype", "c": "location", "S": "itemstatus", "d": "acqdate", "g": "price"}
+ACCEPT = 0.8
+
+_SPACE = b" \t\n\r\f\v"
+_CLASS = re.compile(r"([A-Za-z]{1,3}\s+)?\d{1,3}(\.\d+)?([-(:/\"=][^\s]*)?(\s+\S+)*")
+_CUTTER = re.compile(r"[A-Z][a-z]{0,2}\d{1,4}[a-z]{0,3}\.?")
+_VOLUME = re.compile(r"(?i)(v|vol|volume|t|tomo|n|num|no)(\.\s*|\s+)\d{1,4}\b.*")
+_COPY = re.compile(r"(?i)((ex|exs|exemplar|exempl|exemp|c|cop|copia|copy)(\.\s*|\s+)\d{1,3}|\d{1,3}\s*[ºªoa]?\.?\s*(ex|exemplar)\.?)")
+_MONEY = re.compile(r"(R\$|US\$|\$|€|£)\s*\d|^\d{1,3}(\.\d{3})*,\d{2}$")
+
+
+def item_date(v):
+    """A date of acquisition as YYYY-MM-DD, also from YYYYMMDD; '' otherwise."""
+    d = R.iso_date(v)
+    if d:
+        return d
+    m = re.fullmatch(r"(1[89]\d\d|20\d\d)(\d\d)(\d\d)", v.strip())
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+class Sub:
+    """The values one subfield has across the studied fields."""
+
+    def __init__(self, code, values):
+        self.code = code
+        self.values = values
+        self.n = len(values)
+        self.distinct = len(set(values)) / self.n
+
+    def ratio(self, test):
+        return sum(1 for v in self.values if test(v)) / self.n
+
+    def sample(self, k=3):
+        seen = []
+        for v in self.values:
+            if v not in seen:
+                seen.append(v)
+            if len(seen) == k:
+                break
+        return ", ".join(x[:30] for x in seen)
+
+
+def _in(table):
+    return lambda s, koha: s.ratio(lambda v: R.norm_header(v) in koha[table]) if koha.get(table) else 0.0
+
+
+def _class_like(v):
+    """A class with or without its Cutter: "869.3", "869.3 A848d", "R 981",
+    "821.134.3(81)-31", or three digits alone ("981")."""
+    return bool(_CLASS.fullmatch(v)) and bool(re.search(r"[.\s(]", v) or re.fullmatch(r"\d{3}", v))
+
+
+def _barcode_like(s):
+    if s.distinct < 0.9:
+        return 0.0
+    return s.ratio(lambda v: len(v) <= 30 and not re.search(r"\s", v) and bool(re.search(r"\d", v)))
+
+
+def _copy(s, koha):
+    r = s.ratio(lambda v: bool(_COPY.fullmatch(v)))
+    if r >= ACCEPT:
+        return r
+    # Plain copy numbers: small, repeated, never 0.
+    if s.n >= 2 and s.distinct <= 0.5 and all(re.fullmatch(r"[1-9]\d?", v) for v in s.values):
+        return 1.0
+    return 0.0
+
+
+def _date(s, koha):
+    r = s.ratio(lambda v: bool(R.iso_date(v)))
+    if r >= ACCEPT:
+        return r
+    # YYYYMMDD only when values repeat: a column of barcodes never does.
+    return s.ratio(lambda v: bool(item_date(v))) if s.distinct < 0.9 else 0.0
+
+
+def _callnumber(s, koha):
+    # Three digits alone are a class only next to others with a point or a
+    # space, or when they repeat: a numbering never does.
+    if not s.ratio(lambda v: bool(re.search(r"[.\s(]", v))) and s.distinct >= 0.6:
+        return 0.0
+    return s.ratio(_class_like)
+
+
+# In order: the first test a subfield passes is its role.
+TESTS = [
+    ("branch", _in("branch")),
+    ("itemtype", _in("itemtype")),
+    ("location", _in("location")),
+    ("itemstatus", lambda s, k: s.ratio(lambda v: R.norm_header(v) in STATUS)),
+    ("acqdate", _date),
+    ("price", lambda s, k: s.ratio(lambda v: bool(_MONEY.search(v)) and bool(R.price(v)))),
+    ("volume", lambda s, k: s.ratio(lambda v: bool(_VOLUME.fullmatch(v)))),
+    ("copy", _copy),
+    ("callnumber", _callnumber),
+    ("cutter", lambda s, k: s.ratio(lambda v: bool(_CUTTER.fullmatch(v)))),
+    ("barcode", lambda s, k: _barcode_like(s)),
+    # Text: at least half the values are a few words long.
+    ("itemnote", lambda s, k: 1.0 if s.ratio(lambda v: len(v) >= 12 and " " in v) >= 0.5 else 0.0),
+]
+
+
+def _judge(subs, koha):
+    """(role, why) for each subfield of a 9XX, from its values."""
+    cands = {}
+    for s in subs:
+        cands[s.code] = [(role, r) for role, test in TESTS for r in [test(s, koha)] if r >= ACCEPT]
+    out = {s.code: ("", "values not recognised") for s in subs}
+    taken = {}
+    order = ["branch", "itemtype", "location", "itemstatus", "acqdate", "price", "volume", "copy",
+             "callnumber", "cutter", "barcode", "itemnote"]
+    has_class = any(c and c[0][0] == "callnumber" for c in cands.values())
+    for role in order:
+        hits = []
+        for s in subs:
+            if out[s.code][0]:
+                continue
+            for r, ratio in cands[s.code]:
+                if r == "cutter" and not has_class:
+                    continue
+                if r == role:
+                    hits.append((-ratio, s.code, s))
+                break
+        hits.sort(key=lambda h: (h[0], h[1]))
+        for _, code, s in hits:
+            name = "callnumber" if role == "cutter" else role
+            n = taken.get(name, 0)
+            limit = {"branch": 2, "callnumber": 9, "barcode": 2, "itemnote": 9}.get(name, 1)
+            if n >= limit:
+                out[code] = ("", "another subfield already gives the %s" % TEXT[name])
+                continue
+            taken[name] = n + 1
+            out[code] = (name, role)
+    # No barcode: the most distinct unrecognised subfield with numbers in it.
+    if not taken.get("barcode"):
+        free = [s for s in subs if out[s.code] == ("", "values not recognised") and s.distinct >= 0.9
+                and s.ratio(lambda v: bool(re.search(r"\d", v))) >= ACCEPT]
+        if free:
+            best = max(free, key=lambda s: (s.distinct, -ord(s.code[:1] or " ")))
+            out[best.code] = ("barcode", "barcode")
+    # Two numberings: the barcode is $p, else $i, else the one of steady length;
+    # the other is the inventory number (tombo).
+    bars = [s for s in subs if out[s.code][0] == "barcode"]
+    if len(bars) == 2:
+        bars.sort(key=lambda s: (s.code != "p", s.code != "i", len(set(len(v) for v in s.values)), -s.distinct, s.code))
+        out[bars[1].code] = ("tombo", "tombo")
+    return out
+
+
+def infer(tag, values, koha):
+    """[(code, role, sample, why)] for the subfields of an item field and the
+    952 map ("p=a,o=h+i|j,..."): role '' = not used, for the reason given."""
+    subs = [Sub(c, values[c]) for c in sorted(values)]
+    roles = []
+    if tag == "852":
+        for s in subs:
+            role, why = HOLDINGS.get(s.code, ""), "not part of a Koha item"
+            if role == "branch" and _in("branch")(s, koha) < ACCEPT:
+                role, why = "", "not a library Koha has"
+            elif role == "location" and _in("location")(s, koha) < ACCEPT:
+                role, why = "", "not a shelving location Koha has (authorised values LOC)"
+            roles.append((s.code, role, s.sample(), "" if role else why))
+        cn = [c for c in "khim" if any(r[0] == c and r[1] for r in roles)]
+        spec = "+".join(cn)
+        if any(r[0] == "j" for r in roles):
+            spec = spec + "|j" if spec else "j"
+        callnumber = spec
+    else:
+        judged = _judge(subs, koha)
+        for s in subs:
+            role, why = judged[s.code]
+            roles.append((s.code, role, s.sample(), "" if role else why))
+        classes = [s.code for s in subs if judged[s.code] == ("callnumber", "callnumber")]
+        cutters = [s.code for s in subs if judged[s.code] == ("callnumber", "cutter")]
+        callnumber = "+".join(classes + cutters)
+    parts = []
+    branches = [c for c, r, _, _ in roles if r == "branch"]
+    if branches:
+        parts.append("a=" + branches[0])
+    if len(branches) > 1:
+        parts.append("b=" + branches[1])
+    if callnumber:
+        parts.append("o=" + callnumber)
+    for role, key in TARGET.items():
+        codes = [c for c, r, _, _ in roles if r == role]
+        if codes:
+            parts.append("%s=%s" % (key, "+".join(codes)))
+    return roles, ",".join(parts)
+
+
+def find(recs, tag_recs, n, encoding, koha):
+    """The item field of a legacy export among the studied records, with its
+    roles and 952 map; {} when there is none. 'item_auto' is False when the
+    panel must ask first (a 9XX it does not expect, or a field without a
+    numbering that could be the barcode)."""
+    if not n or tag_recs.get("952", 0) >= n:
+        return {}
+    known = [t for t in TAGS if tag_recs.get(t)]
+    others = [(c, t) for t, c in tag_recs.items()
+              if t[:1] == "9" and t not in TAGS and t not in ("942", "952", "999") and c >= 0.3 * n]
+    if not known and not others:
+        return {}
+    found = [study(recs, t, encoding, koha, tag_recs[t]) for t in known or [max(others)[1]]]
+    # Of the usual fields, the one with a numbering, in the most records.
+    return max(found, key=lambda f: (f["item_auto"], f["item_records"], -TAGS.index(f["item_tag"]) if f["item_tag"] in TAGS else 0))
+
+
+def study(recs, tag, encoding, koha, records):
+    enc = "utf-8" if encoding == "UTF-8" else "latin-1"
+    values = {}
+    sample = []
+    for _, fields in recs:
+        for t, data in fields:
+            if t != tag:
+                continue
+            subs = [(c, v.decode(enc, "replace").strip()) for c, v in marc.iso_subfields(data)[2]]
+            if len(sample) < 2:
+                sample.append(" ".join("$%s %s" % (c, v) for c, v in subs))
+            for c, v in subs:
+                if v and re.fullmatch(r"[a-z0-9]", c):
+                    values.setdefault(c, []).append(v)
+    roles, mapping = infer(tag, values, koha)
+    auto = tag in TAGS and any(r in ("barcode", "tombo") for _, r, _, _ in roles)
+    return {"item_tag": tag, "item_roles": roles, "item_map": mapping, "item_auto": auto,
+            "item_records": records, "item_sample": " | ".join(sample), "callnumber": CALLNUMBER}
+
+
+def subject(tag, roles):
+    """The question's subject: '945 b=barcode c=' (the panel names the roles)."""
+    return " ".join([tag] + ["%s=%s" % (c, r) for c, r, _, _ in roles])
+
+
+def describe(tag, mapping, roles, branch="", itype=""):
+    """Preview lines: where each subfield goes."""
+    dest = {}
+    keys = dict(p.split("=", 1) for p in mapping.split(",") if "=" in p)
+    for key, spec in keys.items():
+        for code in re.split(r"[+|]", spec):
+            dest.setdefault(code, []).append(key)
+    lines = ["Items: field %s moved to 952, one item per field:" % tag]
+    for code, role, sample, why in roles:
+        if role and code in dest:
+            ks = dest[code]
+            if ks == ["a"] and "b" not in keys:
+                ks = ["a", "b"]
+            target = " ".join("$0/$1/$4/$7" if k == "S" else "$" + k for k in ks)
+            lines.append("  %s $%s -> 952 %s, %s: %s" % (tag, code, target, TEXT[role], sample))
+        else:
+            lines.append("  %s $%s not used, %s: %s" % (tag, code, why or "not part of a Koha item", sample))
+    if "o" not in keys:
+        lines.append("  call number: the record's 090 $a $b, else 082 $a")
+    else:
+        lines.append("  call number when the field has none: the record's 090 $a $b, else 082 $a")
+    lines.append("  library and item type when the field has none Koha knows: %s, %s" % (branch or "your choice", itype or "your choice"))
+    return lines
+
+
+def value_table(src, tag, mapping, koha, out):
+    """The values of the checked 952 subfields as the remapper will meet them
+    (the UTF-8 file it reads), each with what Koha gets: "key<TAB>value<TAB>
+    Koha value", '' when Koha has no such library, item type or location, or
+    the date or price cannot be read; '-' for a status that sets nothing
+    (available)."""
+    keys = {}
+    for part in mapping.split(","):
+        k, _, spec = part.partition("=")
+        if k in LOOKUP and spec:
+            keys[k] = spec.split("|")[0].split("+")
+    seen = {k: set() for k in keys}
+    with open(src, "rb") as fh:
+        for _, fields in marc.iso2709_records(fh):
+            for t, data in fields:
+                if t != tag:
+                    continue
+                subs = marc.iso_subfields(data)[2]
+                for k, codes in keys.items():
+                    v = b" ".join(x for code in codes for c, x in subs if c == code and x).strip(_SPACE)
+                    if v:
+                        seen[k].add(v)
+    with open(out, "wb") as fh:
+        for k in sorted(keys):
+            for raw in sorted(seen[k]):
+                if b"\t" in raw or b"\n" in raw:
+                    continue
+                fh.write(b"%s\t%s\t%s\n" % (k.encode(), raw, koha_value(k, raw.decode("utf-8", "replace"), koha).encode("utf-8")))
+
+
+def koha_value(key, v, koha):
+    role = LOOKUP[key]
+    if role in ("branch", "itemtype", "location"):
+        return koha.get(role, {}).get(R.norm_header(v), "")
+    if role == "itemstatus":
+        code = STATUS.get(R.norm_header(v))
+        return "" if code is None else code or "-"
+    if role == "acqdate":
+        return item_date(v)
+    return R.price(v)
 KEIPY
     cat > "$d/kei_import/group.py" <<'KEIPY'
 """Rows describing the same book become one MARC 21 record with one 952
@@ -19380,7 +19744,8 @@ class Questions:
 
     def ask(self, id_, kind, where, subject, samples, options):
         if not any(q[0] == id_ for q in self.open):
-            self.open.append((id_, kind, flat(where, 90), flat(subject, 90), flat(samples), ",".join(options)))
+            # An item field's subject lists each subfield's role: never cut.
+            self.open.append((id_, kind, flat(where, 90), flat(subject, 400 if kind == "items" else 90), flat(samples), ",".join(options)))
 
     def write(self, path):
         with open(path, "w", encoding="utf-8") as fh:
@@ -19521,13 +19886,21 @@ def to_utf8_iso(src, src_format, encoding, out, log, yaz="yaz-marcdump"):
     return p.returncode == 0 and os.path.getsize(out) > 0
 
 
-def remap952(readers, src, out, tag, mapping, callnumber, opts, log):
-    rc, text = run([PERL, reader(readers, "remap952.pl"), "--in", src, "--item-tag", tag, "--map", mapping,
-                    "--callnumber", callnumber, "--branch", opts.branch, "--itype", opts.itype, "--out", out], log)
+def remap952(readers, src, out, tag, mapping, callnumber, opts, log, values=None):
+    cmd = [PERL, reader(readers, "remap952.pl"), "--in", src, "--item-tag", tag, "--map", mapping,
+           "--callnumber", callnumber, "--branch", opts.branch, "--itype", opts.itype, "--out", out]
+    if values:
+        cmd[-2:-2] = ["--values", values]
+    rc, text = run(cmd, log)
     if rc != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
         raise ReaderError(rc or 1, "moving the items to 952 failed")
     return {"records": count(text, "Records read:"), "items": count(text, "Items created:"),
-            "no_barcode": count(text, "Items without barcode:"), "kept_952": count(text, "Records that already had 952 (kept):")}
+            "no_barcode": count(text, "Items without barcode:"), "kept_952": count(text, "Records that already had 952 (kept):"),
+            "branch_field": count(text, "Items with their library from the field:"),
+            "branch_unknown": count(text, "Libraries Koha does not have (your choice used):"),
+            "itype_field": count(text, "Items with their item type from the field:"),
+            "itype_unknown": count(text, "Item types Koha does not have (your choice used):"),
+            "dropped": count(text, "Values left out (location, date, price or status Koha cannot take):")}
 KEIPY
     cat > "$d/kei_import/engine.py" <<'KEIPY'
 """The two passes the panel runs, each as the Koha instance user:
@@ -19547,7 +19920,7 @@ import sys
 from collections import Counter
 from datetime import date
 
-from . import bridge, classify, detect, group, intake, marc, patrons, tables
+from . import bridge, classify, detect, group, holdings, intake, marc, patrons, tables
 from . import rules as R
 from .questions import Questions, flat, qid
 
@@ -19581,8 +19954,8 @@ class MarcPlan:
         self.route = "stage"        # stage | legacy
         self.encoding = info.get("encoding", "UTF-8")
         self.item_tag = info.get("item_tag")
-        self.item_map = info.get("item_map")
-        self.callnumber = info.get("callnumber", "090:ab|082:a")
+        self.item_map = info.get("item_map", "")
+        self.callnumber = info.get("callnumber", holdings.CALLNUMBER)
 
 
 class Analysis:
@@ -19597,6 +19970,7 @@ class Analysis:
         self.questions = None
         self.intake = None
         self.isbn_answer = "apart"
+        self.koha = {}              # branch | itemtype | location -> {normalised code or name: code}
 
 
 # ---------------------------------------------------------------- analyse
@@ -19664,7 +20038,7 @@ def plan_table(a, member, table):
 
 
 def plan_marc(a, d, work):
-    info = detect.inspect_marc(d.member, d.kind)
+    info = detect.inspect_marc(d.member, d.kind, a.koha)
     mp = MarcPlan(d.member, d.kind, info)
     a.marcs.append(mp)
     q = a.questions
@@ -19675,16 +20049,19 @@ def plan_marc(a, d, work):
             mp.encoding = ans
         else:
             q.ask(eid, "encoding", d.member.display, "", info.get("enc_sample", ""), ["ISO_8859-1", "MARC-8", "UTF-8"])
-    if mp.item_tag:
+    # Copies in a legacy item field: moved to 952 at once when the field is
+    # one of the usual ones and holds a numbering; otherwise asked, with
+    # what each subfield was read as.
+    if mp.item_tag and info.get("item_auto"):
         mp.route = "legacy"
-    elif info.get("unknown_tag"):
-        iid = qid(d.member.display, "items", info["unknown_tag"])
+    elif mp.item_tag:
+        iid = qid(d.member.display, "items", mp.item_tag)
         ans = q.answer(iid, ["items", "keep"])
         if ans == "items":
-            mp.route, mp.item_tag, mp.item_map = "legacy", info["unknown_tag"], "p=" + info["unknown_code"]
+            mp.route = "legacy"
         elif ans is None:
-            q.ask(iid, "items", d.member.display, "%s $%s" % (info["unknown_tag"], info["unknown_code"]),
-                  info.get("unknown_sample", ""), ["items", "keep"])
+            q.ask(iid, "items", d.member.display, holdings.subject(mp.item_tag, info["item_roles"]),
+                  info.get("item_sample", ""), ["items", "keep"])
     if mp.route == "legacy" and not bridge.yaz_available(getattr(a, "yaz", "yaz-marcdump")):
         a.needs.add("yaz")
 
@@ -19692,6 +20069,8 @@ def plan_marc(a, d, work):
 def analyse(opts):
     a = Analysis()
     a.yaz = getattr(opts, "yaz", "yaz-marcdump")
+    a.koha = {"branch": _load_map(getattr(opts, "branches", None)), "itemtype": _load_map(getattr(opts, "itypes", None)),
+              "location": _load_map(getattr(opts, "locations", None))}
     a.questions = Questions(opts.answers, opts.profiles)
     a.intake = intake.Intake(opts.work)
     a.intake.add(opts.src)
@@ -20004,15 +20383,17 @@ def build(opts):
                 with open(src, "rb") as fh:
                     sample = [r.formatted() for r in marc.marcxml_records(fh, 2)]
         else:
-            preview.append("Items: field %s%s moved to 952 (map %s)" % (mp.item_tag, " (%s)" % mp.info["system"] if mp.info.get("system") else "", mp.item_map))
+            preview.extend(holdings.describe(mp.item_tag, mp.item_map, mp.info["item_roles"], opts.branch, opts.itype))
             utf8 = os.path.join(out_dir, "marc-%d-utf8.mrc" % n)
             out = os.path.join(out_dir, "marc-%d-koha.mrc" % n)
+            values = os.path.join(out_dir, "marc-%d-values.tsv" % n)
             if not bridge.to_utf8_iso(src, fmt, mp.encoding, utf8, log, opts.yaz):
                 preview.append("The character conversion failed: nothing built from this file.")
                 preview.append("")
                 continue
+            holdings.value_table(utf8, mp.item_tag, mp.item_map, a.koha, values)
             try:
-                st = bridge.remap952(opts.readers, utf8, out, mp.item_tag, mp.item_map, mp.callnumber, opts, log)
+                st = bridge.remap952(opts.readers, utf8, out, mp.item_tag, mp.item_map, mp.callnumber, opts, log, values)
             except bridge.ReaderError as e:
                 preview.append("Not imported: %s." % e)
                 preview.append("")
@@ -20021,6 +20402,15 @@ def build(opts):
             preview.append("Items created: %d" % st["items"])
             preview.append("Items without barcode: %d" % st["no_barcode"])
             preview.append("Records that already had 952 (kept): %d" % st["kept_952"])
+            keys = set(x.split("=", 1)[0] for x in mp.item_map.split(","))
+            if keys & {"a", "b"}:
+                preview.append("Items with their library from the field: %d" % st["branch_field"])
+                preview.append("Libraries Koha does not have (your choice used): %d" % st["branch_unknown"])
+            if "y" in keys:
+                preview.append("Items with their item type from the field: %d" % st["itype_field"])
+                preview.append("Item types Koha does not have (your choice used): %d" % st["itype_unknown"])
+            if keys & {"c", "d", "g", "S"}:
+                preview.append("Values left out (location, date, price or status Koha cannot take): %d" % st["dropped"])
             manifest.append(("biblio", "ISO2709", "UTF-8", out, st["records"], st["items"], "-", m.display))
             totals["records"] += st["records"]
             totals["items"] += st["items"]
@@ -20102,7 +20492,9 @@ def main(argv=None):
     p.add_argument("--readers", default="")
     p.add_argument("--branch", default="")
     p.add_argument("--itype", default="")
+    p.add_argument("--branches")
     p.add_argument("--itypes")
+    p.add_argument("--locations")
     p.add_argument("--categories")
     p.add_argument("--cpf-attr", action="store_true")
     p.add_argument("--today")
@@ -20299,7 +20691,8 @@ magic_engine() {
     shift
     koha_exec "$log" kei_import "$MAGIC_PY" -I -B "$MAGIC_ENGINE/kei_import_run.py" "$@" \
         --in "$MAGIC_INPUT" --work "$MAGIC_WORK" --answers "$MAGIC_WORK/answers.tsv" \
-        --profiles "$MAGIC_WORK/profiles" --readers "$MAGIC_ENGINE/readers" --yaz "$YAZ_MARCDUMP"
+        --profiles "$MAGIC_WORK/profiles" --readers "$MAGIC_ENGINE/readers" --yaz "$YAZ_MARCDUMP" \
+        --branches "$MAGIC_WORK/branches.tsv" --itypes "$MAGIC_WORK/itemtypes.tsv" --locations "$MAGIC_WORK/locations.tsv"
 }
 
 # magic_need_packages "PKG..." "TRIED...": Debian packages a format needs
@@ -20357,6 +20750,10 @@ magic_role_label() {
         language)     t "Language (041)" ;;
         quantity)     t "Number of copies" ;;
         itemstatus)   t "Status of the copy (lost, withdrawn...)" ;;
+        branch)       t "Library of the copy (952)" ;;
+        location)     t "Shelving location of the copy (952)" ;;
+        itemnote)     t "Internal note on the copy (952)" ;;
+        publicnote)   t "Public note on the copy (952)" ;;
         cardnumber)   t "Patron card number" ;;
         fullname)     t "Full name of a patron" ;;
         surname)      t "Surname of a patron" ;;
@@ -20409,7 +20806,7 @@ magic_option_label() {
 # dialogs; each answer is added to ANSWERS for the next pass. 1 when the
 # operator gives up.
 magic_ask() {
-    local lines=() line id kind where subject samples options olist=() opts=() o ans text title
+    local lines=() line id kind where subject samples options olist=() opts=() o ans text title tag roles pairs=()
     mapfile -t lines < "$1"
     title=$(t "🪄  Magic Import Tool")
     for line in "${lines[@]}"; do
@@ -20421,7 +20818,19 @@ magic_ask() {
             table)    text=$(t 'What does "${where}" hold?\n\nColumns: ${subject}\nFirst row: ${samples}') ;;
             column)   text=$(t 'Column "${subject}" of "${where}" is not clear.\nValues: ${samples}\n\nWhat does it hold?') ;;
             encoding) text=$(t 'Which character set does "${where}" use? Its text reads well in more than one.\n\nSample: ${samples}') ;;
-            items)    text=$(t 'The records of "${where}" keep their copies in field ${subject}, a layout the panel does not know.\nSample: ${samples}\n\nMake one Koha item (952) per field, with that subfield as the barcode?') ;;
+            items)
+                # subject: the tag, then code=role for each subfield ("945 b=barcode c=").
+                read -r tag o <<< "$subject"
+                read -r -a pairs <<< "$o"
+                roles=""
+                for o in "${pairs[@]}"; do
+                    if [ -n "${o#*=}" ]; then
+                        roles+="  \$${o%%=*}: $(magic_role_label "${o#*=}")\\n"
+                    else
+                        roles+="  \$${o%%=*}: $(t "(not used)")\\n"
+                    fi
+                done
+                text=$(t 'The records of "${where}" may keep their copies in field ${tag}. Read from their values, its subfields hold:\n${roles}\nSample: ${samples}\n\nMake one Koha item (952) per field this way?') ;;
             isbn)     text=$(t '${subject} ISBN(s) in "${where}" are shared by different titles.\nExamples: ${samples}\n\nHow should they become records?') ;;
             *)        continue ;;
         esac
@@ -20497,6 +20906,11 @@ _lt_magic_run() {
     fi
     [ -d "$MAGIC_PROFILES" ] && cp -f "$MAGIC_PROFILES"/*.tsv "$MAGIC_WORK/profiles/" 2>/dev/null
     : > "$MAGIC_WORK/answers.tsv"
+    # Koha's libraries, item types and shelving locations: the values of a
+    # legacy item field are matched against them.
+    run_sql "SELECT branchcode, branchname FROM ${DB_NAME}.branches;" > "$MAGIC_WORK/branches.tsv" 2>/dev/null
+    run_sql "SELECT itemtype, description FROM ${DB_NAME}.itemtypes;" > "$MAGIC_WORK/itemtypes.tsv" 2>/dev/null
+    run_sql "SELECT authorised_value, lib FROM ${DB_NAME}.authorised_values WHERE category = 'LOC';" > "$MAGIC_WORK/locations.tsv" 2>/dev/null
     chown -R "${INSTANCE}-koha:" "$MAGIC_WORK" 2>/dev/null || true
     chmod -R go-rwx "$MAGIC_WORK"
     display_explanation "Copying the file to the work folder..."
@@ -20553,10 +20967,9 @@ _lt_magic_run() {
     if [[ "$settings" == *" itype "* ]]; then
         MAGIC_ITYPE=$(magic_pick_one "$(t "Item type for the rows without one:")" "SELECT itemtype, description FROM ${DB_NAME}.itemtypes ORDER BY description;") || return 0
     fi
-    run_sql "SELECT itemtype, description FROM ${DB_NAME}.itemtypes;" > "$MAGIC_WORK/itemtypes.tsv" 2>/dev/null
     run_sql "SELECT categorycode, description FROM ${DB_NAME}.categories;" > "$MAGIC_WORK/categories.tsv" 2>/dev/null
-    chown "${INSTANCE}-koha:" "$MAGIC_WORK/itemtypes.tsv" "$MAGIC_WORK/categories.tsv" 2>/dev/null || true
-    args=(--branch "$MAGIC_BRANCH" --itype "$MAGIC_ITYPE" --itypes "$MAGIC_WORK/itemtypes.tsv" --categories "$MAGIC_WORK/categories.tsv")
+    chown "${INSTANCE}-koha:" "$MAGIC_WORK/categories.tsv" 2>/dev/null || true
+    args=(--branch "$MAGIC_BRANCH" --itype "$MAGIC_ITYPE" --categories "$MAGIC_WORK/categories.tsv")
     [ "$(run_sql "SELECT COUNT(*) FROM ${DB_NAME}.borrower_attribute_types WHERE code = 'CPF';" 2>/dev/null)" = "1" ] && args+=(--cpf-attr)
     [ -n "${MAGIC_TODAY:-}" ] && args+=(--today "$MAGIC_TODAY")
     display_explanation "Building the records, items and patrons (nothing is written to Koha yet)..."

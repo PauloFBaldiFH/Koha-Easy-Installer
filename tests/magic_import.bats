@@ -33,6 +33,8 @@ isis_dump()   { python3 "$KEI_REPO/tests/lib/isis_dump.py" "$@"; }
 # Restore database is the subject of tests/restore.bats: here it only says
 # which file it was handed, and that the file was there.
 restore_double() { extra 'function_restore_database() { [ -s "$1" ] && echo "RESTORE $1" >> /run/kei-mock/calls.log; }'; }
+# Menus also record their text (the item question lists the subfields).
+menu_texts()  { extra 'ui_menu() { local title="$1" ans; printf "%s\n" "$2" >> "$KEI_S/menus.log"; shift 2; ans=$(_kei_next_input); [ -n "$ans" ] || ans="${1:-}"; _kei_dialog "MENU [$title] => $ans"; [ "$ans" = "CANCEL" ] && return 1; printf "%s" "$ans"; }'; }
 engine_ran()  { grep -q "^koha-shell library -c \"/usr/bin/python3\" \"-I\" \"-B\" \"/tmp/koha_tools\.[^\"]*/kei/kei_import_run.py\" \"$1\"" "$KEI_S/calls.log"; }
 
 # A Biblivre-like export: accession numbers (tombo) in 949 $a, call number
@@ -201,7 +203,8 @@ bf_circ_schema() {
     panel lt_magic_import
     assert '[ "$status" -eq 0 ]' "$output"
     local f="$KEI_S/last-staged.mrc"
-    assert 'preview | grep -q "^== acervo.mrc  (ISO 2709, 3 record(s), encoding ISO_8859-1)" && preview | grep -q "^Items: field 949 (Biblivre) moved to 952 (map p=a)"' "$(preview)"
+    assert 'preview | grep -q "^== acervo.mrc  (ISO 2709, 3 record(s), encoding ISO_8859-1)" && preview | grep -q "^Items: field 949 moved to 952, one item per field:"' "$(preview)"
+    assert 'preview | grep -qx "  949 \$a -> 952 \$p, barcode: 000123, 000124" && preview | grep -qx "  949 \$b not used, values not recognised: sem tombo"' "the tombo is read as the barcode: $(preview)"
     assert '[ -s "$f" ] && iconv -f UTF-8 -t UTF-8 "$f" >/dev/null' "the staged file must be UTF-8"
     assert '[ "$(head -c 10 "$f" | tail -c 1)" = "a" ]' "leader/09 must say Unicode"
     assert 'marc_dump "$f" | grep -q "São Paulo : \$b Ática"' "accents kept: $(marc_dump "$f" | grep ^260)"
@@ -248,14 +251,109 @@ with open(sys.argv[1], "wb") as fh:
     fh.write(rec([(b"245", b"10\x1faIracema"), (b"945", b"  \x1fbT-101\x1fcx")]))
 PY
     export KEI_SELECT_FILE="$W/local.mrc"
+    menu_texts
     inputs ISO_8859-1 items CPL LIVRO new
     answer yes yes
     panel lt_magic_import
     assert '[ "$(dialogs | grep -c "^MENU \[🪄  Magic Import Tool\] => \(ISO_8859-1\|items\)$")" = "2" ]' "$(dialogs)"
+    assert 'grep -q "may keep their copies in field 945" "$KEI_S/menus.log" && grep -qF '\''hold:\n  $b: Barcode of the copy (952)\n  $c: (not used)\n\nSample: $b T-100 $c x | $b T-101 $c x'\'' "$KEI_S/menus.log"' "the question says how each subfield is read: $(cat "$KEI_S/menus.log")"
     local f="$KEI_S/last-staged.mrc"
-    assert 'preview | grep -q "encoding ISO_8859-1, your answer" && preview | grep -q "^Items: field 945 moved to 952 (map p=b)"' "$(preview)"
+    assert 'preview | grep -q "encoding ISO_8859-1, your answer" && preview | grep -q "^Items: field 945 moved to 952, one item per field:" && preview | grep -qx "  945 \$b -> 952 \$p, barcode: T-100, T-101"' "$(preview)"
     assert 'marc_dump "$f" | grep -qx "245 10 \$a José de Alencar" && marc_dump "$f" | grep -qx "952    \$a CPL \$b CPL \$y LIVRO \$p T-101"' "$(marc_dump "$f")"
     assert 'dialogs | grep -q "^OK ✔ .*Questions answered: 2"' "$(dialogs | tail -1)"
+}
+
+@test "I20 an item field in another system's layout: every subfield read from its values, library and item type checked against Koha" {
+    # 949 as many systems export it: call number in $a, barcode in $i,
+    # library $b, location $l, item type $t, copy $c, date $d, price $p,
+    # status $s. One library (XPL) and one item type (Gibi) Koha does not
+    # have, one impossible date; Latin-1 like most Brazilian exports.
+    tools_sql "INSERT INTO authorised_values (category, authorised_value, lib) VALUES ('LOC', 'REF', 'Referência'), ('LOC', 'GEN', 'Acervo geral');"
+    local i949='<datafield tag="949" ind1=" " ind2=" ">'
+    cat > "$W/vendor.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<collection xmlns="http://www.loc.gov/MARC21/slim">
+<record><leader>00000nam  2200000 a 4500</leader>
+  <datafield tag="245" ind1="1" ind2="0"><subfield code="a">Dom Casmurro</subfield></datafield>
+  $i949<subfield code="a">869.3 A848d</subfield><subfield code="i">0000101</subfield><subfield code="b">CPL</subfield><subfield code="l">Referência</subfield><subfield code="t">Livro</subfield><subfield code="c">1</subfield><subfield code="d">15/03/2020</subfield><subfield code="p">R\$ 25,00</subfield><subfield code="s">Disponível</subfield></datafield>
+  $i949<subfield code="a">869.3 A848d</subfield><subfield code="i">0000102</subfield><subfield code="b">Midway</subfield><subfield code="l">Acervo geral</subfield><subfield code="t">LIVRO</subfield><subfield code="c">2</subfield><subfield code="d">15/03/2020</subfield><subfield code="p">R\$ 25,00</subfield><subfield code="s">Extraviado</subfield></datafield>
+</record>
+<record><leader>00000nam  2200000 a 4500</leader>
+  <datafield tag="245" ind1="0" ind2="0"><subfield code="a">Ciência Hoje</subfield></datafield>
+  $i949<subfield code="a">505 C569</subfield><subfield code="i">0000103</subfield><subfield code="b">XPL</subfield><subfield code="l">REF</subfield><subfield code="t">Revista</subfield><subfield code="c">1</subfield><subfield code="d">2019-01-02</subfield><subfield code="p">R\$ 12,50</subfield><subfield code="s">Baixado</subfield></datafield>
+</record>
+<record><leader>00000nam  2200000 a 4500</leader>
+  <datafield tag="245" ind1="1" ind2="0"><subfield code="a">Iracema</subfield></datafield>
+  $i949<subfield code="a">869.3 A368i</subfield><subfield code="i">0000104</subfield><subfield code="b">CPL</subfield><subfield code="l">GEN</subfield><subfield code="t">Livro</subfield><subfield code="c">1</subfield><subfield code="d">02/01/2019</subfield><subfield code="p">R\$ 30,00</subfield><subfield code="s">Disponível</subfield></datafield>
+</record>
+<record><leader>00000nam  2200000 a 4500</leader>
+  <datafield tag="245" ind1="1" ind2="0"><subfield code="a">Vidas secas</subfield></datafield>
+  $i949<subfield code="a">869.3 R194v</subfield><subfield code="i">0000105</subfield><subfield code="b">CPL</subfield><subfield code="l">GEN</subfield><subfield code="t">Gibi</subfield><subfield code="c">1</subfield><subfield code="d">31/02/2020</subfield><subfield code="p">R\$ 25,00</subfield><subfield code="s">Disponível</subfield></datafield>
+</record>
+</collection>
+XML
+    kei_marc "$W/vendor.mrc" ISO-8859-1 "$W/vendor.xml"
+    export KEI_SELECT_FILE="$W/vendor.mrc"
+    inputs CPL LIVRO new
+    answer yes yes
+    panel lt_magic_import
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert '! dialogs | grep -q "=> items$"' "a usual item field with a barcode is not asked about: $(dialogs)"
+    local p
+    for p in '949 $a -> 952 $o, call number: 869.3 A848d, 505 C569, 869.3 A368i' '949 $b -> 952 $a $b, library: CPL, Midway, XPL' \
+             '949 $c -> 952 $t, copy number: 1, 2' '949 $d -> 952 $d, date acquired: 15/03/2020, 2019-01-02, 02/01/2019' \
+             '949 $i -> 952 $p, barcode: 0000101, 0000102, 0000103' '949 $l -> 952 $c, shelving location: Referência, Acervo geral, REF' \
+             '949 $p -> 952 $g, price: R$ 25,00, R$ 12,50, R$ 30,00' '949 $s -> 952 $0/$1/$4/$7, status: Disponível, Extraviado, Baixado' \
+             '949 $t -> 952 $y, item type: Livro, LIVRO, Revista' 'library and item type when the field has none Koha knows: CPL, LIVRO' \
+             'Items created: 5' 'Items with their library from the field: 4' 'Libraries Koha does not have (your choice used): 1' \
+             'Items with their item type from the field: 4' 'Item types Koha does not have (your choice used): 1' \
+             'Values left out (location, date, price or status Koha cannot take): 1'; do
+        assert 'preview | grep -qxF "  $p" || preview | grep -qxF "$p"' "missing in the preview: $p
+$(preview)"
+    done
+    local f="$KEI_S/last-staged.mrc"
+    for p in '$a CPL $b CPL $y LIVRO $c REF $d 2020-03-15 $g 25.00 $o 869.3 A848d $p 0000101 $t 1' \
+             '$a MPL $b MPL $y LIVRO $1 1 $c GEN $d 2020-03-15 $g 25.00 $o 869.3 A848d $p 0000102 $t 2' \
+             '$a CPL $b CPL $y REV $0 1 $c REF $d 2019-01-02 $g 12.50 $o 505 C569 $p 0000103 $t 1' \
+             '$a CPL $b CPL $y LIVRO $c GEN $d 2019-01-02 $g 30.00 $o 869.3 A368i $p 0000104 $t 1' \
+             '$a CPL $b CPL $y LIVRO $c GEN $g 25.00 $o 869.3 R194v $p 0000105 $t 1'; do
+        assert 'marc_dump "$f" | grep -qxF "952    $p"' "missing 952: $p
+$(marc_dump "$f" | grep ^952)"
+    done
+    assert '! marc_dump "$f" | grep -q "^949"' "legacy item fields removed once moved"
+}
+
+@test "I21 MARCXML with MARC 21 holdings (852): library and location only when Koha has them; a 950 that holds no copies is passed over" {
+    tools_sql "INSERT INTO authorised_values (category, authorised_value, lib) VALUES ('LOC', 'REF', 'Referência');"
+    cat > "$W/holdings.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<collection xmlns="http://www.loc.gov/MARC21/slim">
+<record><leader>00000nam a2200000 a 4500</leader>
+  <datafield tag="245" ind1="1" ind2="0"><subfield code="a">Grande sertão: veredas</subfield></datafield>
+  <datafield tag="852" ind1="8" ind2=" "><subfield code="a">CPL</subfield><subfield code="b">Sala 2</subfield><subfield code="c">REF</subfield><subfield code="h">869.3</subfield><subfield code="i">R788g</subfield><subfield code="p">B-001</subfield><subfield code="t">1</subfield><subfield code="z">Só consulta local</subfield></datafield>
+  <datafield tag="852" ind1="8" ind2=" "><subfield code="a">MPL</subfield><subfield code="b">Sala 2</subfield><subfield code="j">ARM 12</subfield><subfield code="p">B-002</subfield><subfield code="t">2</subfield><subfield code="x">Doação</subfield></datafield>
+  <datafield tag="950" ind1=" " ind2=" "><subfield code="a">Literatura brasileira</subfield></datafield>
+</record>
+<record><leader>00000nam a2200000 a 4500</leader>
+  <datafield tag="245" ind1="0" ind2="0"><subfield code="a">Sagarana</subfield></datafield>
+  <datafield tag="852" ind1="8" ind2=" "><subfield code="a">CPL</subfield><subfield code="b">Sala 3</subfield><subfield code="c">REF</subfield><subfield code="h">869.3</subfield><subfield code="i">R788s</subfield><subfield code="p">B-003</subfield></datafield>
+  <datafield tag="950" ind1=" " ind2=" "><subfield code="a">Contos</subfield></datafield>
+</record>
+</collection>
+XML
+    export KEI_SELECT_FILE="$W/holdings.xml"
+    inputs MPL LIVRO new
+    answer yes yes
+    panel lt_magic_import
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert '! dialogs | grep -q "=> items$"' "$(dialogs)"
+    assert 'preview | grep -q "^== holdings.xml  (MARCXML, 2 record(s)" && preview | grep -q "^Items: field 852 moved to 952, one item per field:"' "$(preview)"
+    assert 'preview | grep -qxF "  852 \$a -> 952 \$a \$b, library: CPL, MPL" && preview | grep -qxF "  852 \$b not used, not a library Koha has: Sala 2, Sala 3"' "$(preview)"
+    local f="$KEI_S/last-staged.mrc"
+    assert 'marc_dump "$f" | grep -qxF "952    \$a CPL \$b CPL \$y LIVRO \$c REF \$o 869.3 R788g \$p B-001 \$t 1 \$z Só consulta local"' "$(marc_dump "$f" | grep ^952)"
+    assert 'marc_dump "$f" | grep -qxF "952    \$a MPL \$b MPL \$y LIVRO \$o ARM 12 \$p B-002 \$t 2 \$x Doação"' "the shelving number stands in for the call number: $(marc_dump "$f" | grep ^952)"
+    assert 'marc_dump "$f" | grep -qxF "952    \$a CPL \$b CPL \$y LIVRO \$c REF \$o 869.3 R788s \$p B-003"'
+    assert 'marc_dump "$f" | grep -qxF "950    \$a Contos" && ! marc_dump "$f" | grep -q "^852"' "the 950 stays, the 852 is moved: $(marc_dump "$f")"
 }
 
 # --- Spreadsheets ---------------------------------------------------------------

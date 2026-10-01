@@ -61,7 +61,7 @@ marc_dump()   { yaz-marcdump "$1" 2>/dev/null; }
 
 # --- 1. Readers of the old systems (their imports: tests/magic_import.bats) --------
 
-@test "BR05 the item reader moves SophiA, Pergamum and custom item fields to 952" {
+@test "BR05 the item reader moves SophiA, Pergamum and custom item fields to 952, with the values the engine checked" {
     cat > "$W/vendors.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <collection xmlns="http://www.loc.gov/MARC21/slim">
@@ -84,6 +84,29 @@ XML
         run yaz-marcdump "$W/o.mrc"
         assert 'echo "$output" | grep -qF "952    \$a MPL \$b MPL \$y REV ${p#*|}"' "$spec: $output"
     done
+    # Values the engine checked (--values): library and item type become
+    # Koha's codes, unknown ones the defaults; status, date and price as Koha
+    # takes them; "h+k|j" takes $j when $h and $k are empty.
+    cat > "$W/items.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<collection xmlns="http://www.loc.gov/MARC21/slim">
+<record><leader>00000nam  2200000 a 4500</leader>
+  <datafield tag="245" ind1="0" ind2="0"><subfield code="a">Um</subfield></datafield>
+  <datafield tag="949" ind1=" " ind2=" "><subfield code="b">CPL</subfield><subfield code="t">Livro</subfield><subfield code="s">Extraviado</subfield><subfield code="d">15/03/2020</subfield><subfield code="p">R$ 25,00</subfield><subfield code="i">I-1</subfield><subfield code="j">ARM 1</subfield></datafield>
+  <datafield tag="949" ind1=" " ind2=" "><subfield code="b">XPL</subfield><subfield code="t">Gibi</subfield><subfield code="s">Disponível</subfield><subfield code="i">I-2</subfield><subfield code="h">869.3</subfield><subfield code="k">R194v</subfield></datafield>
+</record>
+</collection>
+XML
+    kei_marc "$W/i.mrc" UTF-8 "$W/items.xml"
+    printf 'a\tCPL\tCPL\na\tXPL\t\ny\tLivro\tLIVRO\ny\tGibi\t\nS\tExtraviado\t1\nS\tDisponível\t-\nd\t15/03/2020\t2020-03-15\ng\tR$ 25,00\t25.00\n' > "$W/v.tsv"
+    run perl "$W/r.pl" --in "$W/i.mrc" --out "$W/o.mrc" --item-tag 949 --map "a=b,y=t,S=s,d=d,g=p,p=i,o=h+k|j" --callnumber "090:ab|082:a" \
+        --branch MPL --itype REV --values "$W/v.tsv"
+    assert '[ "$status" -eq 0 ]' "$output"
+    assert 'echo "$output" | grep -qx "Items with their library from the field: 1" && echo "$output" | grep -qx "Libraries Koha does not have (your choice used): 1"' "$output"
+    assert 'echo "$output" | grep -qx "Item types Koha does not have (your choice used): 1" && echo "$output" | grep -qx "Values left out (location, date, price or status Koha cannot take): 0"' "$output"
+    run yaz-marcdump "$W/o.mrc"
+    assert 'echo "$output" | grep -qxF "952    \$a CPL \$b CPL \$y LIVRO \$1 1 \$d 2020-03-15 \$g 25.00 \$o ARM 1 \$p I-1"' "$output"
+    assert 'echo "$output" | grep -qxF "952    \$a MPL \$b MPL \$y REV \$o 869.3 R194v \$p I-2"' "$output"
 }
 
 @test "BR09 CPF report is read-only: invalid, shared and non-CPF values" {
