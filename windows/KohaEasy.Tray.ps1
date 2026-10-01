@@ -6,7 +6,8 @@
 #   * menu: Service status (the Koha window), staff interface, catalog,
 #     Start, Stop, Restart Koha services, Rebuild search index, diagnostics
 #     (.txt and .zip), disk space, backups folder, control panel, automatic
-#     start, and a Close that asks whether Koha keeps running
+#     start, Shut down the PC safely (Koha stopped step by step, then
+#     Windows), and a Close that asks whether Koha keeps running
 #   * shown next to the clock the first time on Windows 11 (which hides new
 #     icons behind ^), with a one-time tip where it is
 #   * brought back by the keep-alive task within a minute if it crashed or
@@ -208,6 +209,8 @@ $miReindex = Add-Item (T 'Rebuild search index') {
     $q = (T 'Rebuild the search index from scratch?') + "`n`n" + (T 'Searches in the catalog may be incomplete until it finishes. On large catalogs this takes several minutes.')
     if ([string][System.Windows.Forms.MessageBox]::Show($q, 'Koha', 'YesNo', 'Question') -eq 'Yes') { Invoke-KohaCommand 'RebuildIndex' }
 }
+Add-Separator
+$miPowerOff = Add-Item (T 'Shut down the PC safely') { Invoke-KohaCommand 'SafeShutdown'; Request-Check 5 }
 Add-Separator
 Add-Item (T 'Export diagnostics (.txt)') { Invoke-KohaCommand 'ExportReport' } | Out-Null
 Add-Item (T 'Export diagnostics (.zip)') { Invoke-KohaCommand 'ExportDiagnostics' } | Out-Null

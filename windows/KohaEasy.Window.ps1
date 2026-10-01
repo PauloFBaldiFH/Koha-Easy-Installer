@@ -9,9 +9,11 @@
 #   * quick access: the staff interface first, then the public catalog
 #   * the components: Debian (WSL), MariaDB, Apache, RabbitMQ, Memcached,
 #     koha-common and the staff page's HTTP answer
-#   * the actions: the management panel (terminal menus), Restart Koha and
-#     Open the Debian terminal; More actions holds Stop, Restart Debian and
-#     Koha, Rebuild search index, the library network test and diagnostics
+#   * the actions: the management panel (terminal menus), Restart Koha,
+#     Open the Debian terminal and Shut down the PC safely (its own window,
+#     KohaEasy.Shutdown.ps1); More actions holds Stop, Restart Debian and
+#     Koha, Rebuild search index, the library network test and diagnostics.
+#     Stop and Restart Debian show which step of the safe stop they are on
 # The Debian terminal opens in a window of its own (Windows Terminal, or
 # the classic console), a real terminal where sudo, passwords and full-
 # screen programs work; an embedded one would need a terminal emulator
@@ -342,8 +344,9 @@ $main = New-Flow $true
 $btnPanel = New-FlatButton ([string][char]0x2699 + '  ' + (T 'Management panel')) 'secondary' { Start-KohaHidden 'Panel' }
 $btnServices = New-FlatButton ([string][char]0x27F3 + '  ' + (T 'Restart Koha')) 'secondary' { Invoke-Action 'services' }
 $btnTerminal = New-FlatButton ('>_  ' + (T 'Open the Debian terminal')) 'secondary' { Start-KohaHidden 'Terminal' }
+$btnPowerOff = New-FlatButton (T 'Shut down the PC safely') 'secondary' { Start-KohaHidden 'SafeShutdown' }
 $btnMore = New-FlatButton '' 'ghost' { Set-MoreOpen (-not $more.Visible) }
-foreach ($b in $btnPanel, $btnServices, $btnTerminal, $btnMore) { [void]$main.Controls.Add($b) }
+foreach ($b in $btnPanel, $btnServices, $btnTerminal, $btnPowerOff, $btnMore) { [void]$main.Controls.Add($b) }
 [void]$cardActions.Controls.Add($main)
 
 $more = New-Flow $true
@@ -391,16 +394,21 @@ $script:nextRefresh = [DateTime]::MinValue
 $script:status = $null
 $script:health = $null
 $script:spin = 0
+# Which step of the safe stop Stop and Restart Debian are on (1 to 5).
+$progress = [hashtable]::Synchronized(@{ Step = 0 })
+$stopSteps = @(Get-KohaStopSteps)
 
 $worker = {
-    param($LangDir, $Action)
+    param($LangDir, $Action, $Progress)
     Import-KeiLanguage -LangDir $LangDir
+    $Progress.Step = 0
+    $onStep = { param($n) $Progress.Step = $n }.GetNewClosure()
     $result = $null
     switch ($Action) {
         'start'    { $result = Start-Koha -Trigger user -Wait }
-        'stop'     { $result = Stop-Koha }
+        'stop'     { $result = Stop-Koha -OnStep $onStep }
         'services' { $result = Restart-KohaServices }
-        'debian'   { Stop-Koha | Out-Null; $result = Start-Koha -Trigger user -Wait }
+        'debian'   { Stop-Koha -OnStep $onStep | Out-Null; $Progress.Step = 0; $result = Start-Koha -Trigger user -Wait }
         'report'   { $result = Export-KohaDiagnosticsText }
         'reindex'  { $result = Invoke-KohaSearchReindex }
         'lan'      { $result = Test-KohaLanAccess }
@@ -434,6 +442,7 @@ function Set-Buttons {
     $btnLan.Enabled = (-not $Busy) -and $on
     $btnTerminal.Enabled = (-not $Busy) -and $on
     $btnReport.Enabled = -not $Busy
+    $btnPowerOff.Enabled = (-not $Busy) -and $installed
     $btnPanel.Enabled = $installed
 }
 
@@ -447,7 +456,7 @@ function Invoke-Action {
     Set-Buttons $true
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
-    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action)
+    [void]$ps.AddScript($worker).AddArgument($langDir).AddArgument($Action).AddArgument($progress)
     $script:job = @{ PS = $ps; Handle = $ps.BeginInvoke(); Action = $Action }
 }
 
@@ -579,7 +588,12 @@ $timer.add_Tick({
             if (-not $script:job.Handle.IsCompleted) {
                 if ($script:job.Action -ne 'refresh') {
                     $script:spin = ($script:spin + 1) % 4
-                    $lblBusy.Text = [string]$spinner[$script:spin] + '  ' + $busyText[$script:job.Action]
+                    $text = $busyText[$script:job.Action]
+                    $step = [int]$progress.Step
+                    if ($step -ge 1 -and $step -le $stopSteps.Count -and @('stop', 'debian') -contains $script:job.Action) {
+                        $text = ((T 'Step {0} of {1}') -f $step, $stopSteps.Count) + ': ' + $stopSteps[$step - 1]
+                    }
+                    $lblBusy.Text = [string]$spinner[$script:spin] + '  ' + $text
                 }
                 return
             }
