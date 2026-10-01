@@ -35,6 +35,7 @@ $script:Cfg = @{
     ToastAppId  = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
     AppId       = 'KohaEasy.Koha'
     WindowPath  = '/usr/local/bin/koha-window'
+    DashboardUrl = 'https://github.com/PauloFBaldiFH/Koha-Easy-Installer/releases/download/tui-latest'
     LanSetup    = 2
 }
 if ($env:KOHAEASY_ROOT) { $script:Cfg.Root = $env:KOHAEASY_ROOT }
@@ -1877,6 +1878,70 @@ function Get-KohaPanelLaunch {
     return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
 }
 
+# ----------------------------------------------------------------------
+# koha.nexus: the terminal dashboard (tui\), the panel in one window
+# ----------------------------------------------------------------------
+# Built from tui\ by .github/workflows/tui.yml and published on the
+# repository's tui-latest release; kept next to KohaEasy.ps1. Only a file
+# whose SHA-256 matches the release's SHA256SUMS replaces the one there.
+function Get-KohaDashboardPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'koha-nexus.exe') }
+
+function Install-KohaDashboard {
+    param([string]$BaseUrl = $script:Cfg.DashboardUrl, [string]$Path = (Get-KohaDashboardPath))
+    $name = 'koha-nexus-windows-amd64.exe'
+    $tmp = $Path + '.download'
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        $sums = [string](Invoke-WebRequest -Uri ($BaseUrl + '/SHA256SUMS') -UseBasicParsing -TimeoutSec 30).Content
+        $want = Get-KohaDashboardHash -Sums $sums -Name $name
+        if (-not $want) { throw ('{0} is not in SHA256SUMS' -f $name) }
+        if ((Test-Path -LiteralPath $Path) -and (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $want) { return 'current' }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
+        Invoke-WebRequest -Uri ($BaseUrl + '/' + $name) -OutFile $tmp -UseBasicParsing -TimeoutSec 300
+        $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+        if ($got -ne $want) { throw ('checksum mismatch: {0} instead of {1}' -f $got, $want) }
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        Write-KohaLog ('dashboard installed: ' + $Path)
+        return 'installed'
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Write-KohaLog ('dashboard not installed: ' + $_.Exception.Message)
+        return 'failed'
+    }
+}
+
+# Pure: the SHA-256 (upper case) given for Name in a sha256sum listing.
+function Get-KohaDashboardHash {
+    param([string]$Sums, [string]$Name)
+    foreach ($line in ($Sums -split "`r?`n")) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$' -and $Matches[2] -eq $Name) { return $Matches[1].ToUpperInvariant() }
+    }
+    return ''
+}
+
+# Pure: how the dashboard window opens. Windows Terminal when there is one
+# (true colour, mouse, emoji), the classic console otherwise.
+function Get-KohaDashboardLaunch {
+    param([string]$Exe, [string]$Terminal)
+    if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title Koha "{0}"' -f $Exe) } }
+    return [pscustomobject]@{ File = $Exe; Arguments = '' }
+}
+
+# The tray's double-click, the Koha - Dashboard shortcut and Ctrl+Alt+K.
+# Starts Koha first, as the control panel does. Without the dashboard (no
+# internet when Koha was installed) it is fetched now; when that fails too,
+# the control panel opens instead.
+function Open-KohaDashboard {
+    $exe = Get-KohaDashboardPath
+    if (-not (Test-Path -LiteralPath $exe)) { Install-KohaDashboard | Out-Null }
+    if (-not (Test-Path -LiteralPath $exe)) { Open-KohaPanel; return }
+    Start-Koha -Trigger user | Out-Null
+    $launch = Get-KohaDashboardLaunch -Exe $exe -Terminal (Get-KohaTerminalPath)
+    if ($launch.Arguments) { Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null }
+    else { Start-Process -FilePath $launch.File | Out-Null }
+    Write-KohaLog 'dashboard opened'
+}
+
 # The Koha window's "Debian terminal (advanced)": a shell in Debian as the
 # Debian user chosen at install (sudo for root), in its own window. Exit
 # closes the window.
@@ -2374,6 +2439,9 @@ function Get-KohaShortcutList {
         @{ Name = (T 'Koha - Staff interface'); Kind = 'url'; Target = $script:Cfg.StaffUrl }
         @{ Name = (T 'Koha - Public catalog'); Kind = 'url'; Target = $script:Cfg.OpacUrl }
         (& $lnk (T 'Koha - Control panel') 'Panel')
+        # The terminal dashboard. Windows honours a shortcut's hotkey from
+        # the Start menu: Ctrl+Alt+K opens it from anywhere.
+        (& $lnk (T 'Koha - Dashboard') 'Dashboard') + @{ Hotkey = 'CTRL+ALT+K' }
         @{ Name = (T 'Koha - Backups folder'); Kind = 'lnk'; Target = [System.IO.Path]::Combine([string]$env:SystemRoot, 'explorer.exe'); Arguments = ('"{0}"' -f (Get-KohaPath Backups)) }
         (& $lnk (T 'Koha - Start') 'Start')
         (& $lnk (T 'Koha - Stop') 'Stop')
@@ -2404,7 +2472,7 @@ function Save-KohaUrlShortcut {
 # KohaEasy.exe (KohaEasy.Native). Throws with both reasons when neither
 # could write it.
 function Save-KohaLnkShortcut {
-    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon, [string]$Description = '')
+    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon, [string]$Description = '', [string]$Hotkey = '')
     try {
         $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop
         $lnk = $shell.CreateShortcut($Path)
@@ -2413,6 +2481,7 @@ function Save-KohaLnkShortcut {
         $lnk.WorkingDirectory = Get-KohaPath Root
         $lnk.IconLocation = $Icon + ',0'
         if ($Description) { $lnk.Description = $Description }
+        if ($Hotkey) { $lnk.Hotkey = $Hotkey }
         $lnk.Save()
         return
     } catch {
@@ -2522,7 +2591,9 @@ function New-KohaShortcuts {
                 } else {
                     $tip = ''
                     if ($s.ContainsKey('Description')) { $tip = $s.Description }
-                    Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon -Description $tip
+                    $key = ''
+                    if ($s.ContainsKey('Hotkey')) { $key = $s.Hotkey }
+                    Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon -Description $tip -Hotkey $key
                 }
             } catch {
                 Add-KohaShortcutError $file $_.Exception.Message

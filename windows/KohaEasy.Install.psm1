@@ -1047,6 +1047,12 @@ function Invoke-KohaSafeStep {
 function Install-KohaShortcuts {
     param([string]$StartMenu = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Koha'))
     Test-KohaLanguageMode | Out-Null
+    # The terminal dashboard the Koha - Dashboard shortcut opens. Without
+    # internet now, it is fetched the first time it is opened.
+    switch (Install-KohaDashboard) {
+        'installed' { Write-KohaStep (T 'Dashboard installed: double-click the Koha icon by the clock, or press Ctrl+Alt+K.') 'ok' }
+        'failed' { Write-KohaStep (T 'The dashboard could not be downloaded now; it is fetched the first time it is opened.') 'warn' }
+    }
     $desktop = Get-KohaDesktopPath
     New-KohaShortcuts -StartMenu $StartMenu -Desktop $desktop | Out-Null
     $errors = @(Get-KohaShortcutErrors)

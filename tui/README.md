@@ -11,6 +11,15 @@ go run . --demo          # try the layout anywhere; every routine is simulated
 go build -o koha-nexus . # GOOS=windows for koha-nexus.exe
 ```
 
+Every push to `main` that touches `tui/` builds Windows and Linux binaries
+into the `tui-latest` release (`.github/workflows/tui.yml`). The Windows
+installer downloads `koha-nexus-windows-amd64.exe` from there into
+`C:\KohaEasy\bin` after checking it against `SHA256SUMS`. It opens from:
+
+* a double-click on the Koha icon by the clock (or "Open the dashboard" in its menu),
+* the Start menu shortcut *Koha - Dashboard*,
+* **Ctrl+Alt+K** from anywhere (that shortcut's hotkey).
+
 Flags: `--panel` (panel path inside Linux), `--distro` (WSL distro, Windows),
 `--staff-url`, `--opac-url`.
 

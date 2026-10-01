@@ -197,8 +197,10 @@ function Add-Separator { [void]$menu.Items.Add((New-Object System.Windows.Forms.
 $header = Add-Item (Get-KohaStateText 'stopped') $null
 $header.Enabled = $false
 Add-Separator
-$miWindow = Add-Item (T 'Service status') { Invoke-KohaCommand 'Window' }
-$miWindow.Font = New-Object System.Drawing.Font($miWindow.Font, [System.Drawing.FontStyle]::Bold)
+# The terminal dashboard is the icon's default (double-click, in bold).
+$miDashboard = Add-Item (T 'Open the dashboard') { Invoke-KohaCommand 'Dashboard'; Request-Check 5 }
+$miDashboard.Font = New-Object System.Drawing.Font($miDashboard.Font, [System.Drawing.FontStyle]::Bold)
+Add-Item (T 'Service status') { Invoke-KohaCommand 'Window' } | Out-Null
 $miStaff = Add-Item (T 'Open the staff interface') { Start-Process $cfg.StaffUrl }
 $miOpac = Add-Item (T 'Open the public catalog') { Start-Process $cfg.OpacUrl }
 Add-Separator
@@ -249,7 +251,7 @@ Add-Item (T 'Close this icon') {
     [System.Windows.Forms.Application]::Exit()
 } | Out-Null
 $tray.ContextMenuStrip = $menu
-$tray.add_DoubleClick({ Invoke-KohaCommand 'Window' })
+$tray.add_DoubleClick({ Invoke-KohaCommand 'Dashboard'; Request-Check 5 })
 
 # ----------------------------------------------------------------------
 # Background checks
