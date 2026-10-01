@@ -1496,6 +1496,54 @@ Describe 'Shut down the PC safely' {
     }
 }
 
+Describe 'Terminal dashboard (koha-nexus.exe)' {
+    BeforeAll {
+        $exe = Join-Path $TestDrive 'dash/koha-nexus.exe'
+        $good = [byte[]](1, 2, 3)
+        $sha = { param($b) -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | ForEach-Object { $_.ToString('X2') }) }
+    }
+
+    It 'reads the release''s SHA256SUMS' {
+        $sums = "aa" * 32 + "  koha-nexus-windows-amd64.exe`r`n" + "bb" * 32 + " *koha-nexus-linux-amd64`n"
+        Get-KohaDashboardHash -Sums $sums -Name 'koha-nexus-windows-amd64.exe' | Should -Be ('AA' * 32)
+        Get-KohaDashboardHash -Sums $sums -Name 'koha-nexus-linux-amd64' | Should -Be ('BB' * 32)
+        Get-KohaDashboardHash -Sums $sums -Name 'koha-nexus-linux-arm64' | Should -Be ''
+    }
+
+    It 'opens in Windows Terminal when there is one, in the console otherwise' {
+        $l = Get-KohaDashboardLaunch -Exe 'C:\KohaEasy\bin\koha-nexus.exe' -Terminal 'C:\wt.exe'
+        $l.File | Should -Be 'C:\wt.exe'
+        $l.Arguments | Should -Be '-w new --title Koha "C:\KohaEasy\bin\koha-nexus.exe"'
+        (Get-KohaDashboardLaunch -Exe 'C:\k.exe' -Terminal '').File | Should -Be 'C:\k.exe'
+    }
+
+    It 'installs only a download whose checksum matches, and keeps the old one otherwise' {
+        $script:body = $good
+        $script:sum = & $sha $good
+        Mock -ModuleName KohaEasy.Core Invoke-WebRequest {
+            if ($Uri -like '*/SHA256SUMS') { return [pscustomobject]@{ Content = $script:sum + '  koha-nexus-windows-amd64.exe' } }
+            [System.IO.File]::WriteAllBytes($OutFile, $script:body)
+        }
+        Install-KohaDashboard -BaseUrl 'https://x/tui-latest' -Path $exe | Should -Be 'installed'
+        Install-KohaDashboard -BaseUrl 'https://x/tui-latest' -Path $exe | Should -Be 'current'
+        $script:sum = & $sha ([byte[]](9, 9))
+        $script:body = [byte[]](6, 6)
+        Install-KohaDashboard -BaseUrl 'https://x/tui-latest' -Path $exe | Should -Be 'failed'
+        ([System.IO.File]::ReadAllBytes($exe) -join ',') | Should -Be '1,2,3'
+        Test-Path -LiteralPath ($exe + '.download') | Should -BeFalse
+    }
+
+    It 'is the tray''s double-click, in bold, and the Start menu shortcut with Ctrl+Alt+K' {
+        $tray = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Tray.ps1') -Raw -Encoding UTF8
+        $tray | Should -Match ([regex]::Escape("`$tray.add_DoubleClick({ Invoke-KohaCommand 'Dashboard'"))
+        $tray | Should -Match ([regex]::Escape('$miDashboard.Font = New-Object System.Drawing.Font($miDashboard.Font, [System.Drawing.FontStyle]::Bold)'))
+        $d = @(Get-KohaShortcutList | Where-Object { $_.Name -eq 'Koha - Dashboard' })
+        $d.Count | Should -Be 1
+        $d[0].Arguments | Should -BeLike '* Dashboard -Hidden'
+        $d[0].Hotkey | Should -Be 'CTRL+ALT+K'
+    }
+}
+
 Describe 'Management panel in the Koha window' {
     BeforeAll {
         $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw -Encoding UTF8

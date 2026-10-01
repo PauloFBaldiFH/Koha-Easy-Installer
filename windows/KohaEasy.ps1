@@ -12,6 +12,7 @@
     KohaEasy.ps1 RestartServices               restart Koha's services inside Debian, without restarting WSL (tray)
     KohaEasy.ps1 Panel                         the Koha window and the tray: starts Koha, opens the control panel
     KohaEasy.ps1 Panel -Action <name>          the Koha window's Painel de Gestão: the same, straight on one routine (installer --run <name>)
+    KohaEasy.ps1 Dashboard                     the terminal dashboard (koha-nexus.exe): tray double-click, Koha - Dashboard shortcut, Ctrl+Alt+K; starts Koha first
     KohaEasy.ps1 Terminal                      the Koha window: a Debian shell as the Debian user (advanced), while Debian runs
     KohaEasy.ps1 RebuildIndex                  the tray: rebuilds the search index, with notifications
     KohaEasy.ps1 Open                          starts Koha if needed, opens the staff interface
@@ -34,7 +35,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Launch', 'Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'SafeShutdown', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
+    [ValidateSet('Launch', 'Window', 'Panel', 'Dashboard', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'SafeShutdown', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -64,7 +65,7 @@ trap {
             Add-Content -LiteralPath (Join-Path $logDir ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Value ('{0} | {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $failure)
         } catch { }
     }
-    if (@('Launch', 'Window', 'Tray', 'Panel', 'Terminal', 'SafeShutdown') -contains $Command -and -not $Quiet) {
+    if (@('Launch', 'Window', 'Tray', 'Panel', 'Dashboard', 'Terminal', 'SafeShutdown') -contains $Command -and -not $Quiet) {
         try {
             Add-Type -AssemblyName System.Windows.Forms
             [void][System.Windows.Forms.MessageBox]::Show(('Koha: {0}{1}{1}C:\KohaEasy\logs' -f $_.Exception.Message, [Environment]::NewLine), 'Koha', 'OK', 'Error')
@@ -148,6 +149,10 @@ switch ($Command) {
     'Panel' {
         if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
         Open-KohaPanel -Action $Action
+    }
+    'Dashboard' {
+        if (-not (Test-KohaDistroInstalled)) { Show-Box (Get-KohaStateText 'not_installed') 'OK' 'Warning' | Out-Null; break }
+        Open-KohaDashboard
     }
     'Terminal' {
         # Never starts Debian: WSL would end it abruptly after the shell.

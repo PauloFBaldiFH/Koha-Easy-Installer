@@ -492,6 +492,7 @@ Describe 'Install messages' {
         Mock -ModuleName KohaEasy.Install Set-KohaDistroIcon { }
         Mock -ModuleName KohaEasy.Install Get-KohaShortcutErrors { @('X\Koha.lnk: Unable to save shortcut') }
         Mock -ModuleName KohaEasy.Install New-KohaShortcuts { }
+        Mock -ModuleName KohaEasy.Install Install-KohaDashboard { 'current' }
         $script:places = [System.Collections.Queue]::new(@('', 'startmenu', 'public', 'desktop'))
         Mock -ModuleName KohaEasy.Install Get-KohaIconPlace { $script:places.Dequeue() }
         Install-KohaShortcuts -StartMenu $sm
