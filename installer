@@ -22303,6 +22303,68 @@ if [ ! -s "$TRANSLATION_CONFIG" ] || [ -z "$(_read_lang_conf KOHA_PANEL_LANG)" ]
 fi
 
 # ======================================================================
+# ONE ROUTINE: --run <action>
+# ======================================================================
+# The Koha window on Windows lists the main menu natively and opens the
+# terminal straight on the routine picked there: it runs that one routine,
+# then the panel ends, with no main menu. The names are a fixed list;
+# anything else is refused. Without --run nothing here applies.
+panel_action_function() {
+    case "$1" in
+        install)            echo function_install_koha ;;
+        credentials)        echo function_view_credentials ;;
+        restore)            echo function_restore_database ;;
+        backup-manual)      echo function_manual_backup ;;
+        backup-cloud)       echo function_configure_rclone ;;
+        backup-test)        echo function_test_backup ;;
+        search-toggle)      echo function_toggle_search_engine ;;
+        search-repair)      echo function_repair_indexing ;;
+        cloudflare)         echo function_configure_cloudflare ;;
+        ssl)                echo function_configure_ssl ;;
+        search-console)     echo function_google_search_console ;;
+        status)             echo function_detailed_status ;;
+        health)             echo function_validate_system ;;
+        validation-report)  echo show_validation_report ;;
+        apache-log)         echo function_view_logs ;;
+        db-maintenance)     echo function_deep_maintenance ;;
+        repair-services)    echo function_repair_services ;;
+        fail2ban)           echo function_fail2ban_status ;;
+        staff-firewall)     echo function_staff_firewall ;;
+        rotate-db-password) echo function_rotate_db_password ;;
+        ufw)                echo function_ufw_rules ;;
+        sizing)             echo function_size_server ;;
+        email)              echo function_configure_emails ;;
+        superlibrarian)     echo function_create_superlibrarian ;;
+        interoperability)   echo function_interoperability ;;
+        clock)              echo function_configure_clock ;;
+        library-tools)      echo function_library_tools ;;
+        monitor)            echo function_run_monitor ;;
+        links)              echo function_run_links ;;
+        mc)                 echo function_run_mc ;;
+        crons)              echo function_manage_crons ;;
+        languages)          echo function_install_languages ;;
+        update-system)      echo function_update_system ;;
+        update-panel)       echo function_autoupdate ;;
+        about)              echo function_about ;;
+        reboot)             echo function_reboot_server ;;
+        *)                  return 1 ;;
+    esac
+}
+
+if [ "${1:-}" = "--run" ]; then
+    _run_fn=$(panel_action_function "${2:-}") || {
+        echo "$(t "Unknown panel action:") ${2:-}" >&2
+        exit 2
+    }
+    restore_apt_timers
+    # As in the main menu: only About works without systemd.
+    if [ "${2:-}" != "about" ]; then require_systemd || exit 1; fi
+    "$_run_fn"
+    clear
+    exit 0
+fi
+
+# ======================================================================
 # MAIN MENU (17 OPTIONS)
 # ======================================================================
 while true; do

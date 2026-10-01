@@ -801,7 +801,7 @@ function Test-KohaRelaunchHidden {
 function Get-KohaRelaunchArguments {
     param([string]$Command, [System.Collections.IDictionary]$Bound)
     $a = @($Command)
-    foreach ($k in 'Trigger', 'Mode') { if ($Bound.Contains($k)) { $a += ('-{0} {1}' -f $k, $Bound[$k]) } }
+    foreach ($k in 'Trigger', 'Mode', 'Action') { if ($Bound.Contains($k) -and $Bound[$k]) { $a += ('-{0} {1}' -f $k, $Bound[$k]) } }
     foreach ($k in 'Force', 'Quiet', 'Pause') { if ($Bound.Contains($k) -and [bool]$Bound[$k]) { $a += ('-' + $k) } }
     return ($a -join ' ')
 }
@@ -1849,13 +1849,13 @@ function Confirm-KohaWindowScript {
 # as well (the panel alone would keep Debian up only while it is open). The
 # window gets UTF-8 and the symbol mode, and closes when the panel ends.
 function Open-KohaPanel {
-    param([switch]$NoStart)
+    param([switch]$NoStart, [string]$Action = '')
     if (-not $NoStart) { Start-Koha -Trigger user | Out-Null }
     Confirm-KohaWindowScript | Out-Null
     $wsl = [System.IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'wsl.exe')
-    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath) -Pause (T 'The control panel ended with an error. Press Enter to close this window.')
+    $launch = Get-KohaPanelLaunch -Wsl $wsl -Terminal (Get-KohaTerminalPath) -Pause (T 'The control panel ended with an error. Press Enter to close this window.') -Action $Action
     Start-Process -FilePath $launch.File -ArgumentList $launch.Arguments | Out-Null
-    Write-KohaLog 'control panel opened'
+    if ($Action) { Write-KohaLog ('control panel opened on ' + $Action) } else { Write-KohaLog 'control panel opened' }
 }
 
 # Pure: how the control panel window opens. In Windows Terminal the panel
@@ -1864,12 +1864,15 @@ function Open-KohaPanel {
 # that is already open does not see this process's environment; the text
 # shown after a failure travels in base64 (no spaces or ";" for wt.exe).
 function Get-KohaPanelLaunch {
-    param([string]$Wsl, [string]$Terminal, [string]$Pause = '')
+    param([string]$Wsl, [string]$Terminal, [string]$Pause = '', [string]$Action = '')
     $plain = '1'
     if ($Terminal) { $plain = '0' }
     $vars = 'KEI_PLAIN_GLYPHS=' + $plain
     if ($Pause) { $vars += ' KEI_WINDOW_PAUSE=' + [Convert]::ToBase64String((New-Object System.Text.UTF8Encoding($false)).GetBytes($Pause)) }
     $cmd = '-d {0} -u root --cd /root -- env {1} {2} {3}' -f $script:Cfg.Distro, $vars, $script:Cfg.WindowPath, $script:Cfg.PanelPath
+    # One routine only (the Koha window's Painel de Gestão): the panel runs it
+    # and ends, with no main menu. Only plain action names get through.
+    if ($Action -cmatch '^[a-z][a-z0-9-]*$') { $cmd += ' --run ' + $Action }
     if ($Terminal) { return [pscustomobject]@{ File = $Terminal; Arguments = ('-w new --title Koha "{0}" {1}' -f $Wsl, $cmd) } }
     return [pscustomobject]@{ File = $Wsl; Arguments = $cmd }
 }

@@ -155,3 +155,19 @@ layout() {
     assert 'grep -qE "^ +17\) clear; exit 0 ;;" "$KEI_REPO/installer"'
     assert 'grep -q "via option 16 in the panel" "$KEI_REPO/installer"' "the reboot hint must follow the new numbering"
 }
+
+@test "U06 installer --run: one routine from the Koha window, every name maps to a function" {
+    local fns fn
+    eval "$(sed -n '/^panel_action_function() {/,/^}/p' "$KEI_REPO/installer")"
+    run bash -c "$(declare -f panel_action_function); panel_action_function restore; panel_action_function about; panel_action_function 'rm -rf' || echo refused"
+    assert '[ "$output" = "$(printf "function_restore_database\nfunction_about\nrefused")" ]' "$output"
+    # Each action runs a routine the installer defines.
+    fns=$(sed -n "/^panel_action_function() {/,/^}/p" "$KEI_REPO/installer" | grep -oE "echo [a-z0-9_]+" | cut -d" " -f2)
+    assert '[ "$(printf "%s\n" "$fns" | wc -l)" -ge 30 ]' "$fns"
+    for fn in $fns; do
+        assert 'grep -qE "^$fn\(\) *\{|^function $fn\b" "$KEI_REPO/installer"' "missing $fn"
+    done
+    # --run comes after the panel lock (no two routines at once) and before the main menu.
+    assert '[ "$(grep -n "^if \[ \"\${1:-}\" = \"--run\" \]" "$KEI_REPO/installer" | cut -d: -f1)" -gt "$(grep -n "flock -n 9" "$KEI_REPO/installer" | head -n1 | cut -d: -f1)" ]'
+    assert '[ "$(grep -n "^if \[ \"\${1:-}\" = \"--run\" \]" "$KEI_REPO/installer" | cut -d: -f1)" -lt "$(grep -n "MAIN_OPT=\$(whiptail" "$KEI_REPO/installer" | head -n1 | cut -d: -f1)" ]'
+}

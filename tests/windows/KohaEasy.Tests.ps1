@@ -1111,6 +1111,7 @@ Describe 'No console window, whatever started Koha' {
         Test-KohaRelaunchHidden -Command 'Window' -Hidden $false -Target 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' | Should -BeFalse
         Get-KohaRelaunchArguments -Command 'Start' -Bound @{ Trigger = 'logon'; Quiet = [switch]$true } | Should -Be 'Start -Trigger logon -Quiet'
         Get-KohaRelaunchArguments -Command 'Stop' -Bound @{ Force = [switch]$true; Pause = [switch]$false } | Should -Be 'Stop -Force'
+        Get-KohaRelaunchArguments -Command 'Panel' -Bound @{ Action = 'restore' } | Should -Be 'Panel -Action restore'
         $ps = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw
         $ps.IndexOf('Test-KohaRelaunchHidden') | Should -BeLessThan $ps.IndexOf('switch ($Command)')
     }
@@ -1492,5 +1493,40 @@ Describe 'Shut down the PC safely' {
         $w | Should -Match 'Stop-KohaForPowerOff -OnStep'
         $w.IndexOf('Invoke-KohaPowerOff') | Should -BeGreaterThan $w.IndexOf('EndInvoke')
         $w | Should -Match ([regex]::Escape('if ($null -ne $script:job) { $e.Cancel = $true }'))
+    }
+}
+
+Describe 'Management panel in the Koha window' {
+    BeforeAll {
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw -Encoding UTF8
+        $installer = Get-Content -LiteralPath (Join-Path $repo 'installer') -Raw -Encoding UTF8
+        $menu = $w.Substring($w.IndexOf('$panelMenu = @('))
+        $menu = $menu.Substring(0, $menu.IndexOf("`n)"))
+        $map = ([regex]::Match($installer, '(?ms)^panel_action_function\(\) \{.*?^\}')).Value
+    }
+
+    It 'uses the panel''s own translated labels, so every language works' {
+        $labels = @([regex]::Matches($menu, "Label = '([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        $labels.Count | Should -BeGreaterThan 40
+        foreach ($l in $labels) { ($installer.Contains('"' + $l + '"') -or $installer.Contains("'" + $l + "'")) | Should -BeTrue -Because $l }
+    }
+
+    It 'runs only actions the installer knows, and every group has its icon' {
+        $runs = @([regex]::Matches($menu, "Run = '([a-z0-9-]+)'") | ForEach-Object { $_.Groups[1].Value })
+        $runs.Count | Should -BeGreaterThan 30
+        foreach ($r in $runs) { $map | Should -Match ('(?m)^\s+' + [regex]::Escape($r) + '\)\s+echo [a-z0-9_]+ ;;') }
+        foreach ($i in @([regex]::Matches($menu, "Icon = '([a-z]+)'") | ForEach-Object { $_.Groups[1].Value })) {
+            Join-Path $repo ('windows/icons/' + $i + '.png') | Should -Exist
+        }
+        Join-Path $repo 'windows/icons/LICENSE-fluentui-emoji.txt' | Should -Exist
+    }
+
+    It 'asks before routines that change data, and shows the components only under Details' {
+        foreach ($r in 'restore', 'search-toggle', 'db-maintenance', 'rotate-db-password', 'update-system') {
+            $menu | Should -Match ("Run = '" + $r + "'; Confirm = " + '\$true')
+        }
+        $w | Should -Match ([regex]::Escape('$cardParts.Visible = $false'))
+        $w | Should -Match 'function Set-DetailsOpen'
+        $w | Should -Match ([regex]::Escape("Start-KohaHidden ('Panel -Action ' + `$Item.Run)"))
     }
 }
