@@ -125,6 +125,7 @@ widths() {
     # The installer's own whiptail wrapper instead of the battery's recorder.
     cat >> "$KEI_EXTRA" <<X
 unset -f whiptail
+KEI_UI=whiptail
 PATH="$BATS_TEST_TMPDIR/bin:\$PATH"
 eval "\$(sed -n '/^whiptail() {/,/^}/p' "$KEI_REPO/installer")"
 ask() { echo task-noise; r=\$(whiptail --inputbox "Q" 8 40 3>&1 1>&2 2>&3); echo "got=\$r" > "$BATS_TEST_TMPDIR/answer"; }
@@ -135,4 +136,62 @@ X
     assert 'grep -q task-noise "$LOG"' "$(cat "$LOG")"
     assert '[ "$(cat "$BATS_TEST_TMPDIR/answer")" = "got=the-answer" ]' "$(cat "$BATS_TEST_TMPDIR/answer" 2>&1)"
     assert 'echo "$output" | grep -q "Done!"' "$output"
+}
+
+@test "U12 dialogs use dialog when installed (mouse clicks), with the panel's labels; KEI_UI=whiptail keeps whiptail" {
+    panel eval 'UI_ARGS=(--title " T " --yes-button Sim --scrolltext --nocancel --yesno "Texto" 8 40); ui_dialog_args; printf "%s|" "${UI_ARGS[@]}"'
+    assert '[ "$output" = "--title| T |--yes-label|Sim|--no-cancel|--yesno|Texto|8|40|" ]' "$output"
+    KEI_UI=whiptail panel ui_backend
+    assert '[ "$output" = "whiptail" ]' "$output"
+    command -v dialog >/dev/null || skip "dialog is not installed"
+    panel ui_backend
+    assert '[ "$output" = "dialog" ]' "$output"
+    # The installer's own wrapper: a menu turns on the terminal's mouse reporting.
+    cat >> "$KEI_EXTRA" <<X
+unset -f whiptail
+eval "\$(sed -n '/^whiptail() {/,/^}/p' "$KEI_REPO/installer")"
+X
+    run timeout 10 script -qc "TERM=xterm timeout 2 $KEI_SH $PANEL whiptail --title Menu --menu Pick 12 40 2 1 One 2 Two" /dev/null
+    assert 'echo "$output" | grep -aqF "1006;1000h"' "no mouse reporting: $output"
+    assert 'echo "$output" | grep -aq "Koha Easy Installer & Manager"' "$output"
+}
+
+@test "U13 the pt-BR panel is called Koha descomplicado : instalação e gestão; English keeps its name" {
+    printf 'SYS_LANG=pt\nload_panel_translations\n' >> "$KEI_EXTRA"
+    panel panel_name
+    assert 'echo "$output" | grep -q "Koha descomplicado : instalação e gestão"' "$output"
+    printf 'SYS_LANG=en\n' >> "$KEI_EXTRA"
+    panel panel_name
+    assert '[ "$output" = "Koha Easy Installer & Manager" ]' "$output"
+}
+
+@test "U14 Linux desktop launcher: menu entry with the Koha icon that opens the panel in a terminal" {
+    id keitest >/dev/null 2>&1 || useradd -m keitest
+    # A Portuguese desktop: the folder name comes from the user's XDG settings.
+    local desk="/home/keitest/Área de Trabalho"
+    mkdir -p "$desk" /home/keitest/.config /usr/share/xsessions
+    printf 'XDG_DESKTOP_DIR="$HOME/Área de Trabalho"\n' > /home/keitest/.config/user-dirs.dirs
+    touch /usr/share/xsessions/kei-test.desktop
+    rm -f /home/keitest/.local/share/applications/koha-descomplicado.desktop "$desk/koha-descomplicado.desktop"
+    printf 'REAL_USER=keitest\nREAL_HOME=/home/keitest\n' >> "$KEI_EXTRA"
+    panel install_linux_launcher
+    local entry=/home/keitest/.local/share/applications/koha-descomplicado.desktop
+    rm -f /usr/share/xsessions/kei-test.desktop
+    assert '[ -f "$entry" ]' "$output"
+    assert 'grep -q "^Exec=sudo /usr/local/bin/config.sh$" "$entry" && grep -q "^Terminal=true$" "$entry"' "$(cat "$entry")"
+    assert 'grep -q "^Name\[pt_BR\]=Koha descomplicado : instalação e gestão$" "$entry"' "$(cat "$entry")"
+    assert 'grep -q "^Icon=koha-descomplicado$" "$entry"'
+    assert 'file /usr/share/icons/hicolor/48x48/apps/koha-descomplicado.png | grep -q "PNG image data, 48 x 48"'
+    assert '[ "$(stat -c %U "$entry")" = "keitest" ]'
+    assert '[ -x "$desk/koha-descomplicado.desktop" ]' "the first time it goes on the desktop too"
+    # Removed from the desktop by the user: it is not put back.
+    rm -f "$desk/koha-descomplicado.desktop"
+    touch /usr/share/xsessions/kei-test.desktop
+    panel install_linux_launcher
+    rm -f /usr/share/xsessions/kei-test.desktop
+    assert '[ ! -e "$desk/koha-descomplicado.desktop" ]'
+    # No graphical desktop (a server): nothing is written.
+    rm -f "$entry"
+    panel install_linux_launcher
+    assert '[ ! -e "$entry" ]'
 }

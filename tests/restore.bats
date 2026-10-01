@@ -251,3 +251,16 @@ EOF
     assert 'MYSQL_PWD=KeiTest-Pass_42 mysql --no-defaults -h 127.0.0.1 --protocol=TCP -u koha_library -e "SELECT 1 FROM koha_library.biblio LIMIT 1" >/dev/null' "TCP login as Koha does must work"
     assert 'MYSQL_PWD=KeiTest-Pass_42 mysql --no-defaults -u koha_library -e "SELECT 1 FROM koha_library.biblio LIMIT 1" >/dev/null' "socket login must work"
 }
+
+@test "R22 the restore shows one line per step; the commands' output goes to restore.log" {
+    rm -f /var/log/koha-easy-install/restore.log
+    restore "$FIX/new.sql.gz"
+    assert '[ "$(live_marker)" = "NEW" ]'
+    local step
+    for step in "Testing the backup in a temporary database" "Saving a safety backup" "Importing the catalog" \
+                "Upgrading the database schema" "Reindexing the catalog" "Restarting Koha services"; do
+        assert 'echo "$output" | grep -q "${step}.*Done!"' "missing '$step': $output"
+    done
+    assert '! echo "$output" | grep -q "^>>>"' "$output"
+    assert '[ -s /var/log/koha-easy-install/restore.log ]'
+}
