@@ -152,7 +152,8 @@ EOF
     assert 'grep -q "our %TABLES = ( cutter => '"'"'/etc/koha-easy-install/tables/cutter.tsv'"'"', pha => '"'"'/etc/koha-easy-install/tables/pha.tsv'"'"' );" "$page" && dialogs | grep -q "The page asks for a table until one is loaded"' "$(dialogs | tail -1)"
     local js; js=$(userjs)
     assert '[[ "$js" == "/* the library'"'"'s own code */"* ]] && [ "$(pre_backups CUTTER)" = "1" ]' "the library code is kept: $js"
-    assert 'grep -qF "input[id^='"'"'tag_090_subfield_b'"'"']" <<< "$js" && grep -qF "input[id^='"'"'tag_952_subfield_o'"'"']" <<< "$js" && grep -q "fa fa-calculator" <<< "$js" && grep -q "next(\".kei-cdd\")" <<< "$js"' "$js"
+    assert 'grep -qF "input[id^='"'"'tag_090_subfield_b'"'"']" <<< "$js" && grep -qF "input[id^='"'"'tag_952_subfield_o'"'"']" <<< "$js" && grep -q "fa fa-calculator" <<< "$js" && grep -q "nextAll(\".kei-cdd\")" <<< "$js"' "$js"
+    assert 'grep -qF "input[id^='"'"'tag_090_subfield_a'"'"']" <<< "$js" && grep -q "\"kei-callno\", \"Call number\"" <<< "$js" && grep -qF "tag_080_subfield_a" <<< "$js" && grep -qF "tag_650_subfield_a" <<< "$js"' "the Call number button next to the class and the item call number: $js"
     answer yes
     panel lt_cutter_install
     js=$(userjs)
@@ -277,4 +278,73 @@ SH
     assert 'dialogs | tail -1 | grep -q "could not be read from this PDF"' "$(dialogs | tail -1)"
     local n
     for n in 1 2 3 4 5; do assert 'grep -qF "            \"$n\" \"\$(t \"" <<< "$(sed -n "/^function_cutter()/,/^}/p" "$KEI_REPO/installer")"' "menu item $n"; done
+}
+
+# --- the class of the call number ----------------------------------------------------
+
+# A made-up catalogue: CDD call numbers with subjects (fifth column), one
+# CDU call number, and a location prefix.
+catalogue() {
+    printf '%s\n' $'1\t869.3 A848d\tDom Casmurro\tAssis, Machado de\tLiteratura brasileira ; Romance' \
+        $'2\t869.3 A848m\tMemórias póstumas de Brás Cubas\tAssis, Machado de,\tLiteratura brasileira' \
+        $'3\t981 E19h\tHistória do Brasil\tEco, Outro\tBrasil - História' \
+        $'4\tR 981 Q3h\tHistória geral do Brasil\tQuaresma, Rui\tBrasil - História' \
+        $'5\t869.1 L589p\tPoemas escolhidos\tLent, Ana\tPoesia brasileira' \
+        $'6\t821.134.3(81)-1 Q3q\tO quinze\tQueiroz, Rachel de\tRomance brasileiro' > "$KS/items.tsv"
+}
+
+@test "K10 page: the classification is told from the settings, the class, the record or the catalogue; a class is suggested when there is none" {
+    load_table
+    page
+    catalogue
+    json name="Assis, Machado de" title="Quincas Borba"
+    assert '[ "$(jget scheme)" = "cdd" ] && [ "$(jget scheme_why)" = "collection" ] && [ "$(jget scheme_count.0)" = "5" ] && [ "$(jget scheme_count.1)" = "6" ]' "$output"
+    assert '[ "$(jget suggestions.0.class)" = "869.3" ] && [ "$(jget suggestions.0.why.0.kind)" = "author" ] && [ "$(jget suggestions.0.why.0.n)" = "2" ] && [ "$(jget suggested_call_number)" = "869.3 A848q" ] && [ -z "$(jget call_number | grep 869)" ]' "two titles of the same author: $output"
+    json title="Nova história do Brasil" subjects="Brasil - História" mode=title
+    assert '[ "$(jget suggestions.0.class)" = "981" ] && [ "$(jget suggestions.0.why.0.kind)" = "subject" ] && [ "$(jget suggestions.0.why.0.n)" = "2" ]' "the subject, R 981 read as 981: $output"
+    json name="Assis, Machado de" title="Quincas Borba" c082="869.3 22"
+    assert '[ "$(jget class)" = "869.3" ] && [ "$(jget class_from)" = "082" ] && [ "$(jget scheme_why)" = "record" ] && [ -z "$(jget suggestions)" ] && [ "$(jget call_number)" = "869.3 A848q" ]' "$output"
+    json name="Assis, Machado de" title="Quincas Borba" class=869
+    assert '[ "$(jget suggestions.0.class)" = "869.3" ] && [ -z "$(jget suggested_class)" ] && [ "$(jget call_number)" = "869 A848q" ]' "a class without its decimals gets suggestions: $output"
+    json name="Assis, Machado de" title="Quincas Borba" class=LIT
+    assert '[ "$(jget scheme)" = "local" ] && [ "$(jget scheme_why)" = "class" ] && [ "$(jget call_number)" = "LIT A848q" ]' "$output"
+    # CDU: from 080, from the settings, and the numbers used in a CDU class.
+    json name="Queiroz, Rachel de" title="Dôra, Doralina" c080="821.134.3(81)-31"
+    assert '[ "$(jget scheme)" = "cdu" ] && [ "$(jget scheme_why)" = "record" ] && [ "$(jget call_number)" = "821.134.3(81)-31 Q3d" ]' "$output"
+    json name="Queiroz, Rachel de" title="Dôra, Doralina" scheme=cdu
+    assert '[ "$(jget scheme_why)" = "setting" ] && [ "$(jget suggestions.0.class)" = "821.134.3(81)-1" ] && [ "$(jget suggested_call_number)" = "821.134.3(81)-1 Q3d" ]' "$output"
+    json name="Queiroz, Rachel de" title="Dôra, Doralina" class="821.134.3(81)-1"
+    assert '[ "$(jget used.0.call_number)" = "821.134.3(81)-1 Q3q" ]' "a CDU class with brackets in the search of the numbers used: $output"
+    json name="Eco, Umberto" title="Obra" scheme=cdu
+    assert '[ -z "$(jget suggestions.0.class)" ] && [ -n "$(jget scheme)" ]' "no CDU call number of this author: $output"
+    cgi name="Eco, Umberto" title="Obra" scheme=cdu
+    assert 'grep -q "The panel has no CDU table" <<< "$output" && grep -q "No suggestion" <<< "$output"' "$output"
+    # The page: the suggestions, the suggested call number, the class put into 090 \$a.
+    cgi name="Assis, Machado de" title="Quincas Borba" target=tag_090_subfield_a_1
+    assert 'grep -q "class=\"use\" data-class=\"869.3\"" <<< "$output" && grep -q "Suggested call number: <b>869.3 A848q</b>" <<< "$output" && grep -q "class=\"apply\" data-n=\"A848q\" data-c=\"869.3\"" <<< "$output"' "$output"
+    assert 'grep -q "2 title(s) of the same author" <<< "$output" && grep -q "Classification: <b>CDD (Dewey)</b>" <<< "$output"' "$output"
+    # The gear: the settings of this browser.
+    assert 'grep -q "id=\"kei-gear\"" <<< "$output" && grep -q "id=\"kei-s-letter\"" <<< "$output" && grep -q "id=\"kei-s-edition\"" <<< "$output" && grep -q "id=\"kei-s-copy\"" <<< "$output" && grep -q "kei_callno_settings" <<< "$output" && grep -q "<select id=\"kei-scheme\" name=\"scheme\">" <<< "$output"' "$output"
+}
+
+@test "K11 page: the item editor reads 080, 082 and the subjects of the record; the CDD index of the library suggests classes" {
+    perl -MDBD::SQLite -e 1 2>/dev/null || skip "DBD::SQLite (libdbd-sqlite3-perl) not installed"
+    load_table
+    page
+    catalogue
+    cat > "$KS/biblio/9.xml" <<'XML'
+<record><datafield tag="080" ind1=" " ind2=" "><subfield code="a">82-31</subfield></datafield><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Lent, Rui,</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Versos /</subfield></datafield><datafield tag="650" ind1=" " ind2="4"><subfield code="a">Poesia brasileira.</subfield></datafield></record>
+XML
+    json bn=9
+    assert '[ "$(jget scheme)" = "cdu" ] && [ "$(jget class)" = "82-31" ] && [ "$(jget class_from)" = "080" ] && [ "$(jget subjects)" = "Poesia brasileira" ]' "$output"
+    json bn=9 scheme=cdd
+    assert '[ "$(jget suggestions.0.class)" = "869.1" ] && [ "$(jget suggestions.0.why.0.kind)" = "subject" ]' "$output"
+    # The CDD index (CDD lookup) built from a made-up list of subjects.
+    "$KEI_SH" "$PANEL" cdd_pm > "$W/lib/KohaEasy/CDD.pm"
+    printf '%s\n' "CDD-Classificação Decimal de Dewey: Tabela Resumida" "869.1 - POESIA BRASILEIRA DE TESTE" "981 - HISTORIA DE TESTE DO BRASIL" > "$W/cdd.txt"
+    mkdir -p /var/lib/koha/library/kei-cdd
+    perl -I "$W/lib" -MKohaEasy::CDD -e 'KohaEasy::CDD::build_cli(@ARGV)' "$W/cdd.txt" /var/lib/koha/library/kei-cdd/cdd.sqlite cdd.txt > /dev/null
+    json name="Nobody, Some" title="Versos" subjects="Poesia brasileira" scheme=cdd
+    assert '[ "$(jget suggestions.0.class)" = "869.1" ] && grep -q "\"kind\":\"cdd\",\"label\":\"POESIA BRASILEIRA DE TESTE\"" <<< "$output"' "$output"
+    rm -rf /var/lib/koha/library/kei-cdd
 }
