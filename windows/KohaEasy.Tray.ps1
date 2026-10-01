@@ -207,7 +207,7 @@ $miStop = Add-Item (T 'Stop Koha') { Invoke-KohaCommand 'Stop'; Request-Check 5 
 $miRestart = Add-Item (T 'Restart Koha services') { Invoke-KohaCommand 'RestartServices'; Request-Check 20 }
 $miReindex = Add-Item (T 'Rebuild search index') {
     $q = (T 'Rebuild the search index from scratch?') + "`n`n" + (T 'Searches in the catalog may be incomplete until it finishes. On large catalogs this takes several minutes.')
-    if ([string][System.Windows.Forms.MessageBox]::Show($q, 'Koha', 'YesNo', 'Question') -eq 'Yes') { Invoke-KohaCommand 'RebuildIndex' }
+    if ([string][System.Windows.Forms.MessageBox]::Show($q, (Get-KohaAppTitle), 'YesNo', 'Question') -eq 'Yes') { Invoke-KohaCommand 'RebuildIndex' }
 }
 Add-Separator
 $miPowerOff = Add-Item (T 'Shut down the PC safely') { Invoke-KohaCommand 'SafeShutdown'; Request-Check 5 }

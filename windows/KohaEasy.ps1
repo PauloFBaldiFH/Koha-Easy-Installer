@@ -91,7 +91,7 @@ function Show-Box {
     param([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information')
     if ($Quiet) { return 'None' }
     Add-Type -AssemblyName System.Windows.Forms
-    return [string][System.Windows.Forms.MessageBox]::Show($Text, 'Koha', $Buttons, $Icon)
+    return [string][System.Windows.Forms.MessageBox]::Show($Text, (Get-KohaAppTitle), $Buttons, $Icon)
 }
 
 function Confirm-Stop {
