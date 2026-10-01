@@ -1108,10 +1108,11 @@ Describe 'The Koha window banner' {
         Should -Invoke -ModuleName KohaEasy.Core Write-KohaLog -ParameterFilter { $Message -eq 'restart services: [OK] apache2' } -Times 1 -Exactly
     }
 
-    It 'the window keeps three actions on its surface, Staff before the catalog, and no Refresh button' {
+    It 'the window keeps four actions on its surface, Staff before the catalog, and no Refresh button' {
         $w = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../windows/KohaEasy.Window.ps1') -Raw
         $w.IndexOf("T 'Staff interface'") | Should -BeLessThan $w.IndexOf("T 'Public catalog (OPAC)'")
-        $w | Should -Match 'foreach \(\$b in \$btnPanel, \$btnServices, \$btnTerminal, \$btnMore\)'
+        $w | Should -Match 'foreach \(\$b in \$btnPanel, \$btnServices, \$btnTerminal, \$btnPowerOff, \$btnMore\)'
+        $w | Should -Match "\(T 'Shut down the PC safely'\) 'secondary' \{ Start-KohaHidden 'SafeShutdown' \}"
         $w | Should -Match "\(T 'Open the Debian terminal'\)\) 'secondary' \{ Start-KohaHidden 'Terminal' \}"
         $w | Should -Not -Match "T 'Refresh'"
         $w | Should -Not -Match 'RichTextBox|Invoke-KohaUserCommand'

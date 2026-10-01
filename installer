@@ -8711,7 +8711,8 @@ function_library_tools() {
             "11" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
             "12" "$(t "⇄  Replace a MARC record (staff tool)")" \
             "13" "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" \
-            "14" "$(t "⌁  Koha plugins (turn on or off)")" 3>&1 1>&2 2>&3) || return 0
+            "14" "$(t "⌁  Koha plugins (turn on or off)")" \
+            "15" "$(t "✂  Cutter Calculator")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_magic_import ;;
             2) lt_marc_undo ;;
@@ -8727,6 +8728,7 @@ function_library_tools() {
             12) function_marc_replace ;;
             13) function_cdd ;;
             14) function_koha_plugins ;;
+            15) function_cutter ;;
         esac
         clear
     done
@@ -12151,7 +12153,12 @@ function add(e, num,   k, L) {
     }
     # "Entry<sep>number", "number<sep>entry" or the row of the book "Entry number Entry".
     nf = split(line, f, /[\t;]/)
-    if (nf < 2 && index(line, ",")) nf = split(line, f, /,/)
+    # A comma separates only next to the number ("Sampaio M.,184"); in
+    # "127 Abbot, J." (Cutter-Sanborn) it belongs to the entry.
+    if (nf < 2 && index(line, ",")) {
+        nc = split(line, f, /,/)
+        for (i = 1; i <= nc; i++) if (trim(f[i]) ~ /^[0-9]+$/) { nf = nc; break }
+    }
     if (nf < 2) {
         nw = split(line, w, /[ ]+/); left = ""; right = ""; num = ""
         for (i = 1; i <= nw; i++) {
@@ -12275,8 +12282,8 @@ cat_notation_report() {
             printf '\n%s\n' "$(t "Already used in the catalogue (in the same class, two different authors cannot have the same number):")"
             printf '%s\n' "$used" | awk -F'\t' '{ printf "  %-22s %-28s %s\n", $1, substr($2, 1, 28), substr($3, 1, 40) }'
             printf '\n%s\n' "$(t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):")"
-            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free")"
-            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free")"
+            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free to use")"
+            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free to use")"
         elif [ -n "$class" ]; then
             printf '\n%s\n' "$(t "Not used yet in this class in the catalogue.")"
         fi
@@ -12414,24 +12421,46 @@ lt_cat_cdd() {
 }
 
 lt_cat_load() {
-    local kind file utf8 new report problems entries
-    kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
+    local kind="${1:-}" file utf8 new report problems entries
+    [ -n "$kind" ] || kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
         "pha"    "$(cat_table_name pha)" \
         "cutter" "Cutter-Sanborn" \
         "cdd"    "$(t "CDD (Dewey) schedule: number and caption per line")") || return 0
-    file=$(select_file "/root" "txt csv tsv" "$(t "Pick the table file (.txt, .csv or .tsv):")" "$(t "Table")") || return 0
+    if [ "$kind" = "pha" ]; then
+        file=$(select_file "/root" "txt csv tsv pdf" "$(t "Pick the table file (.txt, .csv, .tsv, or the PDF of the book, even scanned):")" "$(t "Table")") || return 0
+    else
+        file=$(select_file "/root" "txt csv tsv" "$(t "Pick the table file (.txt, .csv or .tsv):")" "$(t "Table")") || return 0
+    fi
     if [ ! -r "$file" ] || [ ! -s "$file" ]; then
         msg_error "" "$(t "The file is empty or cannot be read.\nNothing was changed.")" 10 70
         return 1
     fi
     tools_workdir || return 1
     utf8="$TOOLS_WORK/table-utf8.txt"; new="$TOOLS_WORK/table.tsv"; report="$TOOLS_WORK/table-report.txt"
-    if file_is_utf8 "$file"; then cp -f -- "$file" "$utf8"; else iconv -f WINDOWS-1252 -t UTF-8 "$file" > "$utf8" 2>/dev/null || return 1; fi
+    local pdfrep="" log fixed rows
+    if [ "$(head -c 5 "$file" 2>/dev/null)" = "%PDF-" ]; then
+        log=$(tools_log tables)
+        pdfrep="$TOOLS_WORK/table-pdf-report.txt"
+        if [ "$kind" != "pha" ] || ! cat_pdf_rows "$kind" "$file" "$utf8" "$log" > "$pdfrep" || [ ! -s "$utf8" ]; then
+            msg_error "" "$(t 'The rows of the table could not be read from this PDF. Nothing was changed.\n\nLog: ${log}')" 10 74
+            return 1
+        fi
+    elif file_is_utf8 "$file"; then cp -f -- "$file" "$utf8"; else iconv -f WINDOWS-1252 -t UTF-8 "$file" > "$utf8" 2>/dev/null || return 1; fi
     : > "$new"
     cat_table_import "$kind" "$utf8" "$new" > "$report" 2>&1
     entries=$(sed -n 's/^@@entries //p' "$report"); problems=$(sed -n 's/^@@problems //p' "$report")
     sed -i '/^@@/d' "$report"
-    { printf '%s\n\n' "$(cat_table_name "$kind")"; cat "$report"; } > "$report.2" && mv -f "$report.2" "$report"
+    {
+        printf '%s\n\n' "$(cat_table_name "$kind")"
+        if [ -n "$pdfrep" ]; then
+            rows=$(sed -n 's/^rows=//p' "$pdfrep"); fixed=$(sed -n 's/^fixed=//p' "$pdfrep")
+            printf '%s\n' "$(t 'Rows read from the PDF: ${rows}')"
+            printf '%s\n' "$(t 'Numbers corrected by their order, as the OCR misread them (check them against the book): ${fixed}')"
+            sed -n 's/^fix=/  /p' "$pdfrep"
+            printf '\n'
+        fi
+        cat "$report"
+    } > "$report.2" && mv -f "$report.2" "$report"
     ui_textbox "$(t "Load a table")" "$report"
     if [ "${entries:-0}" = "0" ]; then
         msg_error "" "$(t "No entry was understood. Nothing was changed.")" 8 64
@@ -14220,6 +14249,35 @@ sub notation {
     return { notation => uc($L) . $hit . $mark, entry => $ent, number => $hit, prev => $prev, next => $next_n };
 }
 
+# author_code(%options): the author number of the call number with the
+# options of the Cutter Calculator, on top of notation(). Options:
+#   table         the table file (Cutter-Sanborn or PHA, same layout)
+#   name, title   heading ("Surname, Forename" or an institution) and title
+#   ind2          non-filing characters of 245
+#   mode          auto (default: the author, or the title when there is no
+#                 author), person, corporate or title
+#   title_letter  1 (default) adds the initial of the title (A848d), 0 not
+#   edition       edition number: "2. ed." after the code (the 1st is not marked)
+#   copy          copy number: "ex. 2" after the code
+# Returns { code, notation, entry, number, prev, next, mode, suffix } or
+# { error => 2 (no table) | 3 (no letter) | 4 (no entry for the letter) }.
+sub author_code {
+    my %o    = @_;
+    my $mode = $o{mode} || 'auto';
+    $mode = trim( $o{name} // '' ) ne '' ? 'person' : 'title' if $mode eq 'auto';
+    my $r = notation( $o{table}, $o{name}, $o{title}, $o{ind2}, $mode );
+    return $r if $r->{error};
+    my $code = $r->{notation};
+    if ( defined $o{title_letter} && !$o{title_letter} && $mode ne 'title' ) {
+        my $mark = work_mark( $o{title} // '', $o{ind2} );
+        $code = substr( $code, 0, length($code) - length($mark) );
+    }
+    my @suffix;
+    push @suffix, ( $1 + 0 ) . '. ed.' if ( $o{edition} // '' ) =~ /^\s*0*(\d{1,3})\b/ && $1 > 1;
+    push @suffix, 'ex. ' . ( $1 + 0 ) if ( $o{copy} // '' ) =~ /^\s*0*(\d{1,4})\b/ && $1 > 0;
+    return { %$r, mode => $mode, notation => $code, suffix => join( ' ', @suffix ), code => join( ' ', $code, @suffix ) };
+}
+
 # ----------------------------------------------------------------------
 # Names (AACR2 22.5: entry under the last surname; Portuguese compound
 # surnames Filho, Neto, Júnior and Sobrinho stay with it; the particles
@@ -14838,7 +14896,9 @@ _lt_mr_remove() {
         fi
         memcached_flush || true
     fi
-    rm -f "$MR_FILE" "$MR_STATE" "$MR_PM_DIR/Vision.pm" "$MR_PM_DIR/Rules.pm"
+    rm -f "$MR_FILE" "$MR_STATE" "$MR_PM_DIR/Vision.pm"
+    # The rules module stays while the Cutter Calculator uses it.
+    cutter_installed || rm -f "$MR_PM_DIR/Rules.pm"
     rmdir "$MR_PM_DIR" 2>/dev/null || true
     plack_restart
     log "marc_replace: page removed"
@@ -20294,6 +20354,1167 @@ magic_summary() {
     fi
     text+="\n\n$(t 'Records replaced: ${repl}\nPatrons updated: ${upd}\nLoans: ${loans}\nHolds: ${holds}\n\nUndo the records: Library tools > Undo a MARC import.\nSafety backups: ${DIR_SQL}\nLog: ${log}')"
     msg_ok "$text" 20 78
+}
+
+# ======================================================================
+# 37. CUTTER CALCULATOR (PANEL AND STAFF INTERFACE)
+# ----------------------------------------------------------------------
+# The author number of the call number from the library's own Cutter-Sanborn
+# table (the three-figure table, "848 Assis" per line) or PHA table (Heloísa
+# de Almeida Prado, rows "Entry number Entry", also read from the scanned
+# book), with the same table files and the same rules as Cataloguing aids
+# and the AI cataloguing
+# (cat_notation in the panel, KohaEasy::Cataloguing::Rules::notation in
+# Koha). In the panel: Library tools > Cutter Calculator. In Koha:
+# cataloguing/cutter_calculator.pl, the notation shown as the name is typed,
+# the numbers the class already uses, Copy, the classification of the call
+# number (CDD, CDU or local codes: settings, record, catalogue) with classes
+# suggested from the catalogue and the CDD index when the record has none,
+# a gear for the settings of this browser, a Cutter button next to 090 / 092
+# $b and a Call number button next to 090 / 092 $a and the item call number
+# (952 $o) that read the record and put the class and the notation in it. The
+# editions of the table are copyrighted: it is not distributed with the
+# panel, each library loads its own copy (CONF_DIR/tables/cutter.tsv and
+# pha.tsv). The page only reads Koha.
+# ======================================================================
+CUTTER_FILE="${KOHA_INTRA_CGI}/cataloguing/cutter_calculator.pl"
+CUTTER_STATE="${CONF_DIR}/cutter_calculator.state"
+CUTTER_JS_BEGIN="/* koha-easy-installer cutter begin */"
+CUTTER_JS_END="/* koha-easy-installer cutter end */"
+# Texts of the page (see cutter_text).
+CUTTER_KEYS="title intro f_name f_name_ph f_title f_class f_mode m_auto m_person m_corporate m_title entry read_as call_number \
+    copy copy_cn copied apply gone used other free in_use not_used no_table no_letter no_entry table_info cataloguing \
+    f_table f_edition f_copy f_noletter t_cutter t_pha f_scheme s_auto s_cdd s_cdu s_local w_setting w_class w_record w_collection \
+    w_default class_from cdu_note sug_title sug_none sug_author sug_subject sug_words sug_cdd use_class suggested settings set_intro \
+    set_letter set_edition set_copy save close"
+
+cutter_text() {
+    case "$1" in
+        title)        t "Cutter Calculator" ;;
+        intro)        t "Type the author: the Cutter number appears as you type." ;;
+        f_name)       t "Author (Surname, Forename)" ;;
+        f_name_ph)    t "e.g. Assis, Machado de" ;;
+        f_title)      t "Title (for the letter after the number)" ;;
+        f_class)      t "Class number (optional, to check the numbers in use)" ;;
+        f_mode)       t "Main entry" ;;
+        m_auto)       t "Automatic: the author, or the title when there is none" ;;
+        m_person)     t "Person" ;;
+        m_corporate)  t "Institution (first word)" ;;
+        m_title)      t "Title (no author)" ;;
+        entry)        t "Table entry used" ;;
+        read_as)      t "Read as" ;;
+        call_number)  t "Call number" ;;
+        copy)         t "Copy" ;;
+        copy_cn)      t "Copy the call number" ;;
+        copied)       t "Copied" ;;
+        apply)        t "Use in the record" ;;
+        gone)         t "The cataloguing form was closed or changed: the number was copied instead." ;;
+        used)         t "Already used in the catalogue (in the same class, two different authors cannot have the same number):" ;;
+        other)        t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):" ;;
+        free)         t "free to use" ;;
+        in_use)       t "in use" ;;
+        not_used)     t "Not used yet in this class in the catalogue." ;;
+        no_table)     t "No author table has been loaded yet. In the panel: Library tools > Cutter Calculator, load the Cutter-Sanborn or the PHA table." ;;
+        no_letter)    t "No notation: the name must start with a letter (write it as Surname, Forename)." ;;
+        no_entry)     t "The table has no entry for this letter." ;;
+        table_info)   t "Table of the library: {n} entries." ;;
+        f_table)      t "Table" ;;
+        f_edition)    t "Edition (optional)" ;;
+        f_copy)       t "Copy (optional)" ;;
+        f_noletter)   t "Without the letter of the title" ;;
+        t_cutter)     printf 'Cutter-Sanborn' ;;
+        t_pha)        t "PHA table (Heloísa de Almeida Prado)" ;;
+        f_scheme)     t "Classification" ;;
+        s_auto)       t "Automatic (record and catalogue)" ;;
+        s_cdd)        t "CDD (Dewey)" ;;
+        s_cdu)        t "CDU (UDC)" ;;
+        s_local)      t "Local codes of the library" ;;
+        w_setting)    t "chosen in the settings" ;;
+        w_class)      t "from the class typed" ;;
+        w_record)     t "field {f} of the record" ;;
+        w_collection) t "{n} of {t} call numbers of the catalogue" ;;
+        w_default)    t "the default" ;;
+        class_from)   t "class {c} taken from field {f} of the record" ;;
+        cdu_note)     t "The panel has no CDU table: the class comes from field 080 or from how the catalogue classified similar titles." ;;
+        sug_title)    t "Suggested classes (hints from the record and the catalogue: check them before using)" ;;
+        sug_none)     t "No suggestion: the catalogue has no titles of this author, with these subjects or with these title words yet." ;;
+        sug_author)   t "{n} title(s) of the same author" ;;
+        sug_subject)  t "{n} title(s) with the subject “{s}”" ;;
+        sug_words)    t "{n} title(s) with “{s}” in the title" ;;
+        sug_cdd)      t "CDD index: {s}" ;;
+        use_class)    t "Use this class" ;;
+        suggested)    t "Suggested call number" ;;
+        settings)     t "Settings" ;;
+        set_intro)    t "Saved in this browser: they apply every time the calculator opens." ;;
+        set_letter)   t "Add the letter of the title (e.g. P784q)" ;;
+        set_edition)  t "Add the edition (2. ed.) when the record has one" ;;
+        set_copy)     t "Add the copy number (ex. 2) when the item has one" ;;
+        save)         t "Save" ;;
+        close)        t "Close" ;;
+        cataloguing)  t "Cataloguing" ;;
+    esac
+}
+
+# The page: Perl code around the strings of the panel language.
+cutter_page_script() {
+    cat <<'CUTPL1'
+#!/usr/bin/perl
+
+# cutter_calculator.pl (koha-easy-installer)
+# The author number of the call number while cataloguing: the notation of
+# the library's Cutter-Sanborn or PHA table (the entry right before the name
+# in alphabetical order, the initial, the number and, unless turned off, the
+# initial of the title without its article; an anonymous work is entered by
+# its title), with the edition and the copy when given, worked out by
+# KohaEasy::Cataloguing::Rules::author_code, the same rules as the panel. The class number shows the call numbers of the
+# catalogue that already use the same Cutter number in that class.
+# Opened from the Cutter button next to 090 / 092 $b and the item call
+# number (952 $o), "Use in the record" puts the notation in that field;
+# otherwise it is copied. ?format=json answers with the result as JSON.
+# Installed and removed by the panel (Library tools > Cutter Calculator).
+#
+# Read only: nothing in Koha is changed by this page. The table is the
+# library's own copy, loaded by the panel; it is not distributed with it.
+#
+# Under Koha's persistent Plack the Perl process lives between requests:
+# no named sub captures file-scope lexical variables (package variables).
+
+use Modern::Perl;
+use CGI qw ( -utf8 );
+use C4::Auth qw( checkauth );
+use C4::Context;
+use Encode qw( decode encode );
+use JSON::PP;
+use MIME::Base64 qw( decode_base64 );
+use KohaEasy::Cataloguing::Rules;
+
+sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
+CUTPL1
+    local k
+    printf "our %%TABLES = ( cutter => '%s', pha => '%s' );\nour \$CDD_INDEX = '%s';\nour %%CACHE;\nour %%T = (\n" "$(cat_table_path cutter)" "$(cat_table_path pha)" "$CDD_DB"
+    for k in $CUTTER_KEYS; do
+        printf '    %s => _d(q{%s}),\n' "$k" "$(cutter_text "$k" | base64 -w0)"
+    done
+    printf ');\n'
+    cat <<'CUTPL2'
+
+run();
+
+sub h {
+    my $s = shift // '';
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    $s =~ s/'/&#39;/g;
+    return $s;
+}
+
+sub run {
+    my $cgi = CGI->new;
+    # Any member of the staff who can see the catalogue (read only).
+    my ( $user, $cookie ) = checkauth( $cgi, 0, { catalogue => 1 }, 'intranet' );
+    my %p = map { my $v = $cgi->param($_) // ''; $v =~ s/^\s+|\s+$//g; $v =~ s/\s+/ /g; ( $_ => substr( $v, 0, 300 ) ) } qw( name title ind2 mode class bn target format table edition copy noletter scheme c080 c082 c084 subjects );
+    $p{mode}   = 'auto'   unless $p{mode} =~ /^(auto|person|corporate|title)$/;
+    $p{scheme} = 'auto'   unless $p{scheme} =~ /^(auto|cdd|cdu|local)$/;
+    # The table asked for when it is loaded, otherwise PHA, otherwise Cutter-Sanborn (as the AI cataloguing).
+    my @loaded = grep { -s $TABLES{$_} } qw( pha cutter );
+    $p{table}    = $loaded[0] // '' unless grep { $_ eq $p{table} } @loaded;
+    $p{edition}  = '' unless $p{edition} =~ /^[0-9]{1,3}$/;
+    $p{copy}     = '' unless $p{copy} =~ /^[0-9]{1,4}$/;
+    $p{noletter} = $p{noletter} eq '1' ? '1' : '';
+    $p{target} = ''       unless $p{target} =~ /^[A-Za-z0-9_-]{1,80}$/;
+    $p{bn}     = ''       unless $p{bn} =~ /^[0-9]{1,10}$/;
+    $p{ind2}   = ''       unless $p{ind2} =~ /^[0-9]$/;
+    for my $k (qw( class c080 c082 c084 )) { $p{$k} = '' unless $p{$k} =~ m{^[\p{L}0-9./ ()\[\]:"=+-]{1,40}$} }
+    $p{subjects} =~ s/[\x00-\x1f<>]//g;
+    # From the item editor only the record is known: its 100 / 110 / 245 / 08x / 650.
+    from_record( \%p ) if $p{bn} ne '' && $p{name} eq '' && $p{title} eq '';
+    my $r = calculate( \%p );
+    if ( $p{format} eq 'json' ) {
+        print $cgi->header( -type => 'application/json', -cookie => $cookie, -charset => 'utf-8' );
+        print JSON::PP->new->utf8->canonical->encode($r);
+        return;
+    }
+    print $cgi->header( -cookie => $cookie, -charset => 'utf-8' );
+    print encode( 'UTF-8', $p{format} eq 'part' ? result_html( \%p, $r ) : page( \%p, $r ) );
+    return;
+}
+
+sub xml_text {
+    my $s = shift // '';
+    $s =~ s/&lt;/</g;
+    $s =~ s/&gt;/>/g;
+    $s =~ s/&quot;/"/g;
+    $s =~ s/&apos;/'/g;
+    $s =~ s/&#(\d+);/chr $1/ge;
+    $s =~ s/&#x([0-9a-fA-F]+);/chr hex $1/ge;
+    $s =~ s/&amp;/&/g;
+    return $s;
+}
+
+# The heading, title and class of a catalogue record (MARCXML).
+sub from_record {
+    my $p = shift;
+    my ($xml) = eval { C4::Context->dbh->selectrow_array( q{SELECT metadata FROM biblio_metadata WHERE biblionumber = ? AND format = 'marcxml'}, undef, $p->{bn} ) };
+    return unless defined $xml;
+    $xml = decode( 'UTF-8', $xml ) unless utf8::is_utf8($xml);
+    my $sub = sub {
+        my ( $tag, $code ) = @_;
+        my ($f) = $xml =~ m{<datafield tag="$tag"[^>]*>(.*?)</datafield>}s or return '';
+        my ($v) = $f =~ m{<subfield code="$code">([^<]*)</subfield>} or return '';
+        return KohaEasy::Cataloguing::Rules::trim( xml_text($v) );
+    };
+    my ( $a100, $a110, $a111, $t245 ) = ( $sub->( '100', 'a' ), $sub->( '110', 'a' ), $sub->( '111', 'a' ), $sub->( '245', 'a' ) );
+    $t245 =~ s/[\s\/:;=.]+$//;
+    my ($ind2) = $xml =~ m{<datafield tag="245"[^>]*ind2="([0-9])"};
+    if    ( $a100 ne '' )          { ( $p->{name} = $a100 ) =~ s/[,.\s]+$//; $p->{mode} = 'person' }
+    elsif ( "$a110$a111" ne '' )   { $p->{name} = $a110 ne '' ? $a110 : $a111; $p->{mode} = 'corporate' }
+    else                           { $p->{mode} = 'title' }
+    $p->{title} = $t245;
+    $p->{ind2}  = $ind2 // '';
+    ( $p->{edition} ) = $sub->( '250', 'a' ) =~ /^\D{0,3}([0-9]{1,3})/ if $p->{edition} eq '';
+    $p->{edition} //= '';
+    my $ok = sub { my $v = shift; return $v =~ m{^[\p{L}0-9./ ()\[\]:"=+-]{1,40}$} ? $v : '' };
+    $p->{class} = $ok->( $sub->( '090', 'a' ) ) if $p->{class} eq '';
+    $p->{"c$_"} = $ok->( $sub->( $_, 'a' ) ) for qw( 080 082 084 );
+    if ( $p->{subjects} eq '' ) {
+        my @s = map { m{<subfield code="a">([^<]*)</subfield>} ? KohaEasy::Cataloguing::Rules::trim( xml_text($1) ) : () } $xml =~ m{<datafield tag="650"[^>]*>(.*?)</datafield>}sg;
+        s/[\s.]+$// for @s;
+        $p->{subjects} = join ' ; ', grep { $_ ne '' } @s[ 0 .. ( $#s < 2 ? $#s : 2 ) ];
+    }
+    return;
+}
+
+# ----------------------------------------------------------------------
+# The class of the call number: CDD, CDU or the library's own (local)
+# codes, told from the settings, the record or the call numbers of the
+# catalogue, and suggested from the catalogue (titles of the same author,
+# the same subjects, words of the title) and the CDD index when the record
+# has none. These are hints: the cataloguer decides.
+# ----------------------------------------------------------------------
+
+# The scheme a call number looks like: cdd (869.3), cdu (821.134.3(81),
+# 82-3), local (LIT, INF J: letters first) or ''.
+sub scheme_of {
+    my $cn = shift // '';
+    return 'cdd'   if $cn =~ /(?:^|\s)\d{3}(?:\.\d+)?(?=\s|$)/;
+    return 'cdu'   if $cn =~ m{(?:^|\s)\d[\d.]*(?:[(:"=+/-]|\.\d+\.)} || $cn =~ /(?:^|\s)\d{1,2}(?:\.\d+)?(?=\s|$)/;
+    return 'local' if $cn =~ /^\s*\p{L}[\p{L}.-]*(?:\s|$)/;
+    return '';
+}
+
+# The class part of a call number in SCHEME ("R 869.3 A848d" -> 869.3,
+# "821.134.3(81)-1 A848d" -> 821.134.3(81)-1, "LIT INF A848d" -> LIT INF).
+sub class_of {
+    my ( $cn, $scheme ) = @_;
+    $cn //= '';
+    return $1 if $scheme eq 'cdd' && $cn =~ /(?:^|\s)(\d{3}(?:\.\d+)?)(?=\s|$)/;
+    if ( $scheme eq 'cdu' && $cn =~ m{(?:^|\s)(\d[\d.:()"=+/-]*)} ) { ( my $c = $1 ) =~ s{[.:=+/-]+$}{}; return $c }
+    if ( $scheme eq 'local' && $cn =~ /^\s*\p{L}/ ) {
+        my @t;
+        for ( split ' ', $cn ) { last if /^\p{Lu}\d{1,4}\p{Ll}*$/ || /\d{3}/; push @t, $_ }
+        return join ' ', @t;
+    }
+    return '';
+}
+
+# How the catalogue's call numbers look: { cdd, cdu, local, total } of the
+# latest 2000 items, kept ten minutes (Plack keeps the process).
+sub collection_schemes {
+    return $CACHE{schemes} if $CACHE{schemes} && time - $CACHE{at} < 600;
+    my $rows = eval {
+        C4::Context->dbh->selectall_arrayref( q{/* kei-cutter:sample */
+            SELECT itemcallnumber FROM items WHERE itemcallnumber IS NOT NULL AND itemcallnumber <> '' ORDER BY itemnumber DESC LIMIT 2000} );
+    } || [];
+    my %n = ( total => 0 );
+    for (@$rows) { my $s = scheme_of( $_->[0] ) or next; $n{$s}++; $n{total}++ }
+    $CACHE{at} = time;
+    return $CACHE{schemes} = \%n;
+}
+
+# ( scheme, why, count, total ): the settings, the class typed, the class
+# fields of the record (082 CDD, 080 CDU, 084 other), then the catalogue.
+sub detect_scheme {
+    my $p = shift;
+    return ( $p->{scheme}, 'setting' ) if $p->{scheme} ne 'auto';
+    if ( my $s = scheme_of( $p->{class} ) ) { return ( $s, 'class' ) }
+    return ( 'cdu', 'record', '080' ) if $p->{c080} ne '' && $p->{c082} eq '';
+    return ( 'cdd', 'record', '082' ) if $p->{c082} ne '';
+    return ( 'local', 'record', '084' ) if $p->{c084} ne '';
+    my $n = collection_schemes();
+    if ( $n->{total} ) {
+        my ($s) = sort { ( $n->{$b} // 0 ) <=> ( $n->{$a} // 0 ) || $a cmp $b } qw( cdd cdu local );
+        return ( $s, 'collection', $n->{$s} // 0, $n->{total} );
+    }
+    return ( 'cdd', 'default' );
+}
+
+sub _like { my $t = shift; $t =~ s/([%_\\])/\\$1/g; return $t }
+
+# Call numbers of other records than BN near this one: [ call number, biblionumber ].
+# author: biblio.author starts with the heading; subject: a 650 $a holds
+# it; words: the title has all the words.
+sub near {
+    my ( $kind, $bn, @like ) = @_;
+    my $cond = {
+        author  => 'b.author LIKE ?',
+        subject => q{ExtractValue(m.metadata, '//datafield[@tag="650"]/subfield[@code="a"]') LIKE ?},
+        words   => join( ' AND ', ('b.title LIKE ?') x @like ),
+    }->{$kind};
+    my $join = $kind eq 'subject' ? 'JOIN biblio_metadata m ON m.biblionumber = i.biblionumber' : 'JOIN biblio b ON b.biblionumber = i.biblionumber';
+    return eval {
+        C4::Context->dbh->selectall_arrayref( qq{/* kei-cutter:$kind */
+            SELECT i.itemcallnumber, i.biblionumber FROM items i $join
+            WHERE $cond AND i.biblionumber <> ? AND i.itemcallnumber <> '' LIMIT 400}, undef, @like, $bn eq '' ? 0 : $bn );
+    } || [];
+}
+
+# Classes for a record without one: [ { class, score, why => [ { kind, n, label } ] } ],
+# best first. HEADING is the author as the catalogue writes it.
+sub suggestions {
+    my ( $p, $scheme, $heading ) = @_;
+    my %s;
+    my $add = sub {
+        my ( $kind, $label, $weight, $rows ) = @_;
+        my %by;
+        for (@$rows) { my $c = class_of( $_->[0], $scheme ); $by{$c}{ $_->[1] } = 1 if $c ne '' }
+        for my $c ( keys %by ) {
+            my $n = scalar keys %{ $by{$c} };
+            my $x = $s{$c} //= { class => $c, score => 0, why => [] };
+            $x->{score} += $weight * $n;
+            push @{ $x->{why} }, { kind => $kind, n => $n, label => $label };
+        }
+    };
+    ( my $h = $heading // '' ) =~ s/[,.\s]+$//;
+    $add->( 'author', $h, 3, near( 'author', $p->{bn}, _like($h) . '%' ) ) if length $h >= 3;
+    my @subj = grep { length >= 3 } map { KohaEasy::Cataloguing::Rules::trim($_) } split /;/, $p->{subjects};
+    splice @subj, 3 if @subj > 3;
+    $add->( 'subject', $_, 2, near( 'subject', $p->{bn}, '%' . _like($_) . '%' ) ) for @subj;
+    my @w = grep { length >= 4 && !KohaEasy::Cataloguing::Rules::is_article( lc $_ ) } split /[^\p{L}\p{N}]+/, KohaEasy::Cataloguing::Rules::title_rest( $p->{title}, $p->{ind2} );
+    splice @w, 4 if @w > 4;
+    $add->( 'words', join( ' ', @w ), 1, near( 'words', $p->{bn}, map { '%' . _like($_) . '%' } @w ) ) if @w;
+    # The CDD index of the library (CDD lookup), when it was built.
+    if ( $scheme eq 'cdd' && -s $CDD_INDEX && eval { require KohaEasy::CDD; 1 } ) {
+        my $dbh = eval { KohaEasy::CDD::connect_db($CDD_INDEX) };
+        for my $q ( grep { $_ ne '' } @subj, $p->{title} ) {
+            last unless $dbh;
+            my $found = eval { KohaEasy::CDD::search( $dbh, $q, 3 ) } || [];
+            for my $x (@$found) {
+                next unless $x->{num} =~ /^\d{3}(?:\.\d+)?$/;
+                my $y = $s{ $x->{num} } //= { class => $x->{num}, score => 0, why => [] };
+                $y->{score} += 1;
+                push @{ $y->{why} }, { kind => 'cdd', n => 0, label => $x->{heading} } unless grep { $_->{kind} eq 'cdd' } @{ $y->{why} };
+            }
+        }
+    }
+    my @r = sort { $b->{score} <=> $a->{score} || $a->{class} cmp $b->{class} } values %s;
+    splice @r, 6 if @r > 6;
+    return \@r;
+}
+
+# The class part of the result: scheme, class from the record, suggestions.
+sub class_part {
+    my ( $p, $r, $heading ) = @_;
+    my ( $scheme, $why, $n, $t ) = detect_scheme($p);
+    my %field = ( cdd => '082', cdu => '080', local => '084' );
+    if ( $p->{class} eq '' ) {
+        my $v = $p->{ 'c' . $field{$scheme} };
+        my $c = $scheme eq 'cdd' ? ( ( $v =~ /(\d{3}(?:\.\d+)?)/ )[0] // '' ) : $v;
+        if ( $c ne '' ) { $p->{class} = $c; $r->{class_from} = $field{$scheme} }
+    }
+    $r->{scheme}     = $scheme;
+    $r->{scheme_why} = $why;
+    $r->{scheme_field} = $n if $why eq 'record';
+    $r->{scheme_count} = [ $n, $t ] if $why eq 'collection';
+    # No class, or a CDD class without its decimals (800, 869): suggestions.
+    if ( $p->{class} eq '' || ( $scheme eq 'cdd' && $p->{class} =~ /^\d{3}$/ ) ) {
+        $r->{suggestions} = suggestions( $p, $scheme, $heading );
+        $r->{suggested_class} = $r->{suggestions}[0]{class} if $p->{class} eq '' && @{ $r->{suggestions} };
+    }
+    return;
+}
+
+# Call numbers of the catalogue with the class and the Cutter number BASE
+# (A848, not A8481), other records than BN: [ call number, author, title ].
+sub used {
+    my ( $class, $base, $bn ) = @_;
+    ( my $c = $class ) =~ s/([.()\[\]+*?^\$|{}\\])/\\$1/g;
+    $c =~ s/ /[[:space:]]+/g;
+    my $re = "(^|[[:space:]])${c}[[:space:]]+${base}([^0-9]|\$)";
+    return eval {
+        C4::Context->dbh->selectall_arrayref( q{/* kei-cutter:used */
+            SELECT DISTINCT i.itemcallnumber, COALESCE(b.author, ''), COALESCE(b.title, '')
+            FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber
+            WHERE i.itemcallnumber REGEXP ? AND i.biblionumber <> ?
+            ORDER BY i.itemcallnumber LIMIT 20}, undef, $re, $bn eq '' ? 0 : $bn );
+    } || [];
+}
+
+# The result: { notation, entry, number, read_as, call_number, used,
+# alternatives } or { error => no_table | no_letter | no_entry }.
+sub calculate {
+    my $p = shift;
+    my %r = map { $_ => $p->{$_} } qw( name title ind2 mode table edition copy subjects );
+    my $name = $p->{name};
+    my $mode = $p->{mode} eq 'auto' ? ( $name ne '' ? 'person' : 'title' ) : $p->{mode};
+    $r{mode} = $mode;
+    # "Machado de Assis" is read "Assis, Machado de" (AACR2, as the AI cataloguing does).
+    if ( $mode eq 'person' && index( $name, ',' ) < 0 && $name =~ /^\p{L}\S* / ) {
+        $name = KohaEasy::Cataloguing::Rules::invert_name($name);
+        $r{read_as} = $name;
+    }
+    class_part( $p, \%r, $mode eq 'title' ? '' : $name );
+    $r{class} = $p->{class};
+    if ( $p->{table} eq '' ) { $r{error} = 'no_table'; return \%r }
+    return \%r if ( $mode eq 'title' ? $p->{title} : $name ) eq '';
+    my $n = KohaEasy::Cataloguing::Rules::author_code(
+        table => $TABLES{ $p->{table} }, name => $name, title => $p->{title}, ind2 => $p->{ind2}, mode => $mode,
+        title_letter => $p->{noletter} ? 0 : 1, edition => $p->{edition}, copy => $p->{copy} );
+    if ( $n->{error} ) {
+        $r{error} = { 2 => 'no_table', 3 => 'no_letter', 4 => 'no_entry' }->{ $n->{error} } // 'no_letter';
+        return \%r;
+    }
+    my $L = substr( $n->{notation}, 0, 1 );
+    $r{$_} = $n->{$_} for qw( code notation entry number );
+    $r{call_number} = join ' ', grep { $_ ne '' } $p->{class}, $n->{code};
+    $r{suggested_call_number} = "$r{suggested_class} $n->{code}" if $r{suggested_class};
+    if ( $p->{class} ne '' ) {
+        $r{used} = [ map { { call_number => $_->[0], author => $_->[1], title => $_->[2] } } @{ used( $p->{class}, $L . $n->{number}, $p->{bn} ) } ];
+        $r{alternatives} = [ map { { number => $L . $_, free => @{ used( $p->{class}, $L . $_, $p->{bn} ) } ? JSON::PP::false : JSON::PP::true } } grep { $_ ne '' } $n->{prev}, $n->{next} ]
+            if @{ $r{used} };
+    }
+    return \%r;
+}
+
+sub fill { my ( $s, %v ) = @_; $s =~ s{\{(\w+)\}}{$v{$1} // ''}ge; return $s }
+
+# Why a class is suggested, in words.
+sub why_text {
+    my $w = shift;
+    return fill( $T{sug_cdd}, s => $w->{label} ) if $w->{kind} eq 'cdd';
+    return fill( $T{"sug_$w->{kind}"}, n => $w->{n}, s => $w->{label} );
+}
+
+# The classification of the call number and, without a class, the suggestions.
+sub class_html {
+    my ( $p, $r ) = @_;
+    return '' unless $r->{scheme};
+    my $why = $r->{scheme_why} eq 'record' ? fill( $T{w_record}, f => $r->{scheme_field} )
+        : $r->{scheme_why} eq 'collection' ? fill( $T{w_collection}, n => $r->{scheme_count}[0], t => $r->{scheme_count}[1] )
+        : $T{"w_$r->{scheme_why}"};
+    my $html = '<div class="cls">' . h( $T{f_scheme} ) . ': <b>' . h( $T{"s_$r->{scheme}"} ) . '</b> <span class="hint">(' . h($why) . ')</span>'
+        . ( $r->{class_from} ? ' &middot; <span class="hint">' . h( fill( $T{class_from}, f => $r->{class_from}, c => $r->{class} ) ) . '</span>' : '' ) . '</div>';
+    $html .= '<p class="hint">' . h( $T{cdu_note} ) . '</p>' if $r->{scheme} eq 'cdu' && $r->{suggestions};
+    return $html unless $r->{suggestions};
+    $html .= '<h3>' . h( $T{sug_title} ) . '</h3>';
+    return $html . '<p class="hint">' . h( $T{sug_none} ) . '</p>' unless @{ $r->{suggestions} };
+    return $html . '<table class="list sug"><tbody>' . join(
+        '',
+        map {
+            '<tr><td class="n">' . h( $_->{class} ) . '</td><td>' . join( ' &middot; ', map { h( why_text($_) ) } @{ $_->{why} } )
+                . '</td><td class="act"><button type="button" class="use" data-class="' . h( $_->{class} ) . '">' . h( $T{use_class} ) . '</button></td></tr>'
+        } @{ $r->{suggestions} }
+    ) . '</tbody></table>';
+}
+
+sub result_html {
+    my ( $p, $r ) = @_;
+    my $cls = class_html( $p, $r );
+    return '<div class="msg warn">' . h( $T{ $r->{error} } ) . '</div>' . $cls if $r->{error};
+    return '<p class="hint">' . h( $T{intro} ) . '</p>' . $cls unless $r->{notation};
+    my $class = $p->{class} ne '' ? $p->{class} : $r->{suggested_class} // '';
+    my $full  = $p->{class} ne '' ? $r->{call_number} : $r->{suggested_call_number} // '';
+    my $apply = $p->{target} ne '' ? ' <button type="button" class="apply" data-n="' . h( $r->{code} ) . '" data-c="' . h($class) . '">' . h( $T{apply} ) . '</button>' : '';
+    my $html = '<div class="res"><div class="big">' . h( $r->{code} ) . '</div><div class="facts">'
+        . '<div>' . h( $T{entry} ) . ': <b>' . h( $r->{entry} ) . '</b> (' . h( $r->{number} ) . ')</div>'
+        . ( $r->{read_as} ? '<div>' . h( $T{read_as} ) . ': ' . h( $r->{read_as} ) . '</div>' : '' )
+        . ( $p->{class} ne '' ? '<div>' . h( $T{call_number} ) . ': <b>' . h( $r->{call_number} ) . '</b></div>' : '' )
+        . ( $p->{class} eq '' && $full ne '' ? '<div>' . h( $T{suggested} ) . ': <b>' . h($full) . '</b></div>' : '' )
+        . '</div><div class="acts"><button type="button" class="copy" data-v="' . h( $r->{code} ) . '">' . h( $T{copy} ) . '</button>'
+        . ( $full ne '' ? ' <button type="button" class="copy" data-v="' . h($full) . '">' . h( $T{copy_cn} ) . '</button>' : '' )
+        . $apply . '</div></div>' . $cls;
+    return $html if $p->{class} eq '';
+    return $html . '<p class="ok">' . h( $T{not_used} ) . '</p>' unless @{ $r->{used} };
+    $html .= '<p>' . h( $T{used} ) . '</p><table class="list"><tbody>'
+        . join( '', map { '<tr><td class="n">' . h( $_->{call_number} ) . '</td><td>' . h( $_->{author} ) . '</td><td>' . h( $_->{title} ) . '</td></tr>' } @{ $r->{used} } )
+        . '</tbody></table>';
+    if ( @{ $r->{alternatives} } ) {
+        $html .= '<p>' . h( $T{other} ) . '</p><ul class="alt">'
+            . join( '', map { '<li><b>' . h( $_->{number} ) . '</b> (' . h( $_->{free} ? $T{free} : $T{in_use} ) . ')</li>' } @{ $r->{alternatives} } )
+            . '</ul>';
+    }
+    return $html;
+}
+
+sub page {
+    my ( $p, $r ) = @_;
+    my $count = 0;
+    if ( $p->{table} ne '' && open( my $fh, '<', $TABLES{ $p->{table} } ) ) { $count++ while <$fh>; close $fh }
+    ( my $info = $T{table_info} ) =~ s/\{n\}/$count/;
+    my $opts = sub { my $cur = shift; join '', map { '<option value="' . $_->[0] . '"' . ( $cur eq $_->[0] ? ' selected' : '' ) . '>' . h( $_->[1] ) . '</option>' } @_ };
+    my $sel = $opts->( $p->{mode}, [ auto => $T{m_auto} ], [ person => $T{m_person} ], [ corporate => $T{m_corporate} ], [ title => $T{m_title} ] );
+    my $tsel = $opts->( $p->{table}, map { [ $_ => $T{"t_$_"} ] } grep { -s $TABLES{$_} } qw( pha cutter ) );
+    my $nol = $p->{noletter} ? ' checked' : '';
+    my $ssel = $opts->( $p->{scheme}, map { [ $_ => $T{"s_$_"} ] } qw( auto cdd cdu local ) );
+    my $stab = $opts->( '', map { [ $_ => $T{"t_$_"} ] } grep { -s $TABLES{$_} } qw( pha cutter ) );
+    my $sset = $opts->( '', map { [ $_ => $T{"s_$_"} ] } qw( auto cdd cdu local ) );
+    my $js   = JSON::PP->new->ascii->encode( { target => $p->{target}, copied => $T{copied}, gone => $T{gone} } );
+    my $home = $p->{target} ? '' : '<a class="back" href="/cgi-bin/koha/cataloguing/cataloging-home.pl">' . h( $T{cataloguing} ) . '</a>';
+    my $res  = result_html( $p, $r );
+    my $f    = sub { my $k = shift; return h( $p->{$k} ) };
+    return <<"HTML" . page_script($js);
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>@{[ h( $T{title} ) ]}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; color: #222; background: #fff; }
+    header { background: #408540; color: #fff; padding: 10px 16px; display: flex; gap: 16px; align-items: center; }
+    header h1 { font-size: 1.2em; margin: 0; } header a.back { color: #fff; font-size: .9em; text-decoration: none; }
+    header .gear { margin-left: auto; background: transparent; color: #fff; border: 1px solid #fff; font-size: .9em; }
+    #kei-set { padding: 12px 16px; background: #fffdf3; border-bottom: 1px solid #eadfb4; } #kei-set h2 { font-size: 1em; margin: 0 0 4px; }
+    #kei-set .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px 14px; margin: 8px 0; }
+    .cls { margin: 10px 0; } h3 { font-size: 1em; margin: 14px 0 6px; } td.act { text-align: right; white-space: nowrap; }
+    form { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px 14px; padding: 14px 16px; background: #f3f7f3; border-bottom: 1px solid #dde7dd; }
+    label { display: block; font-size: .8em; color: #555; margin-bottom: 3px; }
+    .chk { align-self: end; } .chk label { font-size: .9em; color: #222; } .chk input { width: auto; }
+    input, select { width: 100%; box-sizing: border-box; padding: 7px; font-size: 1em; border: 1px solid #aaa; border-radius: 3px; }
+    main { padding: 8px 16px 24px; max-width: 900px; }
+    .res { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; margin: 14px 0; }
+    .res .big { font-size: 2.4em; font-weight: bold; color: #306030; letter-spacing: .03em; }
+    .facts { line-height: 1.6; } .acts { margin-left: auto; }
+    button { padding: 5px 10px; margin: 2px; border: 1px solid #408540; background: #fff; color: #306030; border-radius: 3px; cursor: pointer; font-size: .9em; }
+    button.apply { background: #408540; color: #fff; }
+    table.list { border-collapse: collapse; width: 100%; } table.list td { border-bottom: 1px solid #eee; padding: 5px 6px; } td.n { white-space: nowrap; font-weight: bold; }
+    .hint { color: #777; } .ok { color: #306030; } .msg { margin-top: 12px; padding: 10px; border-radius: 4px; } .warn { background: #fcf8e3; color: #8a6d3b; }
+    footer { padding: 10px 16px; color: #888; font-size: .8em; border-top: 1px solid #eee; }
+    \@media (max-width: 640px) { .acts { margin-left: 0; } }
+  </style>
+</head>
+<body>
+<header><h1>@{[ h( $T{title} ) ]}</h1><button type="button" class="gear" id="kei-gear" aria-expanded="false">&#9881; @{[ h( $T{settings} ) ]}</button>$home</header>
+<section id="kei-set" hidden>
+  <h2>@{[ h( $T{settings} ) ]}</h2>
+  <p class="hint">@{[ h( $T{set_intro} ) ]}</p>
+  <div class="grid">
+    <div><label for="kei-s-table">@{[ h( $T{f_table} ) ]}</label><select id="kei-s-table">$stab</select></div>
+    <div><label for="kei-s-scheme">@{[ h( $T{f_scheme} ) ]}</label><select id="kei-s-scheme">$sset</select></div>
+    <div class="chk"><label><input type="checkbox" id="kei-s-letter"> @{[ h( $T{set_letter} ) ]}</label></div>
+    <div class="chk"><label><input type="checkbox" id="kei-s-edition"> @{[ h( $T{set_edition} ) ]}</label></div>
+    <div class="chk"><label><input type="checkbox" id="kei-s-copy"> @{[ h( $T{set_copy} ) ]}</label></div>
+  </div>
+  <button type="button" class="apply" id="kei-s-save">@{[ h( $T{save} ) ]}</button> <button type="button" id="kei-s-close">@{[ h( $T{close} ) ]}</button>
+</section>
+<form id="kei-form" method="get" action="cutter_calculator.pl" autocomplete="off">
+  <div><label for="kei-name">@{[ h( $T{f_name} ) ]}</label><input id="kei-name" name="name" value="@{[ $f->('name') ]}" placeholder="@{[ h( $T{f_name_ph} ) ]}" autofocus></div>
+  <div><label for="kei-title">@{[ h( $T{f_title} ) ]}</label><input id="kei-title" name="title" value="@{[ $f->('title') ]}"></div>
+  <div><label for="kei-class">@{[ h( $T{f_class} ) ]}</label><input id="kei-class" name="class" value="@{[ $f->('class') ]}" placeholder="869.3"></div>
+  <div><label for="kei-mode">@{[ h( $T{f_mode} ) ]}</label><select id="kei-mode" name="mode">$sel</select></div>
+  <div><label for="kei-table">@{[ h( $T{f_table} ) ]}</label><select id="kei-table" name="table">$tsel</select></div>
+  <div><label for="kei-scheme">@{[ h( $T{f_scheme} ) ]}</label><select id="kei-scheme" name="scheme">$ssel</select></div>
+  <div><label for="kei-edition">@{[ h( $T{f_edition} ) ]}</label><input id="kei-edition" name="edition" value="@{[ $f->('edition') ]}" inputmode="numeric" placeholder="2"></div>
+  <div><label for="kei-copy">@{[ h( $T{f_copy} ) ]}</label><input id="kei-copy" name="copy" value="@{[ $f->('copy') ]}" inputmode="numeric" placeholder="2"></div>
+  <div class="chk"><label><input type="checkbox" name="noletter" value="1"$nol> @{[ h( $T{f_noletter} ) ]}</label></div>
+  <input type="hidden" name="ind2" value="@{[ $f->('ind2') ]}">
+  <input type="hidden" name="bn" value="@{[ $f->('bn') ]}">
+  <input type="hidden" name="c080" value="@{[ $f->('c080') ]}">
+  <input type="hidden" name="c082" value="@{[ $f->('c082') ]}">
+  <input type="hidden" name="c084" value="@{[ $f->('c084') ]}">
+  <input type="hidden" name="subjects" value="@{[ $f->('subjects') ]}">
+  <input type="hidden" name="target" value="@{[ $f->('target') ]}">
+  <noscript><button type="submit">OK</button></noscript>
+</form>
+<main id="kei-out">
+$res
+</main>
+<footer>@{[ h($info) ]}</footer>
+HTML
+}
+
+# The script of the page: the result follows the typing (format=part), Copy
+# and "Use in the record" (the notation goes into the field the page was
+# opened from: 090 / 092 $b take the notation, a call number keeps its class).
+sub page_script {
+    my $js = shift;
+    return "<script>\nvar K = $js;\n" . <<'JS';
+(function () {
+    var form = document.getElementById("kei-form"), out = document.getElementById("kei-out"), timer = null, seq = 0;
+    function refresh() {
+        var q = [], els = form.elements, my = ++seq;
+        for (var i = 0; i < els.length; i++) {
+            if (!els[i].name || (els[i].type === "checkbox" && !els[i].checked)) continue;
+            q.push(encodeURIComponent(els[i].name) + "=" + encodeURIComponent(els[i].value));
+        }
+        q.push("format=part");
+        var x = new XMLHttpRequest();
+        x.open("GET", "cutter_calculator.pl?" + q.join("&"));
+        x.onload = function () { if (my === seq && x.status === 200) out.innerHTML = x.responseText; };
+        x.send();
+    }
+    form.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(refresh, 150); });
+    form.addEventListener("change", function () { clearTimeout(timer); timer = setTimeout(refresh, 50); });
+    form.addEventListener("submit", function (e) { e.preventDefault(); refresh(); });
+    // Settings of the gear (this browser only): table, classification, the
+    // letter of the title, edition and copy added when the record has them.
+    var S = { table: "", scheme: "auto", letter: true, edition: true, copy: true }, F = form.elements;
+    var orig = { edition: F.edition.value, copy: F.copy.value };
+    try {
+        var raw = localStorage.getItem("kei_callno_settings"), o = raw ? JSON.parse(raw) : { table: localStorage.getItem("kei_cutter_table") || "" };
+        for (var k in S) if (o && o.hasOwnProperty(k) && o[k] !== null) S[k] = o[k];
+    } catch (e) {}
+    function given(n) { return new RegExp("[?&]" + n + "=").test(location.search); }
+    function pick(sel, v) { for (var j = 0; j < sel.options.length; j++) if (sel.options[j].value === v) { if (sel.value === v) return false; sel.value = v; return true; } return false; }
+    function settle(first) {
+        var changed = false;
+        if (S.table && (!first || !given("table")) && pick(F.table, S.table)) changed = true;
+        if ((!first || !given("scheme")) && pick(F.scheme, S.scheme)) changed = true;
+        if ((!first || !given("noletter")) && F.noletter.checked !== !S.letter) { F.noletter.checked = !S.letter; changed = true; }
+        var want = { edition: S.edition ? orig.edition : "", copy: S.copy ? orig.copy : "" };
+        for (var f in want) if (F[f].value !== want[f] && (F[f].value === orig[f] || F[f].value === "")) { F[f].value = want[f]; changed = true; }
+        if (changed) refresh();
+    }
+    settle(true);
+    F.table.addEventListener("change", function () { S.table = F.table.value; save(); });
+    function save() { try { localStorage.setItem("kei_callno_settings", JSON.stringify(S)); } catch (e) {} }
+    var box = document.getElementById("kei-set"), gear = document.getElementById("kei-gear");
+    function el(id) { return document.getElementById(id); }
+    function show(on) {
+        box.hidden = !on; gear.setAttribute("aria-expanded", on ? "true" : "false");
+        if (!on) return;
+        pick(el("kei-s-table"), S.table || F.table.value);
+        pick(el("kei-s-scheme"), S.scheme);
+        el("kei-s-letter").checked = !!S.letter; el("kei-s-edition").checked = !!S.edition; el("kei-s-copy").checked = !!S.copy;
+    }
+    gear.addEventListener("click", function () { show(box.hidden); });
+    el("kei-s-close").addEventListener("click", function () { show(false); });
+    el("kei-s-save").addEventListener("click", function () {
+        S = { table: el("kei-s-table").value, scheme: el("kei-s-scheme").value, letter: el("kei-s-letter").checked, edition: el("kei-s-edition").checked, copy: el("kei-s-copy").checked };
+        save(); show(false); settle(false);
+    });
+    function fallback(v) {
+        var t = document.createElement("textarea"); t.value = v; document.body.appendChild(t); t.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(t);
+    }
+    function copy(v, btn) {
+        var done = function () { if (btn) { btn.textContent = K.copied; } };
+        if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(v).then(done, function () { fallback(v); done(); }); }
+        else { fallback(v); done(); }
+    }
+    // 090 / 092: the class goes to $a and the Cutter number to $b of the
+    // same field; a call number (952 $o) takes both, keeping a location
+    // prefix typed before the class (R 869.3 A848d).
+    function put(x, v, w) { x.value = v; try { x.dispatchEvent(new w.Event("change", { bubbles: true })); } catch (e) {} }
+    function sibling(x, tag, code) {
+        var sel = "input[id^='tag_" + tag + "_subfield_" + code + "']", box = x.closest ? x.closest("div.tag") : null;
+        return (box && box.querySelector(sel)) || x.ownerDocument.querySelector(sel);
+    }
+    function apply(n, cls, btn) {
+        var w = window.opener, el = null;
+        try { el = w && !w.closed ? w.document.getElementById(K.target) : null; } catch (e) { el = null; }
+        if (!el) { copy(cls ? cls + " " + n : n, btn); alert(K.gone); return; }
+        var t = K.target.match(/^tag_(09[0-9])_subfield_([ab])/), v = el.value.replace(/^\s+|\s+$/g, "");
+        if (t && t[2] === "b") {
+            put(el, n, w);
+            var a = sibling(el, t[1], "a");
+            if (a && cls && !a.value) put(a, cls, w);
+        } else if (t) {
+            var b = sibling(el, t[1], "b");
+            if (b) { if (cls) put(el, cls, w); put(b, n, w); } else put(el, (cls ? cls + " " : "") + n, w);
+        } else if (cls) {
+            var i = v.indexOf(cls);
+            put(el, (i > 0 ? v.slice(0, i) : "") + cls + " " + n, w);
+        } else {
+            var m = v.match(/^(.*?\d{3}(?:[.,]\d+)?)(?:\s|$)/);
+            put(el, m ? m[1] + " " + n : n, w);
+        }
+        el.focus();
+        window.close();
+    }
+    out.addEventListener("click", function (e) {
+        var b = e.target.closest ? e.target.closest("button") : null;
+        if (!b) return;
+        e.preventDefault();
+        if (b.className === "use") { F["class"].value = b.getAttribute("data-class"); refresh(); }
+        else if (b.className === "apply") apply(b.getAttribute("data-n"), b.getAttribute("data-c"), b);
+        else copy(b.getAttribute("data-v"), b);
+    });
+})();
+</script>
+</body>
+</html>
+JS
+}
+CUTPL2
+}
+
+# The buttons in the staff interface (a marked block in IntranetUserJS):
+# Cutter next to 090 and 092 $b and the item call number (952 $o) of the
+# cataloguing forms, after the CDD button when there is one, and Cutter
+# Calculator in the tools of the cataloguing home page. The author, title
+# and class come from the form (from the record in the item editor).
+cutter_js_block() {
+    local label title cn cn_title v
+    label=$(t "Cutter Calculator")
+    title=$(t "Work out the Cutter number of the author and use it in this field")
+    cn=$(t "Call number")
+    cn_title=$(t "Work out the call number (class and Cutter) and use it in this field")
+    for v in label title cn cn_title; do
+        declare -n _s=$v
+        _s=${_s//\\/\\\\}; _s=${_s//\"/\\\"}; _s=${_s//</\\u003c}
+        unset -n _s
+    done
+    cat <<CUTJS
+${CUTTER_JS_BEGIN}
+\$(document).ready(function () {
+    var url = "/cgi-bin/koha/cataloguing/cutter_calculator.pl";
+    if (/\/cgi-bin\/koha\/cataloguing\/cataloging-home\.pl\$/.test(location.pathname)) {
+        var tools = \$("a[href*='tools/inventory.pl'], a[href*='marc_modification_templates.pl'], a[href*='labels/label-home.pl']").closest("ul").first();
+        if (!tools.length) tools = \$("a[href*='/cgi-bin/koha/tools/']").closest("ul").last();
+        if (tools.length && !tools.find("a[href*='cutter_calculator.pl']").length) {
+            var cls = tools.find("a").first().attr("class") || "circ-button";
+            var a = \$("<a></a>").attr({ "class": cls, href: url }).append(\$("<i></i>").attr("class", "fa fa-calculator")).append(document.createTextNode(" ${label}"));
+            tools.append(\$("<li></li>").append(a));
+        }
+        return;
+    }
+    if (!/\/cgi-bin\/koha\/cataloguing\/(addbiblio|additem)\.pl\$/.test(location.pathname)) return;
+    // Cutter next to 090 / 092 \$b; Call number next to 090 / 092 \$a and
+    // the item call number: the same page, which fills both parts.
+    var cutter = "input[id^='tag_090_subfield_b'], input[id^='tag_092_subfield_b']";
+    var callno = "input[id^='tag_090_subfield_a'], input[id^='tag_092_subfield_a'], input[id^='tag_952_subfield_o']";
+    function button(sel, cls, text, tip) {
+        \$(sel).each(function () {
+            if (\$(this).nextAll("." + cls).length) return;
+            var after = \$(this).nextAll(".kei-cdd").first();
+            (after.length ? after : \$(this)).after(\$("<a href=\"#\" style=\"margin-left:4px\"></a>").attr({ "class": cls + " buttonDot", title: tip }).text(text));
+        });
+    }
+    function add() {
+        button(cutter, "kei-cutter", "Cutter", "${title}");
+        button(callno, "kei-callno", "${cn}", "${cn_title}");
+    }
+    add();
+    new MutationObserver(add).observe(document.body, { childList: true, subtree: true });
+    function val(sel) { var v = ""; \$(sel).each(function () { if (!v && this.value) v = this.value; }); return v; }
+    // The class part of a call number: what comes before the Cutter number.
+    function classOf(v) {
+        var t = \$.trim(v || "").split(/\s+/), out = [];
+        for (var i = 0; i < t.length && t[i]; i++) { if (/^[A-Z]\d{1,4}[a-z]*\$/.test(t[i])) break; out.push(t[i]); }
+        return out.join(" ").slice(0, 40);
+    }
+    \$(document).on("click", "a.kei-cutter, a.kei-callno", function (e) {
+        e.preventDefault();
+        var input = \$(this).prevAll("input").first()[0];
+        if (!input) return;
+        var p = { target: input.id }, bn = (location.search.match(/[?&]biblionumber=(\d+)/) || [])[1];
+        if (bn) p.bn = bn;
+        if (!/_subfield_b/.test(input.id)) p["class"] = classOf(input.value);
+        if (/addbiblio\.pl\$/.test(location.pathname)) {
+            var a100 = val("input[id^='tag_100_subfield_a']"), a11x = val("input[id^='tag_110_subfield_a'], input[id^='tag_111_subfield_a']");
+            if (a100) { p.name = a100.replace(/[,.\s]+\$/, ""); p.mode = "person"; }
+            else if (a11x) { p.name = a11x; p.mode = "corporate"; }
+            else p.mode = "title";
+            p.title = val("input[id^='tag_245_subfield_a'], textarea[id^='tag_245_subfield_a']").replace(/[\s\/:;=.]+\$/, "");
+            p.ind2 = val("input[name^='tag_245_indicator2']");
+            p.edition = (val("input[id^='tag_250_subfield_a']").match(/\d{1,3}/) || [""])[0];
+            if (!p["class"]) p["class"] = classOf(val("input[id^='tag_090_subfield_a']"));
+            p.c080 = val("input[id^='tag_080_subfield_a']");
+            p.c082 = val("input[id^='tag_082_subfield_a']");
+            p.c084 = val("input[id^='tag_084_subfield_a']");
+            var subj = [];
+            \$("input[id^='tag_650_subfield_a']").each(function () { if (this.value && subj.length < 3) subj.push(this.value.replace(/[\s.]+\$/, "")); });
+            p.subjects = subj.join(" ; ").slice(0, 300);
+        }
+        var cp = val("input[id^='tag_952_subfield_t']");
+        if (/^\d{1,4}\$/.test(cp)) p.copy = cp;
+        var q = []; for (var k in p) if (p[k]) q.push(k + "=" + encodeURIComponent(p[k]));
+        var w = window.open(url + "?" + q.join("&"), "kei_cutter", "width=900,height=640,scrollbars=yes,resizable=yes");
+        if (w) w.focus();
+    });
+});
+${CUTTER_JS_END}
+CUTJS
+}
+
+cutter_js_sql() {   # cutter_js_sql add|remove FILE: SQL that rewrites IntranetUserJS
+    local cur new
+    cur=$(mr_js_current)
+    cur=$(printf '%s\n' "$cur" | awk -v b="$CUTTER_JS_BEGIN" -v e="$CUTTER_JS_END" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }')
+    new="$cur"
+    if [ "$1" = "add" ]; then new="${cur:+${cur}$'\n'}$(cutter_js_block)"; fi
+    printf "START TRANSACTION;\nUPDATE systempreferences SET value = %s WHERE variable = 'IntranetUserJS';\nCOMMIT;\n" "$(sql_quote "$new")" > "$2"
+}
+
+cutter_installed() { [ -f "$CUTTER_FILE" ]; }
+cutter_js_on() { mr_js_current | grep -qxF "$CUTTER_JS_BEGIN"; }
+cutter_js_latest() { [ "$(mr_js_current | awk -v b="$CUTTER_JS_BEGIN" -v e="$CUTTER_JS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }')" = "$(cutter_js_block)" ]; }
+
+function_cutter() {
+    require_database || return 0
+    local opt status table n
+    while true; do
+        n=$(cat_table_count cutter)
+        if [ "$n" -gt 0 ]; then table="$(t 'Cutter-Sanborn table: ${n} entries.')"; else table="$(t "Cutter-Sanborn table: not loaded yet.")"; fi
+        n=$(cat_table_count pha)
+        if [ "$n" -gt 0 ]; then table+=$'\n'"$(t 'PHA table: ${n} entries.')"; else table+=$'\n'"$(t "PHA table: not loaded yet.")"; fi
+        if cutter_installed; then status="$(t "Installed"): /cgi-bin/koha/cataloguing/cutter_calculator.pl"; else status="$(t "Not installed.")"; fi
+        opt=$(ui_menu "$(t "✂  Cutter Calculator")" "$(t "The call number of a record: the class (CDD, CDU or the library's own codes, from the record or suggested from the catalogue) and the author number from the Cutter-Sanborn or the PHA table of the library, here or in Koha's cataloguing, where the Call number and Cutter buttons put it in the record (with the letter of the title, the edition and the copy as set in the gear of the page). The tables are not distributed with the panel: load the copy of your library (Cutter-Sanborn as text, e.g. 848 Assis; PHA as text or the PDF of the book, even scanned).")"$'\n\n'"$table"$'\n'"$status" \
+            "1" "$(t "Calculate a Cutter number")" \
+            "2" "$(t "Load the Cutter-Sanborn table")" \
+            "3" "$(t "Load the PHA table (text, or the PDF of the book)")" \
+            "4" "$(t "Install or update the page in the staff interface")" \
+            "5" "$(t "Remove the page (the tables are kept)")") || return 0
+        case "$opt" in
+            1) lt_cutter_calc ;;
+            2) lt_cat_load cutter ;;
+            3) lt_cat_load pha ;;
+            4) lt_cutter_install ;;
+            5) lt_cutter_remove ;;
+        esac
+        clear
+    done
+}
+
+# The reader of the PHA book (Python, run as the instance user): the rows
+# "Entry number Entry" of the text of the PDF or of its OCR, with the
+# numbers the OCR misread put back in order (see its own notes).
+cat_pha_rows_py() {
+    cat <<'PHAROWS'
+"""
+pha_rows.py (koha-easy-installer): the rows of the PHA table (Heloísa de
+Almeida Prado) from the text of the book, as pdftotext -layout or an OCR
+(tesseract) gives it: two letters per page spread ("D F"), each line with
+one or more "Entry number Entry" groups (Davidson 28 Favo  Deb 33 Fein).
+
+Out: "left<TAB>number<TAB>right" lines in the order of the book (each pair of
+letters in the alphabetical order of its entries), which the panel's table import
+reads. The numbers of the book follow the decimal order (28, 281 ... 289,
+29) inside each pair of letters, so a number the OCR misread (3 for 8, 5 for
+6...) is corrected when one changed digit puts it back in that order; the
+rest stays as read and the import lists it for checking against the book.
+
+    Usage: pha_rows.py TEXT OUT    (pages separated by form feeds)
+Prints "rows=N", "fixed=N", "pages=N" and up to 40 "fix=..." lines.
+Nothing is sent anywhere; only the standard library is used.
+"""
+import re
+import sys
+import unicodedata
+from collections import Counter
+
+NUM = re.compile(r"^\d{1,4}$")
+# Digits the OCR confuses in the typeface of the book.
+SIMILAR = {"3": "85", "8": "369", "5": "36", "6": "58", "1": "74", "7": "1", "9": "83", "0": "86", "4": "1"}
+
+
+def words(line):
+    """Tokens of a line; OCR noise (bars, colons, stray marks) left out."""
+    out = []
+    for tok in line.split():
+        tok = tok.strip("|:;,_—-~'`\"“”‘’«»()[]{}")
+        if tok and re.search(r"[0-9A-Za-zÀ-ÿ]", tok):
+            out.append(tok)
+    return out
+
+
+def is_initial(tok):
+    return bool(re.fullmatch(r"[A-ZÀ-Þ]\.?", tok))
+
+
+def page_groups(lines):
+    """[(left, number, right, column, letters)] of one page spread."""
+    found = []
+    for line in lines:
+        toks = words(line)
+        idx = [i for i, t in enumerate(toks) if NUM.match(t)]
+        if not idx:
+            continue
+        segs = [toks[:idx[0]]] + [toks[a + 1:b] for a, b in zip(idx, idx[1:])] + [toks[idx[-1] + 1:]]
+        # Before the first number: the left entry (noise before it dropped:
+        # the last word that is not an initial starts it).
+        first = segs[0]
+        k = next((j for j in range(len(first) - 1, -1, -1) if not is_initial(first[j]) and len(first[j]) > 1), 0)
+        lefts, rights = [first[k:]], []
+        for seg in segs[1:-1]:
+            # The right entry: a word and the initials after it; the rest is
+            # the left entry of the next group.
+            k = 1
+            while k < len(seg) - 1 and is_initial(seg[k]):
+                k += 1
+            rights.append(seg[:k])
+            lefts.append(seg[k:])
+        last = segs[-1]
+        k = 1
+        while k < len(last) and is_initial(last[k]):
+            k += 1
+        rights.append(last[:k])
+        for col, (n, le, ri) in enumerate(zip(idx, lefts, rights)):
+            le, ri = " ".join(le), " ".join(ri)
+            if le and ri and le[0].isalpha() and ri[0].isalpha() and short(le) and short(ri):
+                found.append((le, toks[n], ri, col))
+    # The letters of each column: the most common initials in it (a spread
+    # can hold two pairs, as "E I" and "O U").
+    letters = {}
+    for col in {g[3] for g in found}:
+        lc = Counter(g[0][0].upper() for g in found if g[3] == col)
+        rc = Counter(g[2][0].upper() for g in found if g[3] == col)
+        letters[col] = lc.most_common(1)[0][0] + rc.most_common(1)[0][0]
+    groups = [g + (letters[g[3]],) for g in found if (g[0][0].upper() + g[2][0].upper()) == letters[g[3]]]
+    # A page of text (the explanation of the table) has few groups.
+    return groups if len(groups) >= 30 else []
+
+
+def short(entry):
+    """An entry of the table: a word or two and initials, not a sentence."""
+    return len(entry) <= 30 and len(entry.split()) <= 4
+
+
+def key(entry):
+    """The entry as the table sorts it (the panel's name_key, simplified)."""
+    s = unicodedata.normalize("NFD", entry.lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r" +", " ", re.sub(r"[^a-z0-9 ]", " ", s)).strip()
+
+
+def candidates(num):
+    if len(num) > 3:   # a mark of the page read as one more digit
+        return [num[:i] + num[i + 1:] for i in range(len(num))]
+    out = []
+    for i, d in enumerate(num):
+        for s in SIMILAR.get(d, ""):
+            out.append(num[:i] + s + num[i + 1:])
+    # The numbers of the table have no zeros.
+    return [c for c in out if c and "0" not in c]
+
+
+def anchors(nums):
+    """Indexes of the longest increasing run of numbers (decimal order): the
+    numbers the OCR read right; the others are measured against them."""
+    best, prev = [1] * len(nums), [-1] * len(nums)
+    for i in range(len(nums)):
+        for j in range(i):
+            if nums[j] < nums[i] and best[j] + 1 > best[i]:
+                best[i], prev[i] = best[j] + 1, j
+    i = max(range(len(nums)), key=lambda k: best[k]) if nums else -1
+    keep = set()
+    while i >= 0:
+        keep.add(i)
+        i = prev[i]
+    return keep
+
+
+def repair(rows):
+    """Numbers out of the decimal order fixed with one similar digit, when
+    exactly that puts them between the numbers around them."""
+    fixed = []
+    start = 0
+    while start < len(rows):
+        end = start
+        while end < len(rows) and rows[end][4] == rows[start][4]:
+            end += 1
+        nums = [r[1] for r in rows[start:end]]
+        keep = anchors(nums)
+        for i in range(len(nums)):
+            if i in keep:
+                continue
+            lo = next((nums[j] for j in range(i - 1, -1, -1) if j in keep), "")
+            hi = next((nums[j] for j in range(i + 1, len(nums)) if j in keep), None)
+            good = [c for c in candidates(nums[i]) if lo < c and (hi is None or c < hi)]
+            if good:
+                good.sort(key=lambda c: (len(c) != len(nums[i]), c))
+                r = rows[start + i]
+                fixed.append(f"{r[0]} {nums[i]} -> {good[0]}")
+                rows[start + i] = (r[0], good[0]) + r[2:]
+        start = end
+    return fixed
+
+
+def main(src, out):
+    with open(src, encoding="utf-8", errors="replace") as fh:
+        pages = fh.read().split("\f")
+    rows = []
+    for page in pages:
+        rows += page_groups(page.splitlines())
+    # The order of the book: the pairs of letters as they come, each in the
+    # alphabetical order of its entries (more reliable in an OCR than the
+    # order of the columns on the page).
+    first = {}
+    for r in rows:
+        first.setdefault(r[4], len(first))
+    rows.sort(key=lambda r: (first[r[4]], key(r[0])))
+    fixed = repair(rows)
+    with open(out, "w", encoding="utf-8") as fh:
+        for le, num, ri, _, _ in rows:
+            fh.write(f"{le}\t{num}\t{ri}\n")
+    print(f"rows={len(rows)}\nfixed={len(fixed)}\npages={len(pages)}")
+    for f in fixed[:40]:
+        print(f"fix={f}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("usage: pha_rows.py TEXT OUT")
+    main(sys.argv[1], sys.argv[2])
+PHAROWS
+}
+
+# cat_pdf_rows KIND PDF OUT LOG: the rows of an author table from its PDF
+# (only the PHA book: "Entry number Entry"). A PDF with text is read with
+# pdftotext; a scanned book is read page by page with tesseract (OCR, in
+# Portuguese), so it takes a few minutes. Prints the report of the reader.
+cat_pdf_rows() {
+    local kind="$1" pdf="$2" out="$3" log="$4" txt pages p pkg lang
+    txt="$TOOLS_WORK/table-pdf.txt"
+    if ! command -v pdftotext >/dev/null 2>&1 || ! command -v pdftoppm >/dev/null 2>&1; then
+        display_explanation "Installing the tools to read the PDF (poppler-utils)..."
+        apt_install poppler-utils >/dev/null 2>&1
+    fi
+    if ! command -v pdftotext >/dev/null 2>&1; then
+        pkg="poppler-utils"
+        msg_error "" "$(t 'The package ${pkg} could not be installed. Nothing was changed.\n\nLog: ${APT_LOG}')" 10 72
+        return 1
+    fi
+    display_explanation "Reading the text of the PDF..."
+    pdftotext -layout -enc UTF-8 "$pdf" "$txt" >> "$log" 2>&1 || : > "$txt"
+    # A scanned book has no text (or almost none): read the images of the pages.
+    p=$(grep -cE '[[:alpha:]]+ +[0-9]{1,3} +[[:alpha:]]' "$txt" 2>/dev/null)
+    if [ "${p:-0}" -lt 200 ]; then
+        if ! command -v tesseract >/dev/null 2>&1; then
+            display_explanation "Installing the OCR to read the scanned book (tesseract-ocr)..."
+            apt_install tesseract-ocr tesseract-ocr-por >/dev/null 2>&1
+        fi
+        if ! command -v tesseract >/dev/null 2>&1; then
+            pkg="tesseract-ocr"
+            msg_error "" "$(t 'The package ${pkg} could not be installed. Nothing was changed.\n\nLog: ${APT_LOG}')" 10 72
+            return 1
+        fi
+        lang=por; tesseract --list-langs 2>/dev/null | grep -qx por || lang=eng
+        pages=$(pdfinfo "$pdf" 2>/dev/null | sed -n 's/^Pages: *//p')
+        [[ "$pages" =~ ^[0-9]+$ ]] && [ "$pages" -le 400 ] || { msg_error "" "$(t "The PDF could not be read. Nothing was changed.")" 8 64; return 1; }
+        : > "$txt"
+        for ((p = 1; p <= pages; p++)); do
+            printf '\r%s' "$(t 'Reading the scanned book with OCR: page ${p} of ${pages}...')"
+            pdftoppm -r 300 -gray -png -f "$p" -l "$p" "$pdf" "$TOOLS_WORK/ocr-page" >> "$log" 2>&1
+            tesseract "$TOOLS_WORK"/ocr-page*.png - -l "$lang" --psm 6 >> "$txt" 2>> "$log"
+            printf '\f' >> "$txt"
+            rm -f "$TOOLS_WORK"/ocr-page*.png
+        done
+        printf '\n'
+        printf 'ocr=%s pages, %s\n' "$pages" "$lang" >> "$log"
+    fi
+    chown "${INSTANCE}-koha:" "$txt" 2>/dev/null || true
+    cat_pha_rows_py > "$TOOLS_WORK/pha_rows.py"
+    chmod 644 "$TOOLS_WORK/pha_rows.py"
+    : > "$out"; chown "${INSTANCE}-koha:" "$out" 2>/dev/null || true
+    display_explanation "Reading the rows of the table..."
+    koha_exec "$log" pha-rows "$MAGIC_PY" -I "$TOOLS_WORK/pha_rows.py" "$txt" "$out" || return 1
+    tools_output "$log"
+}
+
+lt_cutter_calc() {
+    local kind name title class out
+    if [ ! -s "$(cat_table_path cutter)" ] && [ ! -s "$(cat_table_path pha)" ]; then
+        msg_info "$(t "Cutter Calculator")" "$(t "Load the Cutter-Sanborn or the PHA table of your library first (options 2 and 3).")" 9 70
+        return 0
+    fi
+    kind=$(cat_pick_kind) || return 0
+    name=$(ui_input "$(t "Cutter Calculator")" "$(t "Author as in the heading: Surname, Forename (e.g. Assis, Machado de). For an institution, its name.")" "") || return 0
+    [ -n "${name// /}" ] || return 0
+    title=$(ui_input "$(t "Cutter Calculator")" "$(t "Title of the work (for the initial after the number):")" "") || return 0
+    class=$(ui_input "$(t "Cutter Calculator")" "$(t "Class number (CDD), to check the numbers already used (optional):")" "") || return 0
+    class="${class// /}"
+    if ! [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]]; then
+        msg_error "" "$(t "Invalid class number.")" 8 60
+        return 1
+    fi
+    tools_workdir || return 1
+    out="$TOOLS_WORK/cutter.txt"
+    cat_notation_report "$kind" "$name" "$title" "" person "$class" 0 "$out"
+    ui_textbox "$(t "Cutter Calculator")" "$out"
+}
+
+lt_cutter_install() {
+    if [ ! -d "${KOHA_INTRA_CGI}/cataloguing" ]; then
+        msg_error "" "$(t "The staff interface folder of Koha was not found. Nothing was changed.")" 9 72
+        return 1
+    fi
+    local link="no"
+    prompt_yes_no "$(t "Cutter Calculator")" "$(t "Also add the shortcuts in the staff interface: a Call number button next to the class of 090 and 092 and the item call number, a Cutter button next to the Cutter number of 090 and 092, and Cutter Calculator in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 13 76 && link="yes"
+    tools_locked _lt_cutter_install "$link"
+}
+
+_lt_cutter_install() {
+    local link="$1" log new rules sql restart=0 url note=""
+    log=$(tools_log cutter)
+    new="$TOOLS_WORK/cutter_calculator.pl"
+    rules="$TOOLS_WORK/KohaEasy/Cataloguing/Rules.pm"
+    mkdir -p "${rules%/*}"
+    cutter_page_script > "$new"
+    mr_pm_rules > "$rules"
+    chmod 644 "$new" "$rules"
+    chmod 755 "$TOOLS_WORK/KohaEasy" "${rules%/*}"
+    display_explanation "Checking the page with the Perl modules of Koha..."
+    if ! koha_exec "$log" perl-check /usr/bin/perl -I "$TOOLS_WORK" -c "$new"; then
+        ui_textbox "$(t "Cutter Calculator")" "$log"
+        msg_error "" "$(t 'The page does not compile with this version of Koha. Nothing was changed.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    # The rules module is shared with Replace a MARC record: Plack may hold either.
+    { cutter_installed || mr_installed; } && restart=1
+    if [ "$link" = "yes" ] && ! cutter_js_latest; then
+        tools_safety_backup CUTTER || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cutter_js_sql add "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    { mkdir -p "$MR_PM_DIR" \
+        && install -o root -g root -m 644 "$rules" "$MR_PM_DIR/Rules.pm.new" && mv -f "$MR_PM_DIR/Rules.pm.new" "$MR_PM_DIR/Rules.pm" \
+        && install -o root -g root -m 755 "$new" "${CUTTER_FILE}.new" && mv -f "${CUTTER_FILE}.new" "$CUTTER_FILE"; } || {
+        msg_error "" "$(t "The page could not be installed. Nothing was changed.")" 8 64; return 1; }
+    printf 'installed=%s\nlink=%s\n' "$(date +%F)" "$link" > "$CUTTER_STATE"
+    [ "$restart" = "1" ] && plack_restart
+    url="/cgi-bin/koha/cataloguing/cutter_calculator.pl"
+    [ -s "$(cat_table_path cutter)" ] || [ -s "$(cat_table_path pha)" ] || note="$(t "The page asks for a table until one is loaded (options 2 and 3).")"
+    log "cutter: page installed (link=$link)"
+    msg_ok "$(t '✔ Page installed. In the staff interface: ${url}')"${note:+$'\n\n'"$note"} 11 76
+}
+
+lt_cutter_remove() {
+    cutter_installed || cutter_js_on || { msg_info "$(t "Cutter Calculator")" "$(t "Not installed.")" 8 60; return 0; }
+    prompt_yes_no "$(t "Cutter Calculator")" "$(t "Remove the page and its buttons? The tables are kept.")" 9 74 defaultno || return 0
+    tools_locked _lt_cutter_remove
+}
+
+_lt_cutter_remove() {
+    local log sql
+    log=$(tools_log cutter)
+    if cutter_js_on; then
+        tools_safety_backup CUTTER || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cutter_js_sql remove "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    rm -f "$CUTTER_FILE" "$CUTTER_STATE"
+    # The rules module stays while Replace a MARC record uses it.
+    if ! mr_installed; then
+        rm -f "$MR_PM_DIR/Rules.pm"
+        rmdir "$MR_PM_DIR" 2>/dev/null || true
+    fi
+    plack_restart
+    log "cutter: page removed"
+    msg_ok "$(t "✔ The page was removed.")"
 }
 
 # Loaded with "source installer" (tests/): functions only, no menu.
