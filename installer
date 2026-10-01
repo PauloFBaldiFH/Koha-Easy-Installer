@@ -8711,7 +8711,8 @@ function_library_tools() {
             "11" "$(t "✎  Cataloguing aids: PHA, Cutter, CDD")" \
             "12" "$(t "⇄  Replace a MARC record (staff tool)")" \
             "13" "$(t "⌕  CDD lookup in the cataloguing (staff tool)")" \
-            "14" "$(t "⌁  Koha plugins (turn on or off)")" 3>&1 1>&2 2>&3) || return 0
+            "14" "$(t "⌁  Koha plugins (turn on or off)")" \
+            "15" "$(t "✂  Cutter Calculator")" 3>&1 1>&2 2>&3) || return 0
         case "$opt" in
             1) lt_magic_import ;;
             2) lt_marc_undo ;;
@@ -8727,6 +8728,7 @@ function_library_tools() {
             12) function_marc_replace ;;
             13) function_cdd ;;
             14) function_koha_plugins ;;
+            15) function_cutter ;;
         esac
         clear
     done
@@ -12151,7 +12153,12 @@ function add(e, num,   k, L) {
     }
     # "Entry<sep>number", "number<sep>entry" or the row of the book "Entry number Entry".
     nf = split(line, f, /[\t;]/)
-    if (nf < 2 && index(line, ",")) nf = split(line, f, /,/)
+    # A comma separates only next to the number ("Sampaio M.,184"); in
+    # "127 Abbot, J." (Cutter-Sanborn) it belongs to the entry.
+    if (nf < 2 && index(line, ",")) {
+        nc = split(line, f, /,/)
+        for (i = 1; i <= nc; i++) if (trim(f[i]) ~ /^[0-9]+$/) { nf = nc; break }
+    }
     if (nf < 2) {
         nw = split(line, w, /[ ]+/); left = ""; right = ""; num = ""
         for (i = 1; i <= nw; i++) {
@@ -12275,8 +12282,8 @@ cat_notation_report() {
             printf '\n%s\n' "$(t "Already used in the catalogue (in the same class, two different authors cannot have the same number):")"
             printf '%s\n' "$used" | awk -F'\t' '{ printf "  %-22s %-28s %s\n", $1, substr($2, 1, 28), substr($3, 1, 40) }'
             printf '\n%s\n' "$(t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):")"
-            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free")"
-            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free")"
+            [ -n "$prev" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$prev" "$( [ -n "$(cat_used "$class" "${nota:0:1}${prev}" "$skip")" ] && t "in use" || t "free to use")"
+            [ -n "$nxt" ] && printf '  %s%s  (%s)\n' "${nota:0:1}" "$nxt" "$( [ -n "$(cat_used "$class" "${nota:0:1}${nxt}" "$skip")" ] && t "in use" || t "free to use")"
         elif [ -n "$class" ]; then
             printf '\n%s\n' "$(t "Not used yet in this class in the catalogue.")"
         fi
@@ -12414,8 +12421,8 @@ lt_cat_cdd() {
 }
 
 lt_cat_load() {
-    local kind file utf8 new report problems entries
-    kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
+    local kind="${1:-}" file utf8 new report problems entries
+    [ -n "$kind" ] || kind=$(ui_menu "$(t "Load a table")" "$(t "The tables are copyrighted and are not distributed with the panel. Load the copy of your library: a text file (UTF-8 or Windows-1252) with one entry and its number per line, e.g. Sampaio M.;184, or the rows of the PHA book as printed (Rau 184 Sampaio M.).")" \
         "pha"    "$(cat_table_name pha)" \
         "cutter" "Cutter-Sanborn" \
         "cdd"    "$(t "CDD (Dewey) schedule: number and caption per line")") || return 0
@@ -14838,7 +14845,9 @@ _lt_mr_remove() {
         fi
         memcached_flush || true
     fi
-    rm -f "$MR_FILE" "$MR_STATE" "$MR_PM_DIR/Vision.pm" "$MR_PM_DIR/Rules.pm"
+    rm -f "$MR_FILE" "$MR_STATE" "$MR_PM_DIR/Vision.pm"
+    # The rules module stays while the Cutter Calculator uses it.
+    cutter_installed || rm -f "$MR_PM_DIR/Rules.pm"
     rmdir "$MR_PM_DIR" 2>/dev/null || true
     plack_restart
     log "marc_replace: page removed"
@@ -20294,6 +20303,566 @@ magic_summary() {
     fi
     text+="\n\n$(t 'Records replaced: ${repl}\nPatrons updated: ${upd}\nLoans: ${loans}\nHolds: ${holds}\n\nUndo the records: Library tools > Undo a MARC import.\nSafety backups: ${DIR_SQL}\nLog: ${log}')"
     msg_ok "$text" 20 78
+}
+
+# ======================================================================
+# 37. CUTTER CALCULATOR (PANEL AND STAFF INTERFACE)
+# ----------------------------------------------------------------------
+# The Cutter number of an author from the library's own Cutter-Sanborn
+# table (the three-figure table, "848 Assis" per line), with the same table
+# file and the same rules as Cataloguing aids and the AI cataloguing
+# (cat_notation in the panel, KohaEasy::Cataloguing::Rules::notation in
+# Koha). In the panel: Library tools > Cutter Calculator. In Koha:
+# cataloguing/cutter_calculator.pl, the notation shown as the name is typed,
+# the numbers the class already uses, Copy, and a Cutter button next to
+# 090 / 092 $b and the item call number (952 $o) that reads the author,
+# title and class of the record and puts the notation in the field. The
+# editions of the table are copyrighted: it is not distributed with the
+# panel, each library loads its own copy (CONF_DIR/tables/cutter.tsv). The
+# page only reads Koha.
+# ======================================================================
+CUTTER_FILE="${KOHA_INTRA_CGI}/cataloguing/cutter_calculator.pl"
+CUTTER_STATE="${CONF_DIR}/cutter_calculator.state"
+CUTTER_JS_BEGIN="/* koha-easy-installer cutter begin */"
+CUTTER_JS_END="/* koha-easy-installer cutter end */"
+# Texts of the page (see cutter_text).
+CUTTER_KEYS="title intro f_name f_name_ph f_title f_class f_mode m_person m_corporate m_title entry read_as call_number \
+    copy copy_cn copied apply gone used other free in_use not_used no_table no_letter no_entry table_info cataloguing"
+
+cutter_text() {
+    case "$1" in
+        title)        t "Cutter Calculator" ;;
+        intro)        t "Type the author: the Cutter number appears as you type." ;;
+        f_name)       t "Author (Surname, Forename)" ;;
+        f_name_ph)    t "e.g. Assis, Machado de" ;;
+        f_title)      t "Title (for the letter after the number)" ;;
+        f_class)      t "Class number (optional, to check the numbers in use)" ;;
+        f_mode)       t "Main entry" ;;
+        m_person)     t "Person" ;;
+        m_corporate)  t "Institution (first word)" ;;
+        m_title)      t "Title (no author)" ;;
+        entry)        t "Table entry used" ;;
+        read_as)      t "Read as" ;;
+        call_number)  t "Call number" ;;
+        copy)         t "Copy" ;;
+        copy_cn)      t "Copy the call number" ;;
+        copied)       t "Copied" ;;
+        apply)        t "Use in the record" ;;
+        gone)         t "The cataloguing form was closed or changed: the number was copied instead." ;;
+        used)         t "Already used in the catalogue (in the same class, two different authors cannot have the same number):" ;;
+        other)        t "If it is another author, use the number right before or right after it, or add one more digit (e.g. 1753):" ;;
+        free)         t "free to use" ;;
+        in_use)       t "in use" ;;
+        not_used)     t "Not used yet in this class in the catalogue." ;;
+        no_table)     t "The Cutter-Sanborn table has not been loaded yet. In the panel: Library tools > Cutter Calculator > Load the Cutter-Sanborn table." ;;
+        no_letter)    t "No notation: the name must start with a letter (write it as Surname, Forename)." ;;
+        no_entry)     t "The table has no entry for this letter." ;;
+        table_info)   t "Cutter-Sanborn table of the library: {n} entries." ;;
+        cataloguing)  t "Cataloguing" ;;
+    esac
+}
+
+# The page: Perl code around the strings of the panel language.
+cutter_page_script() {
+    cat <<'CUTPL1'
+#!/usr/bin/perl
+
+# cutter_calculator.pl (koha-easy-installer)
+# The Cutter number of an author while cataloguing: the notation of the
+# library's Cutter-Sanborn table (the entry right before the name in
+# alphabetical order, the initial, the number and the initial of the title
+# without its article), worked out by KohaEasy::Cataloguing::Rules, the
+# same rules as the panel. The class number shows the call numbers of the
+# catalogue that already use the same Cutter number in that class.
+# Opened from the Cutter button next to 090 / 092 $b and the item call
+# number (952 $o), "Use in the record" puts the notation in that field;
+# otherwise it is copied. ?format=json answers with the result as JSON.
+# Installed and removed by the panel (Library tools > Cutter Calculator).
+#
+# Read only: nothing in Koha is changed by this page. The table is the
+# library's own copy, loaded by the panel; it is not distributed with it.
+#
+# Under Koha's persistent Plack the Perl process lives between requests:
+# no named sub captures file-scope lexical variables (package variables).
+
+use Modern::Perl;
+use CGI qw ( -utf8 );
+use C4::Auth qw( checkauth );
+use C4::Context;
+use Encode qw( decode encode );
+use JSON::PP;
+use MIME::Base64 qw( decode_base64 );
+use KohaEasy::Cataloguing::Rules;
+
+sub _d { return decode( 'UTF-8', decode_base64( $_[0] ) ) }
+CUTPL1
+    local k
+    printf "our \$TABLE = '%s';\nour %%T = (\n" "$(cat_table_path cutter)"
+    for k in $CUTTER_KEYS; do
+        printf '    %s => _d(q{%s}),\n' "$k" "$(cutter_text "$k" | base64 -w0)"
+    done
+    printf ');\n'
+    cat <<'CUTPL2'
+
+run();
+
+sub h {
+    my $s = shift // '';
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    $s =~ s/'/&#39;/g;
+    return $s;
+}
+
+sub run {
+    my $cgi = CGI->new;
+    # Any member of the staff who can see the catalogue (read only).
+    my ( $user, $cookie ) = checkauth( $cgi, 0, { catalogue => 1 }, 'intranet' );
+    my %p = map { my $v = $cgi->param($_) // ''; $v =~ s/^\s+|\s+$//g; $v =~ s/\s+/ /g; ( $_ => substr( $v, 0, 300 ) ) } qw( name title ind2 mode class bn target format );
+    $p{mode}   = 'person' unless $p{mode} =~ /^(person|corporate|title)$/;
+    $p{target} = ''       unless $p{target} =~ /^[A-Za-z0-9_-]{1,80}$/;
+    $p{bn}     = ''       unless $p{bn} =~ /^[0-9]{1,10}$/;
+    $p{ind2}   = ''       unless $p{ind2} =~ /^[0-9]$/;
+    $p{class}  = ''       unless $p{class} =~ m{^[0-9A-Za-z./ -]{1,24}$};
+    # From the item editor only the record is known: its 100 / 110 / 245 / 082.
+    from_record( \%p ) if $p{bn} ne '' && $p{name} eq '' && $p{title} eq '';
+    my $r = calculate( \%p );
+    if ( $p{format} eq 'json' ) {
+        print $cgi->header( -type => 'application/json', -cookie => $cookie, -charset => 'utf-8' );
+        print JSON::PP->new->utf8->canonical->encode($r);
+        return;
+    }
+    print $cgi->header( -cookie => $cookie, -charset => 'utf-8' );
+    print encode( 'UTF-8', $p{format} eq 'part' ? result_html( \%p, $r ) : page( \%p, $r ) );
+    return;
+}
+
+sub xml_text {
+    my $s = shift // '';
+    $s =~ s/&lt;/</g;
+    $s =~ s/&gt;/>/g;
+    $s =~ s/&quot;/"/g;
+    $s =~ s/&apos;/'/g;
+    $s =~ s/&#(\d+);/chr $1/ge;
+    $s =~ s/&#x([0-9a-fA-F]+);/chr hex $1/ge;
+    $s =~ s/&amp;/&/g;
+    return $s;
+}
+
+# The heading, title and class of a catalogue record (MARCXML).
+sub from_record {
+    my $p = shift;
+    my ($xml) = eval { C4::Context->dbh->selectrow_array( q{SELECT metadata FROM biblio_metadata WHERE biblionumber = ? AND format = 'marcxml'}, undef, $p->{bn} ) };
+    return unless defined $xml;
+    $xml = decode( 'UTF-8', $xml ) unless utf8::is_utf8($xml);
+    my $sub = sub {
+        my ( $tag, $code ) = @_;
+        my ($f) = $xml =~ m{<datafield tag="$tag"[^>]*>(.*?)</datafield>}s or return '';
+        my ($v) = $f =~ m{<subfield code="$code">([^<]*)</subfield>} or return '';
+        return KohaEasy::Cataloguing::Rules::trim( xml_text($v) );
+    };
+    my ( $a100, $a110, $a111, $t245 ) = ( $sub->( '100', 'a' ), $sub->( '110', 'a' ), $sub->( '111', 'a' ), $sub->( '245', 'a' ) );
+    $t245 =~ s/[\s\/:;=.]+$//;
+    my ($ind2) = $xml =~ m{<datafield tag="245"[^>]*ind2="([0-9])"};
+    if    ( $a100 ne '' )          { ( $p->{name} = $a100 ) =~ s/[,.\s]+$//; $p->{mode} = 'person' }
+    elsif ( "$a110$a111" ne '' )   { $p->{name} = $a110 ne '' ? $a110 : $a111; $p->{mode} = 'corporate' }
+    else                           { $p->{mode} = 'title' }
+    $p->{title} = $t245;
+    $p->{ind2}  = $ind2 // '';
+    if ( $p->{class} eq '' ) {
+        my $c090 = $sub->( '090', 'a' );
+        my ($c082) = $sub->( '082', 'a' ) =~ /([0-9]{3}(?:\.[0-9]+)?)/;
+        $p->{class} = $c090 =~ m{^[0-9A-Za-z./ -]{1,24}$} ? $c090 : $c082 // '';
+    }
+    return;
+}
+
+# Call numbers of the catalogue with the class and the Cutter number BASE
+# (A848, not A8481), other records than BN: [ call number, author, title ].
+sub used {
+    my ( $class, $base, $bn ) = @_;
+    ( my $c = $class ) =~ s/\./\\./g;
+    $c =~ s/ /[[:space:]]+/g;
+    my $re = "(^|[[:space:]])${c}[[:space:]]+${base}([^0-9]|\$)";
+    return eval {
+        C4::Context->dbh->selectall_arrayref( q{/* kei-cutter:used */
+            SELECT DISTINCT i.itemcallnumber, COALESCE(b.author, ''), COALESCE(b.title, '')
+            FROM items i JOIN biblio b ON b.biblionumber = i.biblionumber
+            WHERE i.itemcallnumber REGEXP ? AND i.biblionumber <> ?
+            ORDER BY i.itemcallnumber LIMIT 20}, undef, $re, $bn eq '' ? 0 : $bn );
+    } || [];
+}
+
+# The result: { notation, entry, number, read_as, call_number, used,
+# alternatives } or { error => no_table | no_letter | no_entry }.
+sub calculate {
+    my $p = shift;
+    my %r = map { $_ => $p->{$_} } qw( name title ind2 mode class );
+    unless ( -s $TABLE ) { $r{error} = 'no_table'; return \%r }
+    my $name = $p->{name};
+    # "Machado de Assis" is read "Assis, Machado de" (AACR2, as the AI cataloguing does).
+    if ( $p->{mode} eq 'person' && index( $name, ',' ) < 0 && $name =~ /^\p{L}\S* / ) {
+        $name = KohaEasy::Cataloguing::Rules::invert_name($name);
+        $r{read_as} = $name;
+    }
+    return \%r if ( $p->{mode} eq 'title' ? $p->{title} : $name ) eq '';
+    my $n = KohaEasy::Cataloguing::Rules::notation( $TABLE, $name, $p->{title}, $p->{ind2}, $p->{mode} );
+    if ( $n->{error} ) {
+        $r{error} = { 2 => 'no_table', 3 => 'no_letter', 4 => 'no_entry' }->{ $n->{error} } // 'no_letter';
+        return \%r;
+    }
+    my $L = substr( $n->{notation}, 0, 1 );
+    $r{$_} = $n->{$_} for qw( notation entry number );
+    $r{call_number} = join ' ', grep { $_ ne '' } $p->{class}, $n->{notation};
+    if ( $p->{class} ne '' ) {
+        $r{used} = [ map { { call_number => $_->[0], author => $_->[1], title => $_->[2] } } @{ used( $p->{class}, $L . $n->{number}, $p->{bn} ) } ];
+        $r{alternatives} = [ map { { number => $L . $_, free => @{ used( $p->{class}, $L . $_, $p->{bn} ) } ? JSON::PP::false : JSON::PP::true } } grep { $_ ne '' } $n->{prev}, $n->{next} ]
+            if @{ $r{used} };
+    }
+    return \%r;
+}
+
+sub result_html {
+    my ( $p, $r ) = @_;
+    return '<div class="msg warn">' . h( $T{ $r->{error} } ) . '</div>' if $r->{error};
+    return '<p class="hint">' . h( $T{intro} ) . '</p>' unless $r->{notation};
+    my $apply = $p->{target} ne '' ? ' <button type="button" class="apply" data-n="' . h( $r->{notation} ) . '" data-c="' . h( $p->{class} ) . '">' . h( $T{apply} ) . '</button>' : '';
+    my $html = '<div class="res"><div class="big">' . h( $r->{notation} ) . '</div><div class="facts">'
+        . '<div>' . h( $T{entry} ) . ': <b>' . h( $r->{entry} ) . '</b> (' . h( $r->{number} ) . ')</div>'
+        . ( $r->{read_as} ? '<div>' . h( $T{read_as} ) . ': ' . h( $r->{read_as} ) . '</div>' : '' )
+        . ( $p->{class} ne '' ? '<div>' . h( $T{call_number} ) . ': <b>' . h( $r->{call_number} ) . '</b></div>' : '' )
+        . '</div><div class="acts"><button type="button" class="copy" data-v="' . h( $r->{notation} ) . '">' . h( $T{copy} ) . '</button>'
+        . ( $p->{class} ne '' ? ' <button type="button" class="copy" data-v="' . h( $r->{call_number} ) . '">' . h( $T{copy_cn} ) . '</button>' : '' )
+        . $apply . '</div></div>';
+    return $html if $p->{class} eq '';
+    return $html . '<p class="ok">' . h( $T{not_used} ) . '</p>' unless @{ $r->{used} };
+    $html .= '<p>' . h( $T{used} ) . '</p><table class="list"><tbody>'
+        . join( '', map { '<tr><td class="n">' . h( $_->{call_number} ) . '</td><td>' . h( $_->{author} ) . '</td><td>' . h( $_->{title} ) . '</td></tr>' } @{ $r->{used} } )
+        . '</tbody></table>';
+    if ( @{ $r->{alternatives} } ) {
+        $html .= '<p>' . h( $T{other} ) . '</p><ul class="alt">'
+            . join( '', map { '<li><b>' . h( $_->{number} ) . '</b> (' . h( $_->{free} ? $T{free} : $T{in_use} ) . ')</li>' } @{ $r->{alternatives} } )
+            . '</ul>';
+    }
+    return $html;
+}
+
+sub page {
+    my ( $p, $r ) = @_;
+    my $count = 0;
+    if ( open( my $fh, '<', $TABLE ) ) { $count++ while <$fh>; close $fh }
+    ( my $info = $T{table_info} ) =~ s/\{n\}/$count/;
+    my $sel = join '', map { '<option value="' . $_->[0] . '"' . ( $p->{mode} eq $_->[0] ? ' selected' : '' ) . '>' . h( $_->[1] ) . '</option>' }
+        [ person => $T{m_person} ], [ corporate => $T{m_corporate} ], [ title => $T{m_title} ];
+    my $js   = JSON::PP->new->ascii->encode( { target => $p->{target}, copied => $T{copied}, gone => $T{gone} } );
+    my $home = $p->{target} ? '' : '<a class="back" href="/cgi-bin/koha/cataloguing/cataloging-home.pl">' . h( $T{cataloguing} ) . '</a>';
+    my $res  = result_html( $p, $r );
+    my $f    = sub { my $k = shift; return h( $p->{$k} ) };
+    return <<"HTML" . page_script($js);
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>@{[ h( $T{title} ) ]}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; color: #222; background: #fff; }
+    header { background: #408540; color: #fff; padding: 10px 16px; display: flex; gap: 16px; align-items: center; }
+    header h1 { font-size: 1.2em; margin: 0; } header a.back { color: #fff; margin-left: auto; font-size: .9em; text-decoration: none; }
+    form { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px 14px; padding: 14px 16px; background: #f3f7f3; border-bottom: 1px solid #dde7dd; }
+    label { display: block; font-size: .8em; color: #555; margin-bottom: 3px; }
+    input, select { width: 100%; box-sizing: border-box; padding: 7px; font-size: 1em; border: 1px solid #aaa; border-radius: 3px; }
+    main { padding: 8px 16px 24px; max-width: 900px; }
+    .res { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; margin: 14px 0; }
+    .res .big { font-size: 2.4em; font-weight: bold; color: #306030; letter-spacing: .03em; }
+    .facts { line-height: 1.6; } .acts { margin-left: auto; }
+    button { padding: 5px 10px; margin: 2px; border: 1px solid #408540; background: #fff; color: #306030; border-radius: 3px; cursor: pointer; font-size: .9em; }
+    button.apply { background: #408540; color: #fff; }
+    table.list { border-collapse: collapse; width: 100%; } table.list td { border-bottom: 1px solid #eee; padding: 5px 6px; } td.n { white-space: nowrap; font-weight: bold; }
+    .hint { color: #777; } .ok { color: #306030; } .msg { margin-top: 12px; padding: 10px; border-radius: 4px; } .warn { background: #fcf8e3; color: #8a6d3b; }
+    footer { padding: 10px 16px; color: #888; font-size: .8em; border-top: 1px solid #eee; }
+    \@media (max-width: 640px) { .acts { margin-left: 0; } }
+  </style>
+</head>
+<body>
+<header><h1>@{[ h( $T{title} ) ]}</h1>$home</header>
+<form id="kei-form" method="get" action="cutter_calculator.pl" autocomplete="off">
+  <div><label for="kei-name">@{[ h( $T{f_name} ) ]}</label><input id="kei-name" name="name" value="@{[ $f->('name') ]}" placeholder="@{[ h( $T{f_name_ph} ) ]}" autofocus></div>
+  <div><label for="kei-title">@{[ h( $T{f_title} ) ]}</label><input id="kei-title" name="title" value="@{[ $f->('title') ]}"></div>
+  <div><label for="kei-class">@{[ h( $T{f_class} ) ]}</label><input id="kei-class" name="class" value="@{[ $f->('class') ]}" placeholder="869.3"></div>
+  <div><label for="kei-mode">@{[ h( $T{f_mode} ) ]}</label><select id="kei-mode" name="mode">$sel</select></div>
+  <input type="hidden" name="ind2" value="@{[ $f->('ind2') ]}">
+  <input type="hidden" name="bn" value="@{[ $f->('bn') ]}">
+  <input type="hidden" name="target" value="@{[ $f->('target') ]}">
+  <noscript><button type="submit">OK</button></noscript>
+</form>
+<main id="kei-out">
+$res
+</main>
+<footer>@{[ h($info) ]}</footer>
+HTML
+}
+
+# The script of the page: the result follows the typing (format=part), Copy
+# and "Use in the record" (the notation goes into the field the page was
+# opened from: 090 / 092 $b take the notation, a call number keeps its class).
+sub page_script {
+    my $js = shift;
+    return "<script>\nvar K = $js;\n" . <<'JS';
+(function () {
+    var form = document.getElementById("kei-form"), out = document.getElementById("kei-out"), timer = null, seq = 0;
+    function refresh() {
+        var q = [], els = form.elements, my = ++seq;
+        for (var i = 0; i < els.length; i++) { if (els[i].name) q.push(encodeURIComponent(els[i].name) + "=" + encodeURIComponent(els[i].value)); }
+        q.push("format=part");
+        var x = new XMLHttpRequest();
+        x.open("GET", "cutter_calculator.pl?" + q.join("&"));
+        x.onload = function () { if (my === seq && x.status === 200) out.innerHTML = x.responseText; };
+        x.send();
+    }
+    form.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(refresh, 150); });
+    form.addEventListener("change", function () { clearTimeout(timer); timer = setTimeout(refresh, 50); });
+    form.addEventListener("submit", function (e) { e.preventDefault(); refresh(); });
+    function fallback(v) {
+        var t = document.createElement("textarea"); t.value = v; document.body.appendChild(t); t.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(t);
+    }
+    function copy(v, btn) {
+        var done = function () { if (btn) { btn.textContent = K.copied; } };
+        if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(v).then(done, function () { fallback(v); done(); }); }
+        else { fallback(v); done(); }
+    }
+    function apply(n, cls, btn) {
+        var w = window.opener, el = null;
+        try { el = w && !w.closed ? w.document.getElementById(K.target) : null; } catch (e) { el = null; }
+        if (!el) { copy(n, btn); alert(K.gone); return; }
+        if (/^tag_09[0-9]_subfield_b/.test(K.target)) { el.value = n; }
+        else {
+            var v = el.value.replace(/^\s+|\s+$/g, ""), m = v.match(/^(.*?\d{3}(?:[.,]\d+)?)(?:\s|$)/);
+            el.value = m ? m[1] + " " + n : (cls ? cls + " " + n : n);
+        }
+        try { el.dispatchEvent(new w.Event("change", { bubbles: true })); } catch (e) {}
+        el.focus();
+        window.close();
+    }
+    out.addEventListener("click", function (e) {
+        var b = e.target.closest ? e.target.closest("button") : null;
+        if (!b) return;
+        e.preventDefault();
+        if (b.className === "apply") apply(b.getAttribute("data-n"), b.getAttribute("data-c"), b); else copy(b.getAttribute("data-v"), b);
+    });
+})();
+</script>
+</body>
+</html>
+JS
+}
+CUTPL2
+}
+
+# The buttons in the staff interface (a marked block in IntranetUserJS):
+# Cutter next to 090 and 092 $b and the item call number (952 $o) of the
+# cataloguing forms, after the CDD button when there is one, and Cutter
+# Calculator in the tools of the cataloguing home page. The author, title
+# and class come from the form (from the record in the item editor).
+cutter_js_block() {
+    local label title v
+    label=$(t "Cutter Calculator")
+    title=$(t "Work out the Cutter number of the author and use it in this field")
+    for v in label title; do
+        declare -n _s=$v
+        _s=${_s//\\/\\\\}; _s=${_s//\"/\\\"}; _s=${_s//</\\u003c}
+        unset -n _s
+    done
+    cat <<CUTJS
+${CUTTER_JS_BEGIN}
+\$(document).ready(function () {
+    var url = "/cgi-bin/koha/cataloguing/cutter_calculator.pl";
+    if (/\/cgi-bin\/koha\/cataloguing\/cataloging-home\.pl\$/.test(location.pathname)) {
+        var tools = \$("a[href*='tools/inventory.pl'], a[href*='marc_modification_templates.pl'], a[href*='labels/label-home.pl']").closest("ul").first();
+        if (!tools.length) tools = \$("a[href*='/cgi-bin/koha/tools/']").closest("ul").last();
+        if (tools.length && !tools.find("a[href*='cutter_calculator.pl']").length) {
+            var cls = tools.find("a").first().attr("class") || "circ-button";
+            var a = \$("<a></a>").attr({ "class": cls, href: url }).append(\$("<i></i>").attr("class", "fa fa-calculator")).append(document.createTextNode(" ${label}"));
+            tools.append(\$("<li></li>").append(a));
+        }
+        return;
+    }
+    if (!/\/cgi-bin\/koha\/cataloguing\/(addbiblio|additem)\.pl\$/.test(location.pathname)) return;
+    var fields = "input[id^='tag_090_subfield_b'], input[id^='tag_092_subfield_b'], input[id^='tag_952_subfield_o']";
+    function add() {
+        \$(fields).each(function () {
+            if (\$(this).nextAll(".kei-cutter").length) return;
+            var after = \$(this).next(".kei-cdd");
+            (after.length ? after : \$(this)).after(\$("<a href=\"#\" class=\"kei-cutter buttonDot\" style=\"margin-left:4px\"></a>").attr("title", "${title}").text("Cutter"));
+        });
+    }
+    add();
+    new MutationObserver(add).observe(document.body, { childList: true, subtree: true });
+    function val(sel) { var v = ""; \$(sel).each(function () { if (!v && this.value) v = this.value; }); return v; }
+    \$(document).on("click", "a.kei-cutter", function (e) {
+        e.preventDefault();
+        var input = \$(this).prevAll("input").first()[0];
+        if (!input) return;
+        var p = { target: input.id }, bn = (location.search.match(/[?&]biblionumber=(\d+)/) || [])[1];
+        if (bn) p.bn = bn;
+        var m = input.value.match(/^(.*?\d{3}(?:[.,]\d+)?)(?:\s|\$)/);
+        if (m) p["class"] = m[1];
+        if (/addbiblio\.pl\$/.test(location.pathname)) {
+            var a100 = val("input[id^='tag_100_subfield_a']"), a11x = val("input[id^='tag_110_subfield_a'], input[id^='tag_111_subfield_a']");
+            if (a100) { p.name = a100.replace(/[,.\s]+\$/, ""); p.mode = "person"; }
+            else if (a11x) { p.name = a11x; p.mode = "corporate"; }
+            else p.mode = "title";
+            p.title = val("input[id^='tag_245_subfield_a'], textarea[id^='tag_245_subfield_a']").replace(/[\s\/:;=.]+\$/, "");
+            p.ind2 = val("input[name^='tag_245_indicator2']");
+            if (!p["class"]) p["class"] = val("input[id^='tag_090_subfield_a']") || (val("input[id^='tag_082_subfield_a']").match(/\d{3}(?:\.\d+)?/) || [""])[0];
+        }
+        var q = []; for (var k in p) if (p[k]) q.push(k + "=" + encodeURIComponent(p[k]));
+        var w = window.open(url + "?" + q.join("&"), "kei_cutter", "width=900,height=640,scrollbars=yes,resizable=yes");
+        if (w) w.focus();
+    });
+});
+${CUTTER_JS_END}
+CUTJS
+}
+
+cutter_js_sql() {   # cutter_js_sql add|remove FILE: SQL that rewrites IntranetUserJS
+    local cur new
+    cur=$(mr_js_current)
+    cur=$(printf '%s\n' "$cur" | awk -v b="$CUTTER_JS_BEGIN" -v e="$CUTTER_JS_END" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }')
+    new="$cur"
+    if [ "$1" = "add" ]; then new="${cur:+${cur}$'\n'}$(cutter_js_block)"; fi
+    printf "START TRANSACTION;\nUPDATE systempreferences SET value = %s WHERE variable = 'IntranetUserJS';\nCOMMIT;\n" "$(sql_quote "$new")" > "$2"
+}
+
+cutter_installed() { [ -f "$CUTTER_FILE" ]; }
+cutter_js_on() { mr_js_current | grep -qxF "$CUTTER_JS_BEGIN"; }
+cutter_js_latest() { [ "$(mr_js_current | awk -v b="$CUTTER_JS_BEGIN" -v e="$CUTTER_JS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }')" = "$(cutter_js_block)" ]; }
+
+function_cutter() {
+    require_database || return 0
+    local opt status table n
+    while true; do
+        n=$(cat_table_count cutter)
+        if [ "$n" -gt 0 ]; then table="$(t 'Cutter-Sanborn table: ${n} entries.')"; else table="$(t "Cutter-Sanborn table: not loaded yet.")"; fi
+        if cutter_installed; then status="$(t "Installed"): /cgi-bin/koha/cataloguing/cutter_calculator.pl"; else status="$(t "Not installed.")"; fi
+        opt=$(ui_menu "$(t "✂  Cutter Calculator")" "$(t "The Cutter number of an author from the Cutter-Sanborn table of the library, here or in Koha's cataloguing, where a Cutter button next to 090, 092 and the item call number puts it in the record. The table is not distributed with the panel: load the copy of your library (a text file, one number and its entry per line, e.g. 848 Assis).")"$'\n\n'"$table"$'\n'"$status" \
+            "1" "$(t "Calculate a Cutter number")" \
+            "2" "$(t "Load the Cutter-Sanborn table")" \
+            "3" "$(t "Install or update the page in the staff interface")" \
+            "4" "$(t "Remove the page (the table is kept)")") || return 0
+        case "$opt" in
+            1) lt_cutter_calc ;;
+            2) lt_cat_load cutter ;;
+            3) lt_cutter_install ;;
+            4) lt_cutter_remove ;;
+        esac
+        clear
+    done
+}
+
+lt_cutter_calc() {
+    local name title class out
+    if [ ! -s "$(cat_table_path cutter)" ]; then
+        msg_info "$(t "Cutter Calculator")" "$(t "Load the Cutter-Sanborn table of your library first (option 2).")" 9 70
+        return 0
+    fi
+    name=$(ui_input "$(t "Cutter Calculator")" "$(t "Author as in the heading: Surname, Forename (e.g. Assis, Machado de). For an institution, its name.")" "") || return 0
+    [ -n "${name// /}" ] || return 0
+    title=$(ui_input "$(t "Cutter Calculator")" "$(t "Title of the work (for the initial after the number):")" "") || return 0
+    class=$(ui_input "$(t "Cutter Calculator")" "$(t "Class number (CDD), to check the numbers already used (optional):")" "") || return 0
+    class="${class// /}"
+    if ! [[ "$class" =~ ^[0-9A-Za-z./-]{0,20}$ ]]; then
+        msg_error "" "$(t "Invalid class number.")" 8 60
+        return 1
+    fi
+    tools_workdir || return 1
+    out="$TOOLS_WORK/cutter.txt"
+    cat_notation_report cutter "$name" "$title" "" person "$class" 0 "$out"
+    ui_textbox "$(t "Cutter Calculator")" "$out"
+}
+
+lt_cutter_install() {
+    if [ ! -d "${KOHA_INTRA_CGI}/cataloguing" ]; then
+        msg_error "" "$(t "The staff interface folder of Koha was not found. Nothing was changed.")" 9 72
+        return 1
+    fi
+    local link="no"
+    prompt_yes_no "$(t "Cutter Calculator")" "$(t "Also add the shortcuts in the staff interface: a Cutter button next to the call number fields of the cataloguing form (090, 092, item call number) and Cutter Calculator in the tools of the cataloguing home page? (a marked block in the IntranetUserJS preference, removed with the page; a verified backup is made first)")" 13 76 && link="yes"
+    tools_locked _lt_cutter_install "$link"
+}
+
+_lt_cutter_install() {
+    local link="$1" log new rules sql restart=0 url note=""
+    log=$(tools_log cutter)
+    new="$TOOLS_WORK/cutter_calculator.pl"
+    rules="$TOOLS_WORK/KohaEasy/Cataloguing/Rules.pm"
+    mkdir -p "${rules%/*}"
+    cutter_page_script > "$new"
+    mr_pm_rules > "$rules"
+    chmod 644 "$new" "$rules"
+    chmod 755 "$TOOLS_WORK/KohaEasy" "${rules%/*}"
+    display_explanation "Checking the page with the Perl modules of Koha..."
+    if ! koha_exec "$log" perl-check /usr/bin/perl -I "$TOOLS_WORK" -c "$new"; then
+        ui_textbox "$(t "Cutter Calculator")" "$log"
+        msg_error "" "$(t 'The page does not compile with this version of Koha. Nothing was changed.\n\nLog: ${log}')" 11 74
+        return 1
+    fi
+    # The rules module is shared with Replace a MARC record: Plack may hold either.
+    { cutter_installed || mr_installed; } && restart=1
+    if [ "$link" = "yes" ] && ! cutter_js_latest; then
+        tools_safety_backup CUTTER || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cutter_js_sql add "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    { mkdir -p "$MR_PM_DIR" \
+        && install -o root -g root -m 644 "$rules" "$MR_PM_DIR/Rules.pm.new" && mv -f "$MR_PM_DIR/Rules.pm.new" "$MR_PM_DIR/Rules.pm" \
+        && install -o root -g root -m 755 "$new" "${CUTTER_FILE}.new" && mv -f "${CUTTER_FILE}.new" "$CUTTER_FILE"; } || {
+        msg_error "" "$(t "The page could not be installed. Nothing was changed.")" 8 64; return 1; }
+    printf 'installed=%s\nlink=%s\n' "$(date +%F)" "$link" > "$CUTTER_STATE"
+    [ "$restart" = "1" ] && plack_restart
+    url="/cgi-bin/koha/cataloguing/cutter_calculator.pl"
+    [ -s "$(cat_table_path cutter)" ] || note="$(t "The page asks for the table until it is loaded (option 2).")"
+    log "cutter: page installed (link=$link)"
+    msg_ok "$(t '✔ Page installed. In the staff interface: ${url}')"${note:+$'\n\n'"$note"} 11 76
+}
+
+lt_cutter_remove() {
+    cutter_installed || cutter_js_on || { msg_info "$(t "Cutter Calculator")" "$(t "Not installed.")" 8 60; return 0; }
+    prompt_yes_no "$(t "Cutter Calculator")" "$(t "Remove the page and its buttons? The Cutter-Sanborn table is kept.")" 9 74 defaultno || return 0
+    tools_locked _lt_cutter_remove
+}
+
+_lt_cutter_remove() {
+    local log sql
+    log=$(tools_log cutter)
+    if cutter_js_on; then
+        tools_safety_backup CUTTER || return 1
+        sql="$TOOLS_WORK/intranetuserjs.sql"
+        cutter_js_sql remove "$sql"
+        if ! koha_sql_run "$log" "$sql"; then
+            msg_error "" "$(t 'The operation failed. The safety backup can bring the database back (Restore database): ${TOOLS_PRE}\n\nLog: ${log}')" 12 76
+            return 1
+        fi
+        memcached_flush || true
+    fi
+    rm -f "$CUTTER_FILE" "$CUTTER_STATE"
+    # The rules module stays while Replace a MARC record uses it.
+    if ! mr_installed; then
+        rm -f "$MR_PM_DIR/Rules.pm"
+        rmdir "$MR_PM_DIR" 2>/dev/null || true
+    fi
+    plack_restart
+    log "cutter: page removed"
+    msg_ok "$(t "✔ The page was removed.")"
 }
 
 # Loaded with "source installer" (tests/): functions only, no menu.
