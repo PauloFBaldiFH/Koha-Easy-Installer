@@ -982,7 +982,7 @@ function Start-KohaHidden {
 # for questions a Yes/No box cannot ask. Returns the key, or the last key
 # when the window is closed.
 function Show-KohaChoice {
-    param([string]$Text, [System.Collections.IDictionary]$Choices, [string]$Title = 'Koha')
+    param([string]$Text, [System.Collections.IDictionary]$Choices, [string]$Title = (Get-KohaAppTitle))
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     $keys = @($Choices.Keys)
@@ -2296,6 +2296,23 @@ function Export-KohaDiagnostics {
 # ----------------------------------------------------------------------
 function Get-KohaIconPath { return [System.IO.Path]::Combine((Get-KohaPath Bin), 'koha.ico') }
 
+# The application's title on the Koha window, its header, the dialogs and
+# the Koha shortcut's tooltip ("Koha descomplicado : instalação e gestão"
+# in Portuguese).
+function Get-KohaAppTitle { return (T 'Koha Easy Installer & Manager') }
+
+# The icon of the program shortcuts: KohaEasy.exe's own icon (koha.ico,
+# built into the program the shortcuts start) while KohaEasy.exe is in use,
+# else koha.ico. Explorer and the taskbar read an icon inside the program
+# they start as reliably as the program itself; a loose .ico next to it
+# came back as a blank page on the desktop and the taskbar after a
+# restart, while the program still ran.
+function Get-KohaShortcutIcon {
+    param([string]$Launcher = (Get-KohaLauncherPath))
+    if ($Launcher -and (Test-Path -LiteralPath $Launcher)) { return $Launcher }
+    return (Get-KohaIconPath)
+}
+
 # koha.ico as an icon for a window or the tray ($Size 0: the file's own
 # sizes). Read into memory, and tried again while a program still holds
 # the file (an antivirus scan at sign-in); then KohaEasy.exe's own icon,
@@ -2363,7 +2380,11 @@ function Get-KohaShortcutList {
         (& $lnk (T 'Koha - Export diagnostics') 'ExportReport')
         (& $lnk (T 'Koha - Status icon') 'Tray')
     )
-    foreach ($s in $list) { $s.Icon = Get-KohaIconPath }
+    $lnkIcon = Get-KohaShortcutIcon
+    foreach ($s in $list) {
+        if ($s.Kind -eq 'lnk') { $s.Icon = $lnkIcon } else { $s.Icon = Get-KohaIconPath }
+    }
+    $list[0].Description = Get-KohaAppTitle
     return $list
 }
 
@@ -2380,7 +2401,7 @@ function Save-KohaUrlShortcut {
 # KohaEasy.exe (KohaEasy.Native). Throws with both reasons when neither
 # could write it.
 function Save-KohaLnkShortcut {
-    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon)
+    param([string]$Path, [string]$Target, [string]$Arguments, [string]$Icon, [string]$Description = '')
     try {
         $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop
         $lnk = $shell.CreateShortcut($Path)
@@ -2388,6 +2409,7 @@ function Save-KohaLnkShortcut {
         $lnk.Arguments = $Arguments
         $lnk.WorkingDirectory = Get-KohaPath Root
         $lnk.IconLocation = $Icon + ',0'
+        if ($Description) { $lnk.Description = $Description }
         $lnk.Save()
         return
     } catch {
@@ -2495,7 +2517,9 @@ function New-KohaShortcuts {
                 if ($s.Kind -eq 'url') {
                     Save-KohaUrlShortcut -Path $file -Url $s.Target -Icon $s.Icon
                 } else {
-                    Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon
+                    $tip = ''
+                    if ($s.ContainsKey('Description')) { $tip = $s.Description }
+                    Save-KohaLnkShortcut -Path $file -Target $s.Target -Arguments $s.Arguments -Icon $s.Icon -Description $tip
                 }
             } catch {
                 Add-KohaShortcutError $file $_.Exception.Message
@@ -2541,6 +2565,11 @@ function New-KohaShortcuts {
     # Only with the Start menu shortcut does Windows know Koha's name and
     # icon for its notifications and the taskbar.
     Set-KohaState @{ appIdShortcut = $identity } | Out-Null
+    # Explorer and the taskbar draw the rewritten shortcuts again now, not
+    # from icons cached before.
+    if ($made.Count -gt 0 -and (Import-KohaNative)) {
+        try { [KohaEasy.Native]::RefreshShellIcons() } catch { Write-KohaLog ('icon refresh: ' + $_.Exception.Message) }
+    }
     Write-KohaLog ('shortcuts created: {0}, Koha icon: {1}, Koha identity on the taskbar: {2}' -f $made.Count, $script:KohaIconPlace, $identity)
     return @($made)
 }

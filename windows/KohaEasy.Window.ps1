@@ -34,7 +34,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$title = T 'Koha - Status and services'
+$title = Get-KohaAppTitle
 $mutex = New-Object System.Threading.Mutex($false, 'Local\KohaEasyWindow')
 if (-not $mutex.WaitOne(0)) {
     # Already open: bring that window to the front instead of a second one.
@@ -205,7 +205,7 @@ function New-Flow {
 
 function Confirm-Koha {
     param([string]$Question, [string]$Detail, [string]$Icon = 'Warning')
-    return ([System.Windows.Forms.MessageBox]::Show($form, ($Question + "`n`n" + $Detail), 'Koha', 'YesNo', $Icon) -eq 'Yes')
+    return ([System.Windows.Forms.MessageBox]::Show($form, ($Question + "`n`n" + $Detail), $title, 'YesNo', $Icon) -eq 'Yes')
 }
 $disconnectText = T 'Anyone using the catalog will be disconnected, and nightly backups will not run until Koha is started again.'
 
@@ -242,7 +242,8 @@ $root.Padding = New-Object System.Windows.Forms.Padding(16, 16, 16, 6)
 $root.BackColor = $theme.Bg
 
 # Header: the Koha logo (green, as the Koha community publishes it; the
-# name and logo are theirs, said on its tooltip) and the product name. The
+# name and logo are theirs, said on its tooltip) and the application's
+# title. The
 # PNG is read into memory, so the file is never held open. Without it the
 # window simply starts with the banner.
 $logoFile = Join-Path $here 'koha-logo.png'
@@ -263,7 +264,7 @@ if (Test-Path -LiteralPath $logoFile) {
         $header.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
         [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
         [void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-        $product = New-Text 'Koha Easy Installer' $fontSmall $theme.Muted
+        $product = New-Text $title $fontSmall $theme.Muted
         $product.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
         [void]$header.Controls.Add($logo, 0, 0)
         [void]$header.Controls.Add($product, 1, 0)

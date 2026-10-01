@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 title Koha Easy Installer
 
-:: Verifica se já está a rodar como Administrador
+:: Already running as administrator? Otherwise ask Windows for it (UAC).
 net session >nul 2>&1
 if %errorLevel% == 0 (
     goto :run
