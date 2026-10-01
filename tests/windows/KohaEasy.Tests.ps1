@@ -1303,6 +1303,37 @@ Describe 'Koha icon and logo in the Koha window and the tray' {
     }
 }
 
+Describe 'Koha shortcut icon after a restart, and the application title' {
+    It 'gives the program shortcuts the icon inside KohaEasy.exe while it is in use, koha.ico otherwise' {
+        $exe = Join-Path $TestDrive 'KohaEasy.exe'
+        [System.IO.File]::WriteAllText($exe, 'x')
+        Get-KohaShortcutIcon -Launcher $exe | Should -Be $exe
+        Get-KohaShortcutIcon -Launcher '' | Should -Be (Get-KohaIconPath)
+        Get-KohaShortcutIcon -Launcher (Join-Path $TestDrive 'missing.exe') | Should -Be (Get-KohaIconPath)
+    }
+
+    It 'shows the application title as the Koha shortcut''s tooltip, and tells Explorer to redraw the icons' {
+        @(Get-KohaShortcutList)[0].Description | Should -Be (Get-KohaAppTitle)
+        $core = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Core.psm1') -Raw
+        $core | Should -Match 'if \(\$Description\) \{ \$lnk.Description = \$Description \}'
+        $core | Should -Match '\[KohaEasy.Native\]::RefreshShellIcons\(\)'
+        $cs = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Launcher.cs') -Raw
+        $cs | Should -Match 'SHChangeNotify\(0x08000000, 0x1000, IntPtr.Zero, IntPtr.Zero\)'
+    }
+
+    It 'titles the Koha window, its header and the dialogs "Koha descomplicado : instalação e gestão" in Portuguese' {
+        $pt = Get-Content -LiteralPath (Join-Path $repo 'lang/pt.cache')
+        $key = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('Koha Easy Installer & Manager')) + '|'
+        $line = @($pt | Where-Object { $_.StartsWith($key) })
+        $line.Count | Should -Be 1
+        [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line[0].Substring($key.Length))) | Should -Be 'Koha descomplicado : instalação e gestão'
+        $w = Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.Window.ps1') -Raw
+        $w | Should -Match '\$title = Get-KohaAppTitle'
+        $w | Should -Match '\$product = New-Text \$title'
+        Get-Content -LiteralPath (Join-Path $repo 'windows/KohaEasy.ps1') -Raw | Should -Match 'MessageBox\]::Show\(\$Text, \(Get-KohaAppTitle\)'
+    }
+}
+
 Describe 'Cold boot' {
     It 'reads a Koha that should run as starting in the first seconds after Windows starts' {
         $st = @{ desired = 'running'; startedAt = 0; autostart = 'logon' }

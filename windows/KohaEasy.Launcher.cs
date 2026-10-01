@@ -1,4 +1,4 @@
-// Koha Easy Installer for Windows: KohaEasy.exe.
+﻿// Koha Easy Installer for Windows: KohaEasy.exe.
 //
 // Built on this PC by the installer (KohaEasy.Core.psm1, Install-KohaLauncher)
 // with the C# compiler that ships with Windows (.NET Framework 4), so it is
@@ -134,6 +134,9 @@ namespace KohaEasy
         [DllImport("ole32.dll")]
         static extern int PropVariantClear(ref PropVariant pvar);
 
+        [DllImport("shell32.dll")]
+        static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+
         [DllImport("user32.dll")]
         static extern bool AllowSetForegroundWindow(int processId);
 
@@ -214,6 +217,14 @@ namespace KohaEasy
             {
                 Marshal.ReleaseComObject(link);
             }
+        }
+
+        // Tells Explorer and the taskbar that icons changed (SHCNE_ASSOCCHANGED,
+        // SHCNF_FLUSH), so new or rewritten Koha shortcuts are drawn again
+        // instead of from an icon cache entry made before they existed.
+        public static void RefreshShellIcons()
+        {
+            SHChangeNotify(0x08000000, 0x1000, IntPtr.Zero, IntPtr.Zero);
         }
 
         // A program shortcut written through the shell's own IShellLink, the
