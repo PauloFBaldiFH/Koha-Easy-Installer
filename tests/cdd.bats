@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Library tools 14: the CDD lookup. KohaEasy::CDD (the reader of the CDD
+# Library tools 13: the CDD lookup. KohaEasy::CDD (the reader of the CDD
 # and the searches) on a small made-up sample in the layout of the text of
 # a CDD PDF (the real DDC is copyrighted and never enters the repository),
 # cataloguing/cdd_lookup.pl run as a CGI with the Koha doubles of

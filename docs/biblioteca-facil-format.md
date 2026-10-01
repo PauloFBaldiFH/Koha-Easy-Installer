@@ -1,7 +1,7 @@
 # Biblioteca Fácil: database and backup format
 
-How the panel reads Biblioteca Fácil (Library tools > Brazil: localization &
-migration > Migrate the Biblioteca Fácil database). Reverse engineered from a
+How the panel reads Biblioteca Fácil (Library tools > Magic Import Tool, which
+recognises the backup or data folder and calls this reader). Reverse engineered from a
 backup of the program's version 7 with its empty template database
 (`BibFacil7\Vazio`) plus a few test entries; nothing below comes from the
 vendor. The layout is checked by the importer on every run (record checksums,

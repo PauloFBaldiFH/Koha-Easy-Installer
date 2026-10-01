@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
-# Library tools: MARC import/undo, SQL reports pack, patron import and
-# school-year turnover, data-quality check, LGPD housekeeping. The Koha
+# Library tools: undo of a MARC import, SQL reports pack, school-year
+# turnover, data-quality check, LGPD housekeeping (the imports themselves:
+# tests/magic_import.bats). The Koha
 # scripts are test doubles (tests/mocks/koha-script) acting on a real
 # MariaDB; the panel's own steps (lock, dry run, confirmation, PRE-* backup,
 # koha-shell quoting) run for real.
@@ -20,63 +21,17 @@ teardown() {
 }
 
 pre_backups() { find /var/backups/koha_sql -maxdepth 1 -name "PRE-${1:-}*" 2>/dev/null | wc -l; }
-line_of()     { grep -n -m1 -- "$1" "$KEI_S/calls.log" | cut -d: -f1; }
 # ISO 2709 file with N minimal records (leader position 09 = "a": Unicode).
 marc_file()   { local i; for ((i = 0; i < $2; i++)); do printf '00026nam a2200025 a 4500\036\035'; done > "$1"; }
 bibs()        { tools_sql "SELECT COUNT(*) FROM biblio;"; }
 
-# --- MARC import ---------------------------------------------------------
-
-@test "L01 MARC import: staged preview, then a verified PRE-IMPORT backup, then the import" {
-    marc_file "$W/books.mrc" 3
-    export KEI_SELECT_FILE="$W/books.mrc"
-    inputs "UTF-8" "keep"
-    answer yes
-    panel lt_marc_import
-    assert '[ "$status" -eq 0 ]' "$output"
-    assert 'grep -q "^stage_file.pl --file /tmp/koha_tools\.[^ ]*/books.mrc --format ISO2709 --encoding UTF-8 --add-items --comment koha-easy-installer [0-9-]* books.mrc --match 1 --no-replace \[pre=0\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'grep -q "^commit_file.pl --batch-number 1 \[pre=1\]" "$KEI_S/calls.log"' "the import must come after the safety backup: $(calls)"
-    assert '[ "$(line_of stage_file.pl)" -lt "$(line_of commit_file.pl)" ]'
-    local pre; pre=$(ls /var/backups/koha_sql/PRE-IMPORT_*.sql.gz)
-    assert 'gzip -t "$pre" && zcat "$pre" | tail -n1 | grep -q "Dump completed"' "PRE-IMPORT backup must be complete"
-    assert '[ "$(bibs)" = "203" ]'
-    assert '[ "$(tools_sql "SELECT import_status FROM import_batches WHERE import_batch_id = 1;")" = "imported" ]'
-    assert 'dialogs | grep -q "^OK ✔ Batch 1 imported"'
-    assert '[ -z "$(ls -d /tmp/koha_tools.* 2>/dev/null)" ]' "the work folder must be removed on exit"
-}
-
-@test "L02 MARC import declined after the preview: nothing imported, no backup" {
-    marc_file "$W/books.mrc" 2
-    export KEI_SELECT_FILE="$W/books.mrc"
-    inputs "UTF-8" "new"
-    answer no
-    panel lt_marc_import
-    assert 'grep -q "^stage_file.pl" "$KEI_S/calls.log"'
-    assert '! grep -q "^stage_file.pl.*--match" "$KEI_S/calls.log"' "mode 'new' must not match records"
-    assert '! grep -q "^commit_file.pl" "$KEI_S/calls.log"'
-    assert '[ "$(pre_backups)" = "0" ] && [ "$(bibs)" = "200" ]'
-    assert 'dialogs | grep -q "Nothing was added to the catalog"'
-}
-
-@test "L03 MARC import refuses empty and non-MARC files before calling Koha" {
-    local f
-    : > "$W/empty.mrc"
-    echo "hello" > "$W/text.mrc"
-    echo "<collection></collection>" > "$W/none.xml"
-    for f in empty.mrc text.mrc none.xml; do
-        export KEI_SELECT_FILE="$W/$f"
-        panel lt_marc_import
-    done
-    assert '! grep -q "stage_file.pl" "$KEI_S/calls.log" 2>/dev/null' "$(calls)"
-    assert '[ "$(dialogs | grep -c "^ERROR")" = "3" ]' "$(dialogs)"
-    assert '[ "$(bibs)" = "200" ]'
-}
+# --- MARC undo (batches staged by the Magic Import Tool, tests/magic_import.bats) ---
 
 @test "L04 MARC undo: counts first, PRE-UNDO-IMPORT backup, then commit_file.pl --revert" {
     marc_file "$W/books.mrc" 4
     export KEI_SELECT_FILE="$W/books.mrc"
-    inputs "UTF-8" "new"; answer yes
-    panel lt_marc_import
+    inputs "new"; answer yes yes
+    panel lt_magic_import
     assert '[ "$(bibs)" = "204" ]'
     : > "$KEI_S/calls.log"
     inputs "1"; answer yes
@@ -93,7 +48,7 @@ bibs()        { tools_sql "SELECT COUNT(*) FROM biblio;"; }
     export KEI_SELECT_FILE="$W/books.mrc"
     flock -o /var/lock/koha_backup.lock sleep 30 3>&- &
     HOLD=$!; sleep 0.5
-    panel lt_marc_import
+    panel lt_magic_import
     inputs "1"
     panel lt_reports
     inputs "ST" "FM" "all" "*"
@@ -107,8 +62,8 @@ bibs()        { tools_sql "SELECT COUNT(*) FROM biblio;"; }
     marc_file "$W/books.mrc" 2
     export KEI_SELECT_FILE="$W/books.mrc"
     rm -rf /var/backups/koha_sql; mkdir -p /var/backups; : > /var/backups/koha_sql   # a file where the folder should be
-    inputs "UTF-8" "keep"; answer yes
-    panel lt_marc_import
+    inputs "keep"; answer yes yes
+    panel lt_magic_import
     rm -f /var/backups/koha_sql
     assert 'grep -q "^stage_file.pl" "$KEI_S/calls.log"' "the preview still runs"
     assert '! grep -q "^commit_file.pl" "$KEI_S/calls.log"' "nothing may be imported without the backup"
@@ -164,34 +119,6 @@ bibs()        { tools_sql "SELECT COUNT(*) FROM biblio;"; }
 }
 
 # --- patrons ------------------------------------------------------------------
-
-@test "L10 patron import: dry run first, then PRE-PATRONS backup and --confirm" {
-    printf 'cardnumber,surname,firstname,branchcode\nN1,Nova,Ana,\nN2,Neto,Bruno,MPL\nC1,Existing,Ana,\n' > "$W/patrons.csv"
-    export KEI_SELECT_FILE="$W/patrons.csv"
-    inputs "CPL" "ST"
-    answer no yes          # do not update existing patrons; import
-    panel lt_patron_import
-    assert 'grep -q "^import_patrons.pl --file /tmp/koha_tools\.[^ ]*/patrons.csv --matchpoint cardnumber --default branchcode=CPL --default categorycode=ST -v -v \[pre=0\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'grep -q "^import_patrons.pl .* -v -v --confirm \[pre=1\]" "$KEI_S/calls.log"' "$(calls)"
-    assert 'dialogs | grep -q "New patrons      : 2"' "$(dialogs)"
-    assert '[ "$(tools_sql "SELECT CONCAT(branchcode, categorycode) FROM borrowers WHERE cardnumber = '"'"'N1'"'"';")" = "CPLST" ]'
-    assert '[ "$(tools_sql "SELECT branchcode FROM borrowers WHERE cardnumber = '"'"'N2'"'"';")" = "MPL" ]'
-    assert '[ "$(tools_sql "SELECT surname FROM borrowers WHERE cardnumber = '"'"'C1'"'"';")" = "OLD" ]' "existing patrons stay as they are"
-    assert '[ -f /root/koha_patrons_template.csv ]'
-}
-
-@test "L11 patron import refuses non-UTF-8, semicolon and header-less files" {
-    printf 'cardnumber,surname\nX1,Jo\xe3o\n' > "$W/latin1.csv"
-    printf 'cardnumber;surname\nX1;Joao\n' > "$W/semicolon.csv"
-    printf 'X1,Joao\nX2,Maria\n' > "$W/noheader.csv"
-    local f
-    for f in latin1 semicolon noheader; do
-        export KEI_SELECT_FILE="$W/$f.csv"
-        panel lt_patron_import
-    done
-    assert '! grep -q "import_patrons" "$KEI_S/calls.log" 2>/dev/null'
-    assert 'dialogs | grep -q "not UTF-8" && dialogs | grep -q "semicolons" && dialogs | grep -q "must name the columns"' "$(dialogs)"
-}
 
 @test "L12 school-year turnover: dry run lists the patrons, --confirm only after the backup" {
     inputs "ST" "FM" "age" "*"
