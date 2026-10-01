@@ -152,7 +152,7 @@ Real-Windows behaviour (the installer, notifications, the tray, Task Scheduler, 
 | 7 | Diagnostics & maintenance | Status, health check, logs, optimization |
 | 8 | Security center | Fail2ban, firewall, password rotation |
 | 9 | Koha settings & parameters | Sizing, e-mail, super librarian, SIP2/Z39.50, clock |
-| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration, WhatsApp / Telegram messaging, cataloguing aids, replace a MARC record, CDD lookup |
+| 10 | Library tools | MARC import/undo, SQL reports pack, patron import, school-year turnover, data-quality check, privacy (LGPD), Brazil: localization & migration, WhatsApp / Telegram messaging, cataloguing aids, replace a MARC record, CDD lookup, Koha plugins on or off |
 | 11 | General tools | htop/nethogs, terminal browser, file manager |
 | 12 | Schedules & cron tasks | View, explain, regenerate or edit automated tasks |
 | 13 | Koha languages | Koha language packs and panel language |
@@ -263,6 +263,16 @@ The two modules are installed with the page in `/usr/local/lib/site_perl/KohaEas
 - **Install the page** optionally adds a **CDD** button next to 082, 083, 090, 092 `$a` and the item call number (952 `$o`) in the cataloguing forms, and **CDD lookup** in the tools of the cataloguing home page (a marked block in `IntranetUserJS`, verified `PRE-CDD` backup first). The button opens the lookup with the number already in the field or with the subjects and title of the record as suggestions; **Use in the record** puts the number in the field (082 and 083 get the number and `$2` the edition when empty; 090, 092 and 952 keep the author notation after it). **Copy** copies it.
 - **Remove the page** removes the page, the buttons and the module `KohaEasy/CDD.pm`; the index is kept.
 
+### Koha plugins (on or off)
+
+**Library tools > Koha plugins** turns on or off Koha's own plugin system (**Administration > Manage plugins**), which a new Debian instance ships turned off (`<enable_plugins>0</enable_plugins>` in `koha-conf.xml`).
+
+- **Turn Koha plugins on** sets `enable_plugins` to 1, adds `<pluginsdir>` when it is missing (`/var/lib/koha/<instance>/plugins`, created for the instance user), sets `UseKohaPlugins` on Koha versions that still have that preference, and restarts Plack and the background workers.
+- **Turn Koha plugins off** sets `enable_plugins` back to 0 and changes nothing else: the plugin files and their data stay, and turning plugins on again brings them back as they were.
+- **Where plugins can be installed from**: `.kpz` upload plus the plugin repositories, or only the plugin repositories (`plugins_restricted`). When no repository is set, the panel offers to add the ones `koha-conf.xml` lists as examples (ByWater Solutions, Theke Solutions, PTFS Europe).
+- **Register plugins copied into the folder** runs Koha's `koha-plugins --install` (or `install_plugins.pl` on older Koha) after a verified `PRE-PLUGINS` backup, for plugins unpacked into the plugins folder by hand.
+- Every change writes a new `koha-conf.xml` only when it is well-formed and reads back with the new values; otherwise the file is left as it was. The previous file stays next to it as `koha-conf.xml.bak-<date>`.
+
 ## Automated tasks
 
 Installed in `/etc/cron.d/koha_tasks`:
@@ -311,7 +321,7 @@ Copy your backups somewhere else before running it.
 
 ## Tests (for contributors)
 
-`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card, collection spreadsheets, census reports, ABNT references), the messaging driver (against a WhatsApp / Telegram test double), the author notation and CDD lookup, `marc_replace.pl` (run as a CGI), the schedule upgrade, the WSL mode, the QR code / browser / link sign-in, and the Windows tools (their PowerShell tests run with [Pester 5](https://pester.dev) when `pwsh` is installed).
+`tests/` has a [bats-core](https://github.com/bats-core/bats-core) battery that runs the panel against a real MariaDB: corrupt, truncated and empty backups, MariaDB down or refusing the login, full or unwritable disks, CTRL+C / lost SSH connection in the middle of a restore, locks shared with the nightly backups, indexing after engine switches and restores, Debian/Ubuntu releases on amd64/arm64, the library tools (dry run before any change, lock, verified backup, `koha-shell` quoting), the Brazil tools (Latin-1 MARC migration to 952, CPF check digits, movable holidays, label templates, cataloguing card, collection spreadsheets, census reports, ABNT references), the messaging driver (against a WhatsApp / Telegram test double), the author notation and CDD lookup, the Koha plugins switch in `koha-conf.xml`, `marc_replace.pl` (run as a CGI), the schedule upgrade, the WSL mode, the QR code / browser / link sign-in, and the Windows tools (their PowerShell tests run with [Pester 5](https://pester.dev) when `pwsh` is installed).
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \

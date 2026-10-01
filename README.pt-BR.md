@@ -152,7 +152,7 @@ O comportamento em um Windows real (o instalador, notificações, ícone de stat
 | 7 | Diagnóstico e manutenção | Status, verificação, logs, otimização |
 | 8 | Central de segurança | Fail2ban, firewall, troca de senha |
 | 9 | Configurações e parâmetros do Koha | Dimensionamento, e-mail, superbibliotecário, SIP2/Z39.50, relógio |
-| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração, mensagens por WhatsApp / Telegram, auxílio à catalogação, substituir um registro MARC, consulta à CDD |
+| 10 | Ferramentas da biblioteca | Importação MARC e desfazer, relatórios SQL, importação de leitores, virada do ano letivo, qualidade do catálogo, privacidade (LGPD), Brasil: localização e migração, mensagens por WhatsApp / Telegram, auxílio à catalogação, substituir um registro MARC, consulta à CDD, ligar ou desligar os plugins do Koha |
 | 11 | Ferramentas gerais | htop/nethogs, navegador de terminal, gerenciador de arquivos |
 | 12 | Agendamentos e tarefas (cron) | Ver, entender, regenerar ou editar as tarefas automáticas |
 | 13 | Idiomas do Koha e do painel | Pacotes de idioma do Koha e idioma do painel |
@@ -263,6 +263,16 @@ Os dois módulos são instalados com a página em `/usr/local/lib/site_perl/Koha
 - **Instalar a página** pode adicionar um botão **CDD** ao lado dos campos 082, 083, 090, 092 `$a` e do número de chamada do exemplar (952 `$o`) nos formulários de catalogação, e **Consulta à CDD** nas ferramentas da página inicial da catalogação (um bloco marcado no `IntranetUserJS`, com backup verificado `PRE-CDD` antes). O botão abre a consulta com o número que já está no campo ou com os assuntos e o título do registro como sugestões; **Usar no registro** coloca o número no campo (082 e 083 recebem o número e o `$2` com a edição quando vazio; 090, 092 e 952 mantêm a notação de autor depois dele). **Copiar** copia o número.
 - **Remover a página** remove a página, os botões e o módulo `KohaEasy/CDD.pm`; o índice é mantido.
 
+### Plugins do Koha (ligar ou desligar)
+
+**Ferramentas da biblioteca > Plugins do Koha** liga ou desliga o sistema de plugins do próprio Koha (**Administração > Gerenciar plugins**), que vem desligado numa instância Debian nova (`<enable_plugins>0</enable_plugins>` no `koha-conf.xml`).
+
+- **Ligar os plugins do Koha** coloca `enable_plugins` em 1, acrescenta `<pluginsdir>` quando falta (`/var/lib/koha/<instância>/plugins`, criada para o usuário da instância), liga a preferência `UseKohaPlugins` nas versões do Koha que ainda a têm e reinicia o Plack e os processos em segundo plano.
+- **Desligar os plugins do Koha** volta `enable_plugins` para 0 e não muda mais nada: os arquivos dos plugins e seus dados ficam, e ao ligar de novo eles voltam como estavam.
+- **De onde os plugins podem ser instalados**: envio de `.kpz` mais os repositórios de plugins, ou somente os repositórios de plugins (`plugins_restricted`). Sem nenhum repositório configurado, o painel oferece adicionar os que o `koha-conf.xml` traz como exemplo (ByWater Solutions, Theke Solutions, PTFS Europe).
+- **Registrar plugins copiados para a pasta** executa o `koha-plugins --install` do Koha (ou o `install_plugins.pl` em Koha mais antigo) depois de um backup verificado `PRE-PLUGINS`, para plugins descompactados à mão na pasta de plugins.
+- Cada alteração só grava um `koha-conf.xml` novo quando ele é XML válido e é relido com os valores novos; se não, o arquivo fica como estava. O arquivo anterior fica ao lado como `koha-conf.xml.bak-<data>`.
+
 ## Tarefas automáticas
 
 Instaladas em `/etc/cron.d/koha_tasks`:
@@ -311,7 +321,7 @@ Copie seus backups para outro lugar antes de executá-lo.
 
 ## Testes
 
-A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo, relatórios dos censos, referências ABNT), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o `marc_replace.pl` (executado como CGI), a atualização dos agendamentos, o modo WSL, a autorização por QR code / navegador / link e as ferramentas do Windows (os testes em PowerShell rodam com o [Pester 5](https://pester.dev) quando o `pwsh` está instalado).
+A pasta `tests/` tem uma bateria [bats-core](https://github.com/bats-core/bats-core) que executa o painel contra um MariaDB real: backups corrompidos, truncados e vazios, MariaDB parado ou recusando o login, disco cheio ou sem permissão de escrita, CTRL+C / queda do SSH no meio da restauração, travas compartilhadas com os backups noturnos, indexação depois de trocar o motor de busca e de restaurar, versões do Debian/Ubuntu em amd64/arm64, as ferramentas da biblioteca (simulação antes de qualquer alteração, trava, backup verificado, aspas do `koha-shell`), as ferramentas do Brasil (migração MARC em Latin-1 para o 952, dígitos verificadores do CPF, feriados móveis, modelos de etiquetas, ficha catalográfica, planilhas do acervo, relatórios dos censos, referências ABNT), o driver de mensagens (contra um dublê de WhatsApp / Telegram), a notação de autor e a consulta à CDD, o interruptor dos plugins do Koha no `koha-conf.xml`, o `marc_replace.pl` (executado como CGI), a atualização dos agendamentos, o modo WSL, a autorização por QR code / navegador / link e as ferramentas do Windows (os testes em PowerShell rodam com o [Pester 5](https://pester.dev) quando o `pwsh` está instalado).
 
 ```bash
 sudo apt-get install bats mariadb-server memcached whiptail yaz xsltproc python3 \
