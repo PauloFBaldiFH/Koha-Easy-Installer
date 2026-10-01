@@ -117,10 +117,10 @@ EOF
     cgi "name=<script>alert(1)</script>" "title=\"><i>" "target=x\"><script>" format=part
     assert '! grep -q "<script>alert" <<< "$output" && ! grep -q "class=\"apply\"" <<< "$output"' "a bad target gives no Use button: $output"
     cgi "name=<script>alert(1)</script>" "title=\"><i>"
-    assert 'grep -q "value=\"&lt;script&gt;alert(1)&lt;/script&gt;\"" <<< "$output" && grep -q "value=\"&quot;&gt;&lt;i&gt;\"" <<< "$output" && grep -q "Cutter-Sanborn table of the library: 18 entries" <<< "$output"' "$output"
+    assert 'grep -q "value=\"&lt;script&gt;alert(1)&lt;/script&gt;\"" <<< "$output" && grep -q "value=\"&quot;&gt;&lt;i&gt;\"" <<< "$output" && grep -q "Table of the library: 18 entries" <<< "$output"' "$output"
     rm -f "$TABLE"
     cgi name="Assis, M"
-    assert 'grep -q "The Cutter-Sanborn table has not been loaded yet" <<< "$output"' "$output"
+    assert 'grep -q "No author table has been loaded yet" <<< "$output"' "$output"
 }
 
 # --- panel -------------------------------------------------------------------------
@@ -138,7 +138,7 @@ EOF
     assert 'grep -q "L588  (free to use)" "$r"' "$(cat "$r")"
     rm -f "$TABLE"
     panel lt_cutter_calc
-    assert 'dialogs | grep -q "Load the Cutter-Sanborn table of your library first"' "$(dialogs | tail -1)"
+    assert 'dialogs | grep -q "Load the Cutter-Sanborn or the PHA table of your library first"' "$(dialogs | tail -1)"
 }
 
 @test "K05 panel: the page is compiled, installed with the rules module and its buttons, updated in place and removed cleanly" {
@@ -149,7 +149,7 @@ EOF
     local page="$W/cgi/cataloguing/cutter_calculator.pl"
     assert '[ "$(stat -c "%a %U" "$page")" = "755 root" ] && [ "$(stat -c "%a %U" "$PM/KohaEasy/Cataloguing/Rules.pm")" = "644 root" ]' "$(ls -l "$page" 2>&1) $(dialogs | tail -2)"
     assert 'grep -q "koha-shell library -c \"/usr/bin/perl\" \"-I\" \".*\" \"-c\" \".*cutter_calculator.pl\"" "$KEI_S/calls.log"' "compiled as the instance user first: $(calls)"
-    assert 'grep -q "our \$TABLE = '"'"'/etc/koha-easy-install/tables/cutter.tsv'"'"'" "$page" && dialogs | grep -q "The page asks for the table until it is loaded"' "$(dialogs | tail -1)"
+    assert 'grep -q "our %TABLES = ( cutter => '"'"'/etc/koha-easy-install/tables/cutter.tsv'"'"', pha => '"'"'/etc/koha-easy-install/tables/pha.tsv'"'"' );" "$page" && dialogs | grep -q "The page asks for a table until one is loaded"' "$(dialogs | tail -1)"
     local js; js=$(userjs)
     assert '[[ "$js" == "/* the library'"'"'s own code */"* ]] && [ "$(pre_backups CUTTER)" = "1" ]' "the library code is kept: $js"
     assert 'grep -qF "input[id^='"'"'tag_090_subfield_b'"'"']" <<< "$js" && grep -qF "input[id^='"'"'tag_952_subfield_o'"'"']" <<< "$js" && grep -q "fa fa-calculator" <<< "$js" && grep -q "next(\".kei-cdd\")" <<< "$js"' "$js"
@@ -180,4 +180,101 @@ EOF
     assert 'dialogs | grep -q "does not compile" && [ ! -e "$W/cgi/cataloguing/cutter_calculator.pl" ] && [ "$(pre_backups)" = "0" ]' "$(dialogs | tail -2)"
     local item='"15" "$(t "✂  Cutter Calculator")"'
     assert 'grep -qF "$item" "$KEI_REPO/installer" && grep -qF "15) function_cutter ;;" "$KEI_REPO/installer"'
+}
+
+# --- PHA and the options of the author number ---------------------------------------
+
+# A made-up PHA table in the "Entry;number" form the panel reads.
+load_pha() {
+    mkdir -p /etc/koha-easy-install/tables
+    printf '%s\n' "Aa;11" "Assi;861" "Ast;862" "Ea;12" "Ec;19" "Qa;4" "Qu;43" > "$W/pha.txt"
+    "$KEI_SH" "$PANEL" cat_table_import pha "$W/pha.txt" /etc/koha-easy-install/tables/pha.tsv > /dev/null
+}
+
+@test "K07 page: the table is chosen (PHA when loaded), the letter of the title can be left out, edition and copy are added" {
+    load_table
+    page
+    json name="Assis, Machado de" title="Dom Casmurro"
+    assert '[ "$(jget code)" = "A848d" ] && [ "$(jget table)" = "cutter" ]' "only the Cutter table loaded: $output"
+    load_pha
+    json name="Assis, Machado de" title="Dom Casmurro"
+    assert '[ "$(jget code)" = "A861d" ] && [ "$(jget table)" = "pha" ]' "PHA first when both are loaded: $output"
+    json name="Assis, Machado de" title="Dom Casmurro" table=cutter
+    assert '[ "$(jget code)" = "A848d" ]' "$output"
+    json name="Assis, Machado de" title="Dom Casmurro" noletter=1 class=869.3
+    assert '[ "$(jget code)" = "A861" ] && [ "$(jget call_number)" = "869.3 A861" ]' "$output"
+    json name="Assis, Machado de" title="Dom Casmurro" edition=2 copy=3
+    assert '[ "$(jget code)" = "A861d 2. ed. ex. 3" ] && [ "$(jget notation)" = "A861d" ]' "$output"
+    json name="Assis, Machado de" title="Dom Casmurro" edition=1 copy=abc
+    assert '[ "$(jget code)" = "A861d" ]' "the first edition and a copy that is not a number add nothing: $output"
+    json title="O quinze" ind2=2
+    assert '[ "$(jget code)" = "Q43" ] && [ "$(jget mode)" = "title" ]' "no author: the title without its article: $output"
+    json name="Assis, Machado de" title="Dom Casmurro" table=other
+    assert '[ "$(jget table)" = "pha" ]' "an unknown table falls back to a loaded one: $output"
+    cat > "$KS/biblio/8.xml" <<'XML'
+<record><datafield tag="100" ind1="1" ind2=" "><subfield code="a">Assis, Machado de,</subfield></datafield><datafield tag="245" ind1="1" ind2="0"><subfield code="a">Dom Casmurro /</subfield></datafield><datafield tag="250" ind1=" " ind2=" "><subfield code="a">3. ed.</subfield></datafield></record>
+XML
+    json bn=8
+    assert '[ "$(jget code)" = "A861d 3. ed." ]' "the edition of the record (250): $output"
+    cgi name="Assis, Machado de"
+    assert 'grep -q "<option value=\"pha\" selected>PHA table" <<< "$output" && grep -q "<option value=\"cutter\">Cutter-Sanborn" <<< "$output" && grep -q "name=\"noletter\"" <<< "$output"' "$output"
+}
+
+# OCR-like text of a page spread of the PHA book (letters D and F): rows of
+# "Entry number Entry" groups in the decimal order of the book, made up.
+pha_spread() {
+    python3 - "$@" <<'PY'
+import sys
+nums = sorted({str(n) for n in range(11, 1000) if "0" not in str(n)})[:64]
+abc = "abcdefghijklmnopqrstuvwxyz"
+names = [abc[i // 26] + abc[i % 26] for i in range(64)]
+nums[5] = "113"          # 115 misread as 113 by the OCR
+lines = []
+for i in range(0, 64, 2):
+    a, b = i, i + 1
+    lines.append(f"| D{names[a]} {nums[a]} F{names[a]}   D{names[b]} {nums[b]} F{names[b]} :")
+print("Explicação\nA tabela dá o número 12 de cada nome, e o 3 depois.\n\f" + "\n".join(lines))
+PY
+}
+
+@test "K08 the PHA reader puts the rows of the book in order and corrects a misread number by that order" {
+    "$KEI_SH" "$PANEL" cat_pha_rows_py > "$W/pha_rows.py"
+    pha_spread > "$W/ocr.txt"
+    run python3 "$W/pha_rows.py" "$W/ocr.txt" "$W/rows.tsv"
+    assert '[ "$status" = 0 ] && grep -qx "rows=64" <<< "$output" && grep -qx "fixed=1" <<< "$output" && grep -qx "fix=Daf 113 -> 115" <<< "$output"' "$output"
+    assert '[ "$(head -1 "$W/rows.tsv")" = "$(printf "Daa\t11\tFaa")" ] && grep -qxP "Daf\t115\tFaf" "$W/rows.tsv" && ! grep -q "Explica\|[|:]" "$W/rows.tsv"' "$(head -8 "$W/rows.tsv")"
+    run python3 "$W/pha_rows.py" "$W/ocr.txt"
+    assert '[ "$status" != 0 ] && grep -q usage <<< "$output"' "$output"
+}
+
+@test "K09 panel: the PHA table is loaded from the PDF of a scanned book with OCR; menu of 5 options" {
+    mkdir -p "$W/bin" /etc/koha-easy-install/tables
+    pha_spread > "$W/ocr.txt"
+    # Doubles: a PDF without text, two pages, each page read by the OCR.
+    printf '#!/bin/sh\necho "pdftotext $*" >> %s/tools.log\n: > "$5"\n' "$W" > "$W/bin/pdftotext"
+    printf '#!/bin/sh\necho "Pages:          2"\n' > "$W/bin/pdfinfo"
+    printf '#!/bin/sh\necho "pdftoppm $*" >> %s/tools.log\nfor a; do p="$a"; done\n: > "$p-1.png"\n' "$W" > "$W/bin/pdftoppm"
+    cat > "$W/bin/tesseract" <<SH
+#!/bin/sh
+[ "\$1" = --list-langs ] && { echo por; exit 0; }
+echo "tesseract \$*" >> $W/tools.log
+n=\$(cat $W/n 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n > $W/n
+[ \$n = 1 ] && sed -n '1,2p' $W/ocr.txt || sed -n '3,\$p' $W/ocr.txt | tr -d '\f'
+SH
+    chmod 755 "$W"/bin/*
+    printf '%%PDF-1.4\n%%fake\n' > "$W/PHA.pdf"
+    export KEI_SELECT_FILE="$W/PHA.pdf"
+    extra "PATH=\"$W/bin:\$PATH\""
+    answer yes
+    panel lt_cat_load pha
+    local r="$KEI_S/textbox.last" pha=/etc/koha-easy-install/tables/pha.tsv
+    assert 'grep -q "^pdftoppm -r 300 -gray -png -f 2 -l 2 .*PHA.pdf" "$W/tools.log" && grep -q "^tesseract .* -l por --psm 6" "$W/tools.log"' "$(cat "$W/tools.log" 2>&1) $(dialogs | tail -3)"
+    assert 'grep -q "Rows read from the PDF: 64" "$r" && grep -q "check them against the book): 1" "$r" && grep -q "Daf 113 -> 115" "$r"' "$(cat "$r")"
+    assert '[ "$(wc -l < "$pha")" = "128" ] && grep -qP "^d\tdaf\t115\tDaf$" "$pha" && grep -qP "^f\tfaf\t115\tFaf$" "$pha" && dialogs | grep -q "^OK .*128 entries"' "$(dialogs | tail -3)"
+    # A PDF is only read for the PHA table.
+    export KEI_SELECT_FILE="$W/PHA.pdf"
+    panel lt_cat_load cutter
+    assert 'dialogs | tail -1 | grep -q "could not be read from this PDF"' "$(dialogs | tail -1)"
+    local n
+    for n in 1 2 3 4 5; do assert 'grep -qF "            \"$n\" \"\$(t \"" <<< "$(sed -n "/^function_cutter()/,/^}/p" "$KEI_REPO/installer")"' "menu item $n"; done
 }
