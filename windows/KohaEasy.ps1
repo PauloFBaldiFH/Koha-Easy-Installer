@@ -5,6 +5,7 @@
     KohaEasy.ps1 Start [-Trigger user|logon]   Koha - Start shortcut, tray, sign-in task
     KohaEasy.ps1 Stop [-Force]                 Koha - Stop shortcut, tray
     KohaEasy.ps1 Restart [-Force]              Koha - Restart shortcut, tray
+    KohaEasy.ps1 SafeShutdown                  Koha - Shut down the PC safely (Start menu, tray, Koha window): stops Koha step by step with progress, then shuts down or restarts Windows
     KohaEasy.ps1 Launch                        the Koha icon (desktop, Start menu): starts the tray and Koha when they are not running, puts back a deleted sign-in entry or task, then the Koha window (or brings it to the front)
     KohaEasy.ps1 Window                        the Koha window: banner, quick access, components, actions (Koha - Status, tray)
     KohaEasy.ps1 Status                        the same summary in a message box
@@ -32,7 +33,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Launch', 'Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
+    [ValidateSet('Launch', 'Window', 'Panel', 'Terminal', 'Open', 'Start', 'Stop', 'Restart', 'SafeShutdown', 'RestartServices', 'RebuildIndex', 'Status', 'Run', 'Tray', 'ExportReport', 'ExportDiagnostics', 'CheckDisk', 'CompactDisk', 'SetAutostart', 'RegisterTasks', 'CreateShortcuts', 'SetupNetwork', 'UpdatePortProxy', 'Install')]
     [string]$Command = 'Status',
     [ValidateSet('user', 'logon')][string]$Trigger = 'user',
     [ValidateSet('logon', 'manual')][string]$Mode,
@@ -59,7 +60,7 @@ trap {
             Add-Content -LiteralPath (Join-Path $logDir ('koha-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) -Value ('{0} | {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $failure)
         } catch { }
     }
-    if (@('Launch', 'Window', 'Tray', 'Panel', 'Terminal') -contains $Command -and -not $Quiet) {
+    if (@('Launch', 'Window', 'Tray', 'Panel', 'Terminal', 'SafeShutdown') -contains $Command -and -not $Quiet) {
         try {
             Add-Type -AssemblyName System.Windows.Forms
             [void][System.Windows.Forms.MessageBox]::Show(('Koha: {0}{1}{1}C:\KohaEasy\logs' -f $_.Exception.Message, [Environment]::NewLine), 'Koha', 'OK', 'Error')
@@ -183,6 +184,7 @@ switch ($Command) {
             Show-Box (T 'Koha is stopped. Use Koha - Start to turn it on again.') | Out-Null
         }
     }
+    'SafeShutdown' { & (Join-Path $PSScriptRoot 'KohaEasy.Shutdown.ps1') }
     'Restart' {
         if (Confirm-Stop (T 'Restart Koha?')) {
             Stop-Koha | Out-Null
